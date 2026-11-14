@@ -5,7 +5,7 @@ from .pe import (PE, Scope, LFn, LuaTable, MultiTail, Sym, LinSym, NeedFork, For
 
 
 class Node:
-    __slots__ = ('key', 'tree', 'raw_tree', 'exposed', 'written', 'snap_in', 'error', 'kdeps', 'kin', 'parent', 'kill')
+    __slots__ = ('key', 'tree', 'raw_tree', 'exposed', 'written', 'snap_in', 'error', 'kdeps', 'kin', 'parent', 'kill', 'uses')
 
     def __init__(self, key):
         self.key = key
@@ -19,6 +19,7 @@ class Node:
         self.kin = None
         self.parent = None
         self.kill = None
+        self.uses = None
 
 
 class ProtoIR:
@@ -220,7 +221,7 @@ class Lifter:
     def enter(self, key, kregs):
         """(signature, constants) for arriving at instruction `key` with constants `kregs`."""
         rel = self.rel.get(key, ())
-        if rel and self.is_merge(key):
+        if rel and self.is_merge(key, kregs):
             # head of a real for loop: its hidden loop state cannot be duplicated, so all arrivals
             # share one copy that keeps only the constants they agree on
             inv = self.inv.get(key, {})
@@ -238,12 +239,17 @@ class Lifter:
                     kregs.pop(r, None)
         return frozenset((r, kregs[r]) for r in rel if r in kregs), kregs
 
-    def is_merge(self, key):
+    def is_merge(self, key, kregs):
         info = self.merge.get(key)
         if info is None:
             return False
-        # a loop whose body branches on the loop variable is a state loop: followed, not merged
-        return not (info[1] is not None and info[1] in self.rel.get(info[0], ()))
+        if info[1] is None or info[1] not in self.rel.get(info[0], ()):
+            return True
+        # the body branches on the loop variable: a state loop, followed iteration by iteration
+        # (not merged) whenever this arrival knows its bounds
+        stk = kregs.get(FORSTK, ())
+        top = stk[-1] if stk else None
+        return not (top is not None and top[3] + 3 == info[1])
 
     def walk(self, pir, interp, entry, snap):
         """Explore the proto's control flow, lifting each instruction on first reach.
@@ -257,7 +263,7 @@ class Lifter:
         visits = {}
         while work:
             key2, snap, kregs, parent = work.pop()
-            if self.is_merge(key2):
+            if self.is_merge(key2, kregs):
                 inv = self.inv.get(key2)
                 if inv is None:
                     self.inv[key2] = dict(kregs)
@@ -323,7 +329,11 @@ class Lifter:
                             self.preds.setdefault(tkey, []).append(key2)
                             have = self.rel.get(tkey)
                             if have:
-                                self.add_relevant(pir, key2, have - self.kill_of(node))
+                                kl = self.kill_of(node)
+                                rest = have - kl
+                                for r in have & kl:
+                                    rest = rest | node.uses.get(r, frozenset())
+                                self.add_relevant(pir, key2, rest)
                         work.append((tkey, snap2, regs2, key2))
                 return [], term
 
@@ -340,14 +350,35 @@ class Lifter:
 
     @staticmethod
     def kill_of(n):
+        """Path-state entries the instruction always overwrites.  n.uses[x] says what the new
+        value of x is computed from, so relevance can continue through the computation."""
         kl = n.kill
         if kl is None:
             kl = set()
+            uses = {}
+            td = {}
             for st in n.raw_tree[0]:
                 if st[0] == 'set':
-                    kl.add(st[1][1] if st[1][0] == 'r' else st[1])
+                    e = st[2]
+                    deps = P.k_deps(e, td, set()) if isinstance(e, tuple) else set()
+                    if st[1][0] == 't':
+                        td[st[1]] = frozenset(deps)
+                        if isinstance(e, tuple) and e[0] == 'bin' and e[1] in ('+', '-'):
+                            td.setdefault(P.ADDITIVE, set()).add(st[1])
+                        kl.add(st[1])
+                    elif st[1][0] == 'r':
+                        r = st[1][1]
+                        if isinstance(e, tuple) and P.is_counter_update(r, e, td):
+                            deps = set()
+                        kl.add(r)
+                        uses[r] = frozenset(deps)
                 elif st[0] == 'call':
+                    deps = set()
+                    for a in st[3]:
+                        P.k_deps(a, td, deps)
+                    td[('mv', st[1], 1)] = frozenset(deps)
                     kl.add(('mv', st[1], 1))
+            n.uses = uses
             kl = n.kill = frozenset(kl)
         return kl
 
@@ -367,7 +398,10 @@ class Lifter:
             for p in self.preds.get(k, ()):
                 n = pir.nodes.get(p)
                 if n is not None and n.raw_tree is not None:
-                    rest = add - self.kill_of(n)
+                    kl = self.kill_of(n)
+                    rest = add - kl
+                    for r in add & kl:
+                        rest = rest | n.uses.get(r, frozenset())
                     if rest:
                         work.append((p, rest))
 

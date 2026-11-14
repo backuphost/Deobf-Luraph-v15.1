@@ -359,6 +359,16 @@ NOTK = Special('NOTK')
 
 
 ESCAPED = '__escaped'
+ADDITIVE = '__additive'
+
+
+def is_counter_update(reg, e, td, regs=()):
+    """True for R = R +/- x (directly or through a temporary)."""
+    if e[0] == 'bin' and e[1] in ('+', '-'):
+        return reg in k_deps(e, td, set(), regs)
+    if e[0] == 't' and e in td.get(ADDITIVE, ()):
+        return reg in td.get(e, ())
+    return False
 
 
 def k_eval(e, regs, tv, used=None):
@@ -442,7 +452,7 @@ def k_deps(e, td, out, regs=()):
         if e in regs:
             out.add(e)
         else:
-            out |= td.get(e, ())
+            out |= set(td.get(e, ()))
     elif t == 'bin':
         k_deps(e[2], td, out, regs)
         k_deps(e[3], td, out, regs)
@@ -468,9 +478,13 @@ def k_transfer(stmts, regs, tv, used=None, td=None):
                     tv[dst] = v
                     if td is not None:
                         td[dst] = frozenset(k_deps(st[2], td, set(), regs))
+                        if st[2][0] == 'bin' and st[2][1] in ('+', '-'):
+                            td.setdefault(ADDITIVE, set()).add(dst)
                 regs.pop(dst, None)
             elif dst[0] == 'r':
                 v = k_eval(st[2], regs, tv, used)
+                if v is not NOTK and td is not None and is_counter_update(dst[1], st[2], td, regs):
+                    v = NOTK        # r = r + k: a counter, not a state; following it unrolls loops
                 if v is NOTK or dst[1] in regs.get(ESCAPED, ()):
                     regs.pop(dst[1], None)
                 else:
