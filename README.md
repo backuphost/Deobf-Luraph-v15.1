@@ -1,5 +1,75 @@
 # Luraph v15.1 反混淆工具
 
+# devm — real devirtualisation (new)
+
+`devm/` lifts the Luraph VM back to Lua instead of dumping buffers. Input is a script that
+still contains the Luraph interpreter in readable form — for example a Luau decompiler's
+output for a protected Roblox script (the "形态 C" case below, which the older tools could only
+dissect).
+
+```bash
+python devm/build_luau.py                      # once: builds bin/luau (stock Luau + devm/luau_cli.patch)
+python -m devm protected.lua -o clean.lua --verify
+python deob.py protected.lua -o clean.lua --devm   # same thing through the old entry point
+```
+
+How it works:
+
+1. **Locate** the interpreter (`while true do local op = code[pc] ...`) and patch dump hooks
+   into a copy of the script (`vmmodel.py`, `harness.lua`).
+2. **Dump** the VM state at the moment the interpreter is first entered, by running the patched
+   copy under the Luau CLI with a stub Roblox environment.
+3. **Lift**: a partial evaluator (`pe.py`) runs the interpreter's own source on one VM
+   instruction at a time, with concrete operands and symbolic registers, and records what the
+   handler does as register-level IR. No opcode table is hard-coded, so shuffled opcodes,
+   split "micro-op" handlers and several interpreter variants in one script are all handled.
+4. **Unflatten** (`lifter.py`): constants are tracked along every path; state-machine
+   dispatchers, jump trampolines (`R[x] = k; pc = R[x] + 1`), opaque branches and Luraph's
+   `for s = a, b, c do if s == ... end` state loops are resolved, giving one copy of each
+   instruction per relevant constant state.
+5. **Simplify** (`simplify.py`): the constant table passed to the script body is inlined,
+   cached library locals (`local v = string.byte`) are replaced by the library function, dead
+   assignments are removed.
+6. **Structure and print** (`ircfg.py`, `structure.py`): expression folding, loops/ifs,
+   `local` placement.
+7. **Verify** (`--verify`): the original VM and the recovered code are run side by side in the
+   same stub environment and their observable events (calls into and reads/writes of
+   environment objects, final result) are compared.
+
+Status on the four sample scripts this was developed against:
+
+| sample | interpreter layout | result |
+|---|---|---|
+| HookScript (245 KB) | proto table | 1,332 lines, 0 lift errors, 0 unstructured functions, compiles, `--verify` identical |
+| ClientSynchronizer (253 KB) | proto table | 1,318 lines, 0 lift errors, 0 unstructured functions, compiles, `--verify` identical |
+| TeleportGuard (579 KB) | factory, self-decrypting bytecode | partial: 12 protos found, 9 instructions fail to lift, output not usable yet |
+| Net (766 KB) | factory, self-decrypting bytecode | partial: 13 protos found, 7 instructions fail to lift, output not usable yet |
+
+Limits you should know about:
+
+- **`--verify` is only as strong as the stub environment.** Both proto-table samples are
+  anti-tamper scripts: they check the Roblox environment (`getmetatable(Instance) == nil`,
+  `typeof(Enum) == "Enums"`, C-function checks through `debug.info`, ...) and deliberately hang
+  when a check fails, which it does outside Roblox. The comparison therefore covers start-up up
+  to the first failed check (0 and 2 observable events). As a second check, a 300,000-step
+  program-counter trace of the real VM run was confirmed to stay inside the lifted graph.
+  Code behind the failed check is lifted but has not been executed side by side.
+- **The factory layout is not done.** Its bytecode decrypts itself while running, with keys
+  that pass through VM registers, and constants/protos are decoded lazily. The lifter follows
+  this for the first few hundred instructions (it reproduces the real run's first 55 constant
+  decryptions in order) but then reaches a loop instruction it cannot make sense of; everything
+  after that point is missing. The command exits with status 1 and lists the failures.
+- Variable names are not recoverable (`v12`, `p3`); Luraph's own runtime (integrity checks,
+  the crash routine) is part of the output because it is part of the protected script.
+- One expression in each output still refers to `__LPH_ENV[...]`: the crash routine wiping the
+  VM's internal tables. It only resolves when the code runs through the harness.
+
+Exit status: 0 = clean lift (and identical behaviour with `--verify`), 1 = partial, 2 = no
+Luraph interpreter found or no usable Luau binary.
+
+---
+
+
 自动识别样本形态，两种都能还原源码 —— **不报假成功**。
 
 ## 一、这个工具到底做什么

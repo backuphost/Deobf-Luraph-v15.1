@@ -9,7 +9,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class Stage:
-    def __init__(self, src, workdir, tag, layers=(), log=print):
+    def __init__(self, src, workdir, tag, layers=(), log=print, simplify=True):
+        self.simplify = simplify
         self.src = src
         self.workdir = workdir
         self.tag = tag
@@ -36,7 +37,7 @@ class Stage:
             self.tag, len(protos), nodes, len(errs), len(conf)))
         self.errors = errs
         self.conflicts = conf
-        d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
+        d = structure.Decompiler(protos, self.lifter.root_key, self.native_text, simplify=self.simplify)
         self.text = d.run()
         self.stats = d.stats
         self.log('[%s] decompiled: %d lines, %d unstructured' % (self.tag, self.text.count('\n'), d.stats['unstructured']))
@@ -69,3 +70,26 @@ def trace(chain, outpath, timeout=120):
         return None, err
     with open(outpath, encoding='latin-1') as f:
         return f.read().split('\n'), err
+
+
+OBSERVABLE = ('call ', 'get ', 'set ', 'setglobal ', 'RESULT', 'task error', 'deferred error')
+
+
+def verify(stage, lifted_path, workdir):
+    """Run the VM and the recovered code under the same stub environment and compare the
+    observable events (calls into / reads and writes of environment objects, final result).
+    Returns (identical?, description)."""
+    a, e1 = trace([stage.patched_path], os.path.join(workdir, stage.tag + '.orig.trace'))
+    b, e2 = trace([stage.patched_path, lifted_path], os.path.join(workdir, stage.tag + '.lift.trace'))
+    if a is None or b is None:
+        return False, 'could not run (%s)' % ((e1 or e2 or '').strip()[-200:] or 'no trace produced')
+    globals_a = [x for x in a if x and not x.startswith(OBSERVABLE)]
+    a = [x for x in a if x.startswith(OBSERVABLE)]
+    b = [x for x in b if x.startswith(OBSERVABLE)]
+    note = '%d observable events, %d distinct globals read' % (len(a), len(set(globals_a)))
+    if a == b:
+        return True, 'identical behaviour (%s)' % note
+    n = min(len(a), len(b))
+    d = next((i for i in range(n) if a[i] != b[i]), n)
+    return False, 'behaviour differs at event %d: original %r, recovered %r' % (
+        d, a[d] if d < len(a) else '<end>', b[d] if d < len(b) else '<end>')

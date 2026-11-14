@@ -358,7 +358,22 @@ def find_luau():
     for c in cands:
         if c and (os.path.isfile(c) or shutil.which(c)):
             return c
-    raise RuntimeError('luau binary not found; set LUAU_BIN')
+    raise RuntimeError('luau binary not found; build it with: python devm/build_luau.py (or set LUAU_BIN)')
+
+
+def check_luau():
+    """The harness needs a Luau CLI with a few extra builtins (see devm/build_luau.py)."""
+    luau = find_luau()
+    probe = os.path.join(HERE, '_probe.lua')
+    with open(probe, 'w') as f:
+        f.write('assert(readfile and writefile and appendfile and ewrite and exitafter and cwrap and loadstring and setfenv)')
+    try:
+        r = subprocess.run([luau, probe], capture_output=True, text=True, timeout=30)
+    finally:
+        os.remove(probe)
+    if r.returncode != 0:
+        raise RuntimeError('%s lacks the builtins the devm harness needs; build it with: python devm/build_luau.py' % luau)
+    return luau
 
 
 def run_dump(model, workdir, tag, layers=()):

@@ -560,6 +560,7 @@ class Parser:
 
 
 def parse(src):
+    Func._n = 0     # function ids are per source text (the dump refers to them)
     p = Parser(src)
     body = p.block()
     if p.peek()[0] != 'eof':

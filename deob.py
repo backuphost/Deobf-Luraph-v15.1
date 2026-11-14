@@ -428,7 +428,17 @@ def main():
     ap.add_argument("--force", action="store_true", help="即使判定为 VM 字节码，也强制导出骨架")
     ap.add_argument("--vm-report", action="store_true",
                     help="形态 C（内联 VM）时导出 vm_anatomy.md 解剖报告")
+    ap.add_argument("--devm", action="store_true",
+                    help="devirtualise with the devm lifter (input: decompiled script that still "
+                         "contains the Luraph VM); see the 'devm' section of README.md")
     args = ap.parse_args()
+
+    if args.devm:
+        from devm.__main__ import main as devm_main
+        dv = [args.input, "--verify"]
+        if args.output:
+            dv += ["-o", args.output]
+        return devm_main(dv)
 
     inp = Path(args.input)
     if not inp.exists():
