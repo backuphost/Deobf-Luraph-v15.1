@@ -223,6 +223,15 @@ class ProtoCFG:
         self._merge_conds()
         self._fold_regs()
 
+    def refold(self):
+        """Re-run expression folding after whole-program rewrites."""
+        self._thread()
+        for _ in range(4):
+            self._fold_regs()
+            self._merge_tables()
+        self._merge_conds()
+        self._fold_regs()
+
     # -- stage A
     def _build(self):
         counter = [0]
@@ -640,6 +649,8 @@ class ProtoCFG:
                         uses = sum(1 for e in reads for x in walk_expr(e, []) if x == ('r', n))
                         if sj[0] == 'forbr':
                             uses = 0
+                        if _captures(reads, n):
+                            break       # a closure captures R[n]: the register must stay
                         if uses:
                             if uses == 1:
                                 target = j
@@ -664,7 +675,7 @@ class ProtoCFG:
                     k = target + 1
                     while dead is None and k < len(stmts):
                         reads, writes = stmt_exprs(stmts[k])
-                        if any(x == ('r', n) for e in reads for x in walk_expr(e, [])):
+                        if any(x == ('r', n) for e in reads for x in walk_expr(e, [])) or _captures(reads, n):
                             dead = False
                             break
                         if any(w == ('r', n) for w in writes):
@@ -766,6 +777,17 @@ class ProtoCFG:
                 if changed:
                     break
         self.compute_preds()
+
+
+def _captures(reads, n):
+    """True when a closure created in these expressions captures register n (by value or reference)."""
+    for e in reads:
+        for x in walk_expr(e, []):
+            if x[0] == 'closure':
+                for c in x[2]:
+                    if c[0] in ('ref', 'val') and c[1] == n:
+                        return True
+    return False
 
 
 def cap_step(cur, st):

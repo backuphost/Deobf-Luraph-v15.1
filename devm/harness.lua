@@ -315,6 +315,7 @@ local function rbxLib(name, impl)
 	rbxLibs[name] = lib
 	return lib
 end
+local seenGlobal = {}
 local stubGlobals = { script = stub("script"), game = stub("game"), workspace = stub("workspace"),
 	task = rbxLib("task", taskImpl) }
 if traceMode then
@@ -333,7 +334,11 @@ if traceMode then
 end
 sandbox = setmetatable({}, {
 	__index = function(t, k)
-		if string.sub(tostring(k), 1, 5) ~= "__LPH" then tr(tostring(k)) end
+		-- each global is reported once: how often code re-reads a library table is not behaviour
+		if not seenGlobal[k] and string.sub(tostring(k), 1, 5) ~= "__LPH" then
+			seenGlobal[k] = true
+			tr(tostring(k))
+		end
 		local v = _G[k]
 		if v ~= nil then return v end
 		v = stubGlobals[k]

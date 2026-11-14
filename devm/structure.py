@@ -651,6 +651,22 @@ def cleanup(stmts, in_loop_tail=False):
             st[2] = cleanup(st[2])
             if st[3]:
                 st[3] = cleanup(st[3])
+            tail = []
+            while st[2] and st[3] and same_stmt(st[2][-1], st[3][-1]):
+                # both arms end the same way (the structurer copies join code into each arm)
+                tail.insert(0, st[2].pop())
+                st[3].pop()
+            if tail:
+                if not st[2] and st[3]:
+                    st = ['if', negate(st[1]), st[3], None]
+                elif not st[3]:
+                    st[3] = None
+                if st[2]:
+                    out.append(st)
+                elif any(x[0] == 'call' for x in walk_expr(st[1], [])):
+                    out.append(['call_discard', st[1]])
+                out.extend(tail)
+                continue
         elif t in ('while',):
             st[2] = cleanup(strip_tail_continue(st[2]))
             body = st[2]
@@ -667,6 +683,46 @@ def cleanup(stmts, in_loop_tail=False):
             st[3] = cleanup(strip_tail_continue(st[3]))
         out.append(st)
     return out
+
+
+def same_stmt(a, b):
+    """Structural equality of two AST statements, ignoring the loop-header tags."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        if a and isinstance(a[0], str) and a[0] in ('while', 'fornum', 'forin', 'repeat') and a[0] == b[0]:
+            return all(same_stmt(x, y) for x, y in zip(a[:-1], b[:-1]))
+        return all(same_stmt(x, y) for x, y in zip(a, b))
+    if isinstance(a, tuple):
+        return len(a) == len(b) and all(same_stmt(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def merge_varargs(stmts):
+    """local a = (select(1, ...)); local b = (select(2, ...))  ->  local a, b = ..."""
+    run = []
+    i = 0
+    while i < len(stmts):
+        st = stmts[i]
+        if st[0] == 'local' and len(st[1]) == 1 and len(st[2]) == 1 and st[2][0][0] == 'varargn' \
+                and (not run or st[2][0][1] > run[-1][1]):
+            run.append((st[1][0], st[2][0][1]))
+            i += 1
+            continue
+        break
+    if len(run) < 2 and not (run and run[0][1] == 1):
+        return stmts
+    names = []
+    want = 1
+    for nm, idx in run:
+        while want < idx:
+            names.append('_')
+            want += 1
+        names.append(nm)
+        want += 1
+    return [['local', names, [('va',)]]] + stmts[i:]
 
 
 def has_continue(stmts):
@@ -1240,21 +1296,29 @@ class Printer:
 
 
 class Decompiler:
-    def __init__(self, protos, root_key, native_text=None):
+    def __init__(self, protos, root_key, native_text=None, simplify=True):
         self.protos = protos
         self.root_key = root_key
         self.namer = Namer()
         self.native_text = native_text
         self.stats = {'protos': 0, 'unstructured': 0, 'warnings': []}
         self.done = {}
+        self.cfgs = {k: ProtoCFG(p) for k, p in protos.items()}
+        self.simplified = simplify
+        if simplify:
+            from . import simplify as S
+            S.simplify(self.cfgs, root_key)
 
     def proto_ast(self, key):
         """(params, vararg, ast)"""
-        pir = self.protos[key]
+        import copy
         for coalesce in (False, True):
-            cfg = ProtoCFG(pir)
+            cfg = copy.deepcopy(self.cfgs[key])
             make_reducible(cfg)
             params = assign_variables(cfg, self.namer, coalesce)
+            if self.simplified:
+                from .simplify import drop_unused
+                drop_unused(cfg)
             st = Structurer(cfg)
             ast = st.run()
             ast = cleanup(ast)
@@ -1297,6 +1361,7 @@ class Decompiler:
 
     def run(self):
         params, vararg, ast = self.proto_ast(self.root_key)
+        ast = merge_varargs(ast)
         p = Printer(self, [])
         p.level = -1
         p.block(ast)
