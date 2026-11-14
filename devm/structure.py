@@ -344,6 +344,7 @@ class Structurer:
         self.rpo_idx = {b: i for i, b in enumerate(self.order)}
         self._dominators()
         self._loops()
+        self._postdominators()
         self.emitted = {}
         self.depth = 0
         self.nflags = 0
@@ -376,6 +377,56 @@ class Structurer:
                     idom[b] = new
                     changed = True
         self.idom = idom
+
+    def _postdominators(self):
+        """Immediate post-dominators (blocks that cannot reach an exit have none)."""
+        blocks = self.blocks
+        EXIT = ('exit',)
+        succ = {b: (list(blocks[b].succs()) or [EXIT]) for b in blocks}
+        pred = {EXIT: []}
+        for b, ss in succ.items():
+            for x in ss:
+                pred.setdefault(x, []).append(b)
+        # reverse post-order of the reversed graph, from EXIT
+        seen = {EXIT}
+        post = []
+        stack = [(EXIT, iter(pred.get(EXIT, ())))]
+        while stack:
+            node, it = stack[-1]
+            adv = False
+            for x in it:
+                if x not in seen:
+                    seen.add(x)
+                    stack.append((x, iter(pred.get(x, ()))))
+                    adv = True
+                    break
+            if not adv:
+                post.append(node)
+                stack.pop()
+        order = post[::-1]
+        idx = {b: i for i, b in enumerate(order)}
+        ipd = {EXIT: EXIT}
+
+        def inter(a, b):
+            while a != b:
+                while idx[a] > idx[b]:
+                    a = ipd[a]
+                while idx[b] > idx[a]:
+                    b = ipd[b]
+            return a
+
+        changed = True
+        while changed:
+            changed = False
+            for b in order[1:]:
+                new = None
+                for x in succ[b]:
+                    if x in ipd:
+                        new = x if new is None else inter(x, new)
+                if new is not None and ipd.get(b) != new:
+                    ipd[b] = new
+                    changed = True
+        self.ipdom = {b: (None if d == EXIT else d) for b, d in ipd.items() if b != EXIT}
 
     def dominates(self, a, b):
         while True:
@@ -533,6 +584,13 @@ class Structurer:
             if t == f:
                 return self.jump(t, stop, ctx, out)
             follow = self.if_follow(b)
+            if follow is None:
+                # no join strictly owned by this branch: fall back to where every path from here
+                # meets again (immediate post-dominator), as long as that is still in this loop
+                pd = self.ipdom.get(b)
+                if pd is not None and pd != b and (
+                        ctx is None or pd == ctx[0] or pd == ctx[1] or pd in self.loop_nodes.get(ctx[0], ())):
+                    follow = pd
             if follow is not None:
                 T = self.arm(t, follow, ctx)
                 F = self.arm(f, follow, ctx)

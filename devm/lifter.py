@@ -206,6 +206,7 @@ class Lifter:
         self.preds = {}
         self.merge = {}         # for-loop head -> (first body instruction, loop variable register)
         self.inv = {}
+        state_loops = frozenset()
         for _ in range(300):
             nn = len(pir.nodes)
             ng = len(self.generalized)
@@ -214,6 +215,14 @@ class Lifter:
             self.walk(pir, interp, entry, snap)
             stable = self.inv_next == self.inv
             self.inv = self.inv_next
+            # a loop newly recognised as a state loop invalidates agreements that were computed
+            # while it was still treated as an ordinary loop: start those afresh
+            sl = frozenset(k for k, info in self.merge.items()
+                           if info[1] is not None and info[1] in self.rel.get(info[0], ()))
+            if sl != state_loops:
+                state_loops = sl
+                self.inv = {}
+                stable = False
             if stable and not self.rel_changed and len(pir.nodes) == nn and len(self.generalized) == ng:
                 break
         pir.children = self.queue[nq0:]
@@ -227,9 +236,10 @@ class Lifter:
         if rel and self.is_merge(key, kregs):
             # head of a real for loop: its hidden loop state cannot be duplicated, so all arrivals
             # share one copy that keeps only the constants they agree on
-            inv = self.inv.get(key, {})
+            inv = self.inv.get(key)
             kregs = dict(kregs)
-            for r in rel:
+            # no agreement computed yet: be optimistic (strip nothing), the next round decides
+            for r in (rel if inv is not None else ()):
                 if r == FORSTK:
                     # the loop nesting is structural: unify frame by frame, never drop the stack
                     m = inv.get(FORSTK)
