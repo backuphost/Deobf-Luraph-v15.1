@@ -935,7 +935,7 @@ class Printer:
             return s
         if t == 'r':
             return str(e[1])
-        if t == 'up':
+        if t == 'up' or t == 'upcell':
             if e[1] < len(self.upnames):
                 return self.upnames[e[1]]
             return 'UPVAL_%d' % e[1]
@@ -1009,6 +1009,8 @@ class Printer:
             return '({})'
         if t == 'outer':
             return e[1]
+        if t == 'constfn':
+            return '(function() return %s end)' % lua_number(e[1])
         if t == 'opaque':
             return 'nil --[[%s]]' % e[1]
         if t == 'forval':
@@ -1017,7 +1019,7 @@ class Printer:
 
     def prefix(self, e):
         s = self.expr(e, 9)
-        if e[0] in ('r', 'up', 'global', 'index', 'call', 'method', 'kfn', 'env', 'outer'):
+        if e[0] in ('r', 'up', 'upcell', 'global', 'index', 'call', 'method', 'kfn', 'env', 'outer'):
             return s
         if e[0] == 'k' and isinstance(e[1], str):
             return '(' + s + ')'
@@ -1079,7 +1081,8 @@ class Printer:
             text = self.d.closure_text(st[2], self, name=st[1])
             self.emit('local ' + text)
         elif t == 'call':
-            self.emit(self.expr(st[1]))
+            text = self.expr(st[1])
+            self.emit((';' if text.startswith('(') else '') + text)
         elif t == 'call_discard':
             self.emit('local _ = ' + self.expr(st[1]))
         elif t == 'return':

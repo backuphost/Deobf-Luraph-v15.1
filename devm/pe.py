@@ -136,6 +136,31 @@ class LFn:
         return '<lfn L%s>' % (self.func.line if self.func else self.line)
 
 
+class ConstFn:
+    """A loader-installed function that always returns the same number."""
+    def __init__(self, value, k=None):
+        self.value = value
+        self.k = k
+
+
+class GlobalPath:
+    """A well-known runtime object that is spelled as a global path (Enum.KeyCode.E, ...)."""
+    def __init__(self, text):
+        self.text = text
+
+
+class KNum(float):
+    """A number derived from the loader's key functions. Unlike ordinary values it is tracked
+    across instructions, because self-modifying code uses it as patch address / patch value."""
+    __slots__ = ()
+
+
+def keyed(r, *ops):
+    if is_num(r) and not isinstance(r, KNum) and any(isinstance(o, KNum) for o in ops):
+        return KNum(r)
+    return r
+
+
 class ProtoRef:
     def __init__(self, pid):
         self.pid = pid
@@ -355,6 +380,47 @@ PURE = {
 }
 
 
+def lua_unpack(fmt, data):
+    """string.unpack for plain fixed-size numeric formats; None when the format is not supported."""
+    raw = data.encode('latin-1')
+    endian = '<'
+    out = []
+    pos = 0
+    i = 0
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 8, 'J': 8, 'T': 8}
+    while i < len(fmt):
+        c = fmt[i]
+        i += 1
+        if c in '<=':
+            endian = '<'
+        elif c == '>':
+            endian = '>'
+        elif c == ' ':
+            pass
+        elif c in 'bBhHlLjJTiI':
+            n = sizes.get(c, 4)
+            j = i
+            while j < len(fmt) and fmt[j].isdigit():
+                j += 1
+            if c in 'iI' and j > i:
+                n = int(fmt[i:j])
+                i = j
+            if pos + n > len(raw):
+                return None
+            out.append(int.from_bytes(raw[pos:pos + n], 'little' if endian == '<' else 'big', signed=c in 'bhlji'))
+            pos += n
+        elif c in 'fdn':
+            n = 4 if c == 'f' else 8
+            if pos + n > len(raw):
+                return None
+            out.append(norm(struct.unpack(endian + ('f' if c == 'f' else 'd'), raw[pos:pos + n])[0]))
+            pos += n
+        else:
+            return None
+    out.append(pos + 1)
+    return out
+
+
 def lua_type(v):
     if v is None:
         return 'nil'
@@ -415,6 +481,7 @@ class Dump:
         self.data = data
         self.model = model
         self.tables = {}
+        self.by_path = {}
         self.raw = data['tables']
 
     def conv(self, v, path=None):
@@ -443,6 +510,10 @@ class Dump:
             b = Buffer(bytes.fromhex(v['buf']))
             b.path = path
             return b
+        if 'cfn' in v:
+            return ConstFn(self.conv(v['cfn']), v.get('k'))
+        if 'g' in v:
+            return GlobalPath(v['g'])
         if 'proto' in v:
             return ProtoRef(v['proto'])
         o = Opaque(v.get('o', '?'))
@@ -456,6 +527,8 @@ class Dump:
         t = LuaTable(tid)
         t.path = path
         self.tables[tid] = t
+        if path:
+            self.by_path[path] = t
         raw = self.raw[str(tid)]
         for i, x in enumerate(raw['arr']):
             if x is not None:
@@ -514,6 +587,12 @@ class PE:
         self.path = []
         self.va_base = None
         self.pcvars = {}
+        self.state_writes = set()
+        self.regknown = {}
+        self.nregs = None
+        self.keyfn_override = {}
+        self.keyfn_used = set()
+        self.volatile = set()       # paths of loader-state tables whose scalar fields change at run time
         for l in model.loops:
             self.pcvars[id(l)] = l[2][0][2][0][2][1]
 
@@ -633,8 +712,13 @@ class PE:
             return ('kfn', v.name)
         if isinstance(v, Lib):
             return ('global', v.name)
+        if isinstance(v, GlobalPath):
+            return ('outer', v.text)
+        if isinstance(v, ConstFn):
+            return ('constfn', v.value, v.k)
         if isinstance(v, UpRef):
-            return ('up', v.n)
+            # the upvalue *cell* {regs, _, slot}; generic table instructions may open it later
+            return ('upcell', v.n)
         if isinstance(v, LuaTable):
             if v.fresh and not v.h:
                 v.escaped = True
@@ -660,7 +744,17 @@ class PE:
             return ('opaque', type(v).__name__)
         raise PEError('cannot atomize %r' % (v,))
 
+    def check_reg(self, n):
+        if isinstance(n, int) and (n < 0 or (self.nregs is not None and n > self.nregs + 64)):
+            raise PEError('register %d out of range (bad self-modifying patch?)' % n)
+
     def read_reg(self, n):
+        self.check_reg(n)
+        t = self.regknown.get(n)
+        if t is not None:
+            # the register is known to hold one of the program's own code/constant arrays
+            # (self-modifying code): keep it concrete so the patch can be applied to the model
+            return t
         return self.emit_expr(('r', n), ('r', n))
 
     def regs_range(self, a, b):
@@ -818,12 +912,23 @@ class PE:
         return out
 
     def index(self, obj, key, keyast):
+        if isinstance(key, KNum) and key.is_integer():
+            key = int(key)
         if isinstance(obj, LuaTable):
             if isinstance(key, (Sym, LinSym)):
+                if obj.path and not obj.fresh:
+                    return self.emit_expr(('index', ('outer', obj.path), self.atom(key)))
                 raise PEError('symbolic key into concrete table T%s' % obj.id)
             if isinstance(key, float):
                 key = norm(key)
-            return obj.h.get(key)
+            v = obj.h.get(key)
+            if obj.path in self.volatile and (v is None or is_num(v) or isinstance(v, bool)) and not self.seeking \
+                    and self.inject is not None:
+                # loader state that changes while the program runs (e.g. the stream position)
+                if self.trace is not None:
+                    self.trace.append('   volatile read %s[%r]' % (obj.path, key))
+                return self.emit_expr(('index', ('outer', obj.path), self.atom(key)))
+            return v
         if obj is REGS:
             if isinstance(key, int):
                 return self.read_reg(key)
@@ -840,7 +945,7 @@ class PE:
                     return UpBox(obj.n)
                 if key == 3:
                     return UpKey(obj.n)
-            return self.emit_expr(('index', ('up', obj.n), self.atom(key)))
+            return self.emit_expr(('index', ('upcell', obj.n), self.atom(key)))
         if isinstance(obj, UpBox):
             if isinstance(key, UpKey) and key.n == obj.n:
                 return self.emit_expr(('up', obj.n))
@@ -874,18 +979,33 @@ class PE:
         raise PEError('index: unsupported object %r' % (obj,))
 
     def setindex(self, obj, key, val, keyast=None):
+        if isinstance(key, KNum) and key.is_integer():
+            key = int(key)
         if isinstance(obj, LuaTable):
             if isinstance(key, (Sym, LinSym)):
+                if obj.path and not obj.fresh:
+                    self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
+                    return
                 raise PEError('symbolic key store into concrete table')
             if obj.escaped:
                 raise PEError('store into escaped table')
             if isinstance(key, float):
                 key = norm(key)
+            if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
+                raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key))
+            if obj.path and not obj.fresh and not self.seeking and self.inject is not None \
+                    and obj.path in self.volatile:
+                # a VM instruction writing into loader state that outlives the instruction:
+                # this must happen at run time, not inside the evaluator's model
+                self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
+                self.state_writes.add((obj.path, key))
+                return
             obj.set(key, val)
             return
         if obj is REGS:
             if not isinstance(key, int):
                 raise PEError('register store index %r' % (key,))
+            self.check_reg(key)
             self.emit(('set', ('r', key), self.atom(val)))
             return
         if isinstance(obj, Sym):
@@ -897,7 +1017,7 @@ class PE:
                 return
             raise PEError('bad upvalue box store')
         if isinstance(obj, UpRef):
-            self.emit(('setindex', ('up', obj.n), self.atom(key), self.atom(val)))
+            self.emit(('setindex', ('upcell', obj.n), self.atom(key), self.atom(val)))
             return
         if obj is ENV:
             if isinstance(key, str):
@@ -920,7 +1040,7 @@ class PE:
             return not truthy(v)
         if op == '-':
             if is_num(v):
-                return norm(-v)
+                return keyed(norm(-v), v)
         if op == '#':
             if isinstance(v, str):
                 return len(v)
@@ -1012,7 +1132,7 @@ class PE:
                 r = math.inf
             if isinstance(r, int) and abs(r) >= 2 ** 53:
                 r = float(r)
-            return norm(r)
+            return keyed(norm(r), a, b)
         if op == '..':
             if isinstance(a, (str, int, float)) and isinstance(b, (str, int, float)):
                 return lua_tostr(a) + lua_tostr(b)
@@ -1043,6 +1163,12 @@ class PE:
 
     # -- calls
     def call(self, f, args, want, ast=None):
+        if isinstance(f, ConstFn):
+            v = self.keyfn_override.get(f.k, f.value)
+            self.keyfn_used.add(f.k)
+            if v is None:
+                raise PEError('key function %s could not be evaluated' % (f.k,))
+            return [KNum(v)]
         if isinstance(f, Builtin):
             return self.call_builtin(f.name, args, want)
         if isinstance(f, LFn):
@@ -1075,6 +1201,8 @@ class PE:
         sym = any(isinstance(a, (Sym, MultiTail)) for a in args)
         if name == 'table.create':
             if self.seeking:
+                if args and is_num(args[0]):
+                    self.nregs = int(args[0])
                 return [REGS]
             n = args[0] if args and is_num(args[0]) else 0
             return [self.emit_expr(('newtable', n))]
@@ -1122,8 +1250,12 @@ class PE:
                 if ty:
                     return [ty]
         if not sym:
+            if name == 'string.unpack' and len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
+                r = lua_unpack(args[0], args[1])
+                if r is not None:
+                    return r
             if name in PURE and all(is_num(a) for a in args):
-                return [norm(PURE[name](*args))]
+                return [keyed(norm(PURE[name](*args)), *args)]
             if name in BUF and args and isinstance(args[0], Buffer):
                 return [BUF[name](*args)]
             if name == 'error':
@@ -1278,8 +1410,12 @@ class PE:
             return self.exec_seek(st, scope)
         return self.exec_core(st, scope)
 
+    trace = None
+
     def exec_core(self, st, scope):
         t = st[0]
+        if self.trace is not None:
+            self.trace.append(repr(st)[:300])
         if t == 'if':
             for c, body in st[1]:
                 if self.cond(self.eval1(c, scope)):
@@ -1314,6 +1450,8 @@ class PE:
             names = st[1]
             if len(names) == 1 and len(st[2]) == 1:
                 scope.vars[names[0]] = self.eval1(st[2][0], scope)
+                if self.trace is not None:
+                    self.trace.append('   -> %s = %r' % (names[0], scope.vars[names[0]]))
                 return None
             vals = self.adjust(self.evalargs(st[2], scope), len(names)) if st[2] else [None] * len(names)
             for n, v in zip(names, vals):

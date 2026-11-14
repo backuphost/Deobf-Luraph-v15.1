@@ -1,7 +1,12 @@
 """IR graph -> basic blocks with folded expression trees and named variables."""
 from .lifter import tree_ends
 
-PURE_LEAF = ('k', 'kfn', 'env', 'opaque', 'regs', 'arg', 'varargn', 'nargs', 'va', 'selfarg', 'v', 'forval')
+PURE_LEAF = ('k', 'kfn', 'env', 'opaque', 'regs', 'arg', 'varargn', 'nargs', 'va', 'selfarg', 'v', 'forval', 'constfn',
+             'outer', 'upcell')
+
+
+import os
+DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
 
 
 class Block:
@@ -203,6 +208,27 @@ def count_uses(e, pred, acc):
             acc[x] = acc.get(x, 0) + 1
 
 
+def rpo_order(cfg):
+    seen = set()
+    post = []
+    stack = [(cfg.entry, iter(cfg.blocks[cfg.entry].succs()))]
+    seen.add(cfg.entry)
+    while stack:
+        bid, it = stack[-1]
+        adv = False
+        for s in it:
+            if s not in seen:
+                seen.add(s)
+                stack.append((s, iter(cfg.blocks[s].succs())))
+                adv = True
+                break
+        if not adv:
+            post.append(bid)
+            stack.pop()
+    post.reverse()
+    return post
+
+
 class ProtoCFG:
     def __init__(self, pir):
         self.pir = pir
@@ -216,11 +242,372 @@ class ProtoCFG:
         self._thread()
         self._to_exprs()
         self._detect_params()
+        if not os.environ.get('DEVM_NO_UNFLATTEN'):
+            self._unflatten()
         for _ in range(4):
             self._fold_regs()
             self._merge_tables()
         self._merge_conds()
         self._fold_regs()
+        self._open_upcells()
+
+    # -- control-flow unflattening
+    def _unflatten(self):
+        """Remove Luraph's state-machine obfuscation.
+
+        A "state" register only ever receives numeric constants (or is the control variable of a
+        numeric for loop with constant bounds) and is only ever compared against numeric constants.
+        Such registers carry no data, so the CFG is re-explored with their values known: every
+        comparison folds, the dispatch branches disappear and constant-bound dispatch loops unroll.
+        """
+        blocks = self.blocks
+        CMPS = ('<', '<=', '>', '>=', '==', '~=')
+
+        def isnum(e):
+            return e[0] == 'k' and isinstance(e[1], (int, float)) and not isinstance(e[1], bool)
+
+        def reads_of(st):
+            out = []
+
+            def scan(e):
+                t = e[0]
+                if t == 'r':
+                    out.append((e[1], False))
+                elif t == 'bin':
+                    if e[1] in CMPS:
+                        a, b = e[2], e[3]
+                        if a[0] == 'r' and isnum(b):
+                            out.append((a[1], True))
+                            return
+                        if b[0] == 'r' and isnum(a):
+                            out.append((b[1], True))
+                            return
+                    scan(e[2]); scan(e[3])
+                elif t == 'un':
+                    scan(e[2])
+                elif t in ('index', 'and', 'or'):
+                    scan(e[1]); scan(e[2])
+                elif t == 'call':
+                    scan(e[1])
+                    for a in e[2]:
+                        scan(a)
+                    if e[3]:
+                        scan(e[3])
+                elif t == 'method':
+                    scan(e[1])
+                elif t == 'closure':
+                    for c in e[2]:
+                        if isinstance(c[1], tuple):
+                            scan(c[1])
+                        elif c[0] in ('ref', 'val'):
+                            out.append((c[1], False))
+                elif t == 'table':
+                    for k, v in e[1]:
+                        if k is not None:
+                            scan(k)
+                        scan(v)
+                    if e[2]:
+                        scan(e[2])
+
+            for e in stmt_exprs(st)[0]:
+                scan(e)
+            return out
+
+        def writes_of(st):
+            return [w[1] for w in stmt_exprs(st)[1] if w[0] == 'r']
+
+        # ---- numeric for loops with constant bounds
+        prep_info = {}          # (bid, idx) -> (base, init, limit, step, [idx of the constant sets])
+        prep_bases = {}
+        for bid, b in blocks.items():
+            for i, st in enumerate(b.stmts):
+                if st[0] != 'numforprep':
+                    continue
+                es = st[1]
+                if not (len(es) == 3 and all(e[0] == 'r' and isinstance(e[1], int) for e in es)):
+                    continue
+                base = es[0][1]
+                vals, idxs = [], []
+                for e in es:
+                    found = None
+                    for j in range(i - 1, -1, -1):
+                        sj = b.stmts[j]
+                        if e[1] in writes_of(sj):
+                            if sj[0] == 'set' and isnum(sj[2]):
+                                found = (sj[2][1], j)
+                            break
+                    if found is None:
+                        break
+                    vals.append(found[0])
+                    idxs.append(found[1])
+                ok = len(vals) == 3 and vals[2] != 0 and (vals[1] - vals[0]) / vals[2] < 256
+                prep_bases.setdefault(base, []).append(ok)
+                if ok:
+                    prep_info[(bid, i)] = (base, vals[0], vals[1], vals[2], idxs)
+        for_heads = {}          # base -> [bid]
+        for bid, b in blocks.items():
+            if b.term[0] == 'forbr' and b.term[1] == 'num' and isinstance(b.term[2][0], int):
+                for_heads.setdefault(b.term[2][0] - 3, []).append(bid)
+
+        # ---- reaching definitions
+        order = rpo_order(self)
+        gen = {}
+        for bid in order:
+            g = {}
+            b = blocks[bid]
+            for i, st in enumerate(b.stmts):
+                for r in writes_of(st):
+                    g[r] = frozenset([(bid, i)])
+            for r in writes_of(b.term):
+                g[r] = frozenset([(bid, 'T')])
+            gen[bid] = g
+        self.compute_preds()
+        universe = set()
+        for bid in order:
+            universe.update(gen[bid])
+        IN = {bid: {} for bid in order}
+        OUT = {bid: dict(gen[bid]) for bid in order}
+        changed = True
+        while changed:
+            changed = False
+            for bid in order:
+                b = blocks[bid]
+                inn = {}
+                preds = [p for p in b.preds if p in OUT]
+                for pr in preds:
+                    for r, ds in OUT[pr].items():
+                        cur = inn.get(r)
+                        inn[r] = ds if cur is None else (cur | ds)
+                if bid == self.entry:
+                    # parameters / never-assigned registers
+                    for r in universe:
+                        inn[r] = inn.get(r, frozenset()) | frozenset([('ENTRY', r)])
+                if inn != IN[bid]:
+                    IN[bid] = inn
+                    out = dict(inn)
+                    out.update(gen[bid])
+                    if out != OUT[bid]:
+                        OUT[bid] = out
+                    changed = True
+
+        # ---- webs
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        bad = set()
+        used = set()
+        defkind = {}
+        for bid in order:
+            b = blocks[bid]
+            cur = dict(IN[bid])
+            for i, st in list(enumerate(b.stmts)) + [('T', b.term)]:
+                for r, iscmp in reads_of(st):
+                    ds = cur.get(r) or frozenset([('ENTRY', r)])
+                    first = None
+                    for d in ds:
+                        find(d)
+                        if first is None:
+                            first = d
+                        else:
+                            union(first, d)
+                    if iscmp:
+                        used.add(first)
+                    else:
+                        bad.add(first)
+                        if DEBUG_UNFLATTEN:
+                            for d in ds:
+                                if d[0] != 'ENTRY' and d[1] != 'T':
+                                    sd = blocks[d[0]].stmts[d[1]]
+                                    if sd[0] == 'set' and isnum(sd[2]) and sd[2][1] > 2:
+                                        print('bad use', r, bid, i, repr(st)[:200], d, sd)
+                d = (bid, i)
+                ws = writes_of(st)
+                for r in ws:
+                    cur[r] = frozenset([d])
+                if ws:
+                    find(d)
+                    if st[0] == 'set' and isnum(st[2]):
+                        defkind[d] = 'const'
+                    elif st[0] == 'forbr' and st[1] == 'num' and isinstance(st[2][0], int) \
+                            and prep_bases.get(st[2][0] - 3) and all(prep_bases[st[2][0] - 3]):
+                        defkind[d] = 'for'
+                    else:
+                        defkind[d] = 'other'
+        badroots = {find(d) for d in bad}
+        for d in list(parent):
+            if d[0] == 'ENTRY' or defkind.get(d, 'other') == 'other':
+                badroots.add(find(d))
+        usedroots = {find(d) for d in used}
+        state_defs = {d for d in parent if d[0] != 'ENTRY' and find(d) not in badroots and find(d) in usedroots}
+        if not state_defs:
+            return
+        unroll = {base for base, heads in for_heads.items() if all((h, 'T') in state_defs for h in heads)}
+        # blocks from which a loop header is reachable without re-entering through its setup
+        prep_blocks = {}
+        for (bid, i), info in prep_info.items():
+            prep_blocks.setdefault(info[0], set()).add(bid)
+        for_live = {}
+        for base in unroll:
+            alive = set()
+            stack = list(for_heads[base])
+            stops = prep_blocks.get(base, set())
+            while stack:
+                x = stack.pop()
+                if x in alive:
+                    continue
+                alive.add(x)
+                for pr in blocks[x].preds:
+                    if pr not in stops:
+                        stack.append(pr)
+            for_live[base] = alive
+
+        live_in, _ = self.liveness()
+
+        def fold(e):
+            t = e[0]
+            if t == 'bin' and e[1] in CMPS and isnum(e[2]) and isnum(e[3]):
+                a, b = e[2][1], e[3][1]
+                op = e[1]
+                return ('k', a < b if op == '<' else a <= b if op == '<=' else a > b if op == '>' else
+                        a >= b if op == '>=' else a == b if op == '==' else a != b)
+            if t == 'un' and e[1] == 'not' and e[2][0] == 'k':
+                return ('k', e[2][1] is None or e[2][1] is False)
+            if t in ('and', 'or') and e[1][0] == 'k':
+                truthy = not (e[1][1] is None or e[1][1] is False)
+                if t == 'and':
+                    return e[2] if truthy else e[1]
+                return e[1] if truthy else e[2]
+            return e
+
+        new_blocks = {}
+        ids = {}
+        counter = [0]
+        work = []
+        limit = 40 * len(blocks) + 2000
+
+        def node(bid, env):
+            keep = {}
+            li = live_in.get(bid, ())
+            for k, v in env.items():
+                if isinstance(k, tuple):
+                    if bid in for_live.get(k[1], ()):
+                        keep[k] = v
+                elif k in li:
+                    keep[k] = v
+            key = (bid, tuple(sorted(keep.items(), key=repr)))
+            nid = ids.get(key)
+            if nid is None:
+                if not keep:
+                    nid = bid
+                else:
+                    counter[0] += 1
+                    nid = (bid, 'u', counter[0])
+                ids[key] = nid
+                work.append((nid, bid, keep))
+            return nid
+
+        entry = node(self.entry, {})
+        while work:
+            nid, bid, env = work.pop()
+            if len(ids) > limit:
+                self.warnings.append('unflatten: state explosion, pass skipped')
+                return
+            b = blocks[bid]
+            nb = Block(nid)
+            new_blocks[nid] = nb
+            env = dict(env)
+
+            def sub(e, env=env):
+                def fn(x):
+                    if x[0] == 'r' and x[1] in env:
+                        return ('k', env[x[1]])
+                    return fold(x)
+                return map_expr(e, fn)
+
+            origin = []
+            for i, st in enumerate(b.stmts):
+                d = (bid, i)
+                if d in prep_info and prep_info[d][0] in unroll:
+                    base, init, lim, step, idxs = prep_info[d]
+                    env[('for', base)] = (init, lim, step)
+                    drop = set(idxs)
+                    keep = [(o, s2) for o, s2 in zip(origin, nb.stmts) if o not in drop]
+                    origin = [o for o, _ in keep]
+                    nb.stmts = [s2 for _, s2 in keep]
+                    continue
+                if d in state_defs:
+                    env[st[1][1]] = st[2][1]
+                    continue
+                st2 = map_stmt(st, lambda x: ('k', env[x[1]]) if x[0] == 'r' and x[1] in env else fold(x)) if env else st
+                for r in writes_of(st):
+                    env.pop(r, None)
+                nb.stmts.append(st2)
+                origin.append(i)
+            t = b.term
+            if t[0] == 'goto':
+                nb.term = ('goto', node(t[1], env))
+            elif t[0] == 'br':
+                c = sub(t[1]) if env else t[1]
+                if c[0] == 'k':
+                    truthy = not (c[1] is None or c[1] is False)
+                    nb.term = ('goto', node(t[2] if truthy else t[3], env))
+                else:
+                    nb.term = ('br', c, node(t[2], env), node(t[3], env))
+            elif t[0] == 'forbr':
+                base = t[2][0] - 3 if t[1] == 'num' and isinstance(t[2][0], int) else None
+                if base is not None and ('for', base) in env and (bid, 'T') in state_defs:
+                    cur, lim, step = env[('for', base)]
+                    if (step > 0 and cur <= lim) or (step < 0 and cur >= lim):
+                        env2 = dict(env)
+                        env2[t[2][0]] = cur
+                        env2[('for', base)] = (cur + step, lim, step)
+                        nb.term = ('goto', node(t[3], env2))
+                    else:
+                        env2 = dict(env)
+                        del env2[('for', base)]
+                        nb.term = ('goto', node(t[4], env2))
+                else:
+                    for r in t[2]:
+                        env.pop(r, None)
+                    nb.term = ('forbr', t[1], t[2], node(t[3], env), node(t[4], env))
+            elif t[0] == 'ret':
+                nb.term = map_stmt(t, lambda x: ('k', env[x[1]]) if x[0] == 'r' and x[1] in env else fold(x)) if env else t
+            else:
+                nb.term = t
+        self.blocks = new_blocks
+        self.entry = entry
+        self._thread()
+
+    def _open_upcells(self):
+        """cell[1][cell[3]] (an upvalue cell opened by generic table instructions) -> the upvalue."""
+        def is_part(e, k):
+            return e[0] == 'index' and e[1][0] == 'upcell' and e[2] == ('k', k)
+
+        def fix(e):
+            if e[0] == 'index' and is_part(e[1], 1) and is_part(e[2], 3) and e[1][1] == e[2][1]:
+                return ('up', e[1][1][1])
+            return e
+
+        def fix_stmt(st):
+            st = map_stmt(st, fix)
+            if st[0] == 'setindex' and is_part(st[1], 1) and is_part(st[2], 3) and st[1][1] == st[2][1]:
+                return ('set', ('up', st[1][1][1]), st[3])
+            return st
+
+        for b in self.blocks.values():
+            b.stmts = [fix_stmt(st) for st in b.stmts]
+            b.term = map_stmt(b.term, fix)
 
     # -- stage A
     def _build(self):
@@ -636,6 +1023,10 @@ class ProtoCFG:
                         uses = sum(1 for e in reads for x in walk_expr(e, []) if x == ('r', n))
                         if sj[0] == 'forbr':
                             uses = 0
+                        if any(x[0] == 'closure' and any(c[0] in ('ref', 'val') and c[1] == n for c in x[2])
+                               for e in reads for x in walk_expr(e, [])):
+                            # captured by a closure: the register itself must keep its value
+                            break
                         if uses:
                             if uses == 1:
                                 target = j
@@ -660,7 +1051,7 @@ class ProtoCFG:
                     k = target + 1
                     while dead is None and k < len(stmts):
                         reads, writes = stmt_exprs(stmts[k])
-                        if any(x == ('r', n) for e in reads for x in walk_expr(e, [])):
+                        if any(n in expr_reads(e)[0] for e in reads):
                             dead = False
                             break
                         if any(w == ('r', n) for w in writes):

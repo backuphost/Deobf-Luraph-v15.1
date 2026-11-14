@@ -1,4 +1,6 @@
 """Drives the partial evaluator over every instruction of every proto -> per-proto IR graph."""
+import os
+
 from . import pe as P
 from .pe import (PE, Scope, LFn, LuaTable, MultiTail, Sym, LinSym, NeedFork, ForOp, LoopHead, PEError,
                  REGS, UPVALS)
@@ -71,6 +73,10 @@ class Lifter:
     def instantiate(self, key):
         raise NotImplementedError
 
+    def register(self, key):
+        """Make a proto liftable on its own (without having met the closure that creates it)."""
+        raise NotImplementedError
+
     # ---- running one instruction
     def run_once(self, interp, inject, decisions, perm, prefix):
         pe = self.pe
@@ -104,6 +110,43 @@ class Lifter:
         pe.finish_closures()
         return list(pe.ir), list(pe.path), end, list(pe.events), set(pe.exposed), set(pe.written)
 
+    def known_after(self, tree, known):
+        """[(goto target, registers known to hold program tables)] for every exit of an instruction."""
+        out = []
+        by_path = self.dump.by_path
+
+        def walk(tree, known):
+            stmts, term = tree
+            known = dict(known)
+            for st in stmts:
+                if st[0] == 'set' and st[1][0] == 'r':
+                    e = st[2]
+                    if e[0] == 'outer' and e[1] in by_path:
+                        known[st[1][1]] = by_path[e[1]]
+                    elif e[0] == 'k' and isinstance(e[1], P.KNum):
+                        known[st[1][1]] = e[1]
+                    elif e[0] == 'constfn':
+                        known[st[1][1]] = P.ConstFn(e[1], e[2])
+                    else:
+                        known.pop(st[1][1], None)
+                elif st[0] == 'setmulti':
+                    for n in [n for n in known if not isinstance(n, int) or n >= st[1]]:
+                        del known[n]
+            if term[0] == 'br':
+                walk(term[2], known)
+                walk(term[3], known)
+            elif term[0] == 'forbr':
+                regs = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
+                for n in regs:
+                    known.pop(n, None)
+                walk(term[3], known)
+                walk(term[4], known)
+            elif term[0] == 'goto':
+                out.append((term, known))
+
+        walk(tree, known)
+        return out
+
     def run_node(self, interp, key, snap):
         prefix = 'L%dP%d' % key if key[0] else 'P%d' % key[1]
         paths = []
@@ -111,6 +154,8 @@ class Lifter:
         exposed, written = set(), set()
         while todo:
             d = todo.pop()
+            if os.environ.get('DEVM_TRACE_FOROP'):
+                self.pe.trace = []
             try:
                 ir, path, end, ev, ex, wr = self.run_once(interp, (key[0], snap), d, None, prefix)
             except NeedFork:
@@ -120,6 +165,10 @@ class Lifter:
                     raise PEError('too many symbolic branches')
                 continue
             except ForOp:
+                if os.environ.get('DEVM_TRACE_FOROP') and self.pe.trace:
+                    print('FOROP-TRIGGER', key)
+                    for t in self.pe.trace[-6:]:
+                        print('   ', t[:1500])
                 return self.run_forop(interp, key, snap, prefix)
             exposed |= ex
             written = set(wr) if not paths else (written & wr)
@@ -140,7 +189,15 @@ class Lifter:
         return (prefix, ('br', cond, self.build_tree(tp, depth + 1, idx), self.build_tree(fp, depth + 1, idx)))
 
     def run_forop(self, interp, key, snap, prefix):
+        if os.environ.get('DEVM_TRACE_FOROP'):
+            self.pe.trace = []
         irT, _, endT, evT, ex, wr = self.run_once(interp, (key[0], snap), [], True, prefix)
+        if os.environ.get('DEVM_TRACE_FOROP') and endT[0] != 'goto':
+            print('FOROP', key, endT[:2])
+            print('   IR', irT[:6], 'snapnum', {k: v for k, v in snap.items() if isinstance(v, (int, float))})
+            for t in self.pe.trace[-60:]:
+                print('   ', t)
+            self.pe.trace = None
         irF, _, endF, evF, _, _ = self.run_once(interp, (key[0], snap), [], False, prefix)
         kinds = {e[0] for e in evT}
         reads = [s[2][1] for s in irT if s[0] == 'set' and s[2][0] == 'r']
@@ -166,16 +223,17 @@ class Lifter:
     # ---- whole proto
     def lift_proto(self, key):
         pir = ProtoIR(key)
+        self.pe.keyfn_used = pir.keyfns = set()
         interp = self.instantiate(key)
         _, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
         if end[0] != 'goto':
             raise PEError('interpreter returned before reaching dispatch loop')
         entry, snap = end[1], end[2]
         pir.entry = entry
-        work = [(entry, snap)]
+        work = [(entry, snap, {})]
         nq0 = len(self.queue)
         while work:
-            key2, snap = work.pop()
+            key2, snap, known = work.pop()
             if key2 in pir.nodes:
                 node = pir.nodes[key2]
                 for name, v in node.snap_in.items():
@@ -185,16 +243,20 @@ class Lifter:
             node = Node(key2)
             node.snap_in = snap
             pir.nodes[key2] = node
+            self.pe.regknown = known
             try:
                 node.tree, node.exposed, node.written = self.run_node(interp, key2, snap)
             except PEError as e:
+                if os.environ.get('DEVM_TRACE_ERR'):
+                    print('PEERR', key, key2, e, {k: (v.path if hasattr(v, 'path') else v) for k, v in known.items()})
+                    print('   partial IR', self.pe.ir[-8:])
                 node.error = str(e)
                 node.tree = ([('error', str(e))], ('ret', [], None))
                 pir.errors.append((key2, str(e)))
                 continue
-            for end in tree_ends(node.tree):
-                if end[0] == 'goto':
-                    work.append((end[1], end[2]))
+            for end, kn in self.known_after(node.tree, known):
+                work.append((end[1], end[2], kn))
+        self.pe.regknown = {}
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
         return pir
@@ -261,8 +323,28 @@ class TableProtoLifter(Lifter):
             if st[0] == 'local' and len(st[2]) == 1 and st[2][0][0] == 'index' and st[2][0][1][0] == 'name':
                 counts[st[2][0][1][1]] = counts.get(st[2][0][1][1], 0) + 1
         self.proto_param = max(counts, key=counts.get)
+        # tables handed to the wrapper's enclosing functions are loader state, not program data
+        program = set()
+        stack = [self.base.vars[self.proto_param]]
+        while stack:
+            t = stack.pop()
+            if id(t) in program:
+                continue
+            program.add(id(t))
+            stack.extend(x for x in t.h.values() if isinstance(x, LuaTable))
+        for f in model.chain[:-2]:
+            for p in f.params:
+                v = self.base.vars.get(p)
+                if isinstance(v, LuaTable) and v.path and id(v) not in program:
+                    self.pe.volatile.add(v.path)
+                    for sub in v.h.values():
+                        if isinstance(sub, LuaTable) and sub.path and id(sub) not in program:
+                            self.pe.volatile.add(sub.path)
         self.root_key = self.base.vars[self.proto_param].id
         self.proto_objs[self.root_key] = self.base.vars[self.proto_param]
+
+    def register(self, key):
+        self.proto_objs[key] = self.dump.tables[key]
 
     def instantiate(self, key):
         proto = self.proto_objs[key]

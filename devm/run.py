@@ -1,0 +1,156 @@
+"""Whole pipeline: Luraph-protected script -> readable Lua.
+
+    python -m devm.run <protected.lua> [-o out.lua] [--work DIR]
+
+Stages
+  1. lift the VM's first program.  For current Luraph builds that is only the *bootstrap*:
+     environment checks that derive an XOR key, decrypt the real program and install a table of
+     "key functions" used by self-modifying code.
+  2. make the lifted bootstrap runnable outside Roblox (bootstrap.py), execute it natively inside
+     the harness (mocked Roblox runtime, statistical key recovery) and dump the VM state again at
+     the moment the real program starts.
+  3. lift + decompile the real program from that second dump.  Key functions whose inputs could not
+     be reproduced outside Roblox are solved for: only the right value turns the self-modifying
+     patches into code that lifts without errors.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+from . import bootstrap, cleanup, lifter, pe, pipeline, structure, unidata, vmmodel
+
+sys.setrecursionlimit(100000)
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def lifter_class(model):
+    return lifter.FactoryLifter if model.factory_style else lifter.TableProtoLifter
+
+
+def make_lifter(model, data, overrides):
+    dump = pe.Dump(data, model)
+    L = lifter_class(model)(model, dump)
+    L.pe.keyfn_override = dict(overrides)
+    return L
+
+
+def lift_one(model, data, overrides, key):
+    L = make_lifter(model, data, overrides)
+    L.register(key)
+    return L.lift_proto(key)
+
+
+def solve_keyfns(model, data, log):
+    """Lift everything; search values for key functions until no proto has lift errors."""
+    overrides = {}
+    L = make_lifter(model, data, overrides)
+    protos = L.lift_all(L.root_key)
+    for _ in range(6):
+        bad = [k for k, p in protos.items() if p.errors and p.keyfns]
+        if not bad:
+            break
+        changed = False
+        for key in bad:
+            base = len(protos[key].errors)
+            for fn in sorted(protos[key].keyfns, key=str):
+                good = []
+                best = (base, None)
+                for cand in range(-64, 513):
+                    try:
+                        pir = lift_one(model, data, {**overrides, fn: cand}, key)
+                        e = len(pir.errors)
+                    except Exception:      # a wrong guess can derail the evaluator in arbitrary ways
+                        e = 10 ** 6
+                    if e == 0:
+                        good.append(cand)
+                    if e < best[0]:
+                        best = (e, cand)
+                if best[1] is None:
+                    continue
+                pick = good[0] if good else best[1]
+                log('[keyfn] function %s: solved value %s for proto %s (%d -> %d errors%s)' % (
+                    fn, pick, key, base, 0 if good else best[0],
+                    '' if len(good) <= 1 else '; other consistent values: %s' % good[1:6]))
+                overrides[fn] = pick
+                changed = True
+                base = 0 if good else best[0]
+                if base == 0:
+                    break
+        if not changed:
+            break
+        L = make_lifter(model, data, overrides)
+        protos = L.lift_all(L.root_key)
+    return L, protos, overrides
+
+
+def decompile(stage, L, protos):
+    d = structure.Decompiler(protos, L.root_key, stage.native_text)
+    text = d.run()
+    return text, d.stats
+
+
+def run_bootstrap(model_stage, boot_text, workdir, tag, log):
+    boot = os.path.join(workdir, tag + '.boot.lua')
+    with open(boot, 'w') as f:
+        f.write(boot_text)
+    nf = os.path.join(workdir, 'nfdata.lua')
+    if not os.path.exists(nf):
+        unidata.generate(nf)
+    out = os.path.join(workdir, tag + '.stage2.json')
+    if os.path.exists(out):
+        os.remove(out)
+    r = subprocess.run([vmmodel.find_luau(), os.path.join(HERE, 'harness.lua'), '-a', model_stage.patched_path, out, boot],
+                       capture_output=True, text=True, errors='replace', timeout=900)
+    failed = 0
+    for line in r.stderr.split('\n'):
+        if 'failed environment check' in line:
+            failed += 1
+        elif line.startswith('[fixkey]') or line.startswith('[keyfn]'):
+            log(line)
+    log('[bootstrap] %d environment checks answered differently from Roblox (neutralised)' % failed)
+    if not os.path.exists(out):
+        raise RuntimeError('bootstrap did not reach the real program:\n' + r.stderr[-3000:])
+    with open(out) as f:
+        return json.load(f)
+
+
+def deobfuscate(path, workdir, log=print):
+    os.makedirs(workdir, exist_ok=True)
+    tag = os.path.splitext(os.path.basename(path))[0]
+    with open(path, encoding='latin-1') as f:
+        src = f.read()
+    stage = pipeline.Stage(src, workdir, tag, log=log)
+    text1 = stage.run()
+    boot_text, info = bootstrap.patch(text1)
+    if not info['fixkey']:
+        log('[%s] no encrypted second stage found: the first program is the script' % tag)
+        return cleanup.tidy(text1)
+    data = run_bootstrap(stage, boot_text, workdir, tag, log)
+    L, protos, overrides = solve_keyfns(stage.model, data, log)
+    errs = [(k, e) for k, p in protos.items() for e in p.errors]
+    log('[%s] real program: %d functions, %d instructions, %d lift errors' % (
+        tag, len(protos), sum(len(p.nodes) for p in protos.values()), len(errs)))
+    for k, e in errs[:20]:
+        log('    error in proto %s: %s' % (k, e))
+    text, stats = decompile(stage, L, protos)
+    return cleanup.tidy(text)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Luraph devirtualizer')
+    ap.add_argument('input')
+    ap.add_argument('-o', '--output')
+    ap.add_argument('--work', default=None, help='directory for intermediate files')
+    a = ap.parse_args(argv)
+    work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
+    text = deobfuscate(a.input, work)
+    out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
+    with open(out, 'w', encoding='utf-8') as f:
+        f.write(text)
+    print('written', out, '(%d lines)' % text.count('\n'))
+
+
+if __name__ == '__main__':
+    main()
