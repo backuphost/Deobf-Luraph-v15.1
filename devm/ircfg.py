@@ -222,9 +222,44 @@ class ProtoCFG:
             self._merge_tables()
         self._merge_conds()
         self._fold_regs()
+        if self.merge_identical():
+            self._thread()
+            self._fold_regs()
+
+    def merge_identical(self):
+        """Unify blocks with the same code and the same successors (copies made for constant
+        states that turned out not to matter).  Returns the number of blocks removed."""
+        blocks = self.blocks
+        removed = 0
+        while True:
+            seen = {}
+            rep = {}
+            for bid, b in blocks.items():
+                key = repr((b.stmts, b.term))
+                first = seen.get(key)
+                if first is None:
+                    seen[key] = bid
+                elif bid != self.entry:
+                    rep[bid] = first
+                elif first != self.entry:
+                    rep[first] = bid
+                    seen[key] = bid
+            if not rep:
+                break
+            for b in blocks.values():
+                for s2 in set(b.succs()):
+                    if s2 in rep:
+                        b.retarget(s2, rep[s2])
+            for bid in rep:
+                del blocks[bid]
+            removed += len(rep)
+        if removed:
+            self.compute_preds()
+        return removed
 
     def refold(self):
         """Re-run expression folding after whole-program rewrites."""
+        self.merge_identical()
         self._thread()
         for _ in range(4):
             self._fold_regs()

@@ -478,6 +478,15 @@ class Lifter:
             if sk[2]:
                 tree = rename_temps(tree, '@%d' % sk[2])
             node.tree = tree
+        # setups of loops that were followed iteration by iteration have no loop left to belong to
+        kept = set()
+        for n in nodes.values():
+            for stmts, term in _subtrees(n.tree):
+                if term[0] == 'forbr' and term[1] == 'num':
+                    kept.add(term[2])
+        for n in nodes.values():
+            n.tree = _filter_stmts(n.tree, lambda st: not (st[0] == 'numforprep' and isinstance(st[1], int)
+                                                           and st[1] not in kept))
         pir.nodes = nodes
 
     @staticmethod
@@ -875,6 +884,27 @@ def rename_temps(tree, suffix):
         return x
 
     return ren(tree)
+
+
+def _subtrees(tree):
+    yield tree
+    term = tree[1]
+    if term[0] == 'br':
+        yield from _subtrees(term[2])
+        yield from _subtrees(term[3])
+    elif term[0] == 'forbr':
+        yield from _subtrees(term[3])
+        yield from _subtrees(term[4])
+
+
+def _filter_stmts(tree, keep):
+    stmts, term = tree
+    stmts = [st for st in stmts if keep(st)]
+    if term[0] == 'br':
+        term = ('br', term[1], _filter_stmts(term[2], keep), _filter_stmts(term[3], keep))
+    elif term[0] == 'forbr':
+        term = ('forbr', term[1], term[2], _filter_stmts(term[3], keep), _filter_stmts(term[4], keep))
+    return (stmts, term)
 
 
 def forbr_info(tree):
