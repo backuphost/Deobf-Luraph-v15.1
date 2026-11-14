@@ -208,6 +208,66 @@ def count_uses(e, pred, acc):
             acc[x] = acc.get(x, 0) + 1
 
 
+_CMPS = ('<', '<=', '>', '>=', '==', '~=')
+
+
+def _isnum(e):
+    return e[0] == 'k' and isinstance(e[1], (int, float)) and not isinstance(e[1], bool)
+
+
+def _reads_of(st):
+    """[(register, used only in a comparison against a numeric constant)] for a statement."""
+    out = []
+
+    def scan(e):
+        t = e[0]
+        if t == 'r':
+            out.append((e[1], False))
+        elif t == 'bin':
+            if e[1] in _CMPS:
+                a, b = e[2], e[3]
+                if a[0] == 'r' and _isnum(b):
+                    out.append((a[1], True))
+                    return
+                if b[0] == 'r' and _isnum(a):
+                    out.append((b[1], True))
+                    return
+            scan(e[2]); scan(e[3])
+        elif t == 'un':
+            scan(e[2])
+        elif t in ('index', 'and', 'or'):
+            scan(e[1]); scan(e[2])
+        elif t == 'call':
+            scan(e[1])
+            for a in e[2]:
+                scan(a)
+            if e[3]:
+                scan(e[3])
+        elif t == 'method':
+            scan(e[1])
+        elif t == 'closure':
+            for c in e[2]:
+                if isinstance(c[1], tuple):
+                    scan(c[1])
+                elif c[0] in ('ref', 'val'):
+                    out.append((c[1], False))
+        elif t == 'table':
+            for k, v in e[1]:
+                if k is not None:
+                    scan(k)
+                scan(v)
+            if e[2]:
+                scan(e[2])
+
+    for e in stmt_exprs(st)[0]:
+        scan(e)
+    return out
+
+
+def _writes_of(st):
+    return [w[1] for w in stmt_exprs(st)[1] if w[0] == 'r']
+
+
 def rpo_order(cfg):
     seen = set()
     post = []
@@ -241,6 +301,7 @@ class ProtoCFG:
         self._build()
         self._thread()
         self._to_exprs()
+        self._dead_stores()
         self._detect_params()
         if not os.environ.get('DEVM_NO_UNFLATTEN'):
             self._unflatten()
@@ -250,6 +311,90 @@ class ProtoCFG:
         self._merge_conds()
         self._fold_regs()
         self._open_upcells()
+        self._dead_stores()
+
+    def _reaching(self):
+        """(block order, IN): IN[b][reg] = frozenset of definitions (bid, stmt index | 'T') or
+        ('ENTRY', reg) reaching the start of block b."""
+        blocks = self.blocks
+        order = rpo_order(self)
+        gen = {}
+        for bid in order:
+            g = {}
+            b = blocks[bid]
+            for i, st in enumerate(b.stmts):
+                for r in _writes_of(st):
+                    g[r] = frozenset([(bid, i)])
+            for r in _writes_of(b.term):
+                g[r] = frozenset([(bid, 'T')])
+            gen[bid] = g
+        self.compute_preds()
+        universe = set()
+        for bid in order:
+            universe.update(gen[bid])
+        IN = {bid: {} for bid in order}
+        OUT = {bid: dict(gen[bid]) for bid in order}
+        changed = True
+        while changed:
+            changed = False
+            for bid in order:
+                b = blocks[bid]
+                inn = {}
+                preds = [p for p in b.preds if p in OUT]
+                for pr in preds:
+                    for r, ds in OUT[pr].items():
+                        cur = inn.get(r)
+                        inn[r] = ds if cur is None else (cur | ds)
+                if bid == self.entry:
+                    # parameters / never-assigned registers
+                    for r in universe:
+                        inn[r] = inn.get(r, frozenset()) | frozenset([('ENTRY', r)])
+                if inn != IN[bid]:
+                    IN[bid] = inn
+                    out = dict(inn)
+                    out.update(gen[bid])
+                    if out != OUT[bid]:
+                        OUT[bid] = out
+                    changed = True
+        return order, IN
+
+    def _dead_stores(self):
+        """Drop register definitions that nothing reads (Luraph pads the code with them, and the
+        loads feeding its self-modifying patches become dead once the patches are applied)."""
+        PURE = ('k', 'outer', 'constfn', 'upcell', 'r', 'kfn', 'global', 'env', 'closure', 'newtable', 'opaque')
+        captured = set()
+        for b in self.blocks.values():
+            for st in b.stmts + [b.term]:
+                for e in stmt_exprs(st)[0]:
+                    for x in walk_expr(e, []):
+                        if x[0] == 'closure':
+                            for c in x[2]:
+                                if c[0] == 'ref' and not isinstance(c[1], tuple):
+                                    captured.add(c[1])
+        while True:
+            order, IN = self._reaching()
+            used = set()
+            for bid in order:
+                b = self.blocks[bid]
+                cur = dict(IN[bid])
+                for i, st in list(enumerate(b.stmts)) + [('T', b.term)]:
+                    for r, _ in _reads_of(st):
+                        used.update(cur.get(r, ()))
+                    for r in _writes_of(st):
+                        cur[r] = frozenset([(bid, i)])
+            removed = False
+            for bid in order:
+                b = self.blocks[bid]
+                keep = []
+                for i, st in enumerate(b.stmts):
+                    if st[0] == 'set' and st[1][0] == 'r' and st[2][0] in PURE and (bid, i) not in used \
+                            and st[1][1] not in captured:
+                        removed = True
+                        continue
+                    keep.append(st)
+                b.stmts = keep
+            if not removed:
+                break
 
     # -- control-flow unflattening
     def _unflatten(self):
@@ -261,60 +406,8 @@ class ProtoCFG:
         comparison folds, the dispatch branches disappear and constant-bound dispatch loops unroll.
         """
         blocks = self.blocks
-        CMPS = ('<', '<=', '>', '>=', '==', '~=')
-
-        def isnum(e):
-            return e[0] == 'k' and isinstance(e[1], (int, float)) and not isinstance(e[1], bool)
-
-        def reads_of(st):
-            out = []
-
-            def scan(e):
-                t = e[0]
-                if t == 'r':
-                    out.append((e[1], False))
-                elif t == 'bin':
-                    if e[1] in CMPS:
-                        a, b = e[2], e[3]
-                        if a[0] == 'r' and isnum(b):
-                            out.append((a[1], True))
-                            return
-                        if b[0] == 'r' and isnum(a):
-                            out.append((b[1], True))
-                            return
-                    scan(e[2]); scan(e[3])
-                elif t == 'un':
-                    scan(e[2])
-                elif t in ('index', 'and', 'or'):
-                    scan(e[1]); scan(e[2])
-                elif t == 'call':
-                    scan(e[1])
-                    for a in e[2]:
-                        scan(a)
-                    if e[3]:
-                        scan(e[3])
-                elif t == 'method':
-                    scan(e[1])
-                elif t == 'closure':
-                    for c in e[2]:
-                        if isinstance(c[1], tuple):
-                            scan(c[1])
-                        elif c[0] in ('ref', 'val'):
-                            out.append((c[1], False))
-                elif t == 'table':
-                    for k, v in e[1]:
-                        if k is not None:
-                            scan(k)
-                        scan(v)
-                    if e[2]:
-                        scan(e[2])
-
-            for e in stmt_exprs(st)[0]:
-                scan(e)
-            return out
-
-        def writes_of(st):
-            return [w[1] for w in stmt_exprs(st)[1] if w[0] == 'r']
+        isnum, reads_of, writes_of = _isnum, _reads_of, _writes_of
+        CMPS = _CMPS
 
         # ---- numeric for loops with constant bounds
         prep_info = {}          # (bid, idx) -> (base, init, limit, step, [idx of the constant sets])
@@ -349,46 +442,7 @@ class ProtoCFG:
             if b.term[0] == 'forbr' and b.term[1] == 'num' and isinstance(b.term[2][0], int):
                 for_heads.setdefault(b.term[2][0] - 3, []).append(bid)
 
-        # ---- reaching definitions
-        order = rpo_order(self)
-        gen = {}
-        for bid in order:
-            g = {}
-            b = blocks[bid]
-            for i, st in enumerate(b.stmts):
-                for r in writes_of(st):
-                    g[r] = frozenset([(bid, i)])
-            for r in writes_of(b.term):
-                g[r] = frozenset([(bid, 'T')])
-            gen[bid] = g
-        self.compute_preds()
-        universe = set()
-        for bid in order:
-            universe.update(gen[bid])
-        IN = {bid: {} for bid in order}
-        OUT = {bid: dict(gen[bid]) for bid in order}
-        changed = True
-        while changed:
-            changed = False
-            for bid in order:
-                b = blocks[bid]
-                inn = {}
-                preds = [p for p in b.preds if p in OUT]
-                for pr in preds:
-                    for r, ds in OUT[pr].items():
-                        cur = inn.get(r)
-                        inn[r] = ds if cur is None else (cur | ds)
-                if bid == self.entry:
-                    # parameters / never-assigned registers
-                    for r in universe:
-                        inn[r] = inn.get(r, frozenset()) | frozenset([('ENTRY', r)])
-                if inn != IN[bid]:
-                    IN[bid] = inn
-                    out = dict(inn)
-                    out.update(gen[bid])
-                    if out != OUT[bid]:
-                        OUT[bid] = out
-                    changed = True
+        order, IN = self._reaching()
 
         # ---- webs
         parent = {}

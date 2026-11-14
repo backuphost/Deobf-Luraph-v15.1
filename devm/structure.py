@@ -2,6 +2,7 @@
 import math
 import re
 
+from . import beautify
 from .ircfg import ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
 
 
@@ -953,6 +954,9 @@ class Printer:
             return 'ARG_%d' % e[1]
         if t == 'nargs':
             return 'select("#", ...)'
+        if t == 'index' and e[1] == ('env',) and e[2][0] == 'k' and isinstance(e[2][1], str) \
+                and IDENT.match(e[2][1]) and e[2][1] not in KEYWORDS:
+            return e[2][1]
         if t == 'index' or t == 'method':
             obj = self.prefix(e[1])
             k = e[2] if t == 'index' else ('k', e[2])
@@ -1157,6 +1161,7 @@ class Decompiler:
             st = Structurer(cfg)
             ast = st.run()
             ast = cleanup(ast)
+            ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
             if max_locals(ast) + len(params) <= 180:
                 break
