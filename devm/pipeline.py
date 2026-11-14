@@ -55,7 +55,7 @@ Stage.native_text = _native_text
 
 def trace(chain, outpath):
     luau = vmmodel.find_luau()
-    r = subprocess.run([luau, os.path.join(HERE, 'harness.lua'), chain[0], outpath] + list(chain[1:]),
+    r = subprocess.run([luau, os.path.join(HERE, 'harness.lua'), '-a', chain[0], outpath] + list(chain[1:]),
                        capture_output=True, text=True, timeout=900)
     if not os.path.exists(outpath):
         return None, r.stderr
