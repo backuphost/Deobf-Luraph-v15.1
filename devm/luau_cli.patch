@@ -1,8 +1,16 @@
 diff --git a/CLI/src/Repl.cpp b/CLI/src/Repl.cpp
-index 7ecaabc..10aff50 100644
+index 7ecaabc..ffd297f 100644
 --- a/CLI/src/Repl.cpp
 +++ b/CLI/src/Repl.cpp
-@@ -120,6 +120,74 @@ static int lua_loadstring(lua_State* L)
+@@ -44,6 +44,7 @@
+ #include <locale.h>
+ #include <signal.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ LUAU_FASTFLAG(DebugLuauTimeTracing)
+ 
+@@ -120,6 +121,94 @@ static int lua_loadstring(lua_State* L)
      return 2;          // return nil plus error message
  }
  
@@ -74,10 +82,30 @@ index 7ecaabc..10aff50 100644
 +    return 0;
 +}
 +
++static int cwrapCall_(lua_State* L)
++{
++    int n = lua_gettop(L);
++    lua_pushvalue(L, lua_upvalueindex(1));
++    lua_insert(L, 1);
++    lua_call(L, n, LUA_MULTRET);
++    return lua_gettop(L);
++}
++
++// cwrap(fn, name): a C closure that forwards to fn, so environment stubs look like engine
++// builtins to debug.info (anti-tamper code checks that library functions are C functions)
++static int lua_cwrap_(lua_State* L)
++{
++    luaL_checktype(L, 1, LUA_TFUNCTION);
++    const char* name = strdup(luaL_optstring(L, 2, ""));
++    lua_pushvalue(L, 1);
++    lua_pushcclosurek(L, cwrapCall_, name, 1, NULL);
++    return 1;
++}
++
  static int lua_collectgarbage(lua_State* L)
  {
      const char* option = luaL_optstring(L, 1, "collect");
-@@ -218,6 +286,11 @@ void setupState(lua_State* L)
+@@ -218,6 +307,12 @@ void setupState(lua_State* L)
      static const luaL_Reg funcs[] = {
          {"loadstring", lua_loadstring},
          {"collectgarbage", lua_collectgarbage},
@@ -86,6 +114,7 @@ index 7ecaabc..10aff50 100644
 +        {"ewrite", lua_ewrite_},
 +        {"appendfile", lua_appendfile_},
 +        {"exitafter", lua_exitafter_},
++        {"cwrap", lua_cwrap_},
  #ifdef CALLGRIND
          {"callgrind", lua_callgrind},
  #endif

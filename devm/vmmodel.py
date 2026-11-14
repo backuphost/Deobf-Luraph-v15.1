@@ -37,6 +37,10 @@ class Model:
         self.loops = []             # dispatch loop statements
         self.func_by_line = {}
         self.toplevel = set()       # ids of functions not nested in another function (no upvalues)
+        self.def_scope = {}         # func id -> names visible where the function expression is
+        self.func_exprs = {}
+        self.capture_all = False
+        self.captures = {}          # func id -> upvalue names recorded at closure creation
         for f in self.funcs:
             self.func_by_line.setdefault(f.line, []).append(f)
         self._find()
@@ -148,6 +152,7 @@ class Model:
         self.interp = chain[-1]
         self.loops = loops
         self.visible = self._visible_names()
+        self._plan_captures()
 
     def _visible_names(self):
         """Names in scope where the interpreter closure is defined."""
@@ -173,9 +178,12 @@ class Model:
             t = e[0]
             if t == 'func':
                 f = e[1]
+                self.def_scope[f.id] = list(scope)
+                self.func_exprs[f.id] = f
                 if f is target:
                     found.extend(scope)
-                    return True
+                    if not self.capture_all:
+                        return True
                 return walk_block(f.body, scope + f.params)
             if t in ('index', 'bin'):
                 return walk_expr(e[-2], scope) or walk_expr(e[-1], scope)
@@ -235,11 +243,41 @@ class Model:
             return False
 
         walk_block(self.body, [])
+        if self.capture_all:
+            self.capture_all = False
+            return None
         seen = []
         for n in found:
             if n != '_' and n not in seen:
                 seen.append(n)
         return seen
+
+    def _plan_captures(self):
+        """Closures of the loader (e.g. the lazy-constant __index) are needed by the lifter with
+        their upvalues; choose which function expressions to record and with which names."""
+        self.capture_all = True
+        self._visible_names()
+        inside = set()
+
+        def mark(f):
+            inside.add(f.id)
+            for g in funcs_in(f.body):
+                mark(g)
+
+        mark(self.interp)
+        self.inside_interp = inside
+        chain_ids = {f.id for f in self.chain}
+        for fid, f in self.func_exprs.items():
+            if fid in self.toplevel or fid in inside or fid in chain_ids:
+                continue
+            used = names_in(f.body)
+            names = []
+            for n in self.def_scope.get(fid, ()):
+                if n != '_' and n in used and n not in names:
+                    names.append(n)
+            if len(names) > 180:
+                continue
+            self.captures[fid] = names
 
     # -- patching
     @property
@@ -271,10 +309,47 @@ class Model:
             edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s,__pid) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         else:
             edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
+        for fid, names in self.captures.items():
+            f = self.func_exprs[fid]
+            nl = '{' + ','.join('"%s"' % n for n in names) + '}'
+            edits.append((f.kw_pos, '__LPH_CAP(%d,%s,' % (fid, nl)))
+            # the getter shares the closure's upvalues, so the dump sees their values at dump time
+            edits.append((f.end_pos, ',function() return %s end)' % ','.join(names) if names else ',nil)'))
         edits.sort(key=lambda x: -x[0])
         for pos, text in edits:
             src = src[:pos] + text + ' ' + src[pos:]
         return src
+
+
+def funcs_in(node):
+    """Function objects directly reachable inside an AST fragment (not descending into them)."""
+    out = []
+    stack = [node]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, Func):
+            out.append(x)
+        elif isinstance(x, (tuple, list)):
+            stack.extend(x)
+    return out
+
+
+def names_in(node):
+    """Every identifier mentioned in an AST fragment, nested functions included."""
+    out = set()
+    stack = [node]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, Func):
+            stack.append(x.body)
+        elif isinstance(x, tuple):
+            if len(x) == 2 and x[0] == 'name' and isinstance(x[1], str):
+                out.add(x[1])
+            else:
+                stack.extend(x)
+        elif isinstance(x, list):
+            stack.extend(x)
+    return out
 
 
 def find_luau():

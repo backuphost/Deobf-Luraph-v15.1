@@ -358,6 +358,9 @@ PURE = {
 NOTK = Special('NOTK')
 
 
+ESCAPED = '__escaped'
+
+
 def k_eval(e, regs, tv, used=None):
     """Value of an IR expression when it is a compile-time constant on this path, else NOTK."""
     t = e[0]
@@ -376,7 +379,14 @@ def k_eval(e, regs, tv, used=None):
         if a is NOTK:
             return NOTK
         b = k_eval(e[3], regs, tv, used)
-        if b is NOTK or not is_num(a) or not is_num(b):
+        if b is NOTK:
+            return NOTK
+        if e[1] in ('==', '~='):
+            if isinstance(a, (LuaTable, Special)) or isinstance(b, (LuaTable, Special)):
+                return NOTK
+            eq = (a == b) and (isinstance(a, bool) == isinstance(b, bool)) and (isinstance(a, str) == isinstance(b, str))
+            return eq if e[1] == '==' else not eq
+        if not is_num(a) or not is_num(b):
             return NOTK
         try:
             op = e[1]
@@ -392,15 +402,51 @@ def k_eval(e, regs, tv, used=None):
                 r = math.floor(a / b)
             elif op == '/':
                 r = a / b
+            elif op in ('<', '<=', '>', '>='):
+                return {'<': a < b, '<=': a <= b, '>': a > b, '>=': a >= b}[op]
             else:
                 return NOTK
         except (ZeroDivisionError, OverflowError):
             return NOTK
         return norm(r)
+    if t == 'un':
+        a = k_eval(e[2], regs, tv, used)
+        if a is NOTK:
+            return NOTK
+        if e[1] == 'not':
+            return not truthy(a)
+        if e[1] == '-' and is_num(a):
+            return norm(-a)
+        return NOTK
+    if t in ('and', 'or'):
+        a = k_eval(e[1], regs, tv, used)
+        if a is NOTK:
+            return NOTK
+        if truthy(a) == (t == 'or'):
+            return a
+        return k_eval(e[2], regs, tv, used)
     return NOTK
 
 
-def k_transfer(stmts, regs, tv, used=None):
+def k_deps(e, td, out):
+    """Registers a constant expression was computed from (td: temporary -> registers)."""
+    t = e[0]
+    if t == 'r':
+        out.add(e[1])
+    elif t == 't' or t == 'mv':
+        out |= td.get(e, ())
+    elif t == 'bin':
+        k_deps(e[2], td, out)
+        k_deps(e[3], td, out)
+    elif t == 'un':
+        k_deps(e[2], td, out)
+    elif t in ('and', 'or'):
+        k_deps(e[1], td, out)
+        k_deps(e[2], td, out)
+    return out
+
+
+def k_transfer(stmts, regs, tv, used=None, td=None):
     """Push known-constant register / temporary values through a straight line of IR."""
     for st in stmts:
         t = st[0]
@@ -412,12 +458,26 @@ def k_transfer(stmts, regs, tv, used=None):
                     tv.pop(dst, None)
                 else:
                     tv[dst] = v
+                    if td is not None:
+                        td[dst] = frozenset(k_deps(st[2], td, set()))
             elif dst[0] == 'r':
                 v = k_eval(st[2], regs, tv, used)
-                if v is NOTK:
+                if v is NOTK or dst[1] in regs.get(ESCAPED, ()):
                     regs.pop(dst[1], None)
                 else:
                     regs[dst[1]] = v
+            ex = st[2]
+            if isinstance(ex, (tuple, list)) and ex[0] == 'closure' and isinstance(ex[2], tuple):
+                # a register captured by reference can be changed behind our back by the closure
+                refs = [c[1] for c in ex[2] if c[0] == 'ref']
+                if refs:
+                    regs[ESCAPED] = regs.get(ESCAPED, frozenset()) | frozenset(refs)
+                    for r in refs:
+                        regs.pop(r, None)
+        elif t == 'close':
+            esc = regs.get(ESCAPED)
+            if esc and isinstance(st[1], int):
+                regs[ESCAPED] = frozenset(r for r in esc if not (isinstance(r, int) and r >= st[1]))
         elif t == 'call':
             key = ('mv', st[1], 1)
             f = st[2]
@@ -433,9 +493,18 @@ def k_transfer(stmts, regs, tv, used=None):
                 tv.pop(key, None)
             else:
                 tv[key] = v
-        elif t == 'setmulti':
-            if isinstance(st[1], int):
-                for r in [r for r in regs if isinstance(r, int) and r >= st[1]]:
+                if td is not None:
+                    deps = set()
+                    for a in st[3]:
+                        k_deps(a, td, deps)
+                    td[key] = frozenset(deps)
+        elif t == 'setmulti' or (t == 'setlist' and st[1] == ('regs',)):
+            base = st[1] if t == 'setmulti' else st[2]
+            if isinstance(base, int):
+                for r in [r for r in regs if isinstance(r, int) and r >= base]:
+                    del regs[r]
+            else:
+                for r in [r for r in regs if isinstance(r, int)]:
                     del regs[r]
         elif t in ('numforprep', 'genforprep'):
             if isinstance(st[1], int):
@@ -500,6 +569,71 @@ BUF = {
 }
 
 
+def _lua_sub_range(n, i, j):
+    i = int(i)
+    j = int(j)
+    if i < 0:
+        i = max(n + i + 1, 1)
+    elif i == 0:
+        i = 1
+    if j < 0:
+        j = n + j + 1
+    elif j > n:
+        j = n
+    return i, j
+
+
+def _buf_copy(dst, doff, src, soff=0, count=None):
+    soff = int(soff or 0)
+    if count is None:
+        count = len(src.data) - soff
+    dst.data[int(doff):int(doff) + int(count)] = src.data[soff:soff + int(count)]
+
+
+def _buf_fill(b, off, val, count=None):
+    off = int(off)
+    if count is None:
+        count = len(b.data) - off
+    b.data[off:off + int(count)] = bytes([int(val) & 0xFF]) * int(count)
+
+
+def _buf_writestring(b, off, st, count=None):
+    raw = st.encode('latin-1')
+    if count is not None:
+        raw = raw[:int(count)]
+    b.data[int(off):int(off) + len(raw)] = raw
+
+
+def _str_byte(st, i=1, j=None):
+    if j is None:
+        j = i
+    i, j = _lua_sub_range(len(st), i, j)
+    return [ord(c) for c in st[i - 1:j]]
+
+
+def _str_sub(st, i=1, j=-1):
+    i, j = _lua_sub_range(len(st), i, j)
+    return st[i - 1:j] if i <= j else ''
+
+
+# builtins the loader uses on concrete data (lazy constant decoding builds strings in buffers);
+# each returns a list of results
+CONCRETE = {
+    'buffer.create': lambda n: [Buffer(bytes(int(n)))],
+    'buffer.fromstring': lambda st: [Buffer(st.encode('latin-1'))],
+    'buffer.copy': lambda *a: [_buf_copy(*a)][:0],
+    'buffer.fill': lambda *a: [_buf_fill(*a)][:0],
+    'buffer.writestring': lambda *a: [_buf_writestring(*a)][:0],
+    'string.char': lambda *a: [''.join(chr(int(x) & 0xFF) for x in a)],
+    'string.byte': _str_byte,
+    'string.sub': lambda *a: [_str_sub(*a)],
+    'string.rep': lambda st, n: [st * max(int(n), 0)],
+    'string.len': lambda st: [len(st)],
+    'string.reverse': lambda st: [st[::-1]],
+}
+CONCRETE_TYPES = (int, float, str, Buffer)
+
+
 # ------------------------------------------------------------------ dump loading
 class Dump:
     def __init__(self, data, model):
@@ -521,6 +655,17 @@ class Dump:
             return {'nan': math.nan, 'inf': math.inf, '-inf': -math.inf, '-0': -0.0}[v['f']]
         if 'fn' in v:
             return Builtin(v['fn'])
+        if 'lfn' in v and 'cap' in v:
+            func = self.model.func_exprs.get(v['fid'])
+            sc = Scope()
+            for n in self.model.captures.get(v['fid'], ()):
+                sc.vars[n] = None
+            f = LFn(func, sc, v['lfn'])
+            f.path = path
+            cap = self.table(v['cap']['t'])
+            for k, x in cap.h.items():
+                sc.vars[k] = x
+            return f
         if 'lfn' in v:
             fs = self.model.func_by_line.get(v['lfn'], [])
             f = LFn(fs[0] if len(fs) == 1 else None, None, v['lfn'])
@@ -596,6 +741,7 @@ class PE:
         self.events = []
         self.wrap_func = None
         self.factory = None         # (outer Func, mid Func) for factory-style VMs
+        self.foreign = 0            # >0 while running loader/helper code rather than a handler
         self.instantiating = False
         self.global_scope = Scope()
         self.box_fields = (1, 3)    # (field holding the register table, field holding the index)
@@ -940,7 +1086,16 @@ class PE:
                 raise PEError('symbolic key into concrete table T%s' % obj.id)
             if isinstance(key, float):
                 key = norm(key)
-            return obj.h.get(key)
+            r = obj.h.get(key)
+            if r is None and obj.mt is not None:
+                h = obj.mt.h.get('__index')
+                if isinstance(h, LFn):
+                    # lazily materialised VM data (constants / protos decoded on first use)
+                    vals = self.call_lfn(h, [obj, key], 1)
+                    return vals[0] if vals else None
+                if isinstance(h, LuaTable):
+                    return self.index(h, key, keyast)
+            return r
         if obj is REGS:
             if isinstance(key, int):
                 return self.read_reg(key)
@@ -980,8 +1135,12 @@ class PE:
         if obj is OPENUPS:
             return None
         if isinstance(obj, Lib):
+            if not isinstance(key, str):
+                raise PEError('library %s indexed with %r' % (obj.name, key))
             return Builtin(obj.name + '.' + key)
         if isinstance(obj, str):
+            if not isinstance(key, str):
+                raise PEError('string indexed with %r' % (key,))
             return Builtin('string.' + key)
         if obj is FSTATE:
             return FSTATE
@@ -1198,10 +1357,18 @@ class PE:
     def call_builtin(self, name, args, want):
         sym = any(isinstance(a, (Sym, MultiTail)) for a in args)
         if name == 'table.create':
+            if self.foreign:
+                return [LuaTable()]
             if self.seeking:
                 return [REGS]
             n = args[0] if args and is_num(args[0]) else 0
             return [self.emit_expr(('newtable', n))]
+        if name == 'setmetatable' and len(args) == 2 and isinstance(args[0], LuaTable) \
+                and (args[1] is None or isinstance(args[1], LuaTable)) and not args[0].escaped:
+            args[0].mt = args[1]
+            return [args[0]]
+        if name == 'getmetatable' and len(args) == 1 and isinstance(args[0], LuaTable) and not args[0].escaped:
+            return [args[0].mt]
         if name == 'getfenv':
             return [ENV]
         if name == 'setfenv':
@@ -1245,6 +1412,12 @@ class PE:
                 ty = lua_type(args[0])
                 if ty:
                     return [ty]
+        if name in CONCRETE and args and all(isinstance(a, CONCRETE_TYPES) and not isinstance(a, bool) or a is None
+                                             for a in args):
+            try:
+                return CONCRETE[name](*args)
+            except (struct.error, IndexError, ValueError, TypeError, AttributeError) as ex:
+                raise PEError('%s failed on concrete data: %s' % (name, ex))
         if name in BUF and args and isinstance(args[0], Buffer):
             if sym:
                 args = [self.concretize(a) for a in args]
@@ -1280,17 +1453,19 @@ class PE:
                 f = LFn(f.func, self.global_scope, f.line)
         if f.func is self.wrap_func and f.scope is None or (f.func is self.wrap_func and len(args) == 2 and isinstance(args[0], LuaTable)):
             return [self.make_closure(args)]
-        if f.scope is None:
+        if f.scope is None or f.func.id in self.model.captures:
             # foreign helper: recognise the unpack-like helper (start, stop, regs)
             if any(a is REGS for a in args):
                 nums = [a for a in args if a is not REGS]
                 if len(nums) == 2:
                     a, b = self.unpack_order(f.func, args, nums)
                     return self.regs_range(a, b)
-            if len(args) == 1 and (isinstance(args[0], LuaTable) and args[0].fresh or args[0] is False):
+            if len(args) == 1 and (isinstance(args[0], LuaTable) and args[0].fresh or args[0] is False) \
+                    and not self.foreign:
                 # non-virtualised function: native(upvalue_table) -> closure
                 return [self.make_closure([('native', f.func.line), args[0]])]
-            raise PEError('call of foreign VM closure (line %s) with %r' % (f.line, args))
+            if f.scope is None:
+                raise PEError('call of foreign VM closure (line %s) with %r' % (f.line, args))
         func = f.func
         sc = Scope(f.scope, boundary=(func is self.model.interp))
         if func is self.model.interp:
@@ -1302,7 +1477,18 @@ class PE:
                 sc.vars[p] = None
         if func.vararg:
             sc.vars['...'] = args[len(func.params):]
-        r = self.exec_block(func.body, sc)
+        if func.id in self.model.inside_interp:
+            r = self.exec_block(func.body, sc)
+        else:
+            # loader / helper code: its locals merely share names with interpreter state
+            saved = (self.fvars, self.fstack, self.openups)
+            self.fvars, self.fstack, self.openups = set(), set(), set()
+            self.foreign += 1
+            try:
+                r = self.exec_block(func.body, sc)
+            finally:
+                self.foreign -= 1
+                self.fvars, self.fstack, self.openups = saved
         if r is not None and r[0] == 'return':
             return r[1]
         return []

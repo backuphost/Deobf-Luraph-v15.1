@@ -5,7 +5,7 @@ from .pe import (PE, Scope, LFn, LuaTable, MultiTail, Sym, LinSym, NeedFork, For
 
 
 class Node:
-    __slots__ = ('key', 'tree', 'raw_tree', 'exposed', 'written', 'snap_in', 'error', 'kdeps')
+    __slots__ = ('key', 'tree', 'raw_tree', 'exposed', 'written', 'snap_in', 'error', 'kdeps', 'kin', 'parent', 'kill')
 
     def __init__(self, key):
         self.key = key
@@ -16,6 +16,9 @@ class Node:
         self.error = None
         self.raw_tree = None
         self.kdeps = None
+        self.kin = None
+        self.parent = None
+        self.kill = None
 
 
 class ProtoIR:
@@ -28,7 +31,9 @@ class ProtoIR:
         self.errors = []
         self.cjumps = {}
         self.tv = {}
+        self.td = {}
         self.kconf = set()
+        self.taken = set()      # (node key, leaf index) reached under some feasible state
 
 
 def same_value(a, b):
@@ -96,6 +101,8 @@ class Lifter:
         pe.track = False
         pe.exposed = set()
         pe.written = set()
+        pe.kcur = None
+        pe.kpos = 0
         try:
             vals = pe.call_lfn(interp, [MultiTail('args')], -1)
             tail = None
@@ -137,6 +144,8 @@ class Lifter:
         if len(paths) == 1 and len(paths[0][1]) == depth:
             ir, path, end = paths[0]
             return (ir[start:], end)
+        if any(len(p[1]) <= depth for p in paths):
+            raise PEError('inconsistent fork replay (instruction changed VM state between runs)')
         idx, cond, _ = paths[0][1][depth]
         tp = [p for p in paths if p[1][depth][2]]
         fp = [p for p in paths if not p[1][depth][2]]
@@ -183,12 +192,18 @@ class Lifter:
         entry, snap = end[1], end[2]
         pir.entry = entry
         nq0 = len(self.queue)
-        self.tracked = set()
-        for _ in range(12):
-            before = set(self.tracked)
+        # need[n]: registers whose constant value decides something at node n (a folded branch, a
+        # computed jump, a decryption key); rel[n]: need propagated backwards = what a visit must
+        # distinguish.  Iterate until the explored graph and the relevance sets are stable.
+        self.need = {}
+        self.rel = {}
+        for _ in range(60):
+            nn = len(pir.nodes)
             self.walk(pir, interp, entry, snap)
-            if self.tracked == before:
+            rel = self.relevance(pir)
+            if rel == self.rel and len(pir.nodes) == nn:
                 break
+            self.rel = rel
         # computed jumps that never met a constant
         for k, cj in pir.cjumps.items():
             node = pir.nodes[k]
@@ -198,9 +213,49 @@ class Lifter:
                 node.tree = _map_leaves(node.tree, lambda t: ([('error', msg)], ('ret', [], None))
                                         if t[0] == 'goto' and not isinstance(t[1][1], int) else ([], t))
                 pir.errors.append((k, msg))
+        self.prune_infeasible(pir)
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
         return pir
+
+    @staticmethod
+    def prune_infeasible(pir):
+        """Drop branch arms no feasible state ever took (opaque predicates on constant registers)."""
+        for key, node in pir.nodes.items():
+            if node.error:
+                continue
+            counter = [-1]
+
+            def rec(tree):
+                stmts, term = tree
+                if term[0] == 'br':
+                    a = rec(term[2])
+                    b = rec(term[3])
+                    if a is None and b is None:
+                        return None
+                    if a is None:
+                        return (list(stmts) + list(b[0]), b[1])
+                    if b is None:
+                        return (list(stmts) + list(a[0]), a[1])
+                    return (stmts, ('br', term[1], a, b))
+                if term[0] == 'forbr':
+                    a = rec(term[3])
+                    b = rec(term[4])
+                    dead = ([], ('ret', [], None))
+                    if a is None and b is None:
+                        return None
+                    return (stmts, ('forbr', term[1], term[2], a or dead, b or dead))
+                counter[0] += 1
+                if (key, counter[0]) not in pir.taken:
+                    return None
+                return tree
+
+            # leaves are numbered on the raw tree; computed jumps expand a leaf in place afterwards
+            if key in pir.cjumps:
+                continue
+            new = rec(node.tree)
+            if new is not None:
+                node.tree = new
 
     def walk(self, pir, interp, entry, snap):
         """Explore the proto's control flow, lifting each instruction on first reach.
@@ -209,11 +264,12 @@ class Lifter:
         computed jumps, decryption keys) are part of the visit signature, so code reached with a
         different return address is walked again and every return target is found."""
         visited = set()
-        work = [(entry, snap, {})]
+        work = [(entry, snap, {}, None)]
         confl = set()
+        visits = {}
         while work:
-            key2, snap, kregs = work.pop()
-            sig = (key2, frozenset((r, kregs[r]) for r in self.tracked if r in kregs))
+            key2, snap, kregs, parent = work.pop()
+            sig = (key2, frozenset((r, kregs[r]) for r in self.rel.get(key2, ()) if r in kregs))
             if sig in visited:
                 continue
             visited.add(sig)
@@ -221,6 +277,8 @@ class Lifter:
             if node is None:
                 node = Node(key2)
                 node.snap_in = snap
+                node.kin = kregs
+                node.parent = parent
                 pir.nodes[key2] = node
                 pe = self.pe
                 pe.kregs = kregs
@@ -239,7 +297,8 @@ class Lifter:
                     pir.errors.append((key2, str(e)))
                     continue
                 node.kdeps = dict(pe.kused)
-                self.tracked |= set(node.kdeps)
+                if node.kdeps:
+                    self.need.setdefault(key2, set()).update(node.kdeps)
                 node.raw_tree = node.tree
             else:
                 if key2 not in confl:
@@ -254,14 +313,16 @@ class Lifter:
                 if node.error:
                     continue
             changed = False
-            for li, (path, term) in enumerate(tree_paths(node.raw_tree)):
+            visits[key2] = visits.get(key2, 0) + 1
+            fold = visits[key2] <= 400      # widening: stop specialising a node visited too often
+            deps = set()
+            for li, regs2, path, term in feasible_paths(node.raw_tree, kregs, pir.tv, pir.td, deps if fold else None):
+                pir.taken.add((key2, li))
                 if term[0] != 'goto':
                     continue
-                regs2 = dict(kregs)
-                P.k_transfer(path, regs2, pir.tv)
                 tgt = term[1][1]
                 if isinstance(tgt, int):
-                    work.append((term[1], term[2], regs2))
+                    work.append((term[1], term[2], regs2, key2))
                     continue
                 # computed jump: pc = f(register)
                 val = P.k_eval(tgt.e, regs2, pir.tv) if isinstance(tgt, Sym) else P.NOTK
@@ -273,7 +334,7 @@ class Lifter:
                 cond = None
                 if info is not None and info[0] in regs2:
                     reg = info[0]
-                    self.tracked.add(reg)
+                    deps.add(reg)
                     cond = ('bin', '==', ('r', reg), ('k', regs2[reg]))
                     del regs2[reg]      # the return address is consumed by the jump
                 pcv = self.pe.pcvars[id(self.model.loops[term[1][0]])]
@@ -283,9 +344,40 @@ class Lifter:
                 if tkey not in cases:
                     cases[tkey] = (cond, snap2)
                     changed = True
-                work.append((tkey, snap2, regs2))
+                work.append((tkey, snap2, regs2, parent))    # debugging aid: skip the trampoline
+            if deps:
+                self.need.setdefault(key2, set()).update(deps)
             if changed:
                 node.tree = self.rebuild_computed(node.raw_tree, pir.cjumps[key2])
+
+    def relevance(self, pir):
+        """Backward propagation of need[] over the explored graph."""
+        succs = {}
+        kill = {}
+        for k, n in pir.nodes.items():
+            succs[k] = [e[1] for e in tree_ends(n.tree) if e[0] == 'goto' and isinstance(e[1][1], int)]
+            kl = n.kill
+            if kl is None:
+                kl = n.kill = frozenset(st[1][1] for st in n.raw_tree[0] if st[0] == 'set' and st[1][0] == 'r')
+            kill[k] = kl
+        preds = {}
+        for k, ss in succs.items():
+            for x in ss:
+                preds.setdefault(x, []).append(k)
+        rel = {k: set(v) for k, v in self.need.items()}
+        work = list(rel)
+        while work:
+            k = work.pop()
+            cur = rel.get(k)
+            if not cur:
+                continue
+            for p in preds.get(k, ()):
+                add = cur - kill[p]
+                have = rel.setdefault(p, set())
+                if not add <= have:
+                    have |= add
+                    work.append(p)
+        return {k: frozenset(v) for k, v in rel.items() if v}
 
     @staticmethod
     def rebuild_computed(raw, cj):
@@ -414,6 +506,7 @@ class FactoryLifter(Lifter):
         pe = self.pe
         pe.factory = (self.outer, self.mid)
         self.keys = {}          # id(mid closure scope) -> key
+        self.key_objs = {}
         self.pid_lfn = {}
         self.envs = dump.proto_envs()
         if not self.envs:
@@ -444,7 +537,7 @@ class FactoryLifter(Lifter):
             k = self.keys.get(id(proto.scope))
             if k is None:
                 k = self.keys[id(proto.scope)] = len(self.keys) + 1
-                self.proto_objs[k] = proto
+                self.key_objs[k] = proto      # keeps the scope alive, so id() stays unique
             return k
         raise PEError('unknown proto object %r' % (proto,))
 
@@ -543,3 +636,50 @@ def _map_leaves(tree, fn):
         return (stmts, ('forbr', term[1], term[2], _map_leaves(term[3], fn), _map_leaves(term[4], fn)))
     extra, t2 = fn(term)
     return (list(stmts) + list(extra), t2)
+
+
+def feasible_paths(tree, regs, tv, td, deps, prefix=None, counter=None):
+    """Like tree_paths, but follows only the branch arms the known constants allow.
+
+    Yields (leaf index, register constants at the leaf, statements, terminator).  `deps` collects
+    the registers every folded condition depended on; None disables folding."""
+    if counter is None:
+        counter = [-1]
+    if prefix is None:
+        prefix = []
+    stmts, term = tree
+    regs = dict(regs)
+    P.k_transfer(stmts, regs, tv, None, td)
+    cur = prefix + list(stmts)
+    if term[0] == 'br':
+        c = P.k_eval(term[1], regs, tv) if deps is not None else P.NOTK
+        if c is P.NOTK:
+            yield from feasible_paths(term[2], regs, tv, td, deps, cur, counter)
+            yield from feasible_paths(term[3], regs, tv, td, deps, cur, counter)
+        else:
+            P.k_deps(term[1], td, deps)
+            if P.truthy(c):
+                yield from feasible_paths(term[2], regs, tv, td, deps, cur, counter)
+                counter[0] += count_leaves(term[3])
+            else:
+                counter[0] += count_leaves(term[2])
+                yield from feasible_paths(term[3], regs, tv, td, deps, cur, counter)
+    elif term[0] == 'forbr':
+        clob = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
+        for r in clob:
+            regs.pop(r, None)
+        cur2 = cur + [('clobber', clob)]
+        yield from feasible_paths(term[3], regs, tv, td, deps, cur2, counter)
+        yield from feasible_paths(term[4], regs, tv, td, deps, cur2, counter)
+    else:
+        counter[0] += 1
+        yield counter[0], regs, cur, term
+
+
+def count_leaves(tree):
+    term = tree[1]
+    if term[0] == 'br':
+        return count_leaves(term[2]) + count_leaves(term[3])
+    if term[0] == 'forbr':
+        return count_leaves(term[3]) + count_leaves(term[4])
+    return 1

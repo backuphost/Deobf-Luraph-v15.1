@@ -33,6 +33,7 @@ end
 -- ---------------------------------------------------------------- serializer
 local tblIds, tblList = {}, {}
 local protoOfFn = {}
+local capOf, capVars
 local out = {}
 local function emit(s) out[#out + 1] = s end
 
@@ -74,6 +75,10 @@ function ser(v)
 		if fnames[v] then return '{"fn":"' .. fnames[v] .. '"}' end
 		local line = debug.info(v, "l")
 		local name = debug.info(v, "n")
+		local cap = capOf[v]
+		if cap then
+			return '{"lfn":' .. tostring(line) .. ',"fid":' .. cap.fid .. ',"cap":' .. ser(capVars(cap)) .. "}"
+		end
 		return '{"lfn":' .. tostring(line) .. ',"name":"' .. hex(name or "") .. '"}'
 	elseif t == "buffer" then
 		return '{"buf":"' .. hex(buffer.tostring(v)) .. '"}'
@@ -166,6 +171,26 @@ function __LPH_PROTO(names, n, ...)
 	end
 	protos[#protos + 1] = env
 	return #protos
+end
+
+-- loader closures the lifter must be able to run: remember their upvalues at creation
+capOf = setmetatable({}, { __mode = "k" })
+function __LPH_CAP(fid, names, fn, getter)
+	capOf[fn] = { fid = fid, names = names, getter = getter }
+	return fn
+end
+function capVars(cap)
+	if not cap.vars then
+		local env = {}
+		if cap.getter then
+			local vals = table.pack(cap.getter())
+			for i = 1, #cap.names do
+				env[cap.names[i]] = vals[i]
+			end
+		end
+		cap.vars = env
+	end
+	return cap.vars
 end
 
 function __LPH_REG(pid, fn)
@@ -276,11 +301,11 @@ local function rbxLib(name, impl)
 		__index = function(t, k)
 			local full = name .. "." .. tostring(k)
 			local real = traceMode and impl and impl[k]
-			local f = function(...)
+			local f = cwrap(function(...)
 				tr("call " .. full .. "(" .. briefArgs(...) .. ")")
 				if real then return real(...) end
 				return stub(full .. "()")
-			end
+			end, tostring(k))
 			fnames[f] = full
 			rawset(t, k, f)
 			return f
@@ -295,14 +320,14 @@ local stubGlobals = { script = stub("script"), game = stub("game"), workspace = 
 if traceMode then
 	stubGlobals.shared = stub("shared")
 	for _, n in ipairs({ "wait", "spawn", "delay", "warn", "tick", "time", "elapsedTime", "settings", "UserSettings" }) do
-		local f = function(...)
+		local f = cwrap(function(...)
 			tr("call " .. n .. "(" .. briefArgs(...) .. ")")
 			if n == "tick" or n == "time" or n == "elapsedTime" or n == "wait" then return 0 end
 			if n == "spawn" then return taskImpl.spawn(...) end
 			if n == "delay" then return taskImpl.delay(...) end
 			if n == "warn" then return end
 			return stub(n .. "()")
-		end
+		end, n)
 		stubGlobals[n] = f
 	end
 end
