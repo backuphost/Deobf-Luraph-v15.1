@@ -5,7 +5,6 @@ local _G = getfenv() -- the CLI runs scripts in a sandboxed thread: script globa
 local layers = { select(3, ...) }
 local layerIdx = 0
 local traceMode = string.sub(outPath, -6) == ".trace"
-local trace = {}
 
 local ABORT = "__LPH_ABORT__"
 
@@ -153,7 +152,7 @@ function __LPH_RUN(names, n, ...)
 		return fn
 	end
 	if traceMode then return nil end
-	local root = { kind = "run", vars = env }
+	local root = { kind = "run", vars = env, pid = (select(n + 1, ...)) }
 	finish(root)
 	error(ABORT, 0)
 end
@@ -175,23 +174,114 @@ function __LPH_REG(pid, fn)
 end
 
 -- ---------------------------------------------------------------- environment stubs
+local stubName = setmetatable({}, { __mode = "k" })
+local function brief(v)
+	local t = type(v)
+	if t == "string" then
+		if #v > 40 then return string.format("%q", string.sub(v, 1, 40)) .. "~" .. #v end
+		return string.format("%q", v)
+	elseif t == "number" or t == "boolean" or t == "nil" then
+		return tostring(v)
+	elseif t == "table" and stubName[v] then
+		return stubName[v]
+	end
+	return t
+end
+local function briefArgs(...)
+	local n = select("#", ...)
+	local parts = {}
+	for i = 1, math.min(n, 8) do parts[i] = brief((select(i, ...))) end
+	return table.concat(parts, ",")
+end
+-- trace mode streams every observable event to disk, so a script that ends in a deliberate
+-- busy loop (Luraph's anti-tamper "crash" does exactly that) still leaves a complete trace
+local TRACE_CAP = 60000
+local traceCount = 0
+local traceFull = false
+local function tr(s)
+	if not traceMode or traceFull then return end
+	traceCount += 1
+	appendfile(outPath, s .. "\n")
+	if traceCount >= TRACE_CAP then
+		traceFull = true
+		appendfile(outPath, "RESULT trace cap reached\n")
+		exitafter(0)
+	end
+end
+local stubSeq = 0
 local function stub(name)
 	local t = {}
-	return setmetatable(t, {
-		__index = function(_, k) return stub(name .. "." .. tostring(k)) end,
-		__call = function() return stub(name .. "()") end,
+	stubName[t] = name
+	local mt = {
+		__index = function(_, k)
+			tr("get " .. name .. "." .. brief(k))
+			local v = stub(name .. "." .. tostring(k))
+			rawset(t, k, v)
+			return v
+		end,
+		__newindex = function(_, k, v)
+			tr("set " .. name .. "." .. brief(k) .. " = " .. brief(v))
+			rawset(t, k, v)
+		end,
+		__call = function(_, ...)
+			tr("call " .. name .. "(" .. briefArgs(...) .. ")")
+			stubSeq += 1
+			return stub(name .. "()")
+		end,
 		__tostring = function() return name end,
-	})
+		__len = function() return 0 end,
+		__iter = function() return function() return nil end end,
+		__concat = function(a, b) return tostring(a) .. tostring(b) end,
+		__unm = function(a) return a end,
+		__eq = function(a, b) return rawequal(a, b) end,
+		__lt = function() return false end,
+		__le = function() return true end,
+	}
+	for _, mm in ipairs({ "__add", "__sub", "__mul", "__div", "__mod", "__pow", "__idiv" }) do
+		mt[mm] = function(a, b) return if type(a) == "number" then a elseif type(b) == "number" then b else 0 end
+	end
+	return setmetatable(t, mt)
 end
+-- deferred work (task.defer / task.delay / task.spawn after a yield) runs after the main chunk
+local deferred = {}
+local taskImpl = {
+	spawn = function(f, ...)
+		if type(f) == "function" then
+			local co = coroutine.create(f)
+			local ok, e = coroutine.resume(co, ...)
+			if not ok then tr("task error " .. tostring(e)) end
+			return co
+		end
+		return f
+	end,
+	defer = function(f, ...)
+		if type(f) == "function" then deferred[#deferred + 1] = table.pack(f, ...) end
+		return f
+	end,
+	delay = function(_, f, ...)
+		if type(f) == "function" then deferred[#deferred + 1] = table.pack(f, ...) end
+		return f
+	end,
+	wait = function(n) return n or 0 end,
+	cancel = function() end,
+	synchronize = function() end,
+	desynchronize = function() end,
+}
 -- Roblox datatype libraries: Vector3.new etc. become named stub functions
 local rbxLibs = {}
-local function rbxLib(name)
+local function rbxLib(name, impl)
 	local lib = rbxLibs[name]
 	if lib then return lib end
 	lib = setmetatable({}, {
 		__index = function(t, k)
-			local f = function(...) return stub(name .. "." .. tostring(k) .. "()") end
-			fnames[f] = name .. "." .. tostring(k)
+			local full = name .. "." .. tostring(k)
+			local real = traceMode and impl and impl[k]
+			local f = function(...)
+				tr("call " .. full .. "(" .. briefArgs(...) .. ")")
+				if real then return real(...) end
+				return stub(full .. "()")
+			end
+			fnames[f] = full
 			rawset(t, k, f)
 			return f
 		end,
@@ -200,10 +290,25 @@ local function rbxLib(name)
 	rbxLibs[name] = lib
 	return lib
 end
-local stubGlobals = { script = stub("script"), game = stub("game"), workspace = stub("workspace") }
+local stubGlobals = { script = stub("script"), game = stub("game"), workspace = stub("workspace"),
+	task = rbxLib("task", taskImpl) }
+if traceMode then
+	stubGlobals.shared = stub("shared")
+	for _, n in ipairs({ "wait", "spawn", "delay", "warn", "tick", "time", "elapsedTime", "settings", "UserSettings" }) do
+		local f = function(...)
+			tr("call " .. n .. "(" .. briefArgs(...) .. ")")
+			if n == "tick" or n == "time" or n == "elapsedTime" or n == "wait" then return 0 end
+			if n == "spawn" then return taskImpl.spawn(...) end
+			if n == "delay" then return taskImpl.delay(...) end
+			if n == "warn" then return end
+			return stub(n .. "()")
+		end
+		stubGlobals[n] = f
+	end
+end
 sandbox = setmetatable({}, {
 	__index = function(t, k)
-		if traceMode and #trace < 200000 and string.sub(tostring(k), 1, 5) ~= "__LPH" then trace[#trace + 1] = tostring(k) end
+		if string.sub(tostring(k), 1, 5) ~= "__LPH" then tr(tostring(k)) end
 		local v = _G[k]
 		if v ~= nil then return v end
 		v = stubGlobals[k]
@@ -212,6 +317,10 @@ sandbox = setmetatable({}, {
 			return rbxLib(k)
 		end
 		return nil
+	end,
+	__newindex = function(t, k, v)
+		tr("setglobal " .. tostring(k) .. " = " .. brief(v))
+		rawset(t, k, v)
 	end,
 })
 
@@ -223,10 +332,20 @@ if not fn then
 end
 setfenv(fn, sandbox)
 envTable = sandbox
+if traceMode then
+	writefile(outPath, "")
+	exitafter(tonumber(layers[#layers + 1] or "") or 20)
+end
 local ok, e = pcall(fn)
 if traceMode then
-	trace[#trace + 1] = "RESULT " .. tostring(ok) .. " " .. tostring(e)
-	writefile(outPath, table.concat(trace, "\n") .. "\n")
+	local di = 1
+	while di <= #deferred and di < 1000 do
+		local d = deferred[di]
+		di += 1
+		local dok, de = pcall(d[1], table.unpack(d, 2, d.n))
+		if not dok then tr("deferred error " .. tostring(de)) end
+	end
+	tr("RESULT " .. tostring(ok) .. " " .. tostring(e))
 	return
 end
 if not done then

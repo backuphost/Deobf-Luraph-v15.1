@@ -53,11 +53,19 @@ def _native_text(self, line, upnames, level):
 Stage.native_text = _native_text
 
 
-def trace(chain, outpath):
+def trace(chain, outpath, timeout=120):
+    """Run the sample (optionally with lifted layers swapped in) and record its observable behaviour."""
     luau = vmmodel.find_luau()
-    r = subprocess.run([luau, os.path.join(HERE, 'harness.lua'), '-a', chain[0], outpath] + list(chain[1:]),
-                       capture_output=True, text=True, timeout=900)
+    if os.path.exists(outpath):
+        os.remove(outpath)
+    err = ''
+    try:
+        r = subprocess.run([luau, os.path.join(HERE, 'harness.lua'), '-a', chain[0], outpath] + list(chain[1:]),
+                           capture_output=True, text=True, timeout=timeout)
+        err = r.stderr
+    except subprocess.TimeoutExpired:
+        err = 'timeout'
     if not os.path.exists(outpath):
-        return None, r.stderr
+        return None, err
     with open(outpath, encoding='latin-1') as f:
-        return f.read().split('\n'), r.stderr
+        return f.read().split('\n'), err

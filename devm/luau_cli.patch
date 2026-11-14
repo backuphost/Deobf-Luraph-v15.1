@@ -1,8 +1,8 @@
 diff --git a/CLI/src/Repl.cpp b/CLI/src/Repl.cpp
-index 7ecaabc..2551b4c 100644
+index 7ecaabc..10aff50 100644
 --- a/CLI/src/Repl.cpp
 +++ b/CLI/src/Repl.cpp
-@@ -120,6 +120,43 @@ static int lua_loadstring(lua_State* L)
+@@ -120,6 +120,74 @@ static int lua_loadstring(lua_State* L)
      return 2;          // return nil plus error message
  }
  
@@ -43,16 +43,49 @@ index 7ecaabc..2551b4c 100644
 +    return 0;
 +}
 +
++static int lua_appendfile_(lua_State* L)
++{
++    const char* path = luaL_checkstring(L, 1);
++    size_t l = 0;
++    const char* s = luaL_checklstring(L, 2, &l);
++    FILE* f = fopen(path, "ab");
++    if (!f)
++        luaL_error(L, "cannot open %s", path);
++    fwrite(s, 1, l, f);
++    fclose(f);
++    return 0;
++}
++
++static double exitDeadline_ = 0;
++
++static void exitInterrupt_(lua_State* L, int gc)
++{
++    if (gc >= 0)
++        return;
++    if (exitDeadline_ > 0 && lua_clock() > exitDeadline_)
++        _exit(0);
++}
++
++// exitafter(seconds): hard-stop the process once the deadline passes (for scripts that spin forever)
++static int lua_exitafter_(lua_State* L)
++{
++    exitDeadline_ = lua_clock() + luaL_checknumber(L, 1);
++    lua_callbacks(L)->interrupt = exitInterrupt_;
++    return 0;
++}
++
  static int lua_collectgarbage(lua_State* L)
  {
      const char* option = luaL_optstring(L, 1, "collect");
-@@ -218,6 +255,9 @@ void setupState(lua_State* L)
+@@ -218,6 +286,11 @@ void setupState(lua_State* L)
      static const luaL_Reg funcs[] = {
          {"loadstring", lua_loadstring},
          {"collectgarbage", lua_collectgarbage},
 +        {"readfile", lua_readfile_},
 +        {"writefile", lua_writefile_},
 +        {"ewrite", lua_ewrite_},
++        {"appendfile", lua_appendfile_},
++        {"exitafter", lua_exitafter_},
  #ifdef CALLGRIND
          {"callgrind", lua_callgrind},
  #endif

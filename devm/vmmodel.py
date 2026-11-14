@@ -36,6 +36,7 @@ class Model:
         self.visible = []           # names visible at interp definition
         self.loops = []             # dispatch loop statements
         self.func_by_line = {}
+        self.toplevel = set()       # ids of functions not nested in another function (no upvalues)
         for f in self.funcs:
             self.func_by_line.setdefault(f.line, []).append(f)
         self._find()
@@ -54,6 +55,8 @@ class Model:
             t = e[0]
             if t == 'func':
                 f = e[1]
+                if not fstack:
+                    self.toplevel.add(f.id)
                 walk_block(f.body, fstack + [f])
             elif t in ('index', 'bin'):
                 walk_expr(e[-2], fstack)
@@ -121,6 +124,8 @@ class Model:
                 walk_block(st[3], fstack)
             elif t in ('localfunc', 'funcstmt'):
                 f = st[2]
+                if not fstack:
+                    self.toplevel.add(f.id)
                 walk_block(f.body, fstack + [f])
             elif t == 'return':
                 for e in st[1]:
@@ -263,7 +268,7 @@ class Model:
             end = mid.end_pos
             edits.append((start, '__LPH_REG(__pid,'))
             edits.append((end, ')'))
-            edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
+            edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s,__pid) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         else:
             edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         edits.sort(key=lambda x: -x[0])

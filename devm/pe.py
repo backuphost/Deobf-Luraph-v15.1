@@ -355,6 +355,97 @@ PURE = {
 }
 
 
+NOTK = Special('NOTK')
+
+
+def k_eval(e, regs, tv, used=None):
+    """Value of an IR expression when it is a compile-time constant on this path, else NOTK."""
+    t = e[0]
+    if t == 'k':
+        return e[1]
+    if t == 'r':
+        if e[1] in regs:
+            if used is not None:
+                used[e[1]] = regs[e[1]]
+            return regs[e[1]]
+        return NOTK
+    if t == 't' or t == 'mv':
+        return tv.get(e, NOTK)
+    if t == 'bin':
+        a = k_eval(e[2], regs, tv, used)
+        if a is NOTK:
+            return NOTK
+        b = k_eval(e[3], regs, tv, used)
+        if b is NOTK or not is_num(a) or not is_num(b):
+            return NOTK
+        try:
+            op = e[1]
+            if op == '+':
+                r = a + b
+            elif op == '-':
+                r = a - b
+            elif op == '*':
+                r = a * b
+            elif op == '%':
+                r = a - math.floor(a / b) * b
+            elif op == '//':
+                r = math.floor(a / b)
+            elif op == '/':
+                r = a / b
+            else:
+                return NOTK
+        except (ZeroDivisionError, OverflowError):
+            return NOTK
+        return norm(r)
+    return NOTK
+
+
+def k_transfer(stmts, regs, tv, used=None):
+    """Push known-constant register / temporary values through a straight line of IR."""
+    for st in stmts:
+        t = st[0]
+        if t == 'set':
+            dst = st[1]
+            if dst[0] == 't':
+                v = k_eval(st[2], regs, tv, used) if isinstance(st[2], tuple) else NOTK
+                if v is NOTK:
+                    tv.pop(dst, None)
+                else:
+                    tv[dst] = v
+            elif dst[0] == 'r':
+                v = k_eval(st[2], regs, tv, used)
+                if v is NOTK:
+                    regs.pop(dst[1], None)
+                else:
+                    regs[dst[1]] = v
+        elif t == 'call':
+            key = ('mv', st[1], 1)
+            f = st[2]
+            v = NOTK
+            if f[0] == 'kfn' and f[1] in PURE and st[4] is None:
+                args = [k_eval(a, regs, tv, used) for a in st[3]]
+                if all(a is not NOTK and is_num(a) for a in args):
+                    try:
+                        v = norm(PURE[f[1]](*args))
+                    except Exception:
+                        v = NOTK
+            if v is NOTK:
+                tv.pop(key, None)
+            else:
+                tv[key] = v
+        elif t == 'setmulti':
+            if isinstance(st[1], int):
+                for r in [r for r in regs if isinstance(r, int) and r >= st[1]]:
+                    del regs[r]
+        elif t in ('numforprep', 'genforprep'):
+            if isinstance(st[1], int):
+                for r in range(st[1], st[1] + 6):
+                    regs.pop(r, None)
+        elif t == 'clobber':
+            for r in st[1]:
+                regs.pop(r, None)
+
+
 def lua_type(v):
     if v is None:
         return 'nil'
@@ -504,6 +595,17 @@ class PE:
         self.fvars, self.fstack, self.openups = self._classify_state_vars()
         self.events = []
         self.wrap_func = None
+        self.factory = None         # (outer Func, mid Func) for factory-style VMs
+        self.instantiating = False
+        self.global_scope = Scope()
+        self.box_fields = (1, 3)    # (field holding the register table, field holding the index)
+        # constants known along the path that reached the instruction being lifted (see concretize)
+        self.kregs = {}
+        self.tv = {}
+        self.kused = {}
+        self.kcur = None
+        self.kpos = 0
+        self.up_base = 0
         self.on_closure = None
         self.cur_pc = None
         self.track = False
@@ -660,6 +762,20 @@ class PE:
             return ('opaque', type(v).__name__)
         raise PEError('cannot atomize %r' % (v,))
 
+    def concretize(self, v):
+        """Concrete value of a symbolic value when the path fixes it (the VM decrypts its own
+        bytecode with keys that pass through registers), else the value unchanged."""
+        if not isinstance(v, Sym):
+            return v
+        if self.kcur is None:
+            self.kcur = dict(self.kregs)
+            self.kpos = 0
+        if self.kpos < len(self.ir):
+            k_transfer(self.ir[self.kpos:], self.kcur, self.tv, self.kused)
+            self.kpos = len(self.ir)
+        c = k_eval(v.e, self.kcur, self.tv, self.kused)
+        return v if c is NOTK else c
+
     def read_reg(self, n):
         return self.emit_expr(('r', n), ('r', n))
 
@@ -772,8 +888,7 @@ class PE:
         if t == 'ifexpr':
             c = self.eval1(e[1], scope)
             if isinstance(c, Sym):
-                # vararg count clamp: if (nargs - k) < 0 then -1 else (nargs - k)
-                raise PEError('symbolic if-expression')
+                return self.eval1(e[2] if self.cond(c) else e[3], scope)
             if isinstance(c, tuple) and c[0] == 'linlt0':
                 a = self.eval1(e[2], scope)
                 b = self.eval1(e[3], scope)
@@ -819,6 +934,8 @@ class PE:
 
     def index(self, obj, key, keyast):
         if isinstance(obj, LuaTable):
+            if isinstance(key, Sym):
+                key = self.concretize(key)
             if isinstance(key, (Sym, LinSym)):
                 raise PEError('symbolic key into concrete table T%s' % obj.id)
             if isinstance(key, float):
@@ -835,10 +952,13 @@ class PE:
                 raise PEError('upvalue index %r' % (key,))
             return UpRef(key)
         if isinstance(obj, UpRef):
-            if keyast is not None and keyast[0] == 'num':
-                if key == 1:
+            kind = self.upkind(obj.n)
+            if kind == 'box' or (kind is None and keyast is not None and keyast[0] == 'num'):
+                # boxed upvalue {regs, value, index}; the 1 / 3 may come from operands when the
+                # instruction was split into micro-ops
+                if key == self.box_fields[0]:
                     return UpBox(obj.n)
-                if key == 3:
+                if key == self.box_fields[1]:
                     return UpKey(obj.n)
             return self.emit_expr(('index', ('up', obj.n), self.atom(key)))
         if isinstance(obj, UpBox):
@@ -875,8 +995,12 @@ class PE:
 
     def setindex(self, obj, key, val, keyast=None):
         if isinstance(obj, LuaTable):
+            if isinstance(key, Sym):
+                key = self.concretize(key)
             if isinstance(key, (Sym, LinSym)):
                 raise PEError('symbolic key store into concrete table')
+            if not obj.fresh and isinstance(val, Sym):
+                val = self.concretize(val)
             if obj.escaped:
                 raise PEError('store into escaped table')
             if isinstance(key, float):
@@ -1121,11 +1245,18 @@ class PE:
                 ty = lua_type(args[0])
                 if ty:
                     return [ty]
+        if name in BUF and args and isinstance(args[0], Buffer):
+            if sym:
+                args = [self.concretize(a) for a in args]
+                if any(isinstance(a, (Sym, MultiTail)) for a in args):
+                    raise PEError('symbolic access to VM buffer in %s' % name)
+            try:
+                return [BUF[name](*args)]
+            except (struct.error, IndexError, ValueError, TypeError) as ex:
+                raise PEError('buffer access failed in %s: %s' % (name, ex))
         if not sym:
             if name in PURE and all(is_num(a) for a in args):
                 return [norm(PURE[name](*args))]
-            if name in BUF and args and isinstance(args[0], Buffer):
-                return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))
         return self.emit_call(('kfn', name), args, want)
@@ -1138,6 +1269,15 @@ class PE:
                 return [LinSym(mid, 0), PackedTbl(mid) if mid != 'args' else VARARG_TBL]
         if f.func is None:
             raise PEError('call of unresolved VM closure (line %s)' % f.line)
+        if self.factory is not None:
+            outer, mid = self.factory
+            if f.func is mid and not self.instantiating:
+                # proto(?, upvalues, ...) -> closure
+                ups = [a for a in args if isinstance(a, LuaTable)]
+                return [self.make_closure([f, ups[0] if ups else None])]
+            if f.scope is None and (f.func is outer or f.func.id in self.model.toplevel):
+                # functions of the top-level VM table close over nothing: run them directly
+                f = LFn(f.func, self.global_scope, f.line)
         if f.func is self.wrap_func and f.scope is None or (f.func is self.wrap_func and len(args) == 2 and isinstance(args[0], LuaTable)):
             return [self.make_closure(args)]
         if f.scope is None:
@@ -1184,6 +1324,27 @@ class PE:
             return nums[1], nums[0]
         return nums[0], nums[1]
 
+    def box_layout(self, v):
+        """(regs field, index field) when v is a freshly made upvalue box over the register table."""
+        if not isinstance(v, LuaTable):
+            return None
+        rf = [k for k, x in v.h.items() if x is REGS]
+        if len(rf) != 1:
+            return None
+        nf = [k for k, x in v.h.items() if isinstance(x, int) and not isinstance(x, bool)]
+        if self.box_fields[0] == rf[0] and self.box_fields[1] in nf:
+            return self.box_fields
+        if len(nf) != 1:
+            return None
+        return (rf[0], nf[0])
+
+    def upkind(self, n):
+        """'box' / 'val' for upvalue n of the proto being lifted, None when unknown."""
+        kinds = self.capkinds.get(self.cur_proto)
+        if kinds is not None and n < len(kinds):
+            return kinds[n]
+        return None
+
     def make_closure(self, args):
         proto = args[0]
         ups = args[1] if len(args) > 1 else None
@@ -1198,16 +1359,27 @@ class PE:
         for st in self.pending_closures:
             proto, ups = st[2][1], st[2][2]
             caps = []
+            kinds = []
             if isinstance(ups, LuaTable):
                 n = 0
+                if 0 not in ups.h and 1 in ups.h:
+                    n = 1
+                    self.up_base = 1
+                    caps.append(('pad', 0))
+                    kinds.append(None)
                 while n in ups.h:
                     v = ups.h[n]
-                    if isinstance(v, LuaTable) and v.h.get(1) is REGS:
-                        caps.append(('ref', v.h.get(3)))
+                    box = self.box_layout(v)
+                    if box is not None:
+                        self.box_fields = box
+                        caps.append(('ref', v.h.get(box[1])))
+                        kinds.append('box')
                     elif isinstance(v, Sym) and v.origin:
                         caps.append(('val', v.origin[1]))
+                        kinds.append('val')
                     elif isinstance(v, UpRef):
                         caps.append(('up', v.n))
+                        kinds.append(self.upkind(v.n))
                     else:
                         raise PEError('unknown upvalue capture %r' % (v,))
                     n += 1
@@ -1216,6 +1388,10 @@ class PE:
             else:
                 key = self.on_closure(proto) if self.on_closure else proto
             st[2] = ('closure', key, tuple(caps))
+            try:
+                self.capkinds.setdefault(key, kinds)
+            except TypeError:
+                pass
         res = [tuple(s) if isinstance(s, list) else s for s in self.ir]
         self.ir[:] = res
         self.pending_closures = []

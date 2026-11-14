@@ -1050,6 +1050,9 @@ class Printer:
     level = 0
 
     def emit(self, text):
+        if text.startswith('(') and self.lines:
+            # a line starting with '(' would be parsed as a call of the previous expression
+            text = ';' + text
         self.lines.append('\t' * self.level + text)
 
     def block(self, stmts):
@@ -1168,7 +1171,9 @@ class Decompiler:
         caps = e[2]
         upnames = []
         for c in caps:
-            if c[0] in ('ref', 'val'):
+            if c[0] == 'pad':
+                upnames.append('UPVAL_PAD')
+            elif c[0] in ('ref', 'val'):
                 upnames.append(c[1][1] if isinstance(c[1], tuple) else 'REG_%s' % (c[1],))
             else:
                 upnames.append(printer.upnames[c[1]] if c[1] < len(printer.upnames) else 'UPVAL_%d' % c[1])
