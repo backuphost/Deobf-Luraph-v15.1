@@ -129,7 +129,7 @@ def map_stmt(st, fn):
         return ('setlist', map_expr(st[1], fn), st[2], [map_expr(v, fn) for v in st[3]],
                 map_expr(st[4], fn) if st[4] else None)
     if t in ('numforprep', 'genforprep'):
-        return (t, [map_expr(v, fn) for v in st[1]])
+        return (t, [map_expr(v, fn) for v in st[1]]) + tuple(st[2:])
     if t == 'ret':
         return ('ret', [map_expr(v, fn) for v in st[1]], map_expr(st[2], fn) if st[2] else None)
     if t == 'br':
@@ -212,6 +212,7 @@ class ProtoCFG:
         self.vararg = False
         self.captured_ref = set()
         self.warnings = []
+        self.for_base = {}      # loop-test block -> base register of the loop (matches its setup)
         self._build()
         self._thread()
         self._to_exprs()
@@ -251,6 +252,9 @@ class ProtoCFG:
                     info = term[2]
                     regs = (info + 3,) if term[1] == 'num' else tuple(info)
                     b.term = ('forbr', term[1], regs, subs[0], subs[1])
+                    ints = [r for r in regs if isinstance(r, int)]
+                    if ints:
+                        self.for_base[bid] = min(ints) - 3
             else:
                 raise ValueError(term[0])
 
@@ -351,7 +355,7 @@ class ProtoCFG:
                     new.append(('setlist', st[1], st[2], list(st[3]), tl))
                 elif t == 'numforprep' or t == 'genforprep':
                     a = st[1]
-                    new.append((t, [('r', a), ('r', a + 1), ('r', a + 2)]))
+                    new.append((t, [('r', a), ('r', a + 1), ('r', a + 2)], a))
                 elif t == 'forpop':
                     continue
                 else:

@@ -30,8 +30,8 @@ class ProtoIR:
         self.conflicts = []
         self.errors = []
         self.cjumps = {}
-        self.tv = {}
-        self.td = {}
+        self.succ = {}          # instruction -> successor instructions seen under any state
+        self.mono = None
         self.kconf = set()
         self.taken = set()      # (node key, leaf index) reached under some feasible state
 
@@ -103,6 +103,7 @@ class Lifter:
         pe.written = set()
         pe.kcur = None
         pe.kpos = 0
+        pe.tv = {}
         try:
             vals = pe.call_lfn(interp, [MultiTail('args')], -1)
             tail = None
@@ -180,99 +181,99 @@ class Lifter:
         return (([('forpop',)], endT)), ex, wr
 
     # ---- whole proto
+    STATE_LIMIT = 600       # distinct constant states per instruction before generalising
+    FOR_UNROLL = 64         # constant state loops with at most this many iterations are followed
+
     def lift_proto(self, key):
         pir = ProtoIR(key)
         self.pe.cur_proto = key
         interp = self.instantiate(key)
         self.pe.kregs = {}
-        self.pe.tv = pir.tv
         _, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
         if end[0] != 'goto':
             raise PEError('interpreter returned before reaching dispatch loop')
         entry, snap = end[1], end[2]
         pir.entry = entry
         nq0 = len(self.queue)
-        # need[n]: registers whose constant value decides something at node n (a folded branch, a
-        # computed jump, a decryption key); rel[n]: need propagated backwards = what a visit must
-        # distinguish.  Iterate until the explored graph and the relevance sets are stable.
+        # need[n]: registers whose constant value decides something at instruction n (a folded
+        # branch, a computed jump, a decryption key, a constant for loop); rel[n]: need propagated
+        # backwards = what a visit must distinguish.  Iterate until the explored graph and the
+        # relevance sets are stable.
         self.need = {}
         self.rel = {}
-        for _ in range(60):
+        self.generalized = set()
+        self.preds = {}
+        self.merge = {}         # for-loop head -> (first body instruction, loop variable register)
+        self.inv = {}
+        for _ in range(300):
             nn = len(pir.nodes)
+            ng = len(self.generalized)
+            self.rel_changed = False
             self.walk(pir, interp, entry, snap)
-            rel = self.relevance(pir)
-            if rel == self.rel and len(pir.nodes) == nn:
+            if not self.rel_changed and len(pir.nodes) == nn and len(self.generalized) == ng:
                 break
-            self.rel = rel
-        # computed jumps that never met a constant
-        for k, cj in pir.cjumps.items():
-            node = pir.nodes[k]
-            if any(e[0] == 'goto' and not isinstance(e[1][1], int) for e in tree_ends(node.tree)):
-                msg = 'computed jump with no known target'
-                node.error = msg
-                node.tree = _map_leaves(node.tree, lambda t: ([('error', msg)], ('ret', [], None))
-                                        if t[0] == 'goto' and not isinstance(t[1][1], int) else ([], t))
-                pir.errors.append((k, msg))
-        self.prune_infeasible(pir)
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
+        self.specialise(pir, entry)
         return pir
 
-    @staticmethod
-    def prune_infeasible(pir):
-        """Drop branch arms no feasible state ever took (opaque predicates on constant registers)."""
-        for key, node in pir.nodes.items():
-            if node.error:
-                continue
-            counter = [-1]
+    def enter(self, key, kregs):
+        """(signature, constants) for arriving at instruction `key` with constants `kregs`."""
+        rel = self.rel.get(key, ())
+        if rel and self.is_merge(key):
+            # head of a real for loop: its hidden loop state cannot be duplicated, so all arrivals
+            # share one copy that keeps only the constants they agree on
+            inv = self.inv.get(key, {})
+            kregs = dict(kregs)
+            for r in rel:
+                if r in kregs and (r not in inv or inv[r] != kregs[r]):
+                    del kregs[r]
+        if key in self.generalized and rel:
+            kregs = dict(kregs)
+            for r in rel:
+                if r == FORSTK:
+                    if FORSTK in kregs:
+                        kregs[FORSTK] = tuple(None for _ in kregs[FORSTK])
+                else:
+                    kregs.pop(r, None)
+        return frozenset((r, kregs[r]) for r in rel if r in kregs), kregs
 
-            def rec(tree):
-                stmts, term = tree
-                if term[0] == 'br':
-                    a = rec(term[2])
-                    b = rec(term[3])
-                    if a is None and b is None:
-                        return None
-                    if a is None:
-                        return (list(stmts) + list(b[0]), b[1])
-                    if b is None:
-                        return (list(stmts) + list(a[0]), a[1])
-                    return (stmts, ('br', term[1], a, b))
-                if term[0] == 'forbr':
-                    a = rec(term[3])
-                    b = rec(term[4])
-                    dead = ([], ('ret', [], None))
-                    if a is None and b is None:
-                        return None
-                    return (stmts, ('forbr', term[1], term[2], a or dead, b or dead))
-                counter[0] += 1
-                if (key, counter[0]) not in pir.taken:
-                    return None
-                return tree
-
-            # leaves are numbered on the raw tree; computed jumps expand a leaf in place afterwards
-            if key in pir.cjumps:
-                continue
-            new = rec(node.tree)
-            if new is not None:
-                node.tree = new
+    def is_merge(self, key):
+        info = self.merge.get(key)
+        if info is None:
+            return False
+        # a loop whose body branches on the loop variable is a state loop: followed, not merged
+        return not (info[1] is not None and info[1] in self.rel.get(info[0], ()))
 
     def walk(self, pir, interp, entry, snap):
         """Explore the proto's control flow, lifting each instruction on first reach.
 
-        Constants are tracked along every path; the tracked registers (return addresses for
-        computed jumps, decryption keys) are part of the visit signature, so code reached with a
-        different return address is walked again and every return target is found."""
+        Constants are tracked along every path and branches they decide are followed one way
+        only, which is what keeps the walk on feasible paths: the VM decrypts its bytecode as it
+        runs, so executing an arm the real program never takes would corrupt later code."""
         visited = set()
         work = [(entry, snap, {}, None)]
         confl = set()
         visits = {}
         while work:
             key2, snap, kregs, parent = work.pop()
-            sig = (key2, frozenset((r, kregs[r]) for r in self.rel.get(key2, ()) if r in kregs))
-            if sig in visited:
+            if self.is_merge(key2):
+                inv = self.inv.get(key2)
+                if inv is None:
+                    self.inv[key2] = dict(kregs)
+                else:
+                    drop = [r for r, v in inv.items() if r not in kregs or kregs[r] != v]
+                    if drop:
+                        for r in drop:
+                            del inv[r]
+                        self.rel_changed = True
+            sig, kregs = self.enter(key2, kregs)
+            if (key2, sig) in visited:
                 continue
-            visited.add(sig)
+            visited.add((key2, sig))
+            visits[key2] = visits.get(key2, 0) + 1
+            if visits[key2] > self.STATE_LIMIT:
+                self.generalized.add(key2)
             node = pir.nodes.get(key2)
             if node is None:
                 node = Node(key2)
@@ -297,8 +298,6 @@ class Lifter:
                     pir.errors.append((key2, str(e)))
                     continue
                 node.kdeps = dict(pe.kused)
-                if node.kdeps:
-                    self.need.setdefault(key2, set()).update(node.kdeps)
                 node.raw_tree = node.tree
             else:
                 if key2 not in confl:
@@ -312,93 +311,140 @@ class Lifter:
                         pir.errors.append((key2, 'path-dependent VM state: R[%s] is %r or %r' % (r, v, kregs.get(r))))
                 if node.error:
                     continue
-            changed = False
-            visits[key2] = visits.get(key2, 0) + 1
-            fold = visits[key2] <= 400      # widening: stop specialising a node visited too often
             deps = set()
-            for li, regs2, path, term in feasible_paths(node.raw_tree, kregs, pir.tv, pir.td, deps if fold else None):
-                pir.taken.add((key2, li))
-                if term[0] != 'goto':
-                    continue
-                tgt = term[1][1]
-                if isinstance(tgt, int):
-                    work.append((term[1], term[2], regs2, key2))
-                    continue
-                # computed jump: pc = f(register)
-                val = P.k_eval(tgt.e, regs2, pir.tv) if isinstance(tgt, Sym) else P.NOTK
-                cj = pir.cjumps.setdefault(key2, {})
-                cases = cj.setdefault(li, {})
-                if not isinstance(val, int) or isinstance(val, bool):
-                    continue
-                info = computed_expr(path, tgt.e)
-                cond = None
-                if info is not None and info[0] in regs2:
-                    reg = info[0]
-                    deps.add(reg)
-                    cond = ('bin', '==', ('r', reg), ('k', regs2[reg]))
-                    del regs2[reg]      # the return address is consumed by the jump
-                pcv = self.pe.pcvars[id(self.model.loops[term[1][0]])]
-                snap2 = dict(term[2])
-                snap2[pcv] = val
-                tkey = (term[1][0], val)
-                if tkey not in cases:
-                    cases[tkey] = (cond, snap2)
-                    changed = True
-                work.append((tkey, snap2, regs2, parent))    # debugging aid: skip the trampoline
-            if deps:
-                self.need.setdefault(key2, set()).update(deps)
-            if changed:
-                node.tree = self.rebuild_computed(node.raw_tree, pir.cjumps[key2])
+            succ = pir.succ.setdefault(key2, set())
 
-    def relevance(self, pir):
-        """Backward propagation of need[] over the explored graph."""
-        succs = {}
-        kill = {}
-        for k, n in pir.nodes.items():
-            succs[k] = [e[1] for e in tree_ends(n.tree) if e[0] == 'goto' and isinstance(e[1][1], int)]
-            kl = n.kill
-            if kl is None:
-                kl = n.kill = frozenset(st[1][1] for st in n.raw_tree[0] if st[0] == 'set' and st[1][0] == 'r')
-            kill[k] = kl
-        preds = {}
-        for k, ss in succs.items():
-            for x in ss:
-                preds.setdefault(x, []).append(k)
-        rel = {k: set(v) for k, v in self.need.items()}
-        work = list(rel)
-        while work:
-            k = work.pop()
-            cur = rel.get(k)
-            if not cur:
-                continue
-            for p in preds.get(k, ()):
-                add = cur - kill[p]
-                have = rel.setdefault(p, set())
-                if not add <= have:
-                    have |= add
-                    work.append(p)
-        return {k: frozenset(v) for k, v in rel.items() if v}
+            def leaf(li, regs2, path, term, td, key2=key2, succ=succ, deps=deps):
+                if term[0] == 'goto':
+                    tkey, snap2 = self.resolve_goto(path, term, regs2, td, deps)
+                    if tkey is not None:
+                        if tkey not in succ:
+                            succ.add(tkey)
+                            self.preds.setdefault(tkey, []).append(key2)
+                            have = self.rel.get(tkey)
+                            if have:
+                                self.add_relevant(pir, key2, have - self.kill_of(node))
+                        work.append((tkey, snap2, regs2, key2))
+                return [], term
+
+            folded = fold_tree(node.raw_tree, kregs, deps, leaf, Unroll(self.rel, self.FOR_UNROLL, True))
+            info = forbr_info(folded)
+            if info is not None and key2 not in self.merge:
+                self.merge[key2] = info
+                self.inv[key2] = dict(kregs)
+                self.rel_changed = True
+            if node.kdeps:
+                deps.update(node.kdeps)
+            if deps:
+                self.add_relevant(pir, key2, deps)
 
     @staticmethod
-    def rebuild_computed(raw, cj):
-        """Replace each symbolic goto by a chain of tests, one per return address seen."""
-        counter = [-1]
+    def kill_of(n):
+        kl = n.kill
+        if kl is None:
+            kl = set()
+            for st in n.raw_tree[0]:
+                if st[0] == 'set':
+                    kl.add(st[1][1] if st[1][0] == 'r' else st[1])
+                elif st[0] == 'call':
+                    kl.add(('mv', st[1], 1))
+            kl = n.kill = frozenset(kl)
+        return kl
 
-        def leaf(term):
-            counter[0] += 1
-            cases = cj.get(counter[0])
-            if term[0] != 'goto' or not cases:
-                return ([], term)
-            tail = None
-            for tkey, (cond, snap2) in reversed(list(cases.items())):
-                arm = ([], ('goto', tkey, snap2))
-                if tail is None or cond is None:
-                    tail = arm
-                else:
-                    tail = ([], ('br', cond, arm, tail))
-            return tail
+    def add_relevant(self, pir, key, regs):
+        """rel[key] |= regs, propagated backwards over the edges known so far."""
+        work = [(key, regs)]
+        while work:
+            k, add = work.pop()
+            have = self.rel.get(k)
+            if have is None:
+                have = self.rel[k] = set()
+            add = add - have
+            if not add:
+                continue
+            have |= add
+            self.rel_changed = True
+            for p in self.preds.get(k, ()):
+                n = pir.nodes.get(p)
+                if n is not None and n.raw_tree is not None:
+                    rest = add - self.kill_of(n)
+                    if rest:
+                        work.append((p, rest))
 
-        return _map_leaves(raw, leaf)
+    def resolve_goto(self, path, term, regs2, td, deps):
+        """Target of a leaf goto; computed jumps (pc = f(register)) are resolved from constants."""
+        tgt = term[1][1]
+        if isinstance(tgt, int):
+            return term[1], term[2]
+        val = regs2.get(tgt.e, P.NOTK) if isinstance(tgt, Sym) else P.NOTK
+        if not isinstance(val, int) or isinstance(val, bool):
+            return None, None
+        deps |= td.get(tgt.e, ())
+        regs2.pop(tgt.e, None)
+        info = computed_expr(path, tgt.e)
+        if info is not None and info[0] in regs2:
+            deps.add(info[0])
+            del regs2[info[0]]      # the return address is consumed by the jump
+        pcv = self.pe.pcvars[id(self.model.loops[term[1][0]])]
+        snap2 = dict(term[2])
+        snap2[pcv] = val
+        return (term[1][0], val), snap2
+
+    def specialise(self, pir, entry):
+        """Replace the per-instruction graph by one node per (instruction, relevant constants).
+
+        Every copy keeps only the arms its constants allow, so state-machine dispatchers, jump
+        trampolines and constant-bound "for" state loops dissolve into direct control flow."""
+        mono = pir.nodes
+        pir.mono = mono
+        ids = {}
+        counts = {}
+        nodes = {}
+        work = []
+
+        def state(key, kregs):
+            sig, kregs = self.enter(key, kregs)
+            sk = ids.get((key, sig))
+            if sk is None:
+                n = counts.get(key, 0)
+                counts[key] = n + 1
+                sk = ids[(key, sig)] = (key[0], key[1], n)
+                work.append((sk, key, kregs))
+            return sk
+
+        pir.entry = state(entry, {})
+        while work:
+            sk, key, kregs = work.pop()
+            m = mono.get(key)
+            node = Node(sk)
+            nodes[sk] = node
+            if m is None:
+                msg = 'instruction %s:%s was never lifted' % key
+                node.error = msg
+                node.tree = ([('error', msg)], ('ret', [], None))
+                pir.errors.append((sk, msg))
+                continue
+            node.snap_in, node.exposed, node.written, node.error = m.snap_in, m.exposed, m.written, m.error
+            node.kin = kregs
+            if m.error:
+                node.tree = m.tree
+                continue
+
+            def leaf(li, regs2, path, term, td):
+                if term[0] != 'goto':
+                    return [], term
+                tkey, _ = self.resolve_goto(path, term, regs2, td, set())
+                if tkey is None:
+                    msg = 'computed jump with no known target'
+                    pir.errors.append((sk, msg))
+                    return [('error', msg)], ('ret', [], None)
+                return [], ('goto', state(tkey, regs2))
+
+            tree = fold_tree(m.raw_tree, kregs, set(), leaf, Unroll(self.rel, self.FOR_UNROLL, False))
+            if sk[2]:
+                tree = rename_temps(tree, '@%d' % sk[2])
+            node.tree = tree
+        pir.nodes = nodes
 
     @staticmethod
     def is_self_rewrite(tree, key):
@@ -411,7 +457,7 @@ class Lifter:
             return
         names = {c[1] for c in pir.conflicts}
         self.live = None
-        succ = {k: [e[1] for e in tree_ends(n.tree) if e[0] == 'goto'] for k, n in pir.nodes.items()}
+        succ = {k: list(pir.succ.get(k, ())) for k in pir.nodes}
         live = {k: set(n.exposed) & names for k, n in pir.nodes.items()}
         changed = True
         while changed:
@@ -638,42 +684,174 @@ def _map_leaves(tree, fn):
     return (list(stmts) + list(extra), t2)
 
 
-def feasible_paths(tree, regs, tv, td, deps, prefix=None, counter=None):
-    """Like tree_paths, but follows only the branch arms the known constants allow.
+FORSTK = '__for'    # pseudo register: stack of numeric-for frames (idx, limit, step, A) / None
 
-    Yields (leaf index, register constants at the leaf, statements, terminator).  `deps` collects
-    the registers every folded condition depended on; None disables folding."""
+
+class Unroll:
+    """Policy for constant-bound numeric for loops.
+
+    Luraph turns straight-line code into `for s = a, b, c do if s == ... end` state loops; those
+    are followed iteration by iteration.  A loop counts as a state loop when its body branches on
+    the loop variable, which is known once the body has been explored (rel)."""
+
+    def __init__(self, rel, limit, probing):
+        self.rel = rel
+        self.limit = limit
+        self.probing = probing
+
+    def is_state_loop(self, body_key, reg):
+        return body_key is not None and reg in self.rel.get(body_key, ())
+
+
+def fold_tree(tree, regs, deps, leaf, unroll, prefix=None, counter=None, tv=None, td=None):
+    """Specialise a node tree to the constants in `regs`.
+
+    Branches the constants decide are replaced by the arm taken (their dependencies go to
+    `deps`; deps=None disables folding).  leaf(index, regs, path, term, td) -> (stmts, term) is
+    called for every remaining leaf; leaf indices count all leaves of the unfolded tree.
+    Temporaries are local to the instruction except the ones its snapshot hands to the next
+    instruction; those travel in `regs` under their own name."""
     if counter is None:
         counter = [-1]
-    if prefix is None:
         prefix = []
+        tv = {}
+        td = {}
     stmts, term = tree
     regs = dict(regs)
-    P.k_transfer(stmts, regs, tv, None, td)
-    cur = prefix + list(stmts)
+    out = []
+    for st in stmts:
+        t = st[0]
+        if t == 'numforprep' and isinstance(st[1], int):
+            a = st[1]
+            frame = None
+            init, limit, step = regs.get(a, P.NOTK), regs.get(a + 1, P.NOTK), regs.get(a + 2, P.NOTK)
+            if deps is not None and all(P.is_num(x) for x in (init, limit, step)) and step != 0:
+                trips = (limit - init) / step + 1
+                if trips <= unroll.limit:
+                    frame = (init - step, limit, step, a)
+                    deps.update((a, a + 1, a + 2))
+            regs[FORSTK] = regs.get(FORSTK, ()) + (frame,)
+        elif t == 'genforprep':
+            regs[FORSTK] = regs.get(FORSTK, ()) + (None,)
+        elif t == 'forpop':
+            stk = regs.get(FORSTK, ())
+            if stk:
+                regs[FORSTK] = stk[:-1]
+        else:
+            P.k_transfer((st,), regs, tv, None, td)
+        out.append(st)
+    cur = prefix + out
     if term[0] == 'br':
         c = P.k_eval(term[1], regs, tv) if deps is not None else P.NOTK
         if c is P.NOTK:
-            yield from feasible_paths(term[2], regs, tv, td, deps, cur, counter)
-            yield from feasible_paths(term[3], regs, tv, td, deps, cur, counter)
+            a = fold_tree(term[2], regs, deps, leaf, unroll, cur, counter, dict(tv), dict(td))
+            b = fold_tree(term[3], regs, deps, leaf, unroll, cur, counter, tv, td)
+            return (out, ('br', term[1], a, b))
+        P.k_deps(term[1], td, deps, regs)
+        if P.truthy(c):
+            sub = fold_tree(term[2], regs, deps, leaf, unroll, cur, counter, tv, td)
+            counter[0] += count_leaves(term[3])
         else:
-            P.k_deps(term[1], td, deps)
-            if P.truthy(c):
-                yield from feasible_paths(term[2], regs, tv, td, deps, cur, counter)
+            counter[0] += count_leaves(term[2])
+            sub = fold_tree(term[3], regs, deps, leaf, unroll, cur, counter, tv, td)
+        return (out + list(sub[0]), sub[1])
+    if term[0] == 'forbr':
+        if term[1] == 'num':
+            a = term[2]
+            stk = regs.get(FORSTK, ())
+            top = stk[-1] if stk else None
+            tgt = term[3][1][1] if term[3][1][0] == 'goto' else None
+            fake = top is not None and top[3] == a and deps is not None and unroll.is_state_loop(tgt, a + 3)
+            if top is not None and top[3] == a and deps is not None and not fake and unroll.probing:
+                # first look at a constant loop: run the body once with the first value to see
+                # whether it branches on the loop variable (a state loop) or just uses it
+                idx = P.norm(top[0] + top[2])
+                regs2 = dict(regs)
+                regs2[FORSTK] = stk[:-1] + (None,)
+                regs2[a + 3] = idx
+                cur2 = cur + [('clobber', (a + 3,))]
+                x = fold_tree(term[3], regs2, deps, leaf, unroll, cur2, counter, dict(tv), dict(td))
+                regs[FORSTK] = stk[:-1] + (None,)
+                regs.pop(a + 3, None)
+                y = fold_tree(term[4], regs, deps, leaf, unroll, cur2, counter, tv, td)
+                return (out, ('forbr', term[1], term[2], x, y))
+            if fake:
+                deps.add(FORSTK)
+                idx = P.norm(top[0] + top[2])
+                if (idx <= top[1]) if top[2] > 0 else (idx >= top[1]):
+                    regs[FORSTK] = stk[:-1] + ((idx, top[1], top[2], a),)
+                    regs[a + 3] = idx
+                    st = ('set', ('r', a + 3), ('k', idx))
+                    sub = fold_tree(term[3], regs, deps, leaf, unroll, cur + [st], counter, tv, td)
+                    counter[0] += count_leaves(term[4])
+                    return (out + [st] + list(sub[0]), sub[1])
                 counter[0] += count_leaves(term[3])
-            else:
-                counter[0] += count_leaves(term[2])
-                yield from feasible_paths(term[3], regs, tv, td, deps, cur, counter)
-    elif term[0] == 'forbr':
-        clob = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
+                sub = fold_tree(term[4], regs, deps, leaf, unroll, cur, counter, tv, td)
+                return (out + list(sub[0]), sub[1])
+            clob = (a + 3,)
+        else:
+            clob = tuple(term[2])
         for r in clob:
             regs.pop(r, None)
         cur2 = cur + [('clobber', clob)]
-        yield from feasible_paths(term[3], regs, tv, td, deps, cur2, counter)
-        yield from feasible_paths(term[4], regs, tv, td, deps, cur2, counter)
-    else:
-        counter[0] += 1
-        yield counter[0], regs, cur, term
+        x = fold_tree(term[3], regs, deps, leaf, unroll, cur2, counter, dict(tv), dict(td))
+        y = fold_tree(term[4], regs, deps, leaf, unroll, cur2, counter, tv, td)
+        return (out, ('forbr', term[1], term[2], x, y))
+    counter[0] += 1
+    # hand constant temporaries to the next instruction, drop the ones that end here
+    live = {}
+    if term[0] == 'goto' and len(term) > 2 and isinstance(term[2], dict):
+        for v in term[2].values():
+            if isinstance(v, Sym):
+                c = P.k_eval(v.e, regs, tv)
+                if c is not P.NOTK:
+                    live[v.e] = c
+                    if v.e not in regs:
+                        td.setdefault(v.e, frozenset())
+                    else:
+                        td[v.e] = frozenset((v.e,))
+    for k in [k for k in regs if isinstance(k, tuple)]:
+        del regs[k]
+    regs.update(live)
+    extra, t2 = leaf(counter[0], regs, cur, term, td)
+    return (out + list(extra), t2)
+
+
+_TEMP_ID = None
+
+
+def rename_temps(tree, suffix):
+    """Give the temporaries / call ids of a duplicated node tree their own names."""
+    import re
+    global _TEMP_ID
+    if _TEMP_ID is None:
+        _TEMP_ID = re.compile(r'^(L\d+)?P\d+_c?\d+$|^entry_c?\d+$')
+
+    def ren(x):
+        if isinstance(x, str):
+            return x + suffix if _TEMP_ID.match(x) else x
+        if isinstance(x, tuple):
+            if x and x[0] == 'k':
+                return x
+            if x and x[0] == 'goto':
+                return x
+            return tuple(ren(y) for y in x)
+        if isinstance(x, list):
+            return [ren(y) for y in x]
+        return x
+
+    return ren(tree)
+
+
+def forbr_info(tree):
+    """(body target, loop variable register or None) of the for-loop test left in a tree."""
+    term = tree[1]
+    if term[0] == 'forbr':
+        tgt = term[3][1][1] if term[3][1][0] == 'goto' else None
+        return (tgt, term[2] + 3 if term[1] == 'num' else None)
+    if term[0] == 'br':
+        return forbr_info(term[2]) or forbr_info(term[3])
+    return None
 
 
 def count_leaves(tree):

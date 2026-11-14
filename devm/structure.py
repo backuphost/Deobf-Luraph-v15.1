@@ -273,6 +273,68 @@ def rpo(cfg):
 
 
 # ------------------------------------------------------------------ structuring
+def make_reducible(cfg, limit=400):
+    """Node splitting: give every extra entry of an irreducible loop its own copy of the entered
+    block, until all retreating edges are back edges.  Returns the number of copies made."""
+    from .ircfg import Block
+    blocks = cfg.blocks
+    made = 0
+    while made < limit:
+        cfg.compute_preds()
+        order = rpo(cfg)
+        idx = {b: i for i, b in enumerate(order)}
+        idom = {order[0]: order[0]}
+
+        def inter(a, b):
+            while a != b:
+                while idx[a] > idx[b]:
+                    a = idom[a]
+                while idx[b] > idx[a]:
+                    b = idom[b]
+            return a
+
+        changed = True
+        while changed:
+            changed = False
+            for b in order[1:]:
+                new = None
+                for p in blocks[b].preds:
+                    if p in idom:
+                        new = p if new is None else inter(p, new)
+                if idom.get(b) != new:
+                    idom[b] = new
+                    changed = True
+
+        def dominates(a, b):
+            while True:
+                if a == b:
+                    return True
+                nb = idom[b]
+                if nb == b:
+                    return False
+                b = nb
+
+        bad = None
+        for b in order:
+            for t in blocks[b].succs():
+                if idx[t] <= idx[b] and not dominates(t, b):
+                    bad = (b, t)
+                    break
+            if bad:
+                break
+        if bad is None:
+            return made
+        b, t = bad
+        made += 1
+        nid = ('split', made, t)
+        nb = Block(nid)
+        nb.stmts = list(blocks[t].stmts)
+        nb.term = blocks[t].term
+        blocks[nid] = nb
+        blocks[b].retarget(t, nid)
+    raise Unstructured('irreducible control flow')
+
+
 class Structurer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -284,6 +346,9 @@ class Structurer:
         self._loops()
         self.emitted = {}
         self.depth = 0
+        self.nflags = 0
+        self.pending = {}
+        self.preps = {}
         self.live_in, _ = cfg.liveness()
 
     def _dominators(self):
@@ -375,12 +440,31 @@ class Structurer:
             if x == ctx[1]:
                 out.append(['break'])
                 return None
+            # jump out of several loops at once: Luau has neither goto nor labelled break, so set
+            # a flag, break the innermost loop and let every enclosing loop pass it on
+            chain = [ctx]
             c = ctx[2]
             while c is not None:
                 if x == c[0] or x == c[1]:
-                    raise Unstructured('jump to outer loop')
+                    self.nflags += 1
+                    flag = ('r', 'exit%d' % self.nflags)
+                    out.append(['assign', [flag], [('k', True)]])
+                    out.append(['break'])
+                    for i, lc in enumerate(chain):
+                        last = i == len(chain) - 1
+                        kind = ('continue' if x == c[0] else 'break') if last else 'break'
+                        self.pending.setdefault(id(lc), []).append((flag, kind, last))
+                    return None
+                chain.append(c)
                 c = c[2]
         return x
+
+    def after_loop(self, lctx, out):
+        """Emit the flag checks that forward a multi-level jump once the inner loop has ended."""
+        for flag, kind, last in self.pending.pop(id(lctx), ()):
+            body = [['assign', [flag], [('k', False)]]] if last else []
+            body.append([kind])
+            out.append(['if', flag, body, None])
 
     def build(self, b, stop, ctx, out=None):
         if out is None:
@@ -425,7 +509,10 @@ class Structurer:
             elif t == 'setlist':
                 out.append(['setlist', st[1], st[2], st[3], st[4]])
             elif t in ('numforprep', 'genforprep'):
-                out.append(['prep', t, st[1]])
+                prep = ['prep', t, st[1]]
+                out.append(prep)
+                if len(st) > 2:
+                    self.preps.setdefault(st[2], []).append((out, prep))
             else:
                 out.append(['comment', 'unknown IR ' + repr(st)[:80]])
 
@@ -475,6 +562,16 @@ class Structurer:
             prep = None
             if out and out[-1][0] == 'prep':
                 prep = out.pop()
+            else:
+                # the setup may sit a few statements back (or in an enclosing block) once the
+                # surrounding state machine has been dissolved
+                cands = self.preps.get(self.cfg.for_base.get(h), [])
+                if cands:
+                    lst, prep = cands[-1]
+                    for i, x in enumerate(lst):
+                        if x is prep:
+                            del lst[i]
+                            break
             body = self.arm(term[3], h, lctx)
             if prep is None:
                 out.append(['comment', 'for-loop without visible setup'])
@@ -495,6 +592,7 @@ class Structurer:
                     while len(exprs) > 1 and exprs[-1] == ('k', None):
                         exprs.pop()
                 out.append(['forin', list(term[2]), exprs, body, h])
+            self.after_loop(lctx, out)
             return self.jump(follow, stop, ctx, out)
         # exits
         targets = {}
@@ -513,12 +611,14 @@ class Structurer:
                 cond = term[1] if inside == term[2] else negate(term[1])
                 body = self.arm(inside, h, lctx)
                 out.append(['while', cond, body, h])
+                self.after_loop(lctx, out)
                 return self.jump(follow, stop, ctx, out)
         body = []
         nb = self.emit_block(h, h, lctx, body)
         if nb is not None:
             self.build(nb, h, lctx, body)
         out.append(['while', ('k', True), body, h])
+        self.after_loop(lctx, out)
         if follow is None:
             return None
         return self.jump(follow, stop, ctx, out)
@@ -1134,7 +1234,7 @@ class Printer:
             if st[4]:
                 self.emit('for __i, __v in { %s } do %s[%d + __i] = __v end' % (self.expr(st[4]), tbl, st[2] + len(st[3]) - 1))
         elif t == 'prep':
-            self.emit('-- for-loop setup: ' + ', '.join(self.expr(e) for e in st[2]))
+            pass    # setup of a loop that was followed iteration by iteration
         else:
             self.emit('-- ?? ' + repr(st)[:100])
 
@@ -1153,6 +1253,7 @@ class Decompiler:
         pir = self.protos[key]
         for coalesce in (False, True):
             cfg = ProtoCFG(pir)
+            make_reducible(cfg)
             params = assign_variables(cfg, self.namer, coalesce)
             st = Structurer(cfg)
             ast = st.run()

@@ -373,6 +373,11 @@ def k_eval(e, regs, tv, used=None):
             return regs[e[1]]
         return NOTK
     if t == 't' or t == 'mv':
+        if e in regs:
+            # a temporary that crossed an instruction boundary travels with the path state
+            if used is not None:
+                used[e] = regs[e]
+            return regs[e]
         return tv.get(e, NOTK)
     if t == 'bin':
         a = k_eval(e[2], regs, tv, used)
@@ -428,21 +433,24 @@ def k_eval(e, regs, tv, used=None):
     return NOTK
 
 
-def k_deps(e, td, out):
-    """Registers a constant expression was computed from (td: temporary -> registers)."""
+def k_deps(e, td, out, regs=()):
+    """Path-state entries a constant expression was computed from (td: temporary -> entries)."""
     t = e[0]
     if t == 'r':
         out.add(e[1])
     elif t == 't' or t == 'mv':
-        out |= td.get(e, ())
+        if e in regs:
+            out.add(e)
+        else:
+            out |= td.get(e, ())
     elif t == 'bin':
-        k_deps(e[2], td, out)
-        k_deps(e[3], td, out)
+        k_deps(e[2], td, out, regs)
+        k_deps(e[3], td, out, regs)
     elif t == 'un':
-        k_deps(e[2], td, out)
+        k_deps(e[2], td, out, regs)
     elif t in ('and', 'or'):
-        k_deps(e[1], td, out)
-        k_deps(e[2], td, out)
+        k_deps(e[1], td, out, regs)
+        k_deps(e[2], td, out, regs)
     return out
 
 
@@ -459,7 +467,8 @@ def k_transfer(stmts, regs, tv, used=None, td=None):
                 else:
                     tv[dst] = v
                     if td is not None:
-                        td[dst] = frozenset(k_deps(st[2], td, set()))
+                        td[dst] = frozenset(k_deps(st[2], td, set(), regs))
+                regs.pop(dst, None)
             elif dst[0] == 'r':
                 v = k_eval(st[2], regs, tv, used)
                 if v is NOTK or dst[1] in regs.get(ESCAPED, ()):
@@ -496,8 +505,9 @@ def k_transfer(stmts, regs, tv, used=None, td=None):
                 if td is not None:
                     deps = set()
                     for a in st[3]:
-                        k_deps(a, td, deps)
+                        k_deps(a, td, deps, regs)
                     td[key] = frozenset(deps)
+            regs.pop(key, None)
         elif t == 'setmulti' or (t == 'setlist' and st[1] == ('regs',)):
             base = st[1] if t == 'setmulti' else st[2]
             if isinstance(base, int):
