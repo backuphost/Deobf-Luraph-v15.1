@@ -210,8 +210,11 @@ class Lifter:
             nn = len(pir.nodes)
             ng = len(self.generalized)
             self.rel_changed = False
+            self.inv_next = {}
             self.walk(pir, interp, entry, snap)
-            if not self.rel_changed and len(pir.nodes) == nn and len(self.generalized) == ng:
+            stable = self.inv_next == self.inv
+            self.inv = self.inv_next
+            if stable and not self.rel_changed and len(pir.nodes) == nn and len(self.generalized) == ng:
                 break
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
@@ -227,7 +230,12 @@ class Lifter:
             inv = self.inv.get(key, {})
             kregs = dict(kregs)
             for r in rel:
-                if r in kregs and (r not in inv or inv[r] != kregs[r]):
+                if r == FORSTK:
+                    # the loop nesting is structural: unify frame by frame, never drop the stack
+                    m = inv.get(FORSTK)
+                    if isinstance(m, tuple) and FORSTK in kregs and len(m) == len(kregs[FORSTK]):
+                        kregs[FORSTK] = m
+                elif r in kregs and (r not in inv or inv[r] != kregs[r]):
                     del kregs[r]
         if key in self.generalized and rel:
             kregs = dict(kregs)
@@ -264,15 +272,19 @@ class Lifter:
         while work:
             key2, snap, kregs, parent = work.pop()
             if self.is_merge(key2, kregs):
-                inv = self.inv.get(key2)
+                # what all arrivals of this round agree on; used from the next round on
+                inv = self.inv_next.get(key2)
                 if inv is None:
-                    self.inv[key2] = dict(kregs)
+                    self.inv_next[key2] = dict(kregs)
                 else:
-                    drop = [r for r, v in inv.items() if r not in kregs or kregs[r] != v]
-                    if drop:
-                        for r in drop:
+                    for r in [r for r, v in inv.items() if r not in kregs or kregs[r] != v]:
+                        if r == FORSTK and FORSTK in kregs and isinstance(inv[r], tuple) \
+                                and len(inv[r]) == len(kregs[r]):
+                            inv[r] = tuple(a if a == b else None for a, b in zip(inv[r], kregs[r]))
+                        elif r == FORSTK:
+                            inv[r] = False      # different nesting depths: leave each arrival alone
+                        else:
                             del inv[r]
-                        self.rel_changed = True
             sig, kregs = self.enter(key2, kregs)
             if (key2, sig) in visited:
                 continue
@@ -342,6 +354,7 @@ class Lifter:
             if info is not None and key2 not in self.merge:
                 self.merge[key2] = info
                 self.inv[key2] = dict(kregs)
+                self.inv_next[key2] = dict(kregs)
                 self.rel_changed = True
             if node.kdeps:
                 deps.update(node.kdeps)
