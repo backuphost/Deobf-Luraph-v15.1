@@ -1,6 +1,7 @@
 -- Luraph devirtualizer: runtime dump harness (runs under Luau CLI).
 -- usage: luau harness.lua <patched_sample.lua> <out.json>
 local samplePath, outPath = ...
+local _G = getfenv() -- the CLI runs scripts in a sandboxed thread: script globals live here, not in the real _G
 local layers = { select(3, ...) }
 local layerIdx = 0
 local traceMode = string.sub(outPath, -6) == ".trace"

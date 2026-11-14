@@ -291,7 +291,7 @@ def run_dump(model, workdir, tag, layers=()):
     if os.path.exists(outjson):
         os.remove(outjson)
     chain = list(layers) + [patched]
-    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), chain[0], outjson] + chain[1:],
+    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', chain[0], outjson] + chain[1:],
                        capture_output=True, text=True, timeout=600)
     if not os.path.exists(outjson):
         raise RuntimeError('dump failed: ' + r.stderr[-2000:])
