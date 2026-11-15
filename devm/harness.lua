@@ -246,6 +246,9 @@ local mockRef = nil
 -- numbers held by registers and interpreter locals on entry that were the same on every visit.
 -- The lifter uses them to resolve self-decrypting instructions whose key is computed at run time.
 local oracleOn = false
+local watchPid, watchRegs, watchN, watchLog = {}, nil, 0, {}   -- watch=<pid>: remember the arguments of its last calls
+local extraDepth = 0
+local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
 local orcLast = setmetatable({}, { __mode = "k" })
@@ -314,6 +317,9 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "runlog" then runLog = tonumber(v) ~= 0
 	elseif k == "dumpend" then dumpEnd = tonumber(v) ~= 0
 	elseif k == "oracle" then oracleOn = tonumber(v) ~= 0
+	elseif k == "tb" then tbPid = tonumber(v)
+	elseif k == "depth" then extraDepth = tonumber(v)
+	elseif k == "watch" then watchPid[tonumber(v)] = true
 	elseif k == "httpreply" then httpReply = v
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
@@ -352,7 +358,11 @@ local function brief(v)
 		end
 		return "table#" .. tostring(n)
 	elseif t == "function" then return "fn:" .. tostring(fnames[v] or (protoOfFn[v] and "P" .. protoOfFn[v]) or (fidOf[v] and "F" .. fidOf[v]) or debug.info(v, "l"))
-	else return (string.gsub(string.sub(tostring(v), 1, 40), "%s+", " ")) end
+	else
+		local ok, text = pcall(tostring, v)
+		if not ok then text = "<" .. typeof(v) .. ">" end
+		return (string.gsub(string.sub(text, 1, 40), "%s+", " "))
+	end
 end
 local function ringText(n)
 	local parts = {}
@@ -393,6 +403,23 @@ local lastRegs, seenErr = nil, {}
 function __LPH_STEP(pid, loop, pc, regs, names, ...)
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
+	if tbPid == pid then
+		tbPid = nil
+		ewrite("[traceback] first instruction of proto " .. pid .. " (step " .. stepCount .. ")\n" .. debug.traceback() .. "\n")
+	end
+	if watchPid[pid] and regs then
+		if regs ~= watchRegs then watchRegs, watchN = regs, 0 end
+		watchN += 1
+		if watchN == 2 then
+			local parts = {}
+			for i = 0, 60 do
+				local v = rawget(regs, i)
+				if v ~= nil then parts[#parts + 1] = "R" .. i .. "=" .. brief(v) end
+			end
+			watchLog[#watchLog + 1] = "pid " .. pid .. " step " .. stepCount .. ": " .. table.concat(parts, " ")
+			if #watchLog > 6 then table.remove(watchLog, 1) end
+		end
+	end
 	if oracleOn and regs then
 		local key = pid * 2 ^ 32 + loop * 2 ^ 24 + pc
 		local rec = orc[key]
@@ -532,10 +559,11 @@ function __LPH_RUN(names, n, ...)
 	if __LPH_N.c > runCount then runCount = __LPH_N.c else runCount += 1 end
 	if stubs[env.__pid] then
 		stubHits += 1
-		if stubHits <= 200 then
+		if stubHits <= 5000 then
 			ewrite("[stub] tamper response " .. tostring(env.__pid) .. " suppressed (entry " .. runCount .. ", step " ..
 				math.max(stepCount, __LPH_N.s) .. ")\n")
 		end
+		for _, w in watchLog do ewrite("    [watch] " .. w .. "\n") end
 		if stopAtFail then
 			ewrite("[fail] step=" .. __LPH_N.s .. " run=" .. runCount .. "\n")
 			ewrite("[flow] " .. flowText(1200) .. "\n")
@@ -589,6 +617,22 @@ function __LPH_REG(pid, fn)
 end
 
 -- ---------------------------------------------------------------- environment (Roblox mock)
+-- Wrap a Lua implementation so that its errors read like those of a C function: no position of
+-- the implementation, and the position of the calling Lua function (if any) in front, as luaL_error does.
+local function clike(impl)
+	return function(...)
+		local r = table.pack(pcall(impl, ...))
+		if r[1] then return unpack(r, 2, r.n) end
+		local msg = r[2]
+		if type(msg) == "string" then
+			msg = string.gsub(msg, "^[^\n:]*harness%.lua:%d+: ", "")
+			msg = string.gsub(msg, "^rbxmock:%d+: ", "")
+			error(msg, 2)
+		end
+		error(msg, 0)
+	end
+end
+_G.__LPH_CLIKE = clike
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
 mockRef = mock
@@ -769,9 +813,19 @@ do
 	for k, v in pairs(buffer) do b[k] = v end
 	for _, k in ipairs({ "writeu8", "writei8", "writeu16", "writei16", "writeu32", "writei32", "writef32", "writef64" }) do
 		local real = buffer[k]
-		b[k] = function(buf, off, v)
-			if type(v) ~= "number" then v = 0 end
-			return real(buf, off, v)
+		local size = (string.find(k, "64") and 8) or (string.find(k, "32") and 4) or (string.find(k, "16") and 2) or 1
+		b[k] = function(...)
+			local buf, off, v = ...
+			if type(v) == "table" or type(v) == "userdata" then v = 0 end
+			if type(buf) == "buffer" and type(off) == "number" and type(v) == "number" and off >= 0 and off + size <= buffer.len(buf) then
+				return real(buf, off, v)       -- no extra C call on the path that cannot fail
+			end
+			-- failing call: let the C function raise without this wrapper's position, then re-raise
+			-- with the position of the calling Lua function (if any), as luaL_error would have
+			local r
+			if select("#", ...) >= 3 then r = table.pack(pcall(real, buf, off, v, select(4, ...))) else r = table.pack(pcall(real, ...)) end
+			if r[1] then return unpack(r, 2, r.n) end
+			error(r[2], 2)
 		end
 		fnames[b[k]] = "buffer." .. k
 	end
@@ -803,6 +857,74 @@ mock.getfenv = function(f)
 	return realGetfenv(f)
 end
 fnames[mock.setfenv] = "setfenv"
+-- debug.info must describe harness/mock functions the way it describes the C functions they
+-- stand in for: scripts compare debug.info(type, "slnaf") with "[C]", -1, "type", 0, true, type,
+-- and walk the stack from error handlers expecting [handler, builtin, xpcall, caller].
+-- The stack shown to the script is the real one with every run of mock frames (and the C frames
+-- they call through) folded into a single frame that looks like a C function.
+do
+	local realInfo = debug.info
+	local d = {}
+	for k, v in pairs(mock.debug or debug) do d[k] = v end
+	local function mockLua(src)
+		return src ~= "[C]" and src ~= "sample" and string.sub(src, 1, 5) ~= "layer"
+	end
+	local function describe(a, b)
+		local out, n = {}, 0
+		for i = 1, #b do
+			local ch = string.sub(b, i, i)
+			n += 1
+			if ch == "s" then out[n] = "[C]"
+			elseif ch == "l" then out[n] = -1
+			elseif ch == "n" then out[n] = string.match(fnames[a] or "", "[^%.]*$")
+			elseif ch == "a" then out[n] = 0; n += 1; out[n] = true
+			elseif ch == "f" then out[n] = a
+			else error("invalid option", 3) end
+		end
+		return unpack(out, 1, n)
+	end
+	d.info = function(a, b, c)
+		if type(a) == "function" and type(b) == "string" then
+			if mockLua(realInfo(a, "s")) then return describe(a, b) end
+			return realInfo(a, b)
+		end
+		if type(a) == "number" and type(b) == "string" then
+			if a < 0 then return realInfo(a, b) end
+			if a == 0 then return describe(d.info, b) end
+			-- virtual frames, innermost first: positive = real level, function = folded mock frame
+			local frames, n = {}, 0
+			local lvl = 2
+			while true do
+				local f, src = realInfo(lvl, "fs")
+				if f == nil then break end
+				if mockLua(src) then
+					while n > 0 do
+						local top = frames[n]
+						if type(top) == "function" or realInfo(top, "s") == "[C]" then n -= 1 else break end
+					end
+					n += 1
+					frames[n] = f
+				else
+					n += 1
+					frames[n] = lvl
+				end
+				if n > a and type(frames[a]) == "number" and not mockLua(src) and src ~= "[C]" then break end
+				lvl += 1
+			end
+			local fr = frames[a]
+			if a > n or fr == nil then return end
+			if type(fr) == "function" then return describe(fr, b) end
+			return realInfo(fr, b)
+		end
+		if c ~= nil then return realInfo(a, b, c) end
+		return realInfo(a, b)
+	end
+	for k, v in pairs(d) do
+		if type(v) == "function" and not fnames[v] then fnames[v] = "debug." .. k end
+	end
+	libnames[d] = "debug"
+	mock.debug = d
+end
 fnames[mock.getfenv] = "getfenv"
 
 -- ---------------------------------------------------------------- bootstrap helpers
@@ -915,6 +1037,11 @@ function __LPH_AFTER(ok, message)
 	end
 end
 if __LPH_RUNMAIN then
+	-- depth=<n>: run the script n C calls deeper (a ModuleScript inside n nested requires)
+	for _ = 1, extraDepth do
+		local inner = fn
+		fn = function(...) return select(2, assert(pcall(inner, ...))) end
+	end
 	return fn
 end
 local ok, message = true, ""

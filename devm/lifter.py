@@ -115,6 +115,8 @@ class Lifter:
     def run_once(self, interp, inject, decisions, perm, prefix):
         pe = self.pe
         pe.ir = []
+        pe.regdirty = set()
+        pe.regdirty_all = False
         pe.tcount = 0
         pe.tprefix = prefix
         pe.events = []

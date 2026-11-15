@@ -1,8 +1,8 @@
 diff --git a/CLI/src/Repl.cpp b/CLI/src/Repl.cpp
-index 7ecaabc..77e2dbe 100644
+index 7ecaabc..edb6ce5 100644
 --- a/CLI/src/Repl.cpp
 +++ b/CLI/src/Repl.cpp
-@@ -120,6 +120,53 @@ static int lua_loadstring(lua_State* L)
+@@ -120,6 +120,85 @@ static int lua_loadstring(lua_State* L)
      return 2;          // return nil plus error message
  }
  
@@ -53,10 +53,42 @@ index 7ecaabc..77e2dbe 100644
 +    return 0;
 +}
 +
++// devm: resume a coroutine the way a scheduler does (no parent thread), so that it starts with
++// the full C stack budget instead of inheriting the depth of the caller like coroutine.resume
++static int lua_resumetop_(lua_State* L)
++{
++    lua_State* co = lua_tothread(L, 1);
++    luaL_argexpected(L, co, 1, "thread");
++    int narg = lua_gettop(L) - 1;
++    int costatus = lua_costatus(L, co);
++    if (costatus != LUA_COSUS)
++    {
++        lua_pushboolean(L, 0);
++        lua_pushstring(L, "cannot resume non-suspended coroutine");
++        return 2;
++    }
++    if (!lua_checkstack(co, narg))
++        luaL_error(L, "too many arguments to resume");
++    lua_xmove(L, co, narg);
++    int status = lua_resume(co, NULL, narg);
++    if (status == 0 || status == LUA_YIELD)
++    {
++        int nres = lua_gettop(co);
++        if (!lua_checkstack(L, nres + 1))
++            luaL_error(L, "too many results to resume");
++        lua_pushboolean(L, 1);
++        lua_xmove(co, L, nres);
++        return nres + 1;
++    }
++    lua_pushboolean(L, 0);
++    lua_xmove(co, L, 1);
++    return 2;
++}
++
  static int lua_collectgarbage(lua_State* L)
  {
      const char* option = luaL_optstring(L, 1, "collect");
-@@ -218,6 +265,11 @@ void setupState(lua_State* L)
+@@ -218,6 +297,12 @@ void setupState(lua_State* L)
      static const luaL_Reg funcs[] = {
          {"loadstring", lua_loadstring},
          {"collectgarbage", lua_collectgarbage},
@@ -64,11 +96,12 @@ index 7ecaabc..77e2dbe 100644
 +        {"writefile", lua_writefile_},
 +        {"ewrite", lua_ewrite_},
 +        {"setvectormetatable", lua_setvectormetatable_},
++        {"resumetop", lua_resumetop_},
 +        {"__LPH_RUNMAIN", lua_ewrite_},     // presence marks a CLI that runs a returned function as a main thread
  #ifdef CALLGRIND
          {"callgrind", lua_callgrind},
  #endif
-@@ -680,6 +732,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
+@@ -680,6 +765,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
  
          setupArguments(L, program_argc, program_argv);
          status = lua_resume(L, NULL, program_argc);
