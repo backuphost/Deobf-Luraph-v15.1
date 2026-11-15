@@ -18,14 +18,20 @@ return function(G, fnames, libnames)
 	-- whole batteries of builtins with a single frame left on the stack.
 	local cwrap = G.cwrap
 	local YIELD = cwrap and newproxy() or {}
+	local calllog = G.__LPH_CALLLOG
+	local function logged(name, f)
+		if not calllog then return f end
+		return function(...) calllog(name, ...) return f(...) end
+	end
 	local function named(name, f)
+		f = logged(name, f)
 		if cwrap then f = cwrap(string.match(name, "[^%.]*$"), f) end
 		fnames[f] = name
 		return f
 	end
 	-- implementations that may suspend the caller: f(callerThread, ...) returns YIELD to do so
 	local function namedY(name, f)
-		local g = f
+		local g = logged(name, f)
 		if cwrap then
 			f = cwrap(string.match(name, "[^%.]*$"), g, YIELD)
 		else
@@ -1426,6 +1432,7 @@ return function(G, fnames, libnames)
 	M.math_floor_precision = named("math_floor_precision", function(v)
 		M.mfpCalls += 1
 		if M.onMfp then M.onMfp(M.mfpCalls, v) end
+		if M.mfpDelta == 99999999 then error("attempt to call a nil value", 0) end
 		if M.mfpDelta then
 			return setmetatable({}, { __sub = function(_, expected)
 				if M.onMfpExpected then M.onMfpExpected(M.mfpCalls, v, expected) end

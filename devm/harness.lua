@@ -349,6 +349,17 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "watch" then watchPid[tonumber(v)] = true
 	elseif k == "watchlive" then watchLive = tonumber(v) ~= 0
 	elseif k == "httpreply" then httpReply = v
+	elseif k == "calls" then
+		-- calls=1: log every call of a mocked Roblox / executor function (diagnosis)
+		local n = 0
+		_G.__LPH_CALLLOG = function(name, ...)
+			if name == "GetComponents" then return end
+			n += 1
+			if n > 20000 then return end
+			local a = table.pack(...)
+			for i = 1, math.min(a.n, 4) do a[i] = type(a[i]) == "string" and string.format("%q", string.sub(a[i], 1, 80)) or tostring(a[i]) end
+			ewrite("[call] " .. name .. "(" .. table.concat(a, ", ", 1, math.min(a.n, 4)) .. ")\n")
+		end
 	elseif k == "mfpdelta" then mfpDelta = tonumber(v)
 	elseif k == "globals" then showGlobals = tonumber(v) > 0 and tonumber(v)
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
