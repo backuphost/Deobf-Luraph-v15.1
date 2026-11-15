@@ -242,6 +242,56 @@ local runLog = false
 local dumpEnd = false      -- dump the VM state when the script ends (normally or with an error)
 local stubHits = 0
 local mockRef = nil
+-- oracle mode (oracle=1, needs the step-instrumented sample): for every executed instruction, the
+-- numbers held by registers and interpreter locals on entry that were the same on every visit.
+-- The lifter uses them to resolve self-decrypting instructions whose key is computed at run time.
+local oracleOn = false
+local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
+local orc, orcNames = {}, {}
+local orcLast = setmetatable({}, { __mode = "k" })
+-- the instruction at pc as text: every numeric field of the proto's code arrays
+local insNames = {}
+local function insText(pid, pc)
+	local rec = protos[pid]
+	if not rec then return "" end
+	local names = insNames[pid]
+	if not names then
+		names = {}
+		for name, arr in rec.vars do
+			if type(arr) == "table" and arr ~= rec.self and type(name) == "string" then names[#names + 1] = name end
+		end
+		table.sort(names)
+		insNames[pid] = names
+	end
+	local parts = {}
+	for _, name in names do
+		local x = rawget(rec.vars[name], pc)
+		if type(x) == "number" then parts[#parts + 1] = name .. "=" .. string.format("%.17g", x) end
+	end
+	return table.concat(parts, " ")
+end
+local function writeOracle()
+	if not oracleOn then return end
+	oracleOn = false
+	local parts = {}
+	for key, rec in orc do
+		local r, v = {}, {}
+		for i, x in rec.r do
+			if x == x and math.abs(x) ~= math.huge then r[#r + 1] = string.format('"%d":%.17g', i, x) end
+		end
+		for n, x in rec.v do
+			if x == x and math.abs(x) ~= math.huge then v[#v + 1] = string.format('"%s":%.17g', n, x) end
+		end
+		local vs = {}
+		for i, t in rec.vers do vs[i] = string.format('[%d,"%s"]', rec.steps[i], t) end
+		local sc = {}
+		for k2 in rec.succ do sc[#sc + 1] = string.format("[%d,%d]", k2 // 2 ^ 24, k2 % 2 ^ 24) end
+		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"r":{%s},"v":{%s},"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
+			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, table.concat(r, ","), table.concat(v, ","), table.concat(vs, ","),
+			rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","))
+	end
+	writefile(outPath .. ".oracle", "{" .. table.concat(parts, ",\n") .. "}")
+end
 -- State read and written by code inlined into the sample (no calls: scripts measure the depth of
 -- both the Lua call stack and the C stack, so instrumentation must not add frames):
 --   __LPH_N.c  interpreter-closure entries so far     __LPH_N.t  entry number from which __LPH_RUN is called
@@ -263,8 +313,11 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "errors" then showErrors = tonumber(v) ~= 0
 	elseif k == "runlog" then runLog = tonumber(v) ~= 0
 	elseif k == "dumpend" then dumpEnd = tonumber(v) ~= 0
+	elseif k == "oracle" then oracleOn = tonumber(v) ~= 0
+	elseif k == "httpreply" then httpReply = v
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
+if oracleOn then traceMode = true end
 __LPH_N.t = (traceMode or dumpEnd) and (runLog and 0 or math.huge) or dumpAt
 local shadowOf, shadow = nil, nil
 local prevRec, prevPc = nil, nil
@@ -337,9 +390,59 @@ local function flowText(n)
 end
 
 local lastRegs, seenErr = nil, {}
-function __LPH_STEP(pid, loop, pc, regs)
+function __LPH_STEP(pid, loop, pc, regs, names, ...)
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
+	if oracleOn and regs then
+		local key = pid * 2 ^ 32 + loop * 2 ^ 24 + pc
+		local rec = orc[key]
+		local ver = insText(pid, pc)
+		-- control-flow edges that were actually taken (per activation: one register array each)
+		local prev = orcLast[regs]
+		if prev then prev.succ[loop * 2 ^ 24 + pc] = true end
+		if not rec then
+			local r, v = {}, {}
+			for i = 0, 1023 do
+				local x = rawget(regs, i)
+				if type(x) == "number" then r[i] = x end
+			end
+			if names then
+				local list = orcNames[names]
+				if not list then
+					list = string.split(names, ",")
+					orcNames[names] = list
+				end
+				local vals = { ... }
+				for i, n in list do
+					if type(vals[i]) == "number" then v[n] = vals[i] end
+				end
+				rec = { r = r, v = v, n = 1, names = list }
+			else
+				rec = { r = r, v = v, n = 1 }
+			end
+			rec.vers = { ver }
+			rec.steps = { stepCount }
+			rec.succ = {}
+			orc[key] = rec
+		else
+			rec.n += 1
+			if rec.vers[#rec.vers] ~= ver and #rec.vers < 16 then
+				rec.vers[#rec.vers + 1] = ver
+				rec.steps[#rec.steps + 1] = stepCount
+			end
+			rec.last = stepCount
+			for i, x in rec.r do
+				if rawget(regs, i) ~= x then rec.r[i] = nil end
+			end
+			if rec.names then
+				local vals = { ... }
+				for i, n in rec.names do
+					if rec.v[n] ~= nil and vals[i] ~= rec.v[n] then rec.v[n] = nil end
+				end
+			end
+		end
+		orcLast[regs] = rec
+	end
 	ring[stepCount % ringN] = pid * 2 ^ 32 + loop * 2 ^ 24 + pc
 	if showErrors and regs ~= lastRegs and regs then
 		-- back in another activation: report error messages a protected call left in its registers
@@ -489,6 +592,10 @@ end
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
 mockRef = mock
+mock.onHttp = function(method, url)
+	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
+	return httpReply or ""
+end
 enumName = mock.enumName
 local rbxLibs = {}
 local function rbxLib(name)
@@ -525,7 +632,7 @@ function populateSandbox()
 		if v ~= nil then rawset(sandbox, n, v) end
 	end
 	for k, v in pairs(mock) do
-		if type(k) == "string" then rawset(sandbox, k, v) end
+		if type(k) == "string" and k ~= "onHttp" then rawset(sandbox, k, v) end
 	end
 	for _, n in ipairs({ "game", "workspace", "script", "Enum", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim",
 		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
@@ -782,6 +889,12 @@ envTable = sandbox
 -- returns as the main function of a fresh top-level thread; a stock CLI gets a plain call, one
 -- frame deeper than the real thing.
 function __LPH_AFTER(ok, message)
+	if oracleOn then
+		ewrite("[oracle] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
+			" after " .. stepCount .. " instructions\n")
+		writeOracle()
+		if not dumpEnd then return end
+	end
 	if dumpEnd and not done then
 		ewrite("[end] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. __LPH_N.c .. " closure entries\n")

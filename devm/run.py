@@ -126,6 +126,12 @@ def deobfuscate(path, workdir, log=print):
         src = normalize.reflow(src)
         log('[%s] minified input: reflowed to %d lines for analysis (it still runs as shipped)' % (tag, src.count('\n') + 1))
     stage = pipeline.Stage(src, workdir, tag, log=log, oneline=oneline)
+    if stage.model.factory_style:
+        # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced)
+        text = stage.run_traced()
+        if stage.errors:
+            log('[%s] %d instructions could not be lifted (marked LIFT ERROR in the output)' % (tag, len(stage.errors)))
+        return cleanup.tidy(text)
     text1 = stage.run()
     boot_text, info = bootstrap.patch(text1)
     if not info['fixkey']:

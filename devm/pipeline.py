@@ -43,6 +43,46 @@ class Stage:
         return self.text
 
 
+def _run_traced(self):
+    """Factory-style VMs: run the script to its end under the recording harness and lift the
+    final VM state.
+
+    These builds decrypt their own code while it runs, with keys computed from the environment
+    (whole-array passes at start-up, instructions that decrypt themselves or their successors,
+    one-shot constant decoders).  A dump taken at the first interpreter entry is therefore mostly
+    ciphertext.  At the end of a run everything that executed is plain, and the recorded register
+    values supply the keys wherever the lifter needs one."""
+    m = self.model
+    self.log('[%s] interpreter at line %d, %d dispatch loop(s), factory' % (self.tag, m.interp.line, len(m.loops)))
+    raw, oracle, notes = vmmodel.run_oracle(m, self.workdir, self.tag, getattr(self, 'harness_options', ()))
+    self.log('[%s] traced run: %d protos, %d distinct instructions executed' % (self.tag, len(raw['protos']), len(oracle)))
+    self.run_notes = notes
+    for n in notes:
+        self.log('[%s]   %s' % (self.tag, n))
+    self.dump = pe.Dump(raw, m)
+    self.lifter = lifter.FactoryLifter(m, self.dump)
+    self.lifter.oracle = oracle
+    self.lifter.end_state = True
+    protos = self.lifter.lift_all(self.lifter.root_key)
+    self.protos = protos
+    self.oracle = oracle
+    nodes = sum(len(p.nodes) for p in protos.values())
+    errs = [(k, e) for k, p in protos.items() for e in p.errors]
+    ran = sum(1 for k, p in protos.items() for e in p.errors if (k, e[0][0], e[0][1]) in oracle)
+    self.log('[%s] lifted %d protos, %d instructions, %d resolved with run-time keys, %d errors (%d in code that ran)' % (
+        self.tag, len(protos), nodes, sum(len(p.oracle_used) for p in protos.values()), len(errs), ran))
+    self.errors = errs
+    self.conflicts = [(k, c) for k, p in protos.items() for c in p.conflicts]
+    d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
+    self.text = d.run()
+    self.stats = d.stats
+    self.log('[%s] decompiled: %d lines, %d unstructured' % (self.tag, self.text.count('\n'), d.stats['unstructured']))
+    return self.text
+
+
+Stage.run_traced = _run_traced
+
+
 def _native_text(self, line, upnames, level):
     fs = self.model.func_by_line.get(line, [])
     if len(fs) != 1:

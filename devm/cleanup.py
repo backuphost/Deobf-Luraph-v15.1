@@ -98,6 +98,8 @@ def suggest(rhs):
 
 
 def tidy(text):
+    # stores into a table nothing else can see (a VM scratch array that was never bound to a variable)
+    text = '\n'.join(ln for ln in text.split('\n') if not re.match(r'^\s*\(\{\}\)\[\d+\] = [-\w.]+$', ln))
     text = drop_unused(text)
     for _ in range(4):
         new = rename(text)

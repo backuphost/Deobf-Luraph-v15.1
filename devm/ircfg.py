@@ -320,6 +320,7 @@ class ProtoCFG:
         self._to_exprs()
         self._dead_stores()
         self._detect_params()
+        self._cut_cold_magic()
         if not os.environ.get('DEVM_NO_UNFLATTEN'):
             self._unflatten()
         for _ in range(4):
@@ -327,6 +328,25 @@ class ProtoCFG:
             self._merge_tables()
         self._merge_conds()
         self._fold_regs()
+        if self._cut_cold_edges():
+            self._dead_stores()
+            for _ in range(2):
+                self._fold_regs()
+                self._merge_tables()
+            self._merge_conds()
+            self._fold_regs()
+        if self._collapse_bool_diamonds():
+            self._thread()
+            self._dead_stores()
+            self._fold_regs()
+            for _ in range(12):
+                if not self._recover_for_loops():
+                    break
+                for b in self.blocks.values():
+                    b.stmts = [st for st in b.stmts if not (st[0] == 'set' and st[1] == st[2])]
+                self._thread()
+                self._dead_stores()
+                self._fold_regs()
         self._open_upcells()
         self._dead_stores()
 
@@ -726,7 +746,7 @@ class ProtoCFG:
                     (e[2][0] == 'k' and isinstance(e[2][1], bool)) or (e[3][0] == 'k' and isinstance(e[3][1], bool)))
             dead = set()
             for nb in new_blocks.values():
-                if nb.term[0] == 'br' and boolcmp(nb.term[1]) and not nb.stmts:
+                if nb.term[0] == 'br' and boolcmp(nb.term[1]) and all(st[0] == 'cold' for st in nb.stmts):
                     dead.add(nb.id)
                 else:
                     for st in nb.stmts + [nb.term]:
@@ -746,7 +766,7 @@ class ProtoCFG:
                         nb.term = ('goto', t[3] if t[2] in dead else t[2])
                         changed = True
                     elif (t[0] == 'br' and t[2] in dead and t[3] in dead) or (t[0] == 'goto' and t[1] in dead):
-                        if nb.stmts:
+                        if any(st[0] != 'cold' for st in nb.stmts):
                             return False
                         dead.add(nb.id)
                         changed = True
@@ -757,6 +777,569 @@ class ProtoCFG:
         self.blocks = new_blocks
         self.entry = entry
         self._thread()
+
+    def _cut_cold_magic(self):
+        """Key checks (`x == 149143557`, compared against a large magic number) whose failing side
+        the traced run never took: that side is Luraph's tamper response.  It is cut before the
+        state machine is unflattened, because it usually corrupts the state register on purpose."""
+        blocks = self.blocks
+        self.compute_preds()
+        cut = 0
+        for b in list(blocks.values()):
+            if b.term[0] != 'br':
+                continue
+            e = b.term[1]
+            while e[0] == 'un' and e[1] == 'not':
+                e = e[2]
+            if e[0] == 'r':
+                for st in reversed(b.stmts):
+                    if e[1] in _writes_of(st):
+                        e = st[2] if st[0] == 'set' and st[1] == e else ('k', None)
+                        break
+            while e[0] == 'un' and e[1] == 'not':
+                e = e[2]
+            if not (e[0] == 'bin' and e[1] in ('==', '~=')):
+                continue
+            consts = [x[1] for x in (e[2], e[3]) if _isnum(x)]
+            if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != round(consts[0]):
+                continue
+            for sid in set(b.succs()):
+                sb = blocks[sid]
+                if sb.stmts and sb.stmts[0][0] == 'cold' and len(sb.preds) == 1:
+                    sb.stmts = [('trap', None)]
+                    sb.term = ('ret', [], None)
+                    cut += 1
+        if cut:
+            self._prune()
+            self.compute_preds()
+        return cut
+
+    def _cut_cold_edges(self):
+        """Opaque predicates.  Luraph guards its code with tests of the form `key == 1234` whose
+        failing side jumps to some unrelated block (so a wrong key derails the program).  Those
+        jumps turn straight-line code into huge bogus loops.  An exit that the traced run never
+        took (marked ('cold',) by the lifter) is cut when the test compares a register with a
+        numeric constant and the target is not simply the join point after the test."""
+        blocks = self.blocks
+        # tests that have one outcome whatever the program does: a key register (it held a single
+        # number throughout the traced run) against a constant, or any register against a constant
+        # that is a hair off an integer (225.00000000000492: never equal, by construction)
+        keyregs = getattr(self.pir, 'keyregs', None) or {}
+        folded = 0
+        for b in blocks.values():
+            if b.term[0] != 'br':
+                continue
+            e = b.term[1]
+            flip = False
+            while e[0] == 'un' and e[1] == 'not':
+                e = e[2]
+                flip = not flip
+            if not (e[0] == 'bin' and e[1] in ('==', '~=')):
+                continue
+            if e[2][0] == 'r' and _isnum(e[3]):
+                reg, c = e[2][1], e[3][1]
+            elif e[3][0] == 'r' and _isnum(e[2]):
+                reg, c = e[3][1], e[2][1]
+            else:
+                continue
+            if reg in keyregs:
+                equal = keyregs[reg] == c
+            elif c != round(c) and abs(c - round(c)) < 1e-6:
+                equal = False
+            else:
+                continue
+            truth = (equal if e[1] == '==' else not equal) != flip
+            b.term = ('goto', b.term[2] if truth else b.term[3])
+            folded += 1
+        if folded:
+            self._prune()
+        cold = [b for b in blocks.values() if any(st[0] == 'cold' for st in b.stmts)]
+        if not cold:
+            if folded:
+                self._thread()
+            return folded
+        self.compute_preds()
+        # immediate post-dominators (Cooper-Harvey-Kennedy on the reversed graph)
+        EXIT = ('EXIT',)
+        rsucc = {bid: list(b.preds) for bid, b in blocks.items()}
+        rsucc[EXIT] = [bid for bid, b in blocks.items() if not b.succs()]
+        order, seen, stack = [], {EXIT}, [(EXIT, iter(rsucc[EXIT]))]
+        while stack:
+            n, it = stack[-1]
+            for x in it:
+                if x not in seen:
+                    seen.add(x)
+                    stack.append((x, iter(rsucc[x])))
+                    break
+            else:
+                order.append(n)
+                stack.pop()
+        order.reverse()
+        idx = {n: i for i, n in enumerate(order)}
+        ipdom = {EXIT: EXIT}
+        changed = True
+        while changed:
+            changed = False
+            for n in order[1:]:
+                new = None
+                for p in (blocks[n].succs() or [EXIT]):
+                    if p in ipdom:
+                        if new is None:
+                            new = p
+                        else:
+                            a, b2 = p, new
+                            while a != b2:
+                                while idx[a] > idx[b2]:
+                                    a = ipdom[a]
+                                while idx[b2] > idx[a]:
+                                    b2 = ipdom[b2]
+                            new = a
+                if new is not None and ipdom.get(n) != new:
+                    ipdom[n] = new
+                    changed = True
+
+        def postdominates(t, b):
+            x = ipdom.get(b)
+            while x is not None and x != EXIT:
+                if x == t:
+                    return True
+                x = ipdom.get(x)
+            return False
+
+        for c in cold:
+            only = len(c.stmts) == 1 and c.term[0] == 'goto' and len(c.preds) == 1
+            c.stmts = [st for st in c.stmts if st[0] != 'cold']
+            if not only:
+                continue
+            pred = blocks[next(iter(c.preds))]
+            if pred.term[0] != 'br':
+                continue
+            e = pred.term[1]
+            while e[0] == 'un' and e[1] == 'not':
+                e = e[2]
+            if not (e[0] == 'bin' and e[1] in ('==', '~=') and (
+                    (e[2][0] == 'r' and _isnum(e[3])) or (e[3][0] == 'r' and _isnum(e[2])))):
+                continue
+            target = c.term[1]
+            if postdominates(target, pred.id):
+                continue
+            c.stmts = [('trap', target)]
+            c.term = ('ret', [], None)
+            folded += 1
+        self._thread()
+        return folded + len(cold)
+
+    def _collapse_bool_diamonds(self):
+        """Turn a web of tiny blocks that only shuffle booleans between registers back into one
+        expression.
+
+        `c = (a and g) or (not a and l)` (the continuation test of a numeric for loop, which
+        Luraph spells out when it flattens the loop) is compiled into a handful of blocks that copy
+        truth values around and branch on them, with shared tails.  Starting at a branch, every
+        path through such blocks is followed symbolically; if all of them arrive at the same block,
+        the branch is replaced by plain assignments of the values the registers end up with."""
+        blocks = self.blocks
+
+        def small(b):
+            if len(b.stmts) > 3 or b.term[0] not in ('goto', 'br'):
+                return False
+            for st in b.stmts:
+                if st[0] != 'set' or st[1][0] != 'r':
+                    return False
+                e = st[2]
+                if not (e[0] == 'r' or (e[0] == 'k' and (e[1] is None or isinstance(e[1], bool)))):
+                    return False
+            if b.term[0] == 'br':
+                c = b.term[1]
+                while c[0] == 'un' and c[1] == 'not':
+                    c = c[2]
+                if c[0] != 'r':
+                    return False
+            return True
+
+        def boolish(reg, head):
+            for st in reversed(head.stmts):
+                if reg in _writes_of(st):
+                    return st[0] == 'set' and st[1] == ('r', reg) and _isboolexpr(st[2])
+            return False
+
+        done = 0
+        for hid in list(blocks):
+            head = blocks.get(hid)
+            if head is None or head.term[0] != 'br':
+                continue
+            cond = head.term[1]
+            if cond[0] != 'r':
+                continue
+            # negations known at the end of the head: R6 = not R4
+            neg = {}
+            for st in head.stmts:
+                for w in _writes_of(st):
+                    neg.pop(w, None)
+                    for k in [k for k, v in neg.items() if v == w]:
+                        del neg[k]
+                if st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'un' and st[2][1] == 'not' and st[2][2][0] == 'r' \
+                        and st[2][2][1] != st[1][1]:
+                    neg[st[1][1]] = st[2][2][1]
+
+            def learn(facts, reg, val):
+                facts = dict(facts)
+                facts[reg] = val
+                for k, v in neg.items():
+                    if v == reg:
+                        facts[k] = not val
+                    if k == reg:
+                        facts[v] = not val
+                return facts
+
+            results = []        # (facts, env, exit block)
+            ok = True
+            work = [(head.term[2], {}, learn({}, cond[1], True), 0), (head.term[3], {}, learn({}, cond[1], False), 0)]
+            while work and ok:
+                bid, env, facts, depth = work.pop()
+                b = blocks[bid]
+                if bid == hid or depth > 10 or len(results) + len(work) > 12:
+                    ok = False
+                    break
+                if not small(b):
+                    results.append((facts, env, bid))
+                    continue
+                env = dict(env)
+                for st in b.stmts:
+                    e = st[2]
+                    env[st[1][1]] = env.get(e[1], e) if e[0] == 'r' else e
+                if b.term[0] == 'goto':
+                    work.append((b.term[1], env, facts, depth + 1))
+                    continue
+                c = b.term[1]
+                flip = False
+                while c[0] == 'un':
+                    c = c[2]
+                    flip = not flip
+                v = env.get(c[1], c)
+                if v[0] == 'k':
+                    truth = not (v[1] is None or v[1] is False)
+                elif v[1] in facts:
+                    truth = facts[v[1]]
+                else:
+                    for outcome in (True, False):
+                        work.append((b.term[2] if outcome != flip else b.term[3], env, learn(facts, v[1], outcome), depth + 1))
+                    continue
+                work.append((b.term[2] if truth != flip else b.term[3], env, facts, depth + 1))
+            if not ok or len(results) < 2 or len({r[2] for r in results}) != 1:
+                continue
+            exit_ = results[0][2]
+            if exit_ in (head.term[2], head.term[3]) and all(not r[1] for r in results):
+                continue
+            regs = set()
+            for _, env, _ in results:
+                regs.update(env)
+            a = cond[1]
+            sets = {}
+            for x in sorted(regs, key=repr):
+                side = {}
+                for want in (True, False):
+                    paths = [(f, env.get(x, ('r', x))) for f, env, _ in results if f[a] == want]
+                    vals = {v for _, v in paths}
+                    if len(vals) == 1:
+                        v = next(iter(vals))
+                        if v[0] == 'r' and v[1] in paths[0][0] and all(v[1] in f for f, _ in paths) \
+                                and len({f[v[1]] for f, _ in paths}) == 1 and boolish(v[1], head):
+                            v = ('k', paths[0][0][v[1]])
+                        side[want] = v
+                        continue
+                    # the value follows the truth of one register the paths forked on
+                    cons = []
+                    for f, v in paths:
+                        if v[0] == 'r' and v[1] in f and boolish(v[1], head):
+                            v = ('k', f[v[1]])
+                        cons.append((f, v))
+                    found = None
+                    if all(v[0] == 'k' and isinstance(v[1], bool) for _, v in cons):
+                        keys = set.intersection(*[set(f) for f, _ in cons]) - {a}
+                        for z in sorted(keys, key=repr):
+                            if not boolish(z, head):
+                                continue
+                            if all(f[z] == v[1] for f, v in cons):
+                                found = ('r', z)
+                            elif all(f[z] != v[1] for f, v in cons):
+                                found = ('un', 'not', ('r', z))
+                            if found:
+                                break
+                    if found is None:
+                        side = None
+                        break
+                    side[want] = found
+                if side is None:
+                    sets = None
+                    break
+                vt, vf = side[True], side[False]
+                if vt == vf:
+                    e = vt
+                elif vt == ('k', True) and vf == ('k', False):
+                    e = ('r', a) if boolish(a, head) else None
+                elif vt == ('k', False) and vf == ('k', True):
+                    e = ('un', 'not', ('r', a))
+                else:
+                    def isbool(v):
+                        return (v[0] == 'k' and isinstance(v[1], bool)) or (v[0] == 'r' and boolish(v[1], head)) or v[0] == 'un'
+                    e = None
+                    if isbool(vt):
+                        if vt == ('k', False):
+                            e = ('and', ('un', 'not', ('r', a)), vf)
+                        elif vf == ('k', False) and isbool(vt):
+                            e = ('and', ('r', a), vt)
+                        else:
+                            e = ('or', ('and', ('r', a), vt), ('and', ('un', 'not', ('r', a)), vf))
+                if e is None:
+                    sets = None
+                    break
+                if e != ('r', x):
+                    sets[x] = e
+            if sets is None:
+                continue
+            # order: an assignment must run before the registers it reads are overwritten
+            pending = dict(sets)
+            ordered = []
+            while pending:
+                progress = False
+                for x in sorted(pending, key=repr):
+                    others = [y for y in pending if y != x]
+                    if not any(x in [r for r, _ in _reads_of(('set', ('r', y), pending[y]))] for y in others):
+                        ordered.append(('set', ('r', x), pending.pop(x)))
+                        progress = True
+                        break
+                if not progress:
+                    break
+            if pending:
+                continue
+            head.stmts.extend(ordered)
+            head.term = ('goto', exit_)
+            done += 1
+        if done:
+            self._prune()
+            self.compute_preds()
+        return done
+
+    def _recover_for_loops(self):
+        """Numeric for loops that Luraph rewrote to keep their state in a table.
+
+            S = { ..., step, limit, start - step, ... }      -- pushed before the loop (one slot links
+            while true do                                    --  to the state of the enclosing loop)
+                local i = S[ki] + S[ks]
+                S[ki] = i
+                if not ((S[ks] <= 0 and i >= S[kl]) or (S[ks] > 0 and i <= S[kl])) then break end
+                ...
+            end
+            S = S[link]                                      -- popped afterwards
+
+        becomes `for i = start, limit, step do ... end`."""
+        blocks = self.blocks
+        self.compute_preds()
+        done = 0
+        for hid in sorted(blocks, key=repr):
+            head = blocks.get(hid)
+            if head is None or head.term[0] != 'br' or len(head.preds) < 2:
+                continue
+            env = {}
+
+            def sub(e):
+                return map_expr(e, lambda x: env.get(x[1], x) if x[0] == 'r' else x)
+
+            store = None
+            ok = True
+            for st in head.stmts:
+                if st[0] == 'set' and st[1][0] == 'r':
+                    env[st[1][1]] = sub(st[2])
+                elif st[0] == 'setindex' and store is None:
+                    store = (sub(st[1]), sub(st[2]), sub(st[3]))
+                else:
+                    ok = False
+                    break
+            if not ok or store is None:
+                continue
+            cond = sub(head.term[1])
+            body, exit_ = head.term[2], head.term[3]
+            while cond[0] == 'un' and cond[1] == 'not':
+                cond = cond[2]
+                body, exit_ = exit_, body
+            S, key, ival = store
+            if S[0] != 'r' or key[0] != 'k' or ival[0] != 'bin' or ival[1] != '+':
+                continue
+            step = ival[3]
+            if ival[2] != ('index', S, key) or step[0] != 'index' or step[1] != S or step[2][0] != 'k':
+                continue
+            if not (cond[0] == 'or' and cond[1][0] == 'and' and cond[2][0] == 'and'):
+                continue
+            A, G = cond[1][1], cond[1][2]
+            nA, L = cond[2][1], cond[2][2]
+            if A != ('bin', '<=', step, ('k', 0)) or nA != ('un', 'not', A):
+                continue
+            if not (G[0] == 'bin' and G[1] == '>=' and G[2] == ival and L == ('bin', '<=', ival, G[3])):
+                continue
+            lim = G[3]
+            if lim[0] != 'index' or lim[1] != S or lim[2][0] != 'k':
+                continue
+            s = S[1]
+            ki, ks, kl = key[1], step[2][1], lim[2][1]
+            ivars = [r for r, v in env.items() if v == ival]
+            if not ivars or body == hid or exit_ == hid:
+                continue
+            # loop body: everything that reaches the head again
+            inside = set()
+            stack = [body]
+            while stack:
+                x = stack.pop()
+                if x in inside or x == hid:
+                    continue
+                inside.add(x)
+                stack.extend(blocks[x].succs())
+            latches = {p for p in head.preds if p in inside}
+            entries = [p for p in head.preds if p not in inside]
+            if not latches or not entries or hid in entries:
+                continue
+            # registers the head computes besides the loop variable must be dead afterwards
+            live_in, _ = self.liveness()
+            others = set(env) - set(ivars)
+            if others & (set(live_in.get(body, ())) | set(live_in.get(exit_, ()))):
+                continue
+            # the state table: built at the end of every entry block
+            pushes = {}
+            for p in entries:
+                pb = blocks[p]
+                idx = None
+                for i in range(len(pb.stmts) - 1, -1, -1):
+                    if s in _writes_of(pb.stmts[i]):
+                        idx = i
+                        break
+                if idx is None:
+                    break
+                st = pb.stmts[idx]
+                if not (st[0] == 'set' and st[2][0] == 'table' and not st[2][2]):
+                    break
+                items = {}
+                n = 0
+                for k, v in st[2][1]:
+                    if k is None:
+                        n += 1
+                        items[n] = v
+                    elif k[0] == 'k':
+                        items[k[1]] = v
+                need = [items.get(ki, ('k', None)), items.get(kl, ('k', None)), items.get(ks, ('k', None))]
+                reads = set()
+                for e in need:
+                    reads |= expr_reads(e)[0]
+                    if expr_reads(e)[2]:
+                        reads = None
+                        break
+                if reads is None:
+                    break
+                later = pb.stmts[idx + 1:]
+                if any(set(_writes_of(x)) & reads for x in later) or pb.term[0] not in ('goto', 'br'):
+                    break
+                if any(expr_reads(e)[1] for e in need) and any(stmt_effects(x)[1] for x in later):
+                    break
+                pushes[p] = (idx, items, need)
+            if len(pushes) != len(entries):
+                continue
+            # every other use of the table must read a slot of it (the pop `S = S[link]`, or the next
+            # push taking over the link) or be the push of a nested loop, which stores S as its link
+            order, IN = self._reaching()
+            mine = {(p, idx) for p, (idx, _, _) in pushes.items()}
+            first = next(iter(pushes.values()))[1]
+            S_ = ('r', s)
+
+            def slot_reads(st):
+                """slots read as S[k] by a statement, or None if S is used in any other way."""
+                slots = []
+                ok_ = True
+                for e in stmt_exprs(st)[0]:
+                    n_direct = sum(1 for x in walk_expr(e, []) if x == S_)
+                    n_slot = sum(1 for x in walk_expr(e, []) if x[0] == 'index' and x[1] == S_ and x[2][0] == 'k')
+                    if n_direct != n_slot:
+                        ok_ = False
+                    for x in walk_expr(e, []):
+                        if x[0] == 'index' and x[1] == S_ and x[2][0] == 'k':
+                            slots.append(x[2][1])
+                return slots if ok_ else None
+
+            pops = []
+            bad = False
+            for bid in order:
+                b = blocks[bid]
+                cur = IN[bid].get(s, frozenset())
+                for i, st in list(enumerate(b.stmts)) + [('T', b.term)]:
+                    reads = [r for r, _ in _reads_of(st)]
+                    if s in reads and bid != hid and cur & mine:
+                        slots = slot_reads(st)
+                        if not cur <= mine:
+                            bad = True
+                        elif slots is not None and st[0] != 'setindex':
+                            pops.append((bid, i, slots))
+                        elif st[0] == 'set' and st[1] == S_ and st[2][0] == 'table' \
+                                and sum(1 for x in walk_expr(st[2], []) if x == S_) == 1 \
+                                and any(v == S_ for _, v in st[2][1]):
+                            pass
+                        else:
+                            bad = True
+                    if s in _writes_of(st):
+                        cur = frozenset([(bid, i)])
+                if bad:
+                    break
+            if bad:
+                continue
+            # the slots read afterwards must hold the same simple value whichever entry was taken
+            link = {}
+            for _, _, slots in pops:
+                for k in slots:
+                    vals = {repr(items.get(k, ('k', None))) for _, items, _ in pushes.values()}
+                    v = first.get(k, ('k', None))
+                    if len(vals) != 1 or not (v[0] == 'k' or v == S_ or (v[0] == 'index' and v[1] == S_ and v[2][0] == 'k')):
+                        bad = True
+                    link[k] = v
+            if bad:
+                continue
+            # ---- rewrite
+            for bid, i, slots in pops:
+                def fix(x):
+                    if x[0] == 'index' and x[1] == S_ and x[2][0] == 'k':
+                        return link[x[2][1]]
+                    return x
+                if i == 'T':
+                    blocks[bid].term = map_stmt(blocks[bid].term, fix)
+                else:
+                    blocks[bid].stmts[i] = map_stmt(blocks[bid].stmts[i], fix)
+            ivar = ivars[0]
+            for n, (p, (idx, items, need)) in enumerate(sorted(pushes.items(), key=repr)):
+                pb = blocks[p]
+                del pb.stmts[idx]
+                start, limit, step0 = need
+                if _isnum(start) and _isnum(step0):
+                    init = ('k', start[1] + step0[1])
+                elif start == ('k', 0):
+                    init = step0
+                else:
+                    init = ('bin', '+', start, step0)
+                if limit[0] == 'bin' and limit[1] == '+' and limit[3] == ('k', 0):
+                    limit = limit[2]
+                pre = Block((hid, 'for', n))
+                pre.stmts = [('numforprep', [init, limit, step0])]
+                pre.term = ('goto', hid)
+                blocks[pre.id] = pre
+                pb.retarget(hid, pre.id)
+                if self.entry == hid:
+                    self.entry = pre.id
+            head.stmts = []
+            head.term = ('forbr', 'num', (ivar,), body, exit_)
+            if len(ivars) > 1:
+                nb = Block((hid, 'forvars'))
+                nb.stmts = [('set', ('r', r), ('r', ivar)) for r in ivars[1:]]
+                nb.term = ('goto', body)
+                blocks[nb.id] = nb
+                head.term = ('forbr', 'num', (ivar,), nb.id, exit_)
+            self.compute_preds()
+            done += 1
+        return done
 
     def _open_upcells(self):
         """cell[1][cell[3]] (an upvalue cell opened by generic table instructions) -> the upvalue."""

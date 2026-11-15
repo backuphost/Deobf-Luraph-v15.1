@@ -33,9 +33,12 @@ class ProtoIR:
         self.children = []
         self.conflicts = []
         self.errors = []
+        self.oracle_used = set()
+        self.keyregs = {}           # register -> the only number it ever held in the traced run
 
 
 CAP = '__captured__'      # key in a known-register map: registers captured by reference
+SYMPC = 'jump to a run-time computed instruction'
 
 
 def same_const(a, b):
@@ -80,6 +83,11 @@ class Lifter:
         self.proto_objs = {}
         self.pe.on_closure = self.on_closure
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
+        self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
+        self.end_state = False      # the dump was taken at the end of the run (see PE.frozen)
+        self.journals = {}
+        self.executed_pcs = {}
+        self.entry_override = {}    # proto key -> (loop, pc): first instruction of the program proper
 
     # ---- proto instantiation (family specific)
     def on_closure(self, proto):
@@ -270,6 +278,62 @@ class Lifter:
             raise PEError('unrecognised for-state op')
         return (([('forpop',)], endT)), ex, wr
 
+    def lift_node(self, interp, node, key2, snap, known, indirect, pkey, numknown=False):
+        """Lift one instruction into node.tree; returns None or the error text."""
+        self.pe.regknown = known
+        if self.end_state:
+            jkey = key2[:2]
+            undo(self.journals.pop(jkey, ()))
+            self.pe.frozen = (pkey, key2[0], key2[1]) in self.oracle
+            self.pe.journal = self.journals[jkey] = []
+            if pkey not in self.executed_pcs:
+                self.executed_pcs[pkey] = {k[2] for k in self.oracle if k[0] == pkey}
+            self.pe.protect = ('__LPH_PROTOS[%s]["vars"]' % (pkey,), self.executed_pcs[pkey])
+        base_numknown = self.constprop or numknown
+        self.pe.use_numknown = base_numknown if numknown else self.pe.use_numknown
+        try:
+            # an instruction may decrypt/rewrite itself and ask to be executed again
+            retried = False
+            for _ in range(8):
+                w0 = self.pe.model_writes
+                node.tree, node.exposed, node.written = self.run_node(interp, key2, snap)
+                stmts, term = node.tree
+                if any(e[0] == 'goto' and not isinstance(e[1][1], int) for e in tree_ends(node.tree)) \
+                        and not retried:
+                    retried = True
+                    # jump through a register (Luraph routes many jumps through one trampoline
+                    # instruction): retry with the constants known to be in registers, and from
+                    # now on keep one copy of this instruction per jump target
+                    regs = {s[2][1] for s in node.tree[0] if s[0] == 'set' and s[2][0] == 'r'}
+                    self.pe.use_numknown = True
+                    try:
+                        node.tree, node.exposed, node.written = self.run_node(interp, key2[:2], snap)
+                    finally:
+                        self.pe.use_numknown = base_numknown
+                    stmts, term = node.tree
+                    if len(regs) == 1 and not numknown:
+                        indirect[key2[:2]] = next(iter(regs))
+                if not (term[0] == 'goto' and term[1] == key2[:2] and not stmts and self.pe.model_writes != w0):
+                    break
+                snap = term[2]
+                if not numknown:
+                    node.snap_in = snap
+        except (PEError, TypeError, ValueError, KeyError, IndexError, AttributeError, ZeroDivisionError,
+                OverflowError, struct.error) as e:
+            if not isinstance(e, PEError):
+                e = PEError('evaluator failure: %s: %s' % (type(e).__name__, e))
+            if self.end_state:
+                undo(self.journals.pop(key2[:2], ()))
+            return str(e)
+        finally:
+            self.pe.use_numknown = self.constprop
+            self.pe.frozen = False
+            self.pe.journal = None
+            self.pe.protect = None
+        if any(not isinstance(end[1][1], int) for end, kn in self.known_after(node.tree, known)):
+            return SYMPC
+        return None
+
     # ---- whole proto
     def lift_proto(self, key):
         pir = ProtoIR(key)
@@ -280,6 +344,14 @@ class Lifter:
         if end[0] != 'goto':
             raise PEError('interpreter returned before reaching dispatch loop')
         entry, snap = end[1], end[2]
+        if key in self.entry_override:
+            entry, ovars = self.entry_override[key]
+            pcv = self.pe.pcvars[id(self.model.loops[entry[0]])]
+            snap = dict(snap)
+            for name, v in ovars.items():
+                if name in snap and (snap[name] is None or P.is_num(snap[name])):
+                    snap[name] = P.norm(v)
+            snap[pcv] = entry[1]
         pir.entry = entry
         work = [(entry, snap, {}, None, None)]
         node_in = {}
@@ -333,52 +405,50 @@ class Lifter:
             node = Node(key2)
             node.snap_in = snap
             pir.nodes[key2] = node
-            self.pe.regknown = known
             self.pe.known_reads = node.kreads = set()
-            try:
-                # an instruction may decrypt/rewrite itself and ask to be executed again
-                retried = False
-                for _ in range(8):
-                    w0 = self.pe.model_writes
-                    node.tree, node.exposed, node.written = self.run_node(interp, key2, snap)
-                    stmts, term = node.tree
-                    if any(e[0] == 'goto' and not isinstance(e[1][1], int) for e in tree_ends(node.tree)) \
-                            and not retried:
-                        retried = True
-                        # jump through a register (Luraph routes many jumps through one trampoline
-                        # instruction): retry with the constants known to be in registers, and from
-                        # now on keep one copy of this instruction per jump target
-                        regs = {s[2][1] for s in node.tree[0] if s[0] == 'set' and s[2][0] == 'r'}
-                        self.pe.use_numknown = True
-                        try:
-                            node.tree, node.exposed, node.written = self.run_node(interp, key2[:2], snap)
-                        finally:
-                            self.pe.use_numknown = self.constprop
-                        stmts, term = node.tree
-                        if len(regs) == 1:
-                            indirect[key2[:2]] = next(iter(regs))
-                    if not (term[0] == 'goto' and term[1] == key2 and not stmts and self.pe.model_writes != w0):
-                        break
-                    snap = term[2]
-                    node.snap_in = snap
-            except (PEError, TypeError, ValueError, KeyError, IndexError, AttributeError, ZeroDivisionError,
-                    OverflowError, struct.error) as e:
-                if not isinstance(e, PEError):
-                    e = PEError('evaluator failure: %s: %s' % (type(e).__name__, e))
+            err = self.lift_node(interp, node, key2, snap, known, indirect, key)
+            hint = self.oracle.get((key, key2[0], key2[1])) if err and isinstance(key, int) else None
+            if hint is not None:
+                # The instruction depends on a value that only exists at run time (a decryption key
+                # for self-modifying code, a jump target mixed with a key).  Lift it with the numbers
+                # the registers and interpreter locals actually held when the script ran.
+                oregs, ovars = hint['r'], hint['v']
+                known2 = dict(known)
+                cap = known.get(CAP, ())
+                for r, v in oregs.items():
+                    if r not in known2 and r not in cap:
+                        known2[r] = P.norm(v)
+                snap2 = dict(snap)
+                for name, v in ovars.items():
+                    if isinstance(snap2.get(name), Sym):
+                        snap2[name] = P.norm(v)
+                node2 = Node(key2)
+                node2.snap_in = snap
+                self.pe.known_reads = node2.kreads = set()
+                err2 = self.lift_node(interp, node2, key2, snap2, known2, indirect, key, numknown=True)
+                if err2 is None:
+                    node = node2
+                    pir.nodes[key2] = node
+                    err = None
+                    pir.oracle_used.add(key2)
+                    if os.environ.get('DEVM_TRACE_ERR'):
+                        print('ORACLE resolved', key, key2)
+                else:
+                    self.pe.known_reads = node.kreads
+                    if os.environ.get('DEVM_TRACE_ERR'):
+                        print('ORACLE failed', key, key2, err2)
+            if err is None and hint is None and isinstance(key, int):
+                hint = self.oracle.get((key, key2[0], key2[1]))
+            if err is None and hint is not None and hint.get('succ') and node.tree[1][0] == 'br':
+                node.tree = mark_cold(node.tree, hint['succ'])
+            if err is not None:
                 if os.environ.get('DEVM_TRACE_ERR'):
-                    print('PEERR', key, key2, e, {k: (v.path if hasattr(v, 'path') else v) for k, v in known.items()})
+                    print('PEERR', key, key2, err, {k: (v.path if hasattr(v, 'path') else v) for k, v in known.items()})
                     print('   partial IR', self.pe.ir[-8:])
-                node.error = str(e)
-                node.tree = ([('error', str(e))], ('ret', [], None))
-                pir.errors.append((key2, str(e)))
-                continue
-            bad = [end for end, kn in self.known_after(node.tree, known) if not isinstance(end[1][1], int)]
-            if bad:
-                if os.environ.get('DEVM_TRACE_ERR'):
-                    print('SYMBOLIC PC at', key, key2, bad[0][1], 'IR', node.tree[0][-6:])
-                node.error = 'jump to a run-time computed instruction'
-                node.tree = (list(node.tree[0]) + [('error', node.error)], ('ret', [], None))
-                pir.errors.append((key2, node.error))
+                stmts = list(node.tree[0]) if err == SYMPC and node.tree else []
+                node.error = err
+                node.tree = (stmts + [('error', err)], ('ret', [], None))
+                pir.errors.append((key2, err))
                 continue
             ends = self.known_after(node.tree, known)
             if any(end[1] in indirect for end, kn in ends):
@@ -410,6 +480,19 @@ class Lifter:
             pir.errors = [(k, n.error) for k, n in pir.nodes.items() if n.error]
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
+        if self.end_state and isinstance(key, int):
+            # registers that held one and the same number in every instruction that ran: key material
+            seen, count = {}, {}
+            for (pid, _, _), rec in self.oracle.items():
+                if pid != key:
+                    continue
+                for r, v in rec['r'].items():
+                    count[r] = count.get(r, 0) + 1
+                    if r not in seen:
+                        seen[r] = v
+                    elif seen[r] != v:
+                        seen[r] = None
+            pir.keyregs = {r: P.norm(v) for r, v in seen.items() if v is not None and count[r] >= 200}
         return pir
 
     def check_conflicts(self, pir):
@@ -444,6 +527,60 @@ class Lifter:
             done.add(k)
             self.protos[k] = self.lift_proto(k)
         return self.protos
+
+
+def program_entries(model, oracle):
+    """{pid: ((loop, pc), interpreter locals)} for protos that begin by decrypting themselves.
+
+    The first instructions of such a proto rewrite its whole code and are then overwritten
+    themselves, so in a dump taken at the end of the run they are garbage.  They are recognised
+    by having been executed in a form that differs from the final one in more than the opcode
+    (an instruction that merely retires itself only swaps its opcode for a no-op); the program
+    proper starts at the first instruction executed after the last of them."""
+    opname = [l[2][0][2][0][1][1] for l in model.loops]
+
+    def fields(text):
+        return dict(x.split('=') for x in text.split())
+
+    last_stale = {}
+    for (pid, loop, pc), rec in oracle.items():
+        a, f = fields(rec['vers'][-1][1]), fields(rec['final'])
+        diff = {n for n in a if f.get(n) != a[n]}
+        if diff - {opname[loop]}:
+            last_stale[pid] = max(last_stale.get(pid, 0), rec['last'])
+    out = {}
+    for pid, step in last_stale.items():
+        # only protos whose very first instructions are stale
+        start = min(oracle[k]['vers'][0][0] for k in oracle if k[0] == pid)
+        k0 = [k for k in oracle if k[0] == pid and oracle[k]['vers'][0][0] == start][0]
+        a, f = fields(oracle[k0]['vers'][-1][1]), fields(oracle[k0]['final'])
+        if not ({n for n in a if f.get(n) != a[n]} - {opname[k0[1]]}):
+            continue
+        later = [(oracle[k]['vers'][0][0], k) for k in oracle if k[0] == pid and oracle[k]['vers'][0][0] > step]
+        if later:
+            _, k = min(later)
+            out[pid] = ((k[1], k[2]), oracle[k]['v'])
+    return out
+
+
+def mark_cold(tree, taken):
+    """Tag the exits of a conditional instruction that the traced run never took: ('cold',) is
+    appended to the statements on that exit (see ProtoCFG._cut_cold_edges)."""
+    stmts, term = tree
+    if term[0] == 'br':
+        return (stmts, ('br', term[1], mark_cold(term[2], taken), mark_cold(term[3], taken)))
+    if term[0] == 'goto' and isinstance(term[1][1], int) and tuple(term[1][:2]) not in taken:
+        return (list(stmts) + [('cold',)], term)
+    return tree
+
+
+def undo(journal):
+    """Take back the writes an instruction made to the VM state model."""
+    for obj, key, old in reversed(journal):
+        if key is None:
+            obj.data[:] = old
+        else:
+            obj.set(key, old)
 
 
 def retarget_tree(tree, special):
@@ -592,6 +729,9 @@ class FactoryLifter(Lifter):
                 continue
             fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
             fresh.pe.keyfn_override = self.pe.keyfn_override
+            fresh.oracle = self.oracle
+            fresh.end_state = self.end_state
+            fresh.entry_override = self.entry_override
             pir = fresh.lift_proto(k)
             pir.keyfns = set(pir.keyfns)
             done[k] = pir
