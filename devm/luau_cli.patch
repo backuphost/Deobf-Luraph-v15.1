@@ -1,8 +1,8 @@
 diff --git a/CLI/src/Repl.cpp b/CLI/src/Repl.cpp
-index 7ecaabc..edb6ce5 100644
+index cd877d1..b5d17e2 100644
 --- a/CLI/src/Repl.cpp
 +++ b/CLI/src/Repl.cpp
-@@ -120,6 +120,85 @@ static int lua_loadstring(lua_State* L)
+@@ -117,6 +117,157 @@ static int lua_loadstring(lua_State* L)
      return 2;          // return nil plus error message
  }
  
@@ -85,10 +85,82 @@ index 7ecaabc..edb6ce5 100644
 +    return 2;
 +}
 +
++// devm: cwrap(name, impl) -> C closure that runs the Lua function `impl` on a thread of its own.
++// To the caller the result is a C function in every respect: one call frame, no C-stack depth
++// of the implementation, "[C]" in debug.info and stack walks, errors prefixed with the position
++// of the calling Lua function exactly as luaL_error does.  `impl` raises with error(msg, 0) and
++// must not yield.
++// With a second upvalue (a marker value) the implementation also receives the calling thread as
++// its first argument, and returning the marker alone makes the *caller* yield (task.wait).
++static int cwrap_call_(lua_State* L)
++{
++    int n = lua_gettop(L);
++    bool yielder = !lua_isnoneornil(L, lua_upvalueindex(2));
++    luaL_checkstack(L, n + 5, "cwrap");
++    lua_State* co = lua_newthread(L);
++    lua_pushvalue(L, lua_upvalueindex(1));
++    if (yielder)
++        lua_pushthread(L);
++    for (int i = 1; i <= n; i++)
++        lua_pushvalue(L, i);
++    lua_xmove(L, co, n + 1 + (yielder ? 1 : 0));
++    int status = lua_resume(co, NULL, n + (yielder ? 1 : 0));
++    if (status == 0)
++    {
++        int nres = lua_gettop(co);
++        luaL_checkstack(L, nres + 1, "cwrap");
++        lua_xmove(co, L, nres);
++        if (yielder && nres == 1 && lua_rawequal(L, -1, lua_upvalueindex(2)))
++        {
++            lua_settop(L, 0);
++            return lua_yield(L, 0);
++        }
++        return nres;
++    }
++    if (status == LUA_YIELD)
++        luaL_error(L, "attempt to yield across metamethod/C-call boundary");
++    if (lua_type(co, -1) == LUA_TSTRING)
++    {
++        size_t len = 0;
++        const char* msg = lua_tolstring(co, -1, &len);
++        std::string text(msg, len);
++        if (text.compare(0, 6, "__LPH_") == 0)
++            lua_pushlstring(L, text.data(), text.size()); // harness control message: passed on as is
++        else
++        {
++            luaL_where(L, 1);
++            lua_pushlstring(L, text.data(), text.size());
++            lua_concat(L, 2);
++        }
++    }
++    else
++        lua_xmove(co, L, 1);
++    lua_error(L);
++}
++
++static int lua_cwrap_(lua_State* L)
++{
++    const char* name = luaL_checkstring(L, 1);
++    luaL_checktype(L, 2, LUA_TFUNCTION);
++    // the debug name must outlive the closure: intern it in the registry
++    lua_pushvalue(L, 1);
++    lua_pushboolean(L, 1);
++    lua_rawset(L, LUA_REGISTRYINDEX);
++    lua_pushvalue(L, 2);
++    if (lua_gettop(L) >= 4 && !lua_isnil(L, 3))
++    {
++        lua_pushvalue(L, 3);
++        lua_pushcclosure(L, cwrap_call_, name, 2);
++    }
++    else
++        lua_pushcclosure(L, cwrap_call_, name, 1);
++    return 1;
++}
++
  static int lua_collectgarbage(lua_State* L)
  {
      const char* option = luaL_optstring(L, 1, "collect");
-@@ -218,6 +297,12 @@ void setupState(lua_State* L)
+@@ -215,6 +366,13 @@ void setupState(lua_State* L)
      static const luaL_Reg funcs[] = {
          {"loadstring", lua_loadstring},
          {"collectgarbage", lua_collectgarbage},
@@ -97,11 +169,12 @@ index 7ecaabc..edb6ce5 100644
 +        {"ewrite", lua_ewrite_},
 +        {"setvectormetatable", lua_setvectormetatable_},
 +        {"resumetop", lua_resumetop_},
++        {"cwrap", lua_cwrap_},
 +        {"__LPH_RUNMAIN", lua_ewrite_},     // presence marks a CLI that runs a returned function as a main thread
  #ifdef CALLGRIND
          {"callgrind", lua_callgrind},
  #endif
-@@ -680,6 +765,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
+@@ -630,6 +788,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
  
          setupArguments(L, program_argc, program_argv);
          status = lua_resume(L, NULL, program_argc);

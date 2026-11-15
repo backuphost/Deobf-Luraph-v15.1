@@ -1,0 +1,16 @@
+-- TeleportGuard -- recovered from a Luraph v15.1 build.
+--
+-- The protected program is empty: after Luraph's bootstrap (environment checks, key derivation,
+-- RC4 decryption of the payload) the script's own code consists of argument setup followed by an
+-- immediate return.  There is no statement with an effect to recover.
+--
+-- Evidence:
+--   * Luraph emits only the VM handlers a program uses.  The payload interpreter of this file
+--     (slot [34] of the VM table) has exactly one: copy the varargs into registers.  Its whole
+--     dispatch loop is `while op[pc] == 1 do <copy varargs> pc += 1 end return`.
+--   * Run in two independent Roblox emulations (this repository's harness, and the
+--     Studio-verified environment of the "deobf" deobfuscator) the script performs Luraph's
+--     probes and then returns without touching any Roblox API.
+--
+-- Everything else in the 590 KB input is the Luraph VM and its anti-tamper bootstrap.
+return

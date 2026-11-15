@@ -116,7 +116,7 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
-def deobfuscate(path, workdir, log=print):
+def deobfuscate(path, workdir, log=print, script_path=None):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
@@ -124,10 +124,20 @@ def deobfuscate(path, workdir, log=print):
     oneline = normalize.needs_reflow(src)
     if oneline:
         src = normalize.reflow(src)
+    else:
+        src, n = normalize.inline_protected(src)
+        if n:
+            log('[%s] %d interpreter(s) ran their dispatch loops inside pcall: inlined for lifting' % (tag, n))
         log('[%s] minified input: reflowed to %d lines for analysis (it still runs as shipped)' % (tag, src.count('\n') + 1))
-    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=oneline)
+    # Luraph ships one line and the script checks that (line numbers in its own error messages and
+    # in debug.info must all agree), so the copy that is executed is always laid out as one line,
+    # also when the input is a decompiler's multi-line rendering of the bytecode.
+    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
     if stage.model.factory_style:
-        # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced)
+        # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
+        # exercise=1: functions of the script that nobody called are called once, so that their
+        # code decrypts itself too.
+        stage.harness_options = ['exercise=1'] + (['scriptpath=' + script_path] if script_path else [])
         text = stage.run_traced()
         if stage.errors:
             log('[%s] %d instructions could not be lifted (marked LIFT ERROR in the output)' % (tag, len(stage.errors)))
@@ -153,9 +163,12 @@ def main(argv=None):
     ap.add_argument('input')
     ap.add_argument('-o', '--output')
     ap.add_argument('--work', default=None, help='directory for intermediate files')
+    ap.add_argument('--script-path', default=None,
+                    help='where the script sits in the game, e.g. ReplicatedStorage.Packages.Net.init '
+                         '(scripts check their own GetFullName())')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
-    text = deobfuscate(a.input, work)
+    text = deobfuscate(a.input, work, script_path=a.script_path)
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
     with open(out, 'w', encoding='utf-8') as f:
         f.write(text)

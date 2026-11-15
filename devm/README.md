@@ -4,7 +4,8 @@ Turns a Luraph-protected script (as plain Lua, e.g. after a bytecode decompiler)
 source by partially evaluating the VM interpreter over every instruction.
 
 ```
-# one-time: build the Luau CLI with the file helpers (see luau_cli.patch) and point LUAU_BIN at it
+# one-time: build the Luau CLI at tag 0.739 with luau_cli.patch applied and point LUAU_BIN at it
+# (newer Luau changed how pcall uses the C stack; protected scripts measure that)
 export LUAU_BIN=/path/to/luau
 python -m devm.run protected.lua -o recovered.lua
 ```
@@ -57,3 +58,46 @@ Limits, stated plainly:
   `UNSTRUCTURED` stub.
 
 `antitamper.py` predates the inlined instrumentation and is not wired in.
+
+## Environment fidelity (newer factory builds)
+
+These builds answer a failed environment check by scrambling their own bytecode forever, and the
+RC4 key of the real program is built from what the checks observe, so the mock has to match Roblox
+exactly rather than approximately:
+
+* every function and metamethod the script can reach is a C closure (`cwrap` in luau_cli.patch):
+  one stack frame per call, `[C]` in `debug.info`, errors positioned like `luaL_error` does. The
+  script calls whole batteries of builtins with a single frame left on its stack;
+* `getfenv()` is a nearly empty table that falls through to the globals; the script enumerates it;
+* the executed copy is one line (line numbers in its own error messages are compared);
+* Path2D geometry is a float32 model in the engine's order of operations, ported from the
+  Studio-verified model of the "deobf" Luraph deobfuscator; the float32 bit patterns are key bytes;
+* executor-style globals (`identifyexecutor`, `iscclosure`, `islclosure`) exist, as in the
+  reference environment the key material was compared against.
+
+`harness.lua` options for diagnosing a failed check: `stub=<pid>` (suppress the tamper response),
+`watch=<pid>` (log the arguments of that proto's last calls, e.g. the comparison helper), `tb=<pid>`,
+`depth=<n>`.
+
+### Two-interpreter builds: the payload
+
+The bootstrap runs on one interpreter, the script on another whose dispatch loops sit inside
+`pcall` (errors are re-raised with line information).  `normalize.inline_protected` rewrites that
+interpreter so the loops are in the interpreter function itself; `run.py` then lifts from the first
+proto of the payload interpreter instead of the bootstrap.  Code decrypts itself as it runs, so
+after the script ends the harness calls every payload closure once with permissive stand-in
+arguments (`exercise=1`).  `--script-path Service.Folder.Name` places the script where it expects
+to be (`script:GetFullName()` is checked).
+
+State of the two samples of this build:
+
+* TeleportGuard: every check passes, the key is right, the payload runs.  Its payload interpreter
+  has a single handler (vararg setup): the protected program is empty.  See
+  `deobfuscated/TeleportGuard.lua`.
+* Net: every check passes, the key is right, the payload runs and lifts, but only partly
+  (`deobfuscated/Net.partial.lua`): numeric for loops of the payload interpreter whose bounds are
+  constants are not reconstructed, branches that did not run keep encrypted constants, and the
+  module body stops at a run-time error in the mock environment.
+
+The two proto-table samples recovered earlier (HookScript, ClientSynchronizer) were not re-run
+against these changes: their inputs are not in the repository.

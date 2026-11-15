@@ -248,6 +248,8 @@ local mockRef = nil
 local oracleOn = false
 local watchPid, watchRegs, watchN, watchLog = {}, nil, 0, {}   -- watch=<pid>: remember the arguments of its last calls
 local extraDepth = 0
+local exercise = false     -- exercise=1: after the script ends, call every payload function once
+local budgetAt = math.huge
 local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
@@ -307,6 +309,14 @@ __LPH_S = stubs
 __LPH_X = {}
 __LPH_R = {}
 local RINGN = 4096
+local scriptPath = nil
+for i = #layers, 1, -1 do
+	local sp = string.match(layers[i], "^scriptpath=(.+)$")
+	if sp then
+		scriptPath = sp
+		table.remove(layers, i)
+	end
+end
 while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	local k, v = string.match(table.remove(layers, 1), "^(%w+)=(%d+)$")
 	if k == "steps" then stepLimit = tonumber(v) elseif k == "dumpat" then dumpAt = tonumber(v)
@@ -317,6 +327,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "runlog" then runLog = tonumber(v) ~= 0
 	elseif k == "dumpend" then dumpEnd = tonumber(v) ~= 0
 	elseif k == "oracle" then oracleOn = tonumber(v) ~= 0
+	elseif k == "exercise" then exercise = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
 	elseif k == "watch" then watchPid[tonumber(v)] = true
@@ -348,7 +359,10 @@ local function brief(v)
 			local k = next(v)
 			while k ~= nil do
 				cnt += 1
-				if #keys < 70 then keys[#keys + 1] = type(k) == "string" and k or ("[" .. tostring(k) .. "]") end
+				if #keys < 70 then
+					keys[#keys + 1] = type(k) == "string" and k or ("[" .. tostring(k) .. "]")
+					if k == "n" and type(rawget(v, "n")) == "number" then keys[#keys] = "n=" .. rawget(v, "n") end
+				end
 				k = next(v, k)
 			end
 			if cnt > 0 then
@@ -403,6 +417,7 @@ local lastRegs, seenErr = nil, {}
 function __LPH_STEP(pid, loop, pc, regs, names, ...)
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
+	if stepCount > budgetAt then error("__LPH_BUDGET", 0) end
 	if tbPid == pid then
 		tbPid = nil
 		ewrite("[traceback] first instruction of proto " .. pid .. " (step " .. stepCount .. ")\n" .. debug.traceback() .. "\n")
@@ -536,6 +551,12 @@ function __LPH_STEP(pid, loop, pc, regs, names, ...)
 	end
 end
 
+-- Recording costs calls; with a single frame left on the script's stack (it probes for that) a
+-- Lua __LPH_STEP that calls anything would overflow where the bare script does not.
+if cwrap and (oracleOn or traceMode or showErrors or tbPid) then
+	__LPH_STEP = cwrap("__LPH_STEP", __LPH_STEP)
+end
+
 function __LPH_RUN(names, n, ...)
 	if aborted then error(ABORT, 0) end
 	local vals = { ... }
@@ -598,6 +619,11 @@ function __LPH_PROTO(interp, names, n, ...)
 	return #protos
 end
 
+-- for samples that carry their own instrumentation: marks the calling thread as the script's main thread
+function __LPH_MAIN()
+	if mockRef then mockRef.mainThread = coroutine.running() end
+end
+
 -- metamethod closures of the loader: remember the variables they captured
 closEnv = setmetatable({}, { __mode = "k" })
 function __LPH_CLOS(names, n, ...)
@@ -611,8 +637,23 @@ function __LPH_CLOS(names, n, ...)
 	return fn
 end
 
+local regList = {}         -- every VM closure made, in order (exercise=1 calls the payload's)
 function __LPH_REG(pid, fn)
 	protoOfFn[fn] = pid
+	if exercise and protos[pid] and protos[1] and protos[pid].interp ~= protos[1].interp then
+		-- fn binds upvalues and returns the callable closure: remember every closure it makes
+		-- (payload only: the bootstrap counts the frames of its own calls)
+		local bind = fn
+		fn = function(...)
+			local closure = bind(...)
+			if type(closure) == "function" then
+				protoOfFn[closure] = pid
+				regList[#regList + 1] = closure
+			end
+			return closure
+		end
+		protoOfFn[fn] = pid
+	end
 	return fn
 end
 
@@ -636,6 +677,7 @@ _G.__LPH_CLIKE = clike
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
 mockRef = mock
+if scriptPath then mock.placeScript(scriptPath) end
 mock.onHttp = function(method, url)
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
 	return httpReply or ""
@@ -663,6 +705,12 @@ local fallback = setmetatable({}, {
 		return v
 	end,
 })
+-- (looking up a name that is not defined costs the script no Lua frame: it does so on purpose
+-- with a single frame left on the stack)
+if cwrap then
+	local mt = getmetatable(fallback)
+	mt.__index = cwrap("__index", mt.__index)
+end
 sandbox = setmetatable({}, { __index = fallback })
 function populateSandbox()
 	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
@@ -671,7 +719,7 @@ function populateSandbox()
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
 		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R",
-		"__LPH_CRASH", "__LPH_ENV" }) do
+		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN" }) do
 		local v = _G[n]
 		if v ~= nil then rawset(sandbox, n, v) end
 	end
@@ -684,12 +732,17 @@ function populateSandbox()
 		"Path2DControlPoint", "DateTime", "PhysicalProperties", "Axes", "Faces", "Vector3int16", "Vector2int16",
 		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable",
 		-- executor-specific globals probed by environment-fingerprinting scripts
-		"math_floor_precision" }) do
+		"math_floor_precision", "iscclosure", "islclosure", "identifyexecutor" }) do
 		if rawget(sandbox, n) == nil then
 			local v = fallback[n]
 			if v ~= nil then rawset(sandbox, n, v) end
 		end
 	end
+	-- Like a Roblox script environment, what getfenv() hands out is a nearly empty table whose
+	-- metatable falls through to the globals (a table, so a lookup still costs no call): scripts
+	-- enumerate it and hash the names they find.
+	local globals = sandbox
+	sandbox = setmetatable({ script = rawget(globals, "script") }, { __index = globals })
 end
 
 -- utf8.nfcnormalize / utf8.nfdnormalize (tables generated by unidata.py next to the output file)
@@ -786,13 +839,14 @@ do
 			if not ok then return false end
 			return (U.ccc[cp] or 0) ~= 0 or (cp >= 0x300 and cp <= 0x36F) or cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F)
 		end
-		return function()
+		local function iter()
 			if pos > j then return nil end
 			local first = pos
 			pos += width(pos)
 			while pos <= j and extends(pos) do pos += width(pos) end
 			return first, pos - 1
 		end
+		return cwrap and cwrap("", iter) or iter
 	end
 	for k, v in pairs(u) do
 		if type(v) == "function" then fnames[v] = "utf8." .. k end
@@ -927,6 +981,108 @@ do
 end
 fnames[mock.getfenv] = "getfenv"
 
+-- Closure-kind predicates that executors add to the environment.  Luraph's bootstrap looks them
+-- up and, when present, uses them in its builtin sweep; the reference environment the key
+-- material was checked against (an executor-style one) has them, so they are provided here too.
+mock.iscclosure = function(f)
+	if type(f) ~= "function" then error("invalid argument #1 to 'iscclosure' (function expected, got " .. typeof(f) .. ")", 2) end
+	return foreign(f)
+end
+mock.islclosure = function(f)
+	if type(f) ~= "function" then error("invalid argument #1 to 'islclosure' (function expected, got " .. typeof(f) .. ")", 2) end
+	return not foreign(f)
+end
+mock.identifyexecutor = function() return "Wave", "1.0.0" end
+fnames[mock.identifyexecutor] = "identifyexecutor"
+fnames[mock.iscclosure] = "iscclosure"
+fnames[mock.islclosure] = "islclosure"
+
+-- With cwrap (luau_cli.patch) the shims above become real C closures: one frame per call, "[C]"
+-- to debug.info and to stack walks without any help.  debug.info itself is then the real one.
+if cwrap then
+	local marker = newproxy()
+	local realInfo = debug.info
+	local function native(name, impl)
+		local f = cwrap(string.match(name, "[^%.]*$"), impl)
+		fnames[f] = name
+		return f
+	end
+	-- needs the caller's stack (levels): the implementation is handed the calling thread
+	local function nativeT(name, impl)
+		local f = cwrap(string.match(name, "[^%.]*$"), impl, marker)
+		fnames[f] = name
+		return f
+	end
+	local function isC(f) return realInfo(f, "s") == "[C]" end
+	local function atLevel(co, level, what)
+		if level < 0 then error("invalid argument #1 to '" .. what .. "' (level must be non-negative)", 0) end
+		local f = realInfo(co, level, "f")
+		if f == nil then error("invalid argument #1 to '" .. what .. "' (invalid level)", 0) end
+		return f
+	end
+	mock.getfenv = nativeT("getfenv", function(co, f)
+		if f == nil then f = 1 end
+		if type(f) == "number" then
+			if f == 0 then return sandbox end
+			f = atLevel(co, f, "getfenv")
+		elseif type(f) ~= "function" then
+			error("invalid argument #1 to 'getfenv' (number expected, got " .. typeof(f) .. ")", 0)
+		end
+		if isC(f) then return sandbox end
+		local env = realGetfenv(f)
+		if env == _G then return sandbox end
+		return env
+	end)
+	mock.setfenv = nativeT("setfenv", function(co, f, env)
+		if type(env) ~= "table" then
+			error("invalid argument #2 to 'setfenv' (table expected, got " .. (env == nil and "no value" or typeof(env)) .. ")", 0)
+		end
+		local target = f
+		if type(f) == "number" then
+			if f == 0 then return end
+			target = atLevel(co, f, "setfenv")
+		elseif type(f) ~= "function" then
+			error("invalid argument #1 to 'setfenv' (number expected, got " .. typeof(f) .. ")", 0)
+		end
+		if isC(target) then error("'setfenv' cannot change environment of given object", 0) end
+		realSetfenv(target, env)
+		return f
+	end)
+	mock.iscclosure = native("iscclosure", function(f)
+		if type(f) ~= "function" then error("invalid argument #1 to 'iscclosure' (function expected, got " .. typeof(f) .. ")", 0) end
+		return isC(f)
+	end)
+	mock.islclosure = native("islclosure", function(f)
+		if type(f) ~= "function" then error("invalid argument #1 to 'islclosure' (function expected, got " .. typeof(f) .. ")", 0) end
+		return not isC(f)
+	end)
+	mock.identifyexecutor = native("identifyexecutor", function() return "Wave", "1.0.0" end)
+	-- buffer writes fed with mock objects (where Roblox would have produced a number) must not throw
+	for _, k in ipairs({ "writeu8", "writei8", "writeu16", "writei16", "writeu32", "writei32", "writef32", "writef64" }) do
+		local real = buffer[k]
+		mock.buffer[k] = native("buffer." .. k, function(...)
+			local r
+			if select("#", ...) >= 3 then
+				local buf, off, v = ...
+				if type(v) == "table" or type(v) == "userdata" then v = 0 end
+				r = table.pack(pcall(real, buf, off, v, select(4, ...)))
+			else
+				r = table.pack(pcall(real, ...))
+			end
+			if not r[1] then error(r[2], 0) end
+			return unpack(r, 2, r.n)
+		end)
+	end
+	for _, k in ipairs({ "nfdnormalize", "nfcnormalize", "graphemes" }) do
+		mock.utf8[k] = native("utf8." .. k, mock.utf8[k])
+	end
+	local d = {}
+	for k, v in pairs(mock.debug) do d[k] = v end
+	d.info = realInfo
+	libnames[d] = "debug"
+	mock.debug = d
+end
+
 -- ---------------------------------------------------------------- bootstrap helpers
 -- The bootstrap layer derives an 8-byte XOR key from the outcome of its environment checks and
 -- uses it to decrypt the rest of the bytecode buffer. The checks cannot all pass outside Roblox,
@@ -1010,7 +1166,39 @@ envTable = sandbox
 -- how much of either stack is left.  A CLI built with luau_cli.patch runs the function this script
 -- returns as the main function of a fresh top-level thread; a stock CLI gets a plain call, one
 -- frame deeper than the real thing.
+-- Code decrypts itself as it runs, so functions nobody called (handlers, the API of a module)
+-- stay ciphertext.  Call each closure of the payload once, on a thread of its own, with permissive
+-- stand-in arguments and an instruction budget; closures made along the way are called too.
+local function exercisePayload()
+	if not protos[1] then return end
+	local boot = protos[1].interp
+	local calls, i = 0, 1
+	local called = {}
+	local before = stepCount
+	while i <= #regList and calls < 4000 do
+		local fn = regList[i]
+		i += 1
+		local rec = protos[protoOfFn[fn]]
+		if rec and rec.interp ~= boot and not called[fn] then
+			called[fn] = true
+			calls += 1
+			local args = {}
+			for j = 1, 8 do args[j] = mockRef.stub("arg" .. j) end
+			budgetAt = stepCount + 200000
+			local co = coroutine.create(fn)
+			local _, okr, errr = pcall(coroutine.resume, co, unpack(args))
+			if not okr and calls <= 400 then ewrite("[exercise] proto " .. protoOfFn[fn] .. ": " .. string.sub(tostring(errr), 1, 160) .. "\n") end
+		end
+	end
+	budgetAt = math.huge
+	ewrite("[exercise] called " .. calls .. " payload closures, " .. (stepCount - before) .. " more instructions\n")
+end
+
 function __LPH_AFTER(ok, message)
+	if exercise and not aborted then
+		local okx, errx = pcall(exercisePayload)
+		if not okx then ewrite("[exercise] stopped: " .. tostring(errx) .. "\n") end
+	end
 	if oracleOn then
 		ewrite("[oracle] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. stepCount .. " instructions\n")
@@ -1040,7 +1228,7 @@ if __LPH_RUNMAIN then
 	-- depth=<n>: run the script n C calls deeper (a ModuleScript inside n nested requires)
 	for _ = 1, extraDepth do
 		local inner = fn
-		fn = function(...) return select(2, assert(pcall(inner, ...))) end
+		fn = function(...) return coroutine.wrap(inner)(...) end
 	end
 	return fn
 end
