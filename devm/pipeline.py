@@ -93,6 +93,68 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
+def _poke_list(self):
+    """Lines for the harness's poke pass: every instruction of the payload that was lifted but
+    never ran, with the interpreter state it is reached in (entry pc, dispatch mode, keys).
+
+    The interpreter copies some factory parameters into locals at its top (`local pc = argN`,
+    `local key = argM[1]`); the lifter's snapshot at an instruction holds the values of those
+    locals, which is what the parameters have to be for execution to start right there."""
+    if not getattr(self, 'payload_root', None):
+        return []
+    m, L = self.model, self.lifter
+    out = []
+    for pid, pir in self.protos.items():
+        if not isinstance(pid, int):
+            continue
+        idx, env = L.records[pid - 1]
+        it = m.interps[idx]
+        params = set(it.chain[-3].params)
+        direct, keyed = {}, {}
+        for st in it.func.body:
+            if st[0] != 'local' or len(st[1]) != 1 or len(st[2]) != 1:
+                continue
+            e = st[2][0]
+            if e[0] == 'name' and e[1] in params and pe.is_num(env.get(e[1])):
+                direct[st[1][0]] = e[1]
+            elif e[0] == 'index' and e[1][0] == 'name' and e[1][1] in params and e[2][0] == 'num':
+                keyed[st[1][0]] = (e[1][1], int(e[2][1]))
+        # Only the frontier: instructions that did not run but directly follow one that did (the
+        # arm of a branch that was not taken).  Anything further away may still be ciphertext,
+        # and executing ciphertext corrupts the shared code and constant buffers.
+        frontier = set()
+        for key2, node in pir.nodes.items():
+            if (pid, key2[0], key2[1]) not in self.oracle:
+                continue
+            for e in lifter.tree_ends(node.tree):
+                if e[0] == 'goto' and (pid, e[1][0], e[1][1]) not in self.oracle:
+                    frontier.add(e[1])
+        for key2, node in pir.nodes.items():
+            if key2 not in frontier or node.error:
+                continue
+            snap = node.snap_in
+            fields = []
+            ok = True
+            for var, param in direct.items():
+                v = snap.get(var)
+                if not pe.is_num(v) or v != int(v):
+                    ok = False
+                    break
+                fields.append('%s=%d' % (param, int(v)))
+            for var, (param, i) in keyed.items():
+                v = snap.get(var)
+                if not pe.is_num(v) or v != int(v):
+                    ok = False
+                    break
+                fields.append('%s.%d=%d' % (param, i, int(v)))
+            if ok and fields:
+                out.append('%d;%s' % (pid, ';'.join(fields)))
+    return sorted(set(out))
+
+
+Stage.poke_list = _poke_list
+
+
 def _native_text(self, line, upnames, level):
     fs = self.model.func_by_line.get(line, [])
     if len(fs) != 1:

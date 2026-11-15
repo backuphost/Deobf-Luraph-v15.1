@@ -117,6 +117,7 @@ class Lifter:
         pe.ir = []
         pe.regdirty = set()
         pe.regdirty_all = False
+        pe.reg_reads = []
         pe.tcount = 0
         pe.tprefix = prefix
         pe.events = []
@@ -252,6 +253,7 @@ class Lifter:
         if os.environ.get('DEVM_TRACE_FOROP'):
             self.pe.trace = []
         irT, _, endT, evT, ex, wr = self.run_once(interp, (key[0], snap), [], True, prefix)
+        all_reads = list(self.pe.reg_reads)
         if os.environ.get('DEVM_TRACE_FOROP') and endT[0] != 'goto':
             print('FOROP', key, endT[:2])
             print('   IR', irT[:6], 'snapnum', {k: v for k, v in snap.items() if isinstance(v, (int, float))})
@@ -261,6 +263,9 @@ class Lifter:
         irF, _, endF, evF, _, _ = self.run_once(interp, (key[0], snap), [], False, prefix)
         kinds = {e[0] for e in evT}
         reads = [s[2][1] for s in irT if s[0] == 'set' and s[2][0] == 'r']
+        if not reads:
+            # bounds that are known constants are read without leaving a trace in the IR
+            reads = all_reads
         writes = [s[1][1] for s in irT if s[0] == 'set' and s[1][0] == 'r']
         if endT[0] != 'goto':
             raise PEError('for-op ended with %r' % (endT[0],))
@@ -410,6 +415,8 @@ class Lifter:
             self.pe.known_reads = node.kreads = set()
             err = self.lift_node(interp, node, key2, snap, known, indirect, key)
             hint = self.oracle.get((key, key2[0], key2[1])) if err and isinstance(key, int) else None
+            if hint is not None and hint.get('p'):
+                hint = None      # executed by a probe only: no real register values or branch decisions
             if hint is not None:
                 # The instruction depends on a value that only exists at run time (a decryption key
                 # for self-modifying code, a jump target mixed with a key).  Lift it with the numbers
@@ -441,7 +448,7 @@ class Lifter:
                         print('ORACLE failed', key, key2, err2)
             if err is None and hint is None and isinstance(key, int):
                 hint = self.oracle.get((key, key2[0], key2[1]))
-            if err is None and hint is not None and hint.get('succ') and node.tree[1][0] == 'br':
+            if err is None and hint is not None and not hint.get('p') and hint.get('succ') and node.tree[1][0] == 'br':
                 node.tree = mark_cold(node.tree, hint['succ'])
             if err is not None:
                 if os.environ.get('DEVM_TRACE_ERR'):

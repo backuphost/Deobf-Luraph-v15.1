@@ -396,8 +396,10 @@ return function(G, fnames, libnames)
 	methods.service = methods.GetService
 	m("IsLoaded", function() return true end)
 	m("IsStudio", function() return false end)
-	m("IsClient", function() return true end)
-	m("IsServer", function() return false end)
+	-- server=1 in the harness: the script is analysed as server code
+	M.serverSide = false
+	m("IsClient", function() return not M.serverSide end)
+	m("IsServer", function() return M.serverSide end)
 	m("IsPropertyModified", function(self, name)
 		if rawType(name) ~= "string" then error("Unable to cast " .. rawTypeof(name) .. " to string", 3) end
 		return false

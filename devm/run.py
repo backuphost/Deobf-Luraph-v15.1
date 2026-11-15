@@ -116,7 +116,7 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
@@ -137,8 +137,24 @@ def deobfuscate(path, workdir, log=print, script_path=None):
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
         # code decrypts itself too.
-        stage.harness_options = ['exercise=1'] + (['scriptpath=' + script_path] if script_path else [])
+        stage.harness_options = ['exercise=1'] + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else [])
         text = stage.run_traced()
+        # Paths that never ran keep encrypted instructions and constants.  Execute each lifted
+        # instruction that did not run once, from the interpreter state the lifter found for it,
+        # and lift again; repeat while that uncovers more.
+        base = list(stage.harness_options)
+        allpokes = []
+        for rnd in range(1, 41):
+            new = [p for p in stage.poke_list() if p not in allpokes]
+            if not new:
+                break
+            allpokes.extend(new)        # earlier probes are repeated in order: each run starts afresh
+            pf = os.path.join(workdir, tag + '.poke')
+            with open(pf, 'w') as f:
+                f.write('\n'.join(allpokes) + '\n')
+            log('[%s] round %d: %d more branch arms of the script did not run; probing %d in all' % (tag, rnd, len(new), len(allpokes)))
+            stage.harness_options = base + ['poke=' + pf]
+            text = stage.run_traced()
         if stage.errors:
             log('[%s] %d instructions could not be lifted (marked LIFT ERROR in the output)' % (tag, len(stage.errors)))
         return cleanup.tidy(text)
@@ -166,9 +182,10 @@ def main(argv=None):
     ap.add_argument('--script-path', default=None,
                     help='where the script sits in the game, e.g. ReplicatedStorage.Packages.Net.init '
                          '(scripts check their own GetFullName())')
+    ap.add_argument('--server', action='store_true', help='analyse the script as server code (RunService:IsServer() is true)')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
-    text = deobfuscate(a.input, work, script_path=a.script_path)
+    text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server)
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
     with open(out, 'w', encoding='utf-8') as f:
         f.write(text)

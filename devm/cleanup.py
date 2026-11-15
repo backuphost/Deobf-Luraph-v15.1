@@ -100,6 +100,7 @@ def suggest(rhs):
 def tidy(text):
     # stores into a table nothing else can see (a VM scratch array that was never bound to a variable)
     text = '\n'.join(ln for ln in text.split('\n') if not re.match(r'^\s*\(\{\}\)\[\d+\] = [-\w.]+$', ln))
+    text = _loop_artifacts(text)
     text = drop_unused(text)
     for _ in range(4):
         new = rename(text)
@@ -182,3 +183,61 @@ def rename(text):
         else:
             out.append(s)
     return ''.join(out)
+
+
+def _loop_artifacts(text):
+    """Two leftovers of numeric / generic for loops whose step instruction was lifted as a loop of
+    its own:
+
+        for i = a, b, c do                      -- for-loop setup: a, b, c
+            body                                <statements>
+            -- for-loop without visible setup   -- for-loop without visible setup
+            for i = nil --[[?]] do              for i = nil --[[?]] do
+            end                                     body
+            break                               end
+        end
+
+    left: the step of a loop that is already there (dropped); right: a loop whose bounds were set
+    up a few statements earlier (reattached)."""
+    import re
+    lines = text.split('\n')
+    out = []
+    setup = {}          # indent -> (index in out, bounds)
+    i = 0
+    hdr = re.compile(r'^(\t*)for ([\w, ]+?) (=|in) nil --\[\[\?\]\] do$')
+    while i < len(lines):
+        ln = lines[i]
+        ind = len(ln) - len(ln.lstrip('\t'))
+        st = ln.strip()
+        m = re.match(r'^-- for-loop setup: (.+)$', st)
+        if m:
+            setup[ind] = (len(out), m.group(1))
+            out.append(ln)
+            i += 1
+            continue
+        if st == '-- for-loop without visible setup':
+            j = i + 1
+            while j < len(lines) and re.match(r'^\t*local [\w, ]+$', lines[j]):
+                j += 1
+            h = hdr.match(lines[j]) if j < len(lines) else None
+            if h and len(h.group(1)) == ind:
+                # the step of an enclosing loop: `for x = nil do end break` right before its end
+                if j == i + 1 and j + 3 < len(lines) and lines[j + 1].strip() == 'end' and lines[j + 2].strip() == 'break' \
+                        and lines[j + 3].strip() == 'end' and len(lines[j + 3]) - len(lines[j + 3].lstrip('\t')) == ind - 1:
+                    i = j + 3
+                    continue
+                if ind in setup and h.group(3) == '=':
+                    at, bounds = setup.pop(ind)
+                    out[at] = None
+                    out.extend(lines[i + 1:j])
+                    out.append('%sfor %s = %s do' % (h.group(1), h.group(2), bounds))
+                    i = j + 1
+                    continue
+        if st in ('end', 'else') or st.startswith('elseif ') or st.startswith('until '):
+            for k in [k for k in setup if k > ind]:
+                del setup[k]
+        out.append(ln)
+        i += 1
+    text = '\n'.join(l for l in out if l is not None)
+    # what is left keeps a placeholder that at least parses
+    return text.replace(' = nil --[[?]] do', ' = nil --[[bounds not recovered]], nil do')

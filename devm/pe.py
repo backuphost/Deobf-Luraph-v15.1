@@ -223,6 +223,15 @@ class PackedTbl:
         self.id = id
 
 
+class PackedList:
+    """table.pack(a, b, ...) of known arity made by the interpreter itself (it packs call results
+    and return values before moving them): the values, without materialising a table."""
+    __slots__ = ('vals',)
+
+    def __init__(self, vals):
+        self.vals = list(vals)
+
+
 class MultiTail:
     __slots__ = ('id',)
 
@@ -658,6 +667,7 @@ class PE:
         self.regknown = {}
         self.regdirty = set()
         self.regdirty_all = False
+        self.reg_reads = []       # registers read by the instruction being evaluated (known or not)
         self.nregs = None
         self.keyfn_override = {}
         self.known_reads = set()
@@ -795,6 +805,11 @@ class PE:
     def atom(self, v):
         if isinstance(v, Sym):
             return v.e
+        if isinstance(v, PackedList):
+            # used as a value after all (the script's own table.pack): make the table
+            return self.emit_call(('kfn', 'table.pack'), list(v.vals), 1)[0].e
+        if isinstance(v, PackedTbl) and v.id not in ('args', 'va'):
+            return self.emit_call(('kfn', 'table.pack'), [MultiTail(v.id)], 1)[0].e
         if v is None or isinstance(v, (bool, int, float, str)):
             return ('k', v)
         if v is REGS:
@@ -843,6 +858,8 @@ class PE:
 
     def read_reg(self, n):
         self.check_reg(n)
+        if isinstance(n, int):
+            self.reg_reads.append(n)
         t = self.regknown.get(n)
         if n in self.regdirty or self.regdirty_all:
             t = None
@@ -1077,6 +1094,14 @@ class PE:
         if isinstance(obj, PackedTbl):
             if isinstance(key, int):
                 return self.mv(obj.id, key)
+            if key == 'n':
+                return LinSym(obj.id, 0)
+            raise PEError('packed index %r' % (key,))
+        if isinstance(obj, PackedList):
+            if key == 'n':
+                return len(obj.vals)
+            if isinstance(key, int):
+                return obj.vals[key - 1] if 1 <= key <= len(obj.vals) else None
             raise PEError('packed index %r' % (key,))
         if obj is OPENUPS:
             return None
@@ -1174,6 +1199,8 @@ class PE:
                 return v.length()
             if isinstance(v, PackedTbl):
                 return LinSym(v.id, 0)
+            if isinstance(v, PackedList):
+                return len(v.vals)
         if isinstance(v, (Special, UpRef, LinSym)):
             return self.emit_expr(('un', op, self.atom(v)))
         raise PEError('unop %s on %r' % (op, v))
@@ -1365,10 +1392,20 @@ class PE:
             if rest and isinstance(rest[-1], MultiTail):
                 return [LinSym(rest[-1].id, len(rest) - 1)]
             return [len(rest)]
+        if name == 'table.pack':
+            if len(args) == 1 and isinstance(args[0], MultiTail):
+                return [PackedTbl(args[0].id)]
+            if not any(isinstance(a, MultiTail) for a in args):
+                return [PackedList(args)]
         if name in ('unpack', 'table.unpack'):
             t = args[0]
             if t is REGS:
                 return self.regs_range(args[1], args[2])
+            if isinstance(t, PackedList) and len(args) == 3 and args[1] == 1 and args[2] == len(t.vals):
+                return list(t.vals)
+            if isinstance(t, PackedTbl) and len(args) == 3 and args[1] == 1 and isinstance(args[2], LinSym) \
+                    and args[2].id == t.id and args[2].k == 0:
+                return [MultiTail(t.id)]
             if isinstance(t, LuaTable) and not sym:
                 a = args[1] if len(args) > 1 and args[1] is not None else 1
                 b = args[2] if len(args) > 2 and args[2] is not None else t.length()
@@ -1381,6 +1418,22 @@ class PE:
             else:
                 for i in range(int(args[1]), int(args[2]) + 1):
                     self.emit(('set', ('r', int(args[3]) + i - int(args[1])), ('arg', i)))
+            return [REGS]
+        if name == 'table.move' and len(args) == 5 and args[4] is REGS and args[1] == 1 and is_num(args[2]) and is_num(args[3]) \
+                and isinstance(args[0], (PackedTbl, PackedList)):
+            # the interpreter keeping the first n results of a call: R[A .. A+n-1] = results
+            n, base = int(args[2]), int(args[3])
+            if isinstance(args[0], PackedList):
+                for i in range(n):
+                    v = args[0].vals[i] if i < len(args[0].vals) else None
+                    self.emit(('set', ('r', base + i), self.atom(v)))
+            else:
+                cid = args[0].id
+                for j, st in enumerate(self.ir):
+                    if st[0] == 'call' and st[1] == cid and st[5] == -1:
+                        self.ir[j] = st[:5] + (n,)
+                for i in range(n):
+                    self.emit(('set', ('r', base + i), ('mv', cid, i + 1)))
             return [REGS]
         if name == 'table.move' and len(args) == 5 and args[0] is REGS:
             vals = self.regs_range(args[1], args[2])
@@ -1739,6 +1792,10 @@ class PE:
                 return None
             if it and it[0] is None:
                 raise PEError('for-in over nil')
+            if it and isinstance(it[0], Builtin) and it[0].name == 'next' and len(it) >= 2:
+                # `for k in next, open_upvalues do <close it> end` of an interpreter that keeps its
+                # open-upvalue maps in plain locals: closing has no counterpart in the lifted code
+                return None
             raise PEError('unsupported for-in over %r' % (it[:1],))
         if t == 'return':
             vals = self.evalargs(st[1], scope)

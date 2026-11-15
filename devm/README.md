@@ -94,10 +94,12 @@ State of the two samples of this build:
 * TeleportGuard: every check passes, the key is right, the payload runs.  Its payload interpreter
   has a single handler (vararg setup): the protected program is empty.  See
   `deobfuscated/TeleportGuard.lua`.
-* Net: every check passes, the key is right, the payload runs and lifts, but only partly
-  (`deobfuscated/Net.partial.lua`): numeric for loops of the payload interpreter whose bounds are
-  constants are not reconstructed, branches that did not run keep encrypted constants, and the
-  module body stops at a run-time error in the mock environment.
+* Net: every check passes, the key is right, the payload runs to the `return` of its API table
+  and lifts (`deobfuscated/Net.lua`).  After the exercise pass, probe rounds (`poke=`) start a
+  copy of a proto at instructions the lifter reached but the run did not, so their constants
+  decrypt.  `--server` runs the script as the server; the file combines a server run with the
+  client run's first guard.  Left over: 6 constants of anti-exploit branches no run reached, 2
+  lift errors, 3 loops without bounds.
 
 The two proto-table samples recovered earlier (HookScript, ClientSynchronizer) were not re-run
 against these changes: their inputs are not in the repository.
