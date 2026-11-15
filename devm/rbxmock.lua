@@ -11,9 +11,62 @@ return function(G, fnames, libnames)
 	-- (scripts recurse to within a few calls of the limit), so they are not wrapped in pcall:
 	-- argument errors are raised with error(msg, 2), which puts the position of a calling Lua
 	-- function in front of the message exactly as luaL_error does.
+	--
+	-- With a CLI that has cwrap (see luau_cli.patch) every function and metamethod handed to the
+	-- script IS a C closure: its Lua implementation runs on a thread of its own, so a call costs
+	-- the caller one frame and no C-stack depth, like the builtin it stands for.  Scripts call
+	-- whole batteries of builtins with a single frame left on the stack.
+	local cwrap = G.cwrap
+	local YIELD = cwrap and newproxy() or {}
 	local function named(name, f)
+		if cwrap then f = cwrap(string.match(name, "[^%.]*$"), f) end
 		fnames[f] = name
 		return f
+	end
+	-- implementations that may suspend the caller: f(callerThread, ...) returns YIELD to do so
+	local function namedY(name, f)
+		local g = f
+		if cwrap then
+			f = cwrap(string.match(name, "[^%.]*$"), g, YIELD)
+		else
+			f = function(...)
+				local r = table.pack(g(coroutine.running(), ...))
+				if r.n == 1 and r[1] == YIELD then return coroutine.yield() end
+				return unpack(r, 1, r.n)
+			end
+		end
+		fnames[f] = name
+		return f
+	end
+	-- (one C closure per implementation: __eq only fires when both operands share the metamethod)
+	local sealed = setmetatable({}, { __mode = "k" })
+	local function seal(mt)
+		if cwrap then
+			for k, v in pairs(mt) do
+				if rawType(v) == "function" and string.sub(k, 1, 2) == "__" and rawTypeof(sealed[v]) ~= "boolean" then
+					local c = sealed[v]
+					if not c then
+						c = cwrap(k, v)
+						sealed[v] = c
+						sealed[c] = true
+					end
+					mt[k] = c
+				end
+			end
+			-- methods kept in an __index table
+			local methods = rawget(mt, "__index")
+			if rawType(methods) == "table" then
+				for k, v in pairs(methods) do
+					if rawType(v) == "function" and rawTypeof(sealed[v]) ~= "boolean" then
+						local c = cwrap(tostring(k), v)
+						sealed[c] = true
+						methods[k] = c
+						if not fnames[c] then fnames[c] = tostring(k) end
+					end
+				end
+			end
+		end
+		return mt
 	end
 
 	-- ------------------------------------------------------------ permissive value stub
@@ -42,6 +95,7 @@ return function(G, fnames, libnames)
 	stubMT.__unm = function(a) return a end
 	stubMT.__lt = function() return false end
 	stubMT.__le = function() return true end
+	seal(stubMT)
 	M.stub = stub
 
 	-- ------------------------------------------------------------ signals
@@ -68,18 +122,13 @@ return function(G, fnames, libnames)
 			cmt.__type = "RBXScriptConnection"
 			cmt.__tostring = function() return "Connection" end
 			cmt.__metatable = "The metatable is locked"
+			seal(cmt)
 			return c
 		end
 		methods.connect = methods.Connect
 		methods.Once = methods.Connect
 		methods.ConnectParallel = methods.Connect
-		methods.Wait = function()
-			-- inside a coroutine of the script the wait really suspends it (nothing ever fires here)
-			if M.mainThread and coroutine.running() ~= M.mainThread and coroutine.isyieldable() then
-				return coroutine.yield()
-			end
-			return nil
-		end
+		methods.Wait = true    -- see make(): the only method that can suspend its caller
 		local function make()
 			local sig = newproxy(true)
 			local smt = getmetatable(sig)
@@ -87,6 +136,14 @@ return function(G, fnames, libnames)
 			sigCore[sig] = core
 			smt.__index = function(_, k)
 				local m = methods[k]
+				if m and k == "Wait" then
+					-- inside a coroutine of the script the wait really suspends it (nothing ever fires here)
+					return namedY(k, function(co, self)
+						if sigCore[self] ~= core then error("Expected ':' not '.' calling member function " .. k, 2) end
+						if M.mainThread and co ~= M.mainThread then return YIELD end
+						return nil
+					end)
+				end
 				if m then
 					-- a fresh closure per read, named and strict about its arguments like the real method
 					return named(k, function(self, ...)
@@ -103,6 +160,7 @@ return function(G, fnames, libnames)
 			smt.__type = "RBXScriptSignal"
 			smt.__tostring = function() return "Signal " .. name end
 			smt.__metatable = "The metatable is locked"
+			seal(smt)
 			return sig
 		end
 		local function fire(...)
@@ -121,6 +179,7 @@ return function(G, fnames, libnames)
 
 	local signalProps = {
 		Changed = true, ChildAdded = true, ChildRemoved = true, DescendantAdded = true, DescendantRemoving = true,
+		AncestryChanged = true, AttributeChanged = true, Destroying = true,
 		AncestryChanged = true, Destroying = true, Heartbeat = true, RenderStepped = true, Stepped = true,
 		PreRender = true, PreSimulation = true, PostSimulation = true, PlayerAdded = true, PlayerRemoving = true,
 		CharacterAdded = true, Touched = true, InputBegan = true, InputEnded = true, InputChanged = true,
@@ -191,6 +250,7 @@ return function(G, fnames, libnames)
 		mt.__tostring = function() return d.props.Name end
 		mt.__type = "Instance"
 		mt.__metatable = "The metatable is locked"
+			seal(mt)
 		return u
 	end
 	M.newInstance = newInstance
@@ -530,7 +590,7 @@ return function(G, fnames, libnames)
 			return vec2(x, y)
 		end,
 	}
-	for k, f in pairs(vec2Methods) do named(k, f) end
+	for k, f in pairs(vec2Methods) do vec2Methods[k] = named(k, f) end
 	Vec2MT.__index = function(a, k)
 		if k == "Unit" then
 			local m = rawget(a, "Magnitude")
@@ -541,6 +601,9 @@ return function(G, fnames, libnames)
 	Vec2MT.__unm = function(a) return vec2(-a.X, -a.Y) end
 	Vec2MT.__eq = function(a, b) return a.X == b.X and a.Y == b.Y end
 	Vec2MT.__tostring = function(a) return a.X .. ", " .. a.Y end
+	seal(UDimMT)
+	seal(UDim2MT)
+	seal(Vec2MT)
 	do
 		local L = lib("UDim")
 		rawset(L, "new", named("UDim.new", udim))
@@ -589,99 +652,181 @@ return function(G, fnames, libnames)
 			end
 			return 0, 0
 		end
-		-- A segment is the list of its control positions: 4 for a cubic, 3 when one of the two
-		-- handles is zero (Roblox then drops it: the segment is a quadratic), 2 when both are.
-		local function isZero(u)
-			return u.X.Scale == 0 and u.X.Offset == 0 and u.Y.Scale == 0 and u.Y.Offset == 0
+		-- Curve model: float32 throughout, in the engine's order of operations.  Ported from the
+		-- Studio-verified model of the "deobf" Luraph deobfuscator (envlog.luau, Path2D section):
+		--   pixel = f32(f32(scale * W) + offset); a handle of 0 px is left out (cubic / quadratic /
+		--   line); power basis evaluated by Horner's rule
+		--   GetLength: adaptive bisection per segment (chord a, half chords b; b - a < 1e-5 -> b)
+		--   arc-length queries: s = f32(t * L), then 32 RK4 steps of du/ds = 1/|B'(u)|
+		-- Luraph feeds the float32 bit patterns of these results into its decryption key.
+		local FB = buffer.create(4)
+		local function f32(x)
+			buffer.writef32(FB, 0, x)
+			return buffer.readf32(FB, 0)
+		end
+		local function resolve(u, W, H)
+			return f32(f32(f32(u.X.Scale) * W) + u.X.Offset), f32(f32(f32(u.Y.Scale) * H) + u.Y.Offset)
+		end
+		local function coeffs(sg)
+			local n = #sg // 2
+			local x0, y0 = sg[1], sg[2]
+			local c = { n = n, x0 = x0, y0 = y0 }
+			if n == 2 then
+				c.c1x, c.c1y = f32(sg[3] - x0), f32(sg[4] - y0)
+			elseif n == 3 then
+				local x1, y1, x2, y2 = sg[3], sg[4], sg[5], sg[6]
+				c.c1x, c.c1y = f32(f32(x1 - x0) * 2), f32(f32(y1 - y0) * 2)
+				c.c2x, c.c2y = f32(f32(x0 - f32(x1 * 2)) + x2), f32(f32(y0 - f32(y1 * 2)) + y2)
+			else
+				local x1, y1, x2, y2, x3, y3 = sg[3], sg[4], sg[5], sg[6], sg[7], sg[8]
+				c.c1x, c.c1y = f32(f32(x1 - x0) * 3), f32(f32(y1 - y0) * 3)
+				c.c2x = f32(f32(f32(x0 - f32(x1 * 2)) + x2) * 3)
+				c.c2y = f32(f32(f32(y0 - f32(y1 * 2)) + y2) * 3)
+				c.c3x = f32(f32(f32(x3 - x0) + f32(x1 * 3)) - f32(x2 * 3))
+				c.c3y = f32(f32(f32(y3 - y0) + f32(y1 * 3)) - f32(y2 * 3))
+			end
+			return c
 		end
 		local function segments(self)
-			local pts = data[self].points or {}
+			local W, H = absSize(self)
+			local pts = {}
+			for i, cp in ipairs(data[self].points or {}) do
+				local px, py = resolve(cp.Position, W, H)
+				local lx, ly = resolve(cp.LeftTangent, W, H)
+				local rx, ry = resolve(cp.RightTangent, W, H)
+				pts[i] = { px, py, lx, ly, rx, ry }
+			end
 			local segs = {}
 			for i = 1, #pts - 1 do
 				local a, b = pts[i], pts[i + 1]
-				local seg = { a.Position }
-				if not isZero(a.RightTangent) then seg[#seg + 1] = a.Position + a.RightTangent end
-				if not isZero(b.LeftTangent) then seg[#seg + 1] = b.Position + b.LeftTangent end
-				seg[#seg + 1] = b.Position
-				segs[i] = seg
+				local sg = { a[1], a[2] }
+				if a[5] ~= 0 or a[6] ~= 0 then
+					sg[#sg + 1] = f32(a[1] + a[5]); sg[#sg + 1] = f32(a[2] + a[6])
+				end
+				if b[3] ~= 0 or b[4] ~= 0 then
+					sg[#sg + 1] = f32(b[1] + b[3]); sg[#sg + 1] = f32(b[2] + b[4])
+				end
+				sg[#sg + 1] = b[1]; sg[#sg + 1] = b[2]
+				segs[i] = coeffs(sg)
+				segs[i].x3, segs[i].y3 = b[1], b[2]
 			end
 			return segs
+		end
+		local function eval(c, u)
+			if c.n == 2 then
+				return f32(c.x0 + f32(c.c1x * u)), f32(c.y0 + f32(c.c1y * u))
+			elseif c.n == 3 then
+				return f32(c.x0 + f32(f32(c.c1x + f32(c.c2x * u)) * u)), f32(c.y0 + f32(f32(c.c1y + f32(c.c2y * u)) * u))
+			end
+			local ix, iy = f32(c.c2x + f32(c.c3x * u)), f32(c.c2y + f32(c.c3y * u))
+			return f32(c.x0 + f32(f32(c.c1x + f32(ix * u)) * u)), f32(c.y0 + f32(f32(c.c1y + f32(iy * u)) * u))
+		end
+		local function tangent(c, u)
+			if c.n == 2 then return c.c1x, c.c1y end
+			if c.n == 3 then
+				local k = f32(u * 2)
+				return f32(c.c1x + f32(c.c2x * k)), f32(c.c1y + f32(c.c2y * k))
+			end
+			local k = f32(3 * u)
+			return f32(c.c1x + f32(u * f32(f32(c.c2x * 2) + f32(c.c3x * k)))),
+				f32(c.c1y + f32(u * f32(f32(c.c2y * 2) + f32(c.c3y * k))))
+		end
+		local function dist(ax, ay, bx, by)
+			local dx, dy = f32(bx - ax), f32(by - ay)
+			return f32(math.sqrt(f32(f32(dx * dx) + f32(dy * dy))))
+		end
+		local TOL = f32(1e-5)
+		-- B(u) - P0: the length routine leaves the P0 term out (different rounding)
+		local function eval0(c, u)
+			if c.n == 2 then
+				return f32(c.c1x * u), f32(c.c1y * u)
+			elseif c.n == 3 then
+				return f32(f32(c.c1x + f32(c.c2x * u)) * u), f32(f32(c.c1y + f32(c.c2y * u)) * u)
+			end
+			local ix, iy = f32(c.c2x + f32(c.c3x * u)), f32(c.c2y + f32(c.c3y * u))
+			return f32(f32(c.c1x + f32(ix * u)) * u), f32(f32(c.c1y + f32(iy * u)) * u)
+		end
+		local function seglen(c)
+			local function rec(t0, t1, x0, y0, x1, y1, depth)
+				local tm = f32(f32(t0 + t1) * 0.5)
+				local xm, ym = eval0(c, tm)
+				local a = dist(x0, y0, x1, y1)
+				local b = f32(dist(x0, y0, xm, ym) + dist(xm, ym, x1, y1))
+				if depth >= 30 or f32(b - a) < TOL then return b end
+				return f32(rec(t0, tm, x0, y0, xm, ym, depth + 1) + rec(tm, t1, xm, ym, x1, y1, depth + 1))
+			end
+			local x0, y0 = eval0(c, 0)
+			local x1, y1 = eval0(c, 1)
+			return rec(0, 1, x0, y0, x1, y1, 0)
+		end
+		local SIXTH = f32(1 / 6)
+		local function arcU(c, sl)
+			local d2x, d2y = f32(c.c2x * 2), f32(c.c2y * 2)
+			local d3x, d3y
+			if c.n == 4 then d3x, d3y = f32(c.c3x * 3), f32(c.c3y * 3) end
+			local function inv(u)
+				local dx, dy
+				if c.n == 3 then
+					dx, dy = f32(c.c1x + f32(d2x * u)), f32(c.c1y + f32(d2y * u))
+				else
+					dx = f32(c.c1x + f32(u * f32(d2x + f32(u * d3x))))
+					dy = f32(c.c1y + f32(u * f32(d2y + f32(u * d3y))))
+				end
+				return math.sqrt(f32(f32(dx * dx) + f32(dy * dy)))
+			end
+			local h = f32(sl / 32)
+			local u = 0
+			for _ = 1, 32 do
+				local k1 = f32(h / f32(inv(u)))
+				local k2 = f32(h / f32(inv(f32(u + f32(k1 * 0.5)))))
+				local k3 = f32(h / f32(inv(f32(u + f32(k2 * 0.5)))))
+				local k4 = f32(h / f32(inv(f32(u + k3))))
+				u = f32(u + f32(f32(f32(k1 + f32(2 * f32(k2 + k3))) + k4) * SIXTH))
+			end
+			return u
+		end
+		local function length(segs)
+			local t = 0
+			for _, c in ipairs(segs) do
+				c.len = c.len or seglen(c)
+				t = f32(t + c.len)
+			end
+			return t
 		end
 		local function locate(segs, t)
 			local n = #segs
 			if n == 0 then return nil end
-			local x = math.clamp(t, 0, 1) * n
-			local i = math.min(math.floor(x), n - 1)
-			return segs[i + 1], x - i
-		end
-		-- de Casteljau on plain numbers
-		local function bez(p, u)
-			local q = table.clone(p)
-			for level = #q - 1, 1, -1 do
-				for i = 1, level do q[i] = q[i] + (q[i + 1] - q[i]) * u end
-			end
-			return q[1]
-		end
-		local function dbez(p, u)
-			local n = #p - 1
-			local d = {}
-			for i = 1, n do d[i] = n * (p[i + 1] - p[i]) end
-			return bez(d, u)
-		end
-		local function px(self, seg)
-			local w, h = absSize(self)
-			local xs, ys = {}, {}
-			for i = 1, #seg do
-				xs[i] = seg[i].X.Scale * w + seg[i].X.Offset
-				ys[i] = seg[i].Y.Scale * h + seg[i].Y.Offset
-			end
-			return xs, ys
-		end
-		-- positions come back as pure-scale UDim2s: the pixel position divided by the parent size
-		-- (checked against the key material of real samples)
-		local function posAt(self, seg, u)
-			local w, h = absSize(self)
-			local xs, ys = px(self, seg)
-			local x, y = bez(xs, u), bez(ys, u)
-			return udim2(w ~= 0 and x / w or 0, 0, h ~= 0 and y / h or 0, 0)
-		end
-		local function tanAt(self, seg, u)
-			local xs, ys = px(self, seg)
-			return vec2(dbez(xs, u), dbez(ys, u))
-		end
-		local STEPS = 2000
-		local function segLength(self, seg, upto)
-			local xs, ys = px(self, seg)
-			local total = 0
-			local lx, ly = xs[1], ys[1]
-			for i = 1, STEPS do
-				local u = (upto or 1) * i / STEPS
-				local x, y = bez(xs, u), bez(ys, u)
-				total += math.sqrt((x - lx) ^ 2 + (y - ly) ^ 2)
-				lx, ly = x, y
-			end
-			return total
+			t = f32(t)
+			if t < 0 then t = 0 elseif t > 1 then t = 1 end
+			local x = f32(t * n)
+			local k = math.min(math.floor(x), n - 1)
+			return segs[k + 1], f32(x - k)
 		end
 		local function locateArc(self, segs, t)
-			local lens, total = {}, 0
-			for i, seg in ipairs(segs) do
-				lens[i] = segLength(self, seg)
-				total += lens[i]
-			end
-			local target = math.clamp(t, 0, 1) * total
-			for i, seg in ipairs(segs) do
-				if target <= lens[i] or i == #segs then
-					local lo, hi = 0, 1
-					for _ = 1, 40 do
-						local mid = (lo + hi) / 2
-						if segLength(self, seg, mid) < target then lo = mid else hi = mid end
-					end
-					return seg, (lo + hi) / 2
+			if #segs == 0 then return nil end
+			t = f32(t)
+			if t < 0 then t = 0 elseif t > 1 then t = 1 end
+			local L = length(segs)
+			local sl = f32(t * L)
+			for _, c in ipairs(segs) do
+				if sl <= c.len then
+					if c.n == 2 then return c, f32(sl / c.len) end
+					return c, arcU(c, sl)
 				end
-				target -= lens[i]
+				sl = f32(sl - c.len)
 			end
-			return nil
+			return segs[1], 0
 		end
+		-- positions come back as pure-scale UDim2s: the pixel position divided by the parent size
+		local function posAt(self, c, u)
+			local W, H = absSize(self)
+			local x, y = eval(c, u)
+			return udim2(W ~= 0 and f32(x / W) or 0, 0, H ~= 0 and f32(y / H) or 0, 0)
+		end
+		local function tanAt(self, c, u)
+			return vec2(tangent(c, u))
+		end
+		local function segLength(self, c) return seglen(c) end
 		m("SetControlPoints", function(self, pts)
 			local copy = {}
 			for i, p in ipairs(pts) do copy[i] = p end
@@ -701,11 +846,7 @@ return function(G, fnames, libnames)
 		m("UpdateControlPoint", function(self, i, p) (data[self].points or {})[i] = p end)
 		m("GetSegmentCount", function(self) return math.max(#(data[self].points or {}) - 1, 0) end)
 		m("GetMaxControlPoints", function() return 250 end)
-		m("GetLength", function(self)
-			local total = 0
-			for _, seg in ipairs(segments(self)) do total += segLength(self, seg) end
-			return total
-		end)
+		m("GetLength", function(self) return length(segments(self)) end)
 		m("GetPositionOnCurve", function(self, t)
 			local seg, u = locate(segments(self), t)
 			if not seg then return udim2(0, 0, 0, 0) end
@@ -744,6 +885,7 @@ return function(G, fnames, libnames)
 			mt.__tostring = function() return "Enum." .. etName .. "." .. name end
 			mt.__type = "EnumItem"
 			mt.__metatable = "The metatable is locked"
+			seal(mt)
 			return u
 		end
 		local function enumType(etName)
@@ -795,6 +937,7 @@ return function(G, fnames, libnames)
 			mt.__tostring = function() return etName end
 			mt.__type = "Enum"
 			mt.__metatable = "The metatable is locked"
+			seal(mt)
 			return et
 		end
 		local Enum = newproxy(true)
@@ -809,6 +952,7 @@ return function(G, fnames, libnames)
 		mt.__tostring = function() return "Enums" end
 		mt.__type = "Enums"
 		mt.__metatable = "The metatable is locked"
+			seal(mt)
 		M.Enum = Enum
 		M.enumName = function(v)
 			if typeNames[v] == "Enums" then return "Enum" end
@@ -884,6 +1028,7 @@ return function(G, fnames, libnames)
 			mt.__type = "Random"
 			mt.__tostring = function() return "Random" end
 			mt.__metatable = "The metatable is locked"
+			seal(mt)
 			return r, draw, function(h, l) hi, lo = h, l end, function() return hi, lo end
 		end
 		rawset(Random, "new", named("Random.new", function(seed)
@@ -941,8 +1086,8 @@ return function(G, fnames, libnames)
 				return a
 			end,
 		}
-		for k, f in pairs(methods) do named(k, f) end
-		G.setvectormetatable({
+		for k, f in pairs(methods) do methods[k] = named(k, f) end
+		G.setvectormetatable(seal({
 			__index = function(v, k)
 				-- (a computed key does not take the VM's built-in x/y/z path)
 				if k == "X" or k == "x" then return v.x end
@@ -953,7 +1098,7 @@ return function(G, fnames, libnames)
 				return methods[k]
 			end,
 			__type = "Vector3",
-		})
+		}))
 		local L = {}
 		libnames[L] = "Vector3"
 		L.new = named("Vector3.new", v3)
@@ -1143,6 +1288,7 @@ return function(G, fnames, libnames)
 		cfMT.__eq = function(a, b) return cfm.FuzzyEq(a, b, 0) end
 		cfMT.__tostring = function(a) return table.concat({ cfm.GetComponents(a) }, ", ") end
 		cfMT.__metatable = "The metatable is locked"
+			seal(cfMT)
 		M.CFrame = CF
 	end
 
@@ -1171,16 +1317,15 @@ return function(G, fnames, libnames)
 		task.delay = named("task.delay", function(_, f, ...)
 			return type(f) == "thread" and f or coroutine.create(f)
 		end)
-		task.wait = named("task.wait", function(t)
+		local function waitImpl(co, t)
 			if t ~= nil and rawType(t) ~= "number" then
 				error("invalid argument #1 to 'wait' (number expected, got " .. rawTypeof(t) .. ")", 2)
 			end
-			local co = coroutine.running()
-			if M.mainThread and co ~= M.mainThread and coroutine.isyieldable() then
+			if M.mainThread and co ~= M.mainThread then
 				-- a coroutine of the script: really yield (it shows as "suspended" until the scheduler,
 				-- i.e. the next wait of the main thread, resumes it)
 				queue[#queue + 1] = { co, t or 0.03 }
-				return coroutine.yield()
+				return YIELD
 			end
 			local q = queue
 			queue = {}
@@ -1188,7 +1333,8 @@ return function(G, fnames, libnames)
 				if coroutine.status(item[1]) == "suspended" then resume(unpack(item)) end
 			end
 			return t or 0.03
-		end)
+		end
+		task.wait = namedY("task.wait", waitImpl)
 		task.cancel = named("task.cancel", function(...)
 			if select("#", ...) == 0 then error("missing argument #1 to 'cancel' (thread expected)", 2) end
 			local co = ...
@@ -1201,7 +1347,7 @@ return function(G, fnames, libnames)
 		task.desynchronize = named("task.desynchronize", function() end)
 		libnames[task] = "task"
 		M.task = task
-		M.wait = named("wait", task.wait)
+		M.wait = namedY("wait", waitImpl)
 		M.spawn = named("spawn", function(f, ...) return run(f, ...) end)
 		M.delay = named("delay", function() end)
 	end

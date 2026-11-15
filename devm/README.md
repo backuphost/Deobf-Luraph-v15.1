@@ -4,7 +4,8 @@ Turns a Luraph-protected script (as plain Lua, e.g. after a bytecode decompiler)
 source by partially evaluating the VM interpreter over every instruction.
 
 ```
-# one-time: build the Luau CLI with the file helpers (see luau_cli.patch) and point LUAU_BIN at it
+# one-time: build the Luau CLI at tag 0.739 with luau_cli.patch applied and point LUAU_BIN at it
+# (newer Luau changed how pcall uses the C stack; protected scripts measure that)
 export LUAU_BIN=/path/to/luau
 python -m devm.run protected.lua -o recovered.lua
 ```
@@ -57,3 +58,28 @@ Limits, stated plainly:
   `UNSTRUCTURED` stub.
 
 `antitamper.py` predates the inlined instrumentation and is not wired in.
+
+## Environment fidelity (newer factory builds)
+
+These builds answer a failed environment check by scrambling their own bytecode forever, and the
+RC4 key of the real program is built from what the checks observe, so the mock has to match Roblox
+exactly rather than approximately:
+
+* every function and metamethod the script can reach is a C closure (`cwrap` in luau_cli.patch):
+  one stack frame per call, `[C]` in `debug.info`, errors positioned like `luaL_error` does. The
+  script calls whole batteries of builtins with a single frame left on its stack;
+* `getfenv()` is a nearly empty table that falls through to the globals; the script enumerates it;
+* the executed copy is one line (line numbers in its own error messages are compared);
+* Path2D geometry is a float32 model in the engine's order of operations, ported from the
+  Studio-verified model of the "deobf" Luraph deobfuscator; the float32 bit patterns are key bytes;
+* executor-style globals (`identifyexecutor`, `iscclosure`, `islclosure`) exist, as in the
+  reference environment the key material was compared against.
+
+`harness.lua` options for diagnosing a failed check: `stub=<pid>` (suppress the tamper response),
+`watch=<pid>` (log the arguments of that proto's last calls, e.g. the comparison helper), `tb=<pid>`,
+`depth=<n>`.
+
+State: TeleportGuard and Net (factory, two interpreters) pass every check, derive the right key and
+run their payload under the harness. The payload runs on the second interpreter, which the lifter
+does not handle yet (TeleportGuard: not detected; Net: `condition on symbolic count` in its
+prologue), so the output of `run.py` for them is still the bootstrap, not the script.

@@ -552,6 +552,11 @@ def run_oracle(model, workdir, tag, options=()):
     for p in (outjson, outjson + '.oracle'):
         if os.path.exists(p):
             os.remove(p)
+    # utf8.nfcnormalize / nfdnormalize data: the bytes of normalised strings steer the script
+    nf = os.path.join(workdir, 'nfdata.lua')
+    if not os.path.exists(nf):
+        from . import unidata
+        unidata.generate(nf)
     r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] +
                        list(options), capture_output=True, text=True, errors='replace', timeout=1800)
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
