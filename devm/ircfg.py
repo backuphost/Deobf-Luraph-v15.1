@@ -308,13 +308,18 @@ class ProtoCFG:
         self.warnings = []
         self.param_regs = None
         self._build()
-        eb = self.blocks[self.entry]
-        for i, st in enumerate(eb.stmts):
-            if st[0] == 'params':
-                # explicit parameter block (register base, count) emitted by the function prologue
-                self.param_regs = list(range(st[1], st[1] + st[2]))
-                self.nparams = st[2]
-                del eb.stmts[i]
+        # explicit parameter block (register base, count) emitted by the function prologue; the
+        # prologue need not be the first instruction
+        for b in [self.blocks[self.entry]] + [x for x in self.blocks.values() if x is not self.blocks[self.entry]]:
+            found = False
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'params':
+                    self.param_regs = list(range(st[1], st[1] + st[2]))
+                    self.nparams = st[2]
+                    del b.stmts[i]
+                    found = True
+                    break
+            if found:
                 break
         self._thread()
         self._to_exprs()

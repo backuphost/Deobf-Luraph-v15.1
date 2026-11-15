@@ -248,8 +248,14 @@ local mockRef = nil
 local oracleOn = false
 local watchPid, watchRegs, watchN, watchLog = {}, nil, 0, {}   -- watch=<pid>: remember the arguments of its last calls
 local extraDepth = 0
+local cGlobals = nil        -- environment of C functions as seen by getfenv(level)
+local serverSide = false   -- server=1: RunService:IsServer() is true
+local executorEnv = false  -- executor=1: provide identifyexecutor / iscclosure / islclosure
+local pokePath = nil       -- poke=<file>: instructions to execute once after the run (see pokePass)
 local exercise = false     -- exercise=1: after the script ends, call every payload function once
 local budgetAt = math.huge
+local probing = false      -- true while the poke pass runs
+local pidAlias = {}        -- pid of a probe's copy of a proto -> pid of the proto itself
 local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
@@ -291,8 +297,8 @@ local function writeOracle()
 		for i, t in rec.vers do vs[i] = string.format('[%d,"%s"]', rec.steps[i], t) end
 		local sc = {}
 		for k2 in rec.succ do sc[#sc + 1] = string.format("[%d,%d]", k2 // 2 ^ 24, k2 % 2 ^ 24) end
-		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"r":{%s},"v":{%s},"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
-			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, table.concat(r, ","), table.concat(v, ","), table.concat(vs, ","),
+		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"r":{%s},"v":{%s},"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
+			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, rec.probe and 1 or 0, table.concat(r, ","), table.concat(v, ","), table.concat(vs, ","),
 			rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","))
 	end
 	writefile(outPath .. ".oracle", "{" .. table.concat(parts, ",\n") .. "}")
@@ -312,8 +318,12 @@ local RINGN = 4096
 local scriptPath = nil
 for i = #layers, 1, -1 do
 	local sp = string.match(layers[i], "^scriptpath=(.+)$")
+	local pk = string.match(layers[i], "^poke=(.+)$")
 	if sp then
 		scriptPath = sp
+		table.remove(layers, i)
+	elseif pk then
+		pokePath = pk
 		table.remove(layers, i)
 	end
 end
@@ -327,6 +337,8 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "runlog" then runLog = tonumber(v) ~= 0
 	elseif k == "dumpend" then dumpEnd = tonumber(v) ~= 0
 	elseif k == "oracle" then oracleOn = tonumber(v) ~= 0
+	elseif k == "server" then serverSide = tonumber(v) ~= 0
+	elseif k == "executor" then executorEnv = tonumber(v) ~= 0
 	elseif k == "exercise" then exercise = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
@@ -418,6 +430,7 @@ function __LPH_STEP(pid, loop, pc, regs, names, ...)
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
 	if stepCount > budgetAt then error("__LPH_BUDGET", 0) end
+	pid = pidAlias[pid] or pid
 	if tbPid == pid then
 		tbPid = nil
 		ewrite("[traceback] first instruction of proto " .. pid .. " (step " .. stepCount .. ")\n" .. debug.traceback() .. "\n")
@@ -465,9 +478,11 @@ function __LPH_STEP(pid, loop, pc, regs, names, ...)
 			rec.vers = { ver }
 			rec.steps = { stepCount }
 			rec.succ = {}
+			rec.probe = probing      -- only ever executed by a probe: its register values mean nothing
 			orc[key] = rec
 		else
 			rec.n += 1
+			if not probing then rec.probe = false end
 			if rec.vers[#rec.vers] ~= ver and #rec.vers < 16 then
 				rec.vers[#rec.vers + 1] = ver
 				rec.steps[#rec.steps + 1] = stepCount
@@ -613,7 +628,12 @@ function __LPH_PROTO(interp, names, n, ...)
 	for i = 1, n do
 		env[names[i]] = vals[i]
 	end
-	protos[#protos + 1] = { interp = interp, vars = env, self = vals[1] }
+	local rec = { interp = interp, vars = env, self = vals[1] }
+	if pokePath then
+		-- to start this proto again at another instruction (see pokePass)
+		rec.names, rec.vals, rec.n, rec.factory = names, vals, n, debug.info(2, "f")
+	end
+	protos[#protos + 1] = rec
 	if #protos == 1 and mockRef then mockRef.mainThread = coroutine.running() end
 	if traceMode and runLog then ewrite("[proto] pid=" .. #protos .. " interp=" .. interp .. "\n") end
 	return #protos
@@ -637,15 +657,17 @@ function __LPH_CLOS(names, n, ...)
 	return fn
 end
 
+local lastBind = {}        -- pid -> arguments of the last upvalue binding of that proto
 local regList = {}         -- every VM closure made, in order (exercise=1 calls the payload's)
 function __LPH_REG(pid, fn)
 	protoOfFn[fn] = pid
-	if exercise and protos[pid] and protos[1] and protos[pid].interp ~= protos[1].interp then
+	if (exercise or pokePath) and protos[pid] and protos[1] and protos[pid].interp ~= protos[1].interp then
 		-- fn binds upvalues and returns the callable closure: remember every closure it makes
 		-- (payload only: the bootstrap counts the frames of its own calls)
 		local bind = fn
 		fn = function(...)
 			local closure = bind(...)
+			lastBind[pid] = table.pack(...)
 			if type(closure) == "function" then
 				protoOfFn[closure] = pid
 				regList[#regList + 1] = closure
@@ -678,6 +700,7 @@ local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
 mockRef = mock
 if scriptPath then mock.placeScript(scriptPath) end
+mock.serverSide = serverSide
 mock.onHttp = function(method, url)
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
 	return httpReply or ""
@@ -732,7 +755,7 @@ function populateSandbox()
 		"Path2DControlPoint", "DateTime", "PhysicalProperties", "Axes", "Faces", "Vector3int16", "Vector2int16",
 		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable",
 		-- executor-specific globals probed by environment-fingerprinting scripts
-		"math_floor_precision", "iscclosure", "islclosure", "identifyexecutor" }) do
+		"math_floor_precision" }) do
 		if rawget(sandbox, n) == nil then
 			local v = fallback[n]
 			if v ~= nil then rawset(sandbox, n, v) end
@@ -740,9 +763,20 @@ function populateSandbox()
 	end
 	-- Like a Roblox script environment, what getfenv() hands out is a nearly empty table whose
 	-- metatable falls through to the globals (a table, so a lookup still costs no call): scripts
-	-- enumerate it and hash the names they find.
+	-- enumerate it and hash the names they find.  script, _G and shared are real fields of it:
+	-- anti-cheat code treats an environment that only inherits _G / shared as an executor's.
 	local globals = sandbox
-	sandbox = setmetatable({ script = rawget(globals, "script") }, { __index = globals })
+	rawset(globals, "_G", {})       -- the scripts' shared table, not the CLI's own globals
+	if not executorEnv then
+		-- a plain Roblox client has none of these; scripts with their own anti-cheat look for them
+		for _, n in ipairs({ "identifyexecutor", "iscclosure", "islclosure" }) do
+			mock[n] = nil
+			rawset(globals, n, nil)
+		end
+	end
+	sandbox = setmetatable({ script = rawget(globals, "script"), _G = rawget(globals, "_G"), shared = rawget(globals, "shared") },
+		{ __index = globals })
+	cGlobals = setmetatable({ _G = rawget(globals, "_G"), shared = rawget(globals, "shared") }, { __index = globals })
 end
 
 -- utf8.nfcnormalize / utf8.nfdnormalize (tables generated by unidata.py next to the output file)
@@ -1022,13 +1056,20 @@ if cwrap then
 	end
 	mock.getfenv = nativeT("getfenv", function(co, f)
 		if f == nil then f = 1 end
+		local byLevel = false
 		if type(f) == "number" then
 			if f == 0 then return sandbox end
 			f = atLevel(co, f, "getfenv")
+			byLevel = true
 		elseif type(f) ~= "function" then
 			error("invalid argument #1 to 'getfenv' (number expected, got " .. typeof(f) .. ")", 0)
 		end
-		if isC(f) then return sandbox end
+		if isC(f) then
+			-- a C function on the stack (getfenv called through pcall) has the engine's global
+			-- table as its environment, where _G and shared are real fields
+			if byLevel and cGlobals then return cGlobals end
+			return sandbox
+		end
 		local env = realGetfenv(f)
 		if env == _G then return sandbox end
 		return env
@@ -1194,10 +1235,110 @@ local function exercisePayload()
 	ewrite("[exercise] called " .. calls .. " payload closures, " .. (stepCount - before) .. " more instructions\n")
 end
 
+-- Instructions on paths that never ran are still encrypted, and so are their constants: each
+-- decrypts and rewrites itself when it executes, with keys the interpreter carries in locals.
+-- The lifter knows those keys for every instruction it reached statically; the poke file lists
+-- them, one instruction per line:
+--     pid;<param>=<number>;<param>.<index>=<number>;...
+-- For each line the proto's factory is called again with those parameters replaced (entry pc,
+-- dispatch mode, keys), its upvalues are bound as they were last, and the interpreter runs until
+-- it fails for lack of the values the real path would have had in its registers (or for a few
+-- hundred instructions).  The code arrays and constant tables are shared with the real proto, so the
+-- plain instruction and its decoded constants are in the dump afterwards.
+local function pokePass()
+	local text = readfile(pokePath)
+	local done, skipped = 0, 0
+	-- A probe starts with empty registers and may wander into code that already ran; whatever it
+	-- rewrites there (instructions patch themselves with register values) is put back.
+	local guard = {}
+	for key in orc do
+		local pid, pc = key // 2 ^ 32, key % 2 ^ 24
+		local rec = protos[pid]
+		if rec and protos[1] and rec.interp ~= protos[1].interp then
+			for _, arr in rec.vars do
+				if type(arr) == "table" and arr ~= rec.self and getmetatable(arr) == nil then
+					local g = guard[arr]
+					if not g then
+						g = {}
+						guard[arr] = g
+					end
+					local v = rawget(arr, pc)
+					g[pc] = v == nil and guard or v      -- (guard itself stands for nil)
+				end
+			end
+		end
+	end
+	probing = true
+	local restored = 0
+	local function restore()
+		for arr, g in guard do
+			for pc, v in g do
+				local want = v
+				if v == guard then want = nil end
+				if rawget(arr, pc) ~= want then
+					rawset(arr, pc, want)
+					restored += 1
+				end
+			end
+		end
+	end
+	for line in string.gmatch(text, "[^\n]+") do
+		local fields = string.split(line, ";")
+		local pid = tonumber(fields[1])
+		local rec = protos[pid]
+		local ups = lastBind[pid]
+		if rec and rec.factory and ups then
+			local vals = table.clone(rec.vals)
+			local pos = {}
+			for i = 1, rec.n do pos[rec.names[i]] = i end
+			local copied = {}
+			for j = 2, #fields do
+				local name, value = string.match(fields[j], "^([^=]+)=(.+)$")
+				local base, idx = string.match(name, "^([^.]+)%.(%d+)$")
+				if base then
+					local i = pos[base]
+					if i then
+						if not copied[i] then
+							vals[i] = table.clone(vals[i])
+							copied[i] = true
+						end
+						vals[i][tonumber(idx)] = tonumber(value)
+					end
+				elseif pos[name] then
+					vals[pos[name]] = tonumber(value)
+				end
+			end
+			local before = #protos
+			local okf, binder = pcall(rec.factory, unpack(vals, 1, rec.n))
+			for clone = before + 1, #protos do pidAlias[clone] = pid end
+			local okb, closure
+			if okf and type(binder) == "function" then okb, closure = pcall(binder, unpack(ups, 1, ups.n)) end
+			if okb and type(closure) == "function" then
+				budgetAt = stepCount + 400
+				pcall(coroutine.resume, coroutine.create(closure))
+				restore()
+				done += 1
+			else
+				skipped += 1
+			end
+		else
+			skipped += 1
+		end
+	end
+	budgetAt = math.huge
+	probing = false
+	ewrite("[poke] started at " .. done .. " instructions that had not run (" .. skipped .. " skipped, " .. restored ..
+		" fields of executed instructions put back)\n")
+end
+
 function __LPH_AFTER(ok, message)
 	if exercise and not aborted then
 		local okx, errx = pcall(exercisePayload)
 		if not okx then ewrite("[exercise] stopped: " .. tostring(errx) .. "\n") end
+	end
+	if pokePath and not aborted then
+		local okx, errx = pcall(pokePass)
+		if not okx then ewrite("[poke] stopped: " .. tostring(errx) .. "\n") end
 	end
 	if oracleOn then
 		ewrite("[oracle] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
