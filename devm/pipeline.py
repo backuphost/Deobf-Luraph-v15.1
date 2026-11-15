@@ -63,7 +63,17 @@ def _run_traced(self):
     self.lifter = lifter.FactoryLifter(m, self.dump)
     self.lifter.oracle = oracle
     self.lifter.end_state = True
-    protos = self.lifter.lift_all(self.lifter.root_key)
+    # Two-interpreter builds: the first program is Luraph's bootstrap (environment checks, key
+    # derivation, decryption); the script itself is the first proto of the other interpreter.
+    root = self.lifter.root_key
+    boot = self.lifter.records[root - 1][0]
+    payload = [i + 1 for i, (idx, _) in enumerate(self.lifter.records) if idx != boot]
+    self.payload_root = payload[0] if payload else None
+    if payload:
+        root = payload[0]
+        self.lifter.root_key = root
+        self.log('[%s] payload: proto %d is the script (protos 1..%d are the bootstrap)' % (self.tag, root, root - 1))
+    protos = self.lifter.lift_all(root)
     self.protos = protos
     self.oracle = oracle
     nodes = sum(len(p.nodes) for p in protos.values())

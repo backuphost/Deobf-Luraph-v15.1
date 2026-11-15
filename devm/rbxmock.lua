@@ -438,7 +438,7 @@ return function(G, fnames, libnames)
 	setParent(workspace, game)
 	data[game].props.PlaceId = 1
 	data[game].props.GameId = 1
-	data[game].props.JobId = ""
+	data[game].props.JobId = "5c3a1a7e-0b1f-4c2d-9e57-3f6a8d2b4c10"    -- (empty only in Studio; scripts derive keys from it)
 	for _, s in ipairs({ "Players", "RunService", "ReplicatedStorage", "ReplicatedFirst", "StarterPlayer", "StarterGui",
 		"Lighting", "HttpService", "TweenService", "UserInputService", "CoreGui", "StarterPack", "TeleportService" }) do
 		methods.GetService(game, s)
@@ -460,6 +460,23 @@ return function(G, fnames, libnames)
 	end
 	local script = newInstance("LocalScript", "Script")
 	setParent(script, methods.FindFirstChild(data[services.Players].props.LocalPlayer, "PlayerScripts"))
+
+	-- scriptpath=<Service.Folder...Name>: where the script under analysis sits.  Scripts check
+	-- their own GetFullName() and refuse to run elsewhere.
+	function M.placeScript(path)
+		local parts = string.split(path, ".")
+		local parent = methods.GetService(game, parts[1])
+		for i = 2, #parts - 1 do
+			local child = methods.FindFirstChild(parent, parts[i])
+			if not child then
+				child = newInstance("Folder", parts[i])
+				setParent(child, parent)
+			end
+			parent = child
+		end
+		data[script].props.Name = parts[#parts]
+		setParent(script, parent)
+	end
 
 	M.game = game
 	M.Game = game

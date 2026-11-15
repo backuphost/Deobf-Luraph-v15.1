@@ -79,7 +79,25 @@ exactly rather than approximately:
 `watch=<pid>` (log the arguments of that proto's last calls, e.g. the comparison helper), `tb=<pid>`,
 `depth=<n>`.
 
-State: TeleportGuard and Net (factory, two interpreters) pass every check, derive the right key and
-run their payload under the harness. The payload runs on the second interpreter, which the lifter
-does not handle yet (TeleportGuard: not detected; Net: `condition on symbolic count` in its
-prologue), so the output of `run.py` for them is still the bootstrap, not the script.
+### Two-interpreter builds: the payload
+
+The bootstrap runs on one interpreter, the script on another whose dispatch loops sit inside
+`pcall` (errors are re-raised with line information).  `normalize.inline_protected` rewrites that
+interpreter so the loops are in the interpreter function itself; `run.py` then lifts from the first
+proto of the payload interpreter instead of the bootstrap.  Code decrypts itself as it runs, so
+after the script ends the harness calls every payload closure once with permissive stand-in
+arguments (`exercise=1`).  `--script-path Service.Folder.Name` places the script where it expects
+to be (`script:GetFullName()` is checked).
+
+State of the two samples of this build:
+
+* TeleportGuard: every check passes, the key is right, the payload runs.  Its payload interpreter
+  has a single handler (vararg setup): the protected program is empty.  See
+  `deobfuscated/TeleportGuard.lua`.
+* Net: every check passes, the key is right, the payload runs and lifts, but only partly
+  (`deobfuscated/Net.partial.lua`): numeric for loops of the payload interpreter whose bounds are
+  constants are not reconstructed, branches that did not run keep encrypted constants, and the
+  module body stops at a run-time error in the mock environment.
+
+The two proto-table samples recovered earlier (HookScript, ClientSynchronizer) were not re-run
+against these changes: their inputs are not in the repository.

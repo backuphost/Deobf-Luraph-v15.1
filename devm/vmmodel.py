@@ -490,7 +490,7 @@ class Model:
                     it.index, olst, len(oparams), ','.join(oparams))))
                 if mid.name_stmt:
                     # `local function NAME(...) ... end`: register right after the declaration
-                    edits.append((mid.end_pos, ' __LPH_REG(__pid,%s)' % mid.name_stmt))
+                    edits.append((mid.end_pos, ' %s = __LPH_REG(__pid,%s)' % (mid.name_stmt, mid.name_stmt)))
                 else:
                     edits.append((mid.kw_pos, '__LPH_REG(__pid,'))
                     edits.append((mid.end_pos, ')'))

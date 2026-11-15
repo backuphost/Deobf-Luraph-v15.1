@@ -248,6 +248,8 @@ local mockRef = nil
 local oracleOn = false
 local watchPid, watchRegs, watchN, watchLog = {}, nil, 0, {}   -- watch=<pid>: remember the arguments of its last calls
 local extraDepth = 0
+local exercise = false     -- exercise=1: after the script ends, call every payload function once
+local budgetAt = math.huge
 local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
@@ -307,6 +309,14 @@ __LPH_S = stubs
 __LPH_X = {}
 __LPH_R = {}
 local RINGN = 4096
+local scriptPath = nil
+for i = #layers, 1, -1 do
+	local sp = string.match(layers[i], "^scriptpath=(.+)$")
+	if sp then
+		scriptPath = sp
+		table.remove(layers, i)
+	end
+end
 while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	local k, v = string.match(table.remove(layers, 1), "^(%w+)=(%d+)$")
 	if k == "steps" then stepLimit = tonumber(v) elseif k == "dumpat" then dumpAt = tonumber(v)
@@ -317,6 +327,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "runlog" then runLog = tonumber(v) ~= 0
 	elseif k == "dumpend" then dumpEnd = tonumber(v) ~= 0
 	elseif k == "oracle" then oracleOn = tonumber(v) ~= 0
+	elseif k == "exercise" then exercise = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
 	elseif k == "watch" then watchPid[tonumber(v)] = true
@@ -406,6 +417,7 @@ local lastRegs, seenErr = nil, {}
 function __LPH_STEP(pid, loop, pc, regs, names, ...)
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
+	if stepCount > budgetAt then error("__LPH_BUDGET", 0) end
 	if tbPid == pid then
 		tbPid = nil
 		ewrite("[traceback] first instruction of proto " .. pid .. " (step " .. stepCount .. ")\n" .. debug.traceback() .. "\n")
@@ -625,8 +637,23 @@ function __LPH_CLOS(names, n, ...)
 	return fn
 end
 
+local regList = {}         -- every VM closure made, in order (exercise=1 calls the payload's)
 function __LPH_REG(pid, fn)
 	protoOfFn[fn] = pid
+	if exercise and protos[pid] and protos[1] and protos[pid].interp ~= protos[1].interp then
+		-- fn binds upvalues and returns the callable closure: remember every closure it makes
+		-- (payload only: the bootstrap counts the frames of its own calls)
+		local bind = fn
+		fn = function(...)
+			local closure = bind(...)
+			if type(closure) == "function" then
+				protoOfFn[closure] = pid
+				regList[#regList + 1] = closure
+			end
+			return closure
+		end
+		protoOfFn[fn] = pid
+	end
 	return fn
 end
 
@@ -650,6 +677,7 @@ _G.__LPH_CLIKE = clike
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
 mockRef = mock
+if scriptPath then mock.placeScript(scriptPath) end
 mock.onHttp = function(method, url)
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
 	return httpReply or ""
@@ -1138,7 +1166,39 @@ envTable = sandbox
 -- how much of either stack is left.  A CLI built with luau_cli.patch runs the function this script
 -- returns as the main function of a fresh top-level thread; a stock CLI gets a plain call, one
 -- frame deeper than the real thing.
+-- Code decrypts itself as it runs, so functions nobody called (handlers, the API of a module)
+-- stay ciphertext.  Call each closure of the payload once, on a thread of its own, with permissive
+-- stand-in arguments and an instruction budget; closures made along the way are called too.
+local function exercisePayload()
+	if not protos[1] then return end
+	local boot = protos[1].interp
+	local calls, i = 0, 1
+	local called = {}
+	local before = stepCount
+	while i <= #regList and calls < 4000 do
+		local fn = regList[i]
+		i += 1
+		local rec = protos[protoOfFn[fn]]
+		if rec and rec.interp ~= boot and not called[fn] then
+			called[fn] = true
+			calls += 1
+			local args = {}
+			for j = 1, 8 do args[j] = mockRef.stub("arg" .. j) end
+			budgetAt = stepCount + 200000
+			local co = coroutine.create(fn)
+			local _, okr, errr = pcall(coroutine.resume, co, unpack(args))
+			if not okr and calls <= 400 then ewrite("[exercise] proto " .. protoOfFn[fn] .. ": " .. string.sub(tostring(errr), 1, 160) .. "\n") end
+		end
+	end
+	budgetAt = math.huge
+	ewrite("[exercise] called " .. calls .. " payload closures, " .. (stepCount - before) .. " more instructions\n")
+end
+
 function __LPH_AFTER(ok, message)
+	if exercise and not aborted then
+		local okx, errx = pcall(exercisePayload)
+		if not okx then ewrite("[exercise] stopped: " .. tostring(errx) .. "\n") end
+	end
 	if oracleOn then
 		ewrite("[oracle] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. stepCount .. " instructions\n")
