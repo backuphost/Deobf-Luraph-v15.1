@@ -349,8 +349,19 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "watch" then watchPid[tonumber(v)] = true
 	elseif k == "watchlive" then watchLive = tonumber(v) ~= 0
 	elseif k == "httpreply" then httpReply = v
+	elseif k == "calls" then
+		-- calls=1: log every call of a mocked Roblox / executor function (diagnosis)
+		local n = 0
+		_G.__LPH_CALLLOG = function(name, ...)
+			if name == "GetComponents" then return end
+			n += 1
+			if n > 20000 then return end
+			local a = table.pack(...)
+			for i = 1, math.min(a.n, 4) do a[i] = type(a[i]) == "string" and string.format("%q", string.sub(a[i], 1, 80)) or tostring(a[i]) end
+			ewrite("[call] " .. name .. "(" .. table.concat(a, ", ", 1, math.min(a.n, 4)) .. ")\n")
+		end
 	elseif k == "mfpdelta" then mfpDelta = tonumber(v)
-	elseif k == "globals" then showGlobals = tonumber(v) ~= 0
+	elseif k == "globals" then showGlobals = tonumber(v) > 0 and tonumber(v)
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
 if oracleOn then traceMode = true end
@@ -1238,6 +1249,23 @@ populateSandbox()
 for k, v in pairs(sandbox) do baseGlobals[k] = v end
 setfenv(fn, sandbox)
 envTable = sandbox
+if showGlobals == 2 then
+	-- globals=2: the script sees a logging proxy (detectable; for diagnosis only)
+	local real, seen = sandbox, {}
+	local proxy = setmetatable({}, {
+		__index = function(_, k)
+			local v = real[k]
+			if not seen[k] then seen[k] = true; ewrite("[gread] " .. tostring(k) .. " -> " .. type(v) .. "\n") end
+			return v
+		end,
+		__newindex = function(_, k, v)
+			ewrite("[gwrite] " .. tostring(k) .. " = " .. type(v) .. " " .. brief(v) .. "\n")
+			real[k] = v
+		end,
+	})
+	setfenv(fn, proxy)
+	envTable = proxy
+end
 -- Run at the call depth of an ordinary script thread (Lua frames and C calls alike): scripts probe
 -- how much of either stack is left.  A CLI built with luau_cli.patch runs the function this script
 -- returns as the main function of a fresh top-level thread; a stock CLI gets a plain call, one
