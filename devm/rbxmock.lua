@@ -1415,12 +1415,18 @@ return function(G, fnames, libnames)
 	end)
 	M.typeNames = typeNames
 
-	-- Executor-specific globals probed by some scripts to fingerprint the host environment.
-	-- Providing passthrough stubs prevents nil-call crashes while keeping the analysis running.
-	-- math_floor_precision: ZekeHub executor precision helper used in key-derivation routines.
-	M.math_floor_precision = named("math_floor_precision", function(v, p)
-		local factor = 10 ^ (p or 0)
-		return math.floor(v * factor + 0.5) / factor
+	-- math_floor_precision: not a Roblox or executor global.  The ZekeHub/Luarmor build
+	-- (loadstring6) reads it from the environment, so an earlier loader stage must define it, and
+	-- pushes (math_floor_precision(seed) - expected(seed)) % 2^24 into its key six times, with a
+	-- seed that differs from run to run (iteration order of fresh tables used as keys).  The key
+	-- is only stable if the real function equals the script's own keyed permutation of the seed
+	-- plus a constant; that function is not in the file.  This stand-in returns its argument, so
+	-- the key comes out wrong and the payload does not decrypt; every call is reported.
+	M.mfpCalls = 0
+	M.math_floor_precision = named("math_floor_precision", function(v)
+		M.mfpCalls += 1
+		if M.onMfp then M.onMfp(M.mfpCalls, v) end
+		return v
 	end)
 
 	return M

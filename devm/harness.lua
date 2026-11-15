@@ -246,6 +246,7 @@ local mockRef = nil
 -- numbers held by registers and interpreter locals on entry that were the same on every visit.
 -- The lifter uses them to resolve self-decrypting instructions whose key is computed at run time.
 local oracleOn = false
+local watchLive = false
 local watchPid, watchRegs, watchN, watchLog = {}, nil, 0, {}   -- watch=<pid>: remember the arguments of its last calls
 local extraDepth = 0
 local cGlobals = nil        -- environment of C functions as seen by getfenv(level)
@@ -343,6 +344,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
 	elseif k == "watch" then watchPid[tonumber(v)] = true
+	elseif k == "watchlive" then watchLive = tonumber(v) ~= 0
 	elseif k == "httpreply" then httpReply = v
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
@@ -445,6 +447,13 @@ function __LPH_STEP(pid, loop, pc, regs, names, ...)
 				if v ~= nil then parts[#parts + 1] = "R" .. i .. "=" .. brief(v) end
 			end
 			watchLog[#watchLog + 1] = "pid " .. pid .. " step " .. stepCount .. ": " .. table.concat(parts, " ")
+			if watchLive then
+				-- watchlive=1: print every watched call as it happens, strings in full
+				for i = 0, 60 do
+					local v = rawget(regs, i)
+					if type(v) == "string" then ewrite("[watch] step " .. stepCount .. " R" .. i .. " #" .. #v .. " " .. string.format("%q", v) .. "\n") end
+				end
+			end
 			if #watchLog > 6 then table.remove(watchLog, 1) end
 		end
 	end
@@ -701,6 +710,9 @@ local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(
 mockRef = mock
 if scriptPath then mock.placeScript(scriptPath) end
 mock.serverSide = serverSide
+mock.onMfp = function(i, v)
+	if i == 1 then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it\n") end
+end
 mock.onHttp = function(method, url)
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
 	return httpReply or ""
@@ -856,8 +868,11 @@ do
 	end
 	local u = {}
 	for k, v in pairs(utf8) do u[k] = v end
-	u.nfdnormalize = function(s) return enc(nfd(s)) end
+	-- insertion order fixes the iteration order of the table, which scripts hash: the same order
+	-- as the reference environment (graphemes, nfcnormalize, nfdnormalize after the built-ins)
+	u.graphemes = true
 	u.nfcnormalize = function(s) return enc(nfc(s)) end
+	u.nfdnormalize = function(s) return enc(nfd(s)) end
 	-- utf8.graphemes(s, i, j): stateful iterator over (first byte, last byte) of each grapheme cluster;
 	-- a cluster is approximated as a starter followed by combining marks / joiners
 	u.graphemes = function(s, i, j)

@@ -116,7 +116,7 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=False):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
@@ -133,11 +133,12 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False):
     # in debug.info must all agree), so the copy that is executed is always laid out as one line,
     # also when the input is a decompiler's multi-line rendering of the bytecode.
     stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
+    stage.force_root = root
     if stage.model.factory_style:
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
         # code decrypts itself too.
-        stage.harness_options = ['exercise=1'] + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else [])
+        stage.harness_options = ['exercise=1'] + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['executor=1'] if executor else [])
         text = stage.run_traced()
         # Paths that never ran keep encrypted instructions and constants.  Execute each lifted
         # instruction that did not run once, from the interpreter state the lifter found for it,
@@ -179,13 +180,16 @@ def main(argv=None):
     ap.add_argument('input')
     ap.add_argument('-o', '--output')
     ap.add_argument('--work', default=None, help='directory for intermediate files')
+    ap.add_argument('--http-reply', default=None, help='what game:HttpGet returns (scripts that mix a server reply into their key)')
+    ap.add_argument('--executor', action='store_true', help='provide executor globals (identifyexecutor, iscclosure, islclosure)')
+    ap.add_argument('--root', type=int, default=None, help='proto number to lift from (1 = the first program)')
     ap.add_argument('--script-path', default=None,
                     help='where the script sits in the game, e.g. ReplicatedStorage.Packages.Net.init '
                          '(scripts check their own GetFullName())')
     ap.add_argument('--server', action='store_true', help='analyse the script as server code (RunService:IsServer() is true)')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
-    text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server)
+    text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor)
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
     with open(out, 'w', encoding='utf-8') as f:
         f.write(text)

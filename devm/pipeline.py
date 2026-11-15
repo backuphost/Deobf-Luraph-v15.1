@@ -68,6 +68,11 @@ def _run_traced(self):
     root = self.lifter.root_key
     boot = self.lifter.records[root - 1][0]
     payload = [i + 1 for i, (idx, _) in enumerate(self.lifter.records) if idx != boot]
+    # --root overrides: in some builds the other interpreter only runs a helper of the build (a
+    # keystream routine) and the script is the first program after all.
+    forced = getattr(self, 'force_root', None)
+    if forced:
+        payload = [forced] if forced != root else []
     self.payload_root = payload[0] if payload else None
     if payload:
         root = payload[0]
