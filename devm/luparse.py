@@ -22,7 +22,7 @@ import re
 
 
 class Func:
-    __slots__ = ('params', 'vararg', 'body', 'line', 'body_pos', 'end_line', 'id', 'kw_pos', 'end_pos')
+    __slots__ = ('params', 'vararg', 'body', 'line', 'body_pos', 'end_line', 'id', 'kw_pos', 'end_pos', 'name_stmt')
     _n = 0
 
     def __init__(self, params, vararg, body, line, body_pos, end_line):
@@ -32,6 +32,7 @@ class Func:
         self.line = line
         self.body_pos = body_pos
         self.end_line = end_line
+        self.name_stmt = None     # NAME when declared as `local function NAME`
         Func._n += 1
         self.id = Func._n
 
@@ -264,7 +265,9 @@ class Parser:
                 self.next()
                 if self.accept('kw', 'function'):
                     name = self.expect('name')[1]
-                    return ('localfunc', name, self.funcbody(t[2]))
+                    f = self.funcbody(t[2])
+                    f.name_stmt = name
+                    return ('localfunc', name, f)
                 names = []
                 while True:
                     names.append(self.expect('name')[1])
