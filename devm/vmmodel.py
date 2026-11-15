@@ -1,6 +1,7 @@
 """Locate the Luraph interpreter inside a (decompiled) script and patch in dump hooks."""
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -23,6 +24,18 @@ def is_dispatch_loop(st):
     if e[0] != 'index' or e[1][0] != 'name' or e[2][0] != 'name':
         return False
     return body[1][0] == 'if'
+
+
+CELL_RE = re.compile(r'\b(\w+)\[(\d+)\]\[(\w+)\[(\d+)\]\]')
+
+
+class Interp:
+    """One interpreter closure: its enclosing functions, dispatch loops and visible names."""
+    func = None
+    chain = None
+    loops = None
+    visible = None
+    index = 0
 
 
 class Model:
@@ -135,18 +148,55 @@ class Model:
             f = chain[-1]
             return f.end_line - f.line
 
-        chain, loops = max(best.values(), key=size)
-        # the VM closure is the innermost vararg function around the dispatch loop
-        while len(chain) > 1 and not chain[-1].vararg:
-            chain = chain[:-1]
-        self.chain = chain
-        self.interp = chain[-1]
-        self.loops = loops
-        self.visible = self._visible_names()
+        # The VM closure is the outermost vararg function around a dispatch loop (newer builds run
+        # the loop inside a nested protected-call closure). A script can contain several
+        # interpreters; group the loops per interpreter.
+        groups = {}
+        for chain, loops in best.values():
+            cut = None
+            for i, f in enumerate(chain):
+                if f.vararg:
+                    cut = i
+                    break
+            if cut is None:
+                continue
+            chain = chain[:cut + 1]
+            g = groups.setdefault(chain[-1].id, (chain, []))
+            g[1].extend(loops)
+        if not groups:
+            raise RuntimeError('no Luraph interpreter closure found')
+        self.interps = []
+        for chain, loops in sorted(groups.values(), key=lambda g: g[0][-1].line):
+            it = Interp()
+            it.chain = chain
+            it.func = chain[-1]
+            it.loops = loops
+            it.index = len(self.interps)
+            it.visible = self._visible_names(it.func)
+            self.interps.append(it)
+        main = max(self.interps, key=lambda it: it.func.end_line - it.func.line)
+        self.chain = main.chain
+        self.interp = main.func
+        self.visible = main.visible
+        self.loops = [l for it in self.interps for l in it.loops]
+        self.interp_funcs = {id(it.func): it for it in self.interps}
+        self.cells = self._cell_layout()
 
-    def _visible_names(self):
+    def _cell_layout(self):
+        """(box key, slot key) of upvalue cells: the interpreter reads them as cell[a][cell[b]]."""
+        counts = {}
+        for it in self.interps:
+            for m in CELL_RE.finditer(self.src, it.func.body_pos, it.func.end_pos):
+                if m.group(1) == m.group(3):
+                    k = (int(m.group(2)), int(m.group(4)))
+                    counts[k] = counts.get(k, 0) + 1
+        if not counts:
+            return (1, 3)
+        return max(counts, key=counts.get)
+
+    def _visible_names(self, target=None):
         """Names in scope where the interpreter closure is defined."""
-        target = self.interp
+        target = target or self.interp
         found = []
 
         def walk_block(block, scope):
@@ -247,24 +297,34 @@ class Model:
         return len([p for p in parent.params if p != '_']) == 2 and parent.body and parent.body[-1][0] == 'return' \
             and parent.body[-1][1] and parent.body[-1][1][0][0] == 'func' and parent.body[-1][1][0][1] is self.interp
 
+    def _mid_is_statement(self, mid):
+        """True when the middle closure is declared with `local function`."""
+        return self.src[mid.kw_pos - 6:mid.kw_pos].strip() == 'local' or \
+            self.src[max(0, mid.kw_pos - 16):mid.kw_pos].rstrip().endswith('local')
+
     def patched_source(self):
         src = self.src
         edits = []   # (pos, text)
-        names = self.visible
-        lst = '{' + ','.join('"%s"' % n for n in names) + '}'
         if self.factory_style:
-            outer = self.chain[-3]
-            mid = self.chain[-2]
-            oparams = [p for p in outer.params if p != '_']
-            olst = '{' + ','.join('"%s"' % n for n in oparams) + '}'
-            edits.append((outer.body_pos, 'local __pid = __LPH_PROTO(%s,%d,%s);' % (olst, len(oparams), ','.join(oparams))))
-            # wrap the mid closure expression
-            start = mid.kw_pos
-            end = mid.end_pos
-            edits.append((start, '__LPH_REG(__pid,'))
-            edits.append((end, ')'))
-            edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
+            for it in self.interps:
+                outer, mid = it.chain[-3], it.chain[-2]
+                names = it.visible + ['__pid']
+                lst = '{' + ','.join('"%s"' % n for n in names) + '}'
+                oparams = [p for p in outer.params if p != '_']
+                olst = '{' + ','.join('"%s"' % n for n in oparams) + '}'
+                edits.append((outer.body_pos, 'local __pid = __LPH_PROTO(%d,%s,%d,%s);' % (
+                    it.index, olst, len(oparams), ','.join(oparams))))
+                if mid.name_stmt:
+                    # `local function NAME(...) ... end`: register right after the declaration
+                    edits.append((mid.end_pos, ' __LPH_REG(__pid,%s);' % mid.name_stmt))
+                else:
+                    edits.append((mid.kw_pos, '__LPH_REG(__pid,'))
+                    edits.append((mid.end_pos, ')'))
+                edits.append((it.func.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
+                    lst, len(names), ','.join(names))))
         else:
+            names = self.visible
+            lst = '{' + ','.join('"%s"' % n for n in names) + '}'
             edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         edits.sort(key=lambda x: -x[0])
         for pos, text in edits:

@@ -232,13 +232,13 @@ function __LPH_RUN(names, n, ...)
 end
 
 -- factory-style VMs: record every proto instantiation
-function __LPH_PROTO(names, n, ...)
+function __LPH_PROTO(interp, names, n, ...)
 	local vals = { ... }
 	local env = {}
 	for i = 1, n do
 		env[names[i]] = vals[i]
 	end
-	protos[#protos + 1] = env
+	protos[#protos + 1] = { interp = interp, vars = env }
 	return #protos
 end
 

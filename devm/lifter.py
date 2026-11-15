@@ -6,8 +6,13 @@ from .pe import (PE, Scope, LFn, LuaTable, MultiTail, Sym, LinSym, NeedFork, For
                  REGS, UPVALS)
 
 
+def ircfg_cells(cells):
+    from . import ircfg
+    ircfg.CELLS = cells
+
+
 class Node:
-    __slots__ = ('key', 'tree', 'exposed', 'written', 'snap_in', 'error')
+    __slots__ = ('key', 'tree', 'exposed', 'written', 'snap_in', 'error', 'kreads')
 
     def __init__(self, key):
         self.key = key
@@ -16,6 +21,7 @@ class Node:
         self.written = set()
         self.snap_in = None
         self.error = None
+        self.kreads = set()
 
 
 class ProtoIR:
@@ -26,6 +32,23 @@ class ProtoIR:
         self.children = []
         self.conflicts = []
         self.errors = []
+
+
+CAP = '__captured__'      # key in a known-register map: registers captured by reference
+
+
+def same_const(a, b):
+    if a is b:
+        return True
+    if type(a) != type(b) and not (P.is_num(a) and P.is_num(b)):
+        return False
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if P.is_num(a):
+        return a == b
+    if isinstance(a, P.ConstFn):
+        return a.k == b.k and a.value == b.value
+    return False
 
 
 def same_value(a, b):
@@ -48,12 +71,14 @@ class Lifter:
     def __init__(self, model, dump, log=None):
         self.model = model
         self.dump = dump
+        ircfg_cells(model.cells)
         self.pe = PE(model, dump)
         self.log = log or (lambda *a: None)
         self.protos = {}
         self.queue = []
         self.proto_objs = {}
         self.pe.on_closure = self.on_closure
+        self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
 
     # ---- proto instantiation (family specific)
     def on_closure(self, proto):
@@ -119,18 +144,29 @@ class Lifter:
             stmts, term = tree
             known = dict(known)
             for st in stmts:
+                if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
+                    refs = {c[1] for c in st[2][2] if c[0] == 'ref' and not isinstance(c[1], tuple)}
+                    if refs:
+                        known[CAP] = known.get(CAP, frozenset()) | refs
+                        for r in refs:
+                            known.pop(r, None)
+                if st[0] == 'call' and any(a == ('regs',) for a in st[3]):
+                    # the register array itself escaped into a call: anything may have changed
+                    known = {CAP: known[CAP]} if CAP in known else {}
+                if st[0] == 'set' and st[1][0] == 'r' and st[1][1] in known.get(CAP, ()):
+                    continue
                 if st[0] == 'set' and st[1][0] == 'r':
                     e = st[2]
                     if e[0] == 'outer' and e[1] in by_path:
                         known[st[1][1]] = by_path[e[1]]
-                    elif e[0] == 'k' and isinstance(e[1], P.KNum):
+                    elif e[0] == 'k' and (P.is_num(e[1]) or isinstance(e[1], bool)):
                         known[st[1][1]] = e[1]
                     elif e[0] == 'constfn':
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
                     else:
                         known.pop(st[1][1], None)
                 elif st[0] == 'setmulti':
-                    for n in [n for n in known if not isinstance(n, int) or n >= st[1]]:
+                    for n in [n for n in known if n != CAP and (not isinstance(n, int) or n >= st[1])]:
                         del known[n]
             if term[0] == 'br':
                 walk(term[2], known)
@@ -148,7 +184,20 @@ class Lifter:
         return out
 
     def run_node(self, interp, key, snap):
-        prefix = 'L%dP%d' % key if key[0] else 'P%d' % key[1]
+        tn = os.environ.get('DEVM_TRACE_NODE')
+        if tn and tn == '%s,%s' % key[:2]:
+            self.pe.trace = []
+            try:
+                return self.run_node_(interp, key, snap)
+            finally:
+                print('TRACE NODE', key)
+                for t in self.pe.trace[-int(os.environ.get('DEVM_TRACE_N', '40')):]:
+                    print('   ', t[:int(os.environ.get('DEVM_TRACE_W', '260'))])
+                self.pe.trace = None
+        return self.run_node_(interp, key, snap)
+
+    def run_node_(self, interp, key, snap):
+        prefix = ('L%dP%d' % key[:2] if key[0] else 'P%d' % key[1]) + ('' if len(key) == 2 else 'v%s' % (key[2],))
         paths = []
         todo = [[]]
         exposed, written = set(), set()
@@ -224,28 +273,93 @@ class Lifter:
     def lift_proto(self, key):
         pir = ProtoIR(key)
         self.pe.keyfn_used = pir.keyfns = set()
+        indirect = {}       # (loop, pc) of a jump-through-register instruction -> register
         interp = self.instantiate(key)
         _, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
         if end[0] != 'goto':
             raise PEError('interpreter returned before reaching dispatch loop')
         entry, snap = end[1], end[2]
         pir.entry = entry
-        work = [(entry, snap, {})]
+        work = [(entry, snap, {}, None, None)]
+        node_in = {}
+        relifts = {}
+        self.pe.use_numknown = self.constprop
         nq0 = len(self.queue)
         while work:
-            key2, snap, known = work.pop()
+            key2, snap, known, pred, pend = work.pop()
+            if key2 in pir.nodes and self.constprop and len(key2) == 2:
+                # a pure jump whose target comes out of a register is a trampoline shared by many
+                # jump sites: keep one copy per target instead of merging the register away
+                node = pir.nodes[key2]
+                r = indirect.get(key2)
+                if r is None and not node.tree[0] and node.tree[1][0] == 'goto' and len(node.kreads) == 1:
+                    r = next(iter(node.kreads))
+                    if P.is_num(node_in[key2].get(r)):
+                        indirect[key2] = r
+                    else:
+                        r = None
+                if r is not None and P.is_num(known.get(r)) and not same_const(known[r], node_in[key2].get(r)):
+                    key2 = key2 + (known[r],)
+                    if pred is not None:
+                        pred.tree = retarget_tree(pred.tree, {id(pend): key2})
             if key2 in pir.nodes:
                 node = pir.nodes[key2]
-                for name, v in node.snap_in.items():
-                    if name in snap and not same_value(v, snap[name]):
-                        pir.conflicts.append((key2, name, v, snap[name]))
-                continue
+                if self.constprop:
+                    # constant propagation: a register is only "known" at an instruction if every
+                    # path agrees on it; when a later path disagrees the instruction is re-lifted
+                    old = node_in[key2]
+                    meet = {r: v for r, v in old.items()
+                            if r != CAP and r in known and same_const(known[r], v)}
+                    cap = old.get(CAP, frozenset()) | known.get(CAP, frozenset())
+                    for r in cap:
+                        meet.pop(r, None)
+                    if cap:
+                        meet[CAP] = cap
+                    if len(meet) == len(old) and meet.get(CAP) == old.get(CAP):
+                        continue
+                    known = meet
+                    snap = node.snap_in
+                    relifts[key2] = relifts.get(key2, 0) + 1
+                    if relifts[key2] > 60:
+                        continue
+                    del pir.nodes[key2]
+                else:
+                    for name, v in node.snap_in.items():
+                        if name in snap and not same_value(v, snap[name]):
+                            pir.conflicts.append((key2, name, v, snap[name]))
+                    continue
+            node_in[key2] = known
             node = Node(key2)
             node.snap_in = snap
             pir.nodes[key2] = node
             self.pe.regknown = known
+            self.pe.known_reads = node.kreads = set()
             try:
-                node.tree, node.exposed, node.written = self.run_node(interp, key2, snap)
+                # an instruction may decrypt/rewrite itself and ask to be executed again
+                retried = False
+                for _ in range(8):
+                    w0 = self.pe.model_writes
+                    node.tree, node.exposed, node.written = self.run_node(interp, key2, snap)
+                    stmts, term = node.tree
+                    if any(e[0] == 'goto' and not isinstance(e[1][1], int) for e in tree_ends(node.tree)) \
+                            and not retried:
+                        retried = True
+                        # jump through a register (Luraph routes many jumps through one trampoline
+                        # instruction): retry with the constants known to be in registers, and from
+                        # now on keep one copy of this instruction per jump target
+                        regs = {s[2][1] for s in node.tree[0] if s[0] == 'set' and s[2][0] == 'r'}
+                        self.pe.use_numknown = True
+                        try:
+                            node.tree, node.exposed, node.written = self.run_node(interp, key2[:2], snap)
+                        finally:
+                            self.pe.use_numknown = self.constprop
+                        stmts, term = node.tree
+                        if len(regs) == 1:
+                            indirect[key2[:2]] = next(iter(regs))
+                    if not (term[0] == 'goto' and term[1] == key2 and not stmts and self.pe.model_writes != w0):
+                        break
+                    snap = term[2]
+                    node.snap_in = snap
             except PEError as e:
                 if os.environ.get('DEVM_TRACE_ERR'):
                     print('PEERR', key, key2, e, {k: (v.path if hasattr(v, 'path') else v) for k, v in known.items()})
@@ -254,9 +368,42 @@ class Lifter:
                 node.tree = ([('error', str(e))], ('ret', [], None))
                 pir.errors.append((key2, str(e)))
                 continue
-            for end, kn in self.known_after(node.tree, known):
-                work.append((end[1], end[2], kn))
+            bad = [end for end, kn in self.known_after(node.tree, known) if not isinstance(end[1][1], int)]
+            if bad:
+                if os.environ.get('DEVM_TRACE_ERR'):
+                    print('SYMBOLIC PC at', key, key2, bad[0][1], 'IR', node.tree[0][-6:])
+                node.error = 'jump to a run-time computed instruction'
+                node.tree = (list(node.tree[0]) + [('error', node.error)], ('ret', [], None))
+                pir.errors.append((key2, node.error))
+                continue
+            ends = self.known_after(node.tree, known)
+            if any(end[1] in indirect for end, kn in ends):
+                # specialise jumps into a trampoline by the value it will jump through
+                special = {}
+                for end, kn in ends:
+                    r = indirect.get(end[1])
+                    if r is not None and P.is_num(kn.get(r)):
+                        special[id(end)] = end[1] + (kn[r],)
+                node.tree = retarget_tree(node.tree, special)
+                ends = self.known_after(node.tree, known)
+            for end, kn in ends:
+                work.append((end[1], end[2], kn, node, end))
         self.pe.regknown = {}
+        self.pe.use_numknown = False
+        if self.constprop:
+            # drop instructions that were only reachable under assumptions later withdrawn
+            seen = set()
+            stack = [pir.entry]
+            while stack:
+                k = stack.pop()
+                if k in seen or k not in pir.nodes:
+                    continue
+                seen.add(k)
+                for e in tree_ends(pir.nodes[k].tree):
+                    if e[0] == 'goto':
+                        stack.append(e[1])
+            pir.nodes = {k: n for k, n in pir.nodes.items() if k in seen}
+            pir.errors = [(k, n.error) for k, n in pir.nodes.items() if n.error]
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
         return pir
@@ -293,6 +440,18 @@ class Lifter:
             done.add(k)
             self.protos[k] = self.lift_proto(k)
         return self.protos
+
+
+def retarget_tree(tree, special):
+    """Copy of an instruction tree with selected goto terminators (by identity) pointing elsewhere."""
+    stmts, term = tree
+    if term[0] == 'br':
+        return (stmts, ('br', term[1], retarget_tree(term[2], special), retarget_tree(term[3], special)))
+    if term[0] == 'forbr':
+        return (stmts, ('forbr', term[1], term[2], retarget_tree(term[3], special), retarget_tree(term[4], special)))
+    if term[0] == 'goto' and id(term) in special:
+        return (stmts, ('goto', special[id(term)], term[2]))
+    return tree
 
 
 def tree_ends(tree):
@@ -366,4 +525,69 @@ class TableProtoLifter(Lifter):
         r = pe.exec_block(self.wrap.body, sc)
         if not r or r[0] != 'return' or not isinstance(r[1][0], LFn):
             raise PEError('wrap did not return the interpreter closure')
+        return r[1][0]
+
+
+class FactoryLifter(Lifter):
+    """Family 2: factory(self, code arrays..., ...) -> wrap(upvalues) -> function(...).
+
+    Every proto is turned into a closure factory while the bytecode is deserialized; the harness
+    records the arguments of each factory call (see __LPH_PROTO), a proto is identified by that
+    record's index.
+    """
+
+    def __init__(self, model, dump, log=None):
+        super().__init__(model, dump, log)
+        self.records = dump.proto_records()
+        self.constprop = True
+        root = dump.root_vars()
+        self.root_key = root['__pid']
+        for it in model.interps:
+            # program data = everything reachable from the factory arguments except `self`
+            pass
+        # loader state lives in the VM's own table (first factory parameter)
+        for idx, env in self.records:
+            it = model.interps[idx]
+            first = [p for p in it.chain[-3].params if p != '_'][0]
+            v = env.get(first)
+            if isinstance(v, LuaTable) and v.path:
+                self.pe.volatile.add(v.path)
+
+    def proto_key(self, proto):
+        if isinstance(proto, P.ProtoRef):
+            return proto.pid
+        raise PEError('unknown proto object %r' % (proto,))
+
+    def register(self, key):
+        pass
+
+    def instantiate(self, key):
+        idx, env = self.records[key - 1]
+        it = self.model.interps[idx]
+        outer, mid = it.chain[-3], it.chain[-2]
+        pe = self.pe
+        pe.set_interp(it)
+        pe.seeking = False
+        pe.perm = None
+        pe.ir = []
+        pe.wrap_func = None
+        sc = Scope()
+        for p in outer.params:
+            if p != '_':
+                sc.vars[p] = env.get(p)
+        sc.vars['__pid'] = key
+        r = pe.exec_block(outer.body, sc)
+        if not r or r[0] != 'return' or not isinstance(r[1][0], LFn) or r[1][0].func is not mid:
+            raise PEError('factory did not return the wrapper closure')
+        midfn = r[1][0]
+        sc2 = Scope(midfn.scope)
+        first = True
+        for p in mid.params:
+            if p == '_':
+                continue
+            sc2.vars[p] = UPVALS if first else None
+            first = False
+        r = pe.exec_block(mid.body, sc2)
+        if not r or r[0] != 'return' or not isinstance(r[1][0], LFn):
+            raise PEError('wrapper did not return the interpreter closure')
         return r[1][0]

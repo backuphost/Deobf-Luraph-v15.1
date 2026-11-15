@@ -6,6 +6,7 @@ PURE_LEAF = ('k', 'kfn', 'env', 'opaque', 'regs', 'arg', 'varargn', 'nargs', 'va
 
 
 import os
+CELLS = (1, 3)        # upvalue cell layout of the VM being lifted (set by the lifter)
 DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
 
 
@@ -645,17 +646,19 @@ class ProtoCFG:
 
     def _open_upcells(self):
         """cell[1][cell[3]] (an upvalue cell opened by generic table instructions) -> the upvalue."""
+        box, slot = CELLS
+
         def is_part(e, k):
             return e[0] == 'index' and e[1][0] == 'upcell' and e[2] == ('k', k)
 
         def fix(e):
-            if e[0] == 'index' and is_part(e[1], 1) and is_part(e[2], 3) and e[1][1] == e[2][1]:
+            if e[0] == 'index' and is_part(e[1], box) and is_part(e[2], slot) and e[1][1] == e[2][1]:
                 return ('up', e[1][1][1])
             return e
 
         def fix_stmt(st):
             st = map_stmt(st, fix)
-            if st[0] == 'setindex' and is_part(st[1], 1) and is_part(st[2], 3) and st[1][1] == st[2][1]:
+            if st[0] == 'setindex' and is_part(st[1], box) and is_part(st[2], slot) and st[1][1] == st[2][1]:
                 return ('set', ('up', st[1][1][1]), st[3])
             return st
 

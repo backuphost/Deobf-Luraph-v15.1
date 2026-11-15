@@ -550,8 +550,13 @@ class Dump:
         vt = [x for k, x in raw['hash'] if bytes.fromhex(k['s']) == b'vars'][0]
         return self.table(vt['t'], '__LPH_ENV').h
 
-    def proto_envs(self):
-        return [self.conv(p).h for p in self.data['protos']]
+    def proto_records(self):
+        """[(interpreter index, {factory parameter: value})] for factory-style VMs, 1-based pid order."""
+        out = []
+        for i, p in enumerate(self.data['protos']):
+            rec = self.conv(p, '__LPH_PROTOS[%d]' % (i + 1)).h
+            out.append((rec.get('interp'), rec['vars'].h if isinstance(rec.get('vars'), LuaTable) else {}))
+        return out
 
 
 # ------------------------------------------------------------------ evaluator
@@ -574,7 +579,8 @@ class PE:
         self.inject = None          # (loop_idx, snapshot)
         self.seeking = False
         self.interp_scope = None
-        self.fvars, self.fstack, self.openups = self._classify_state_vars()
+        self.state_sets = {it.index: self._classify_state_vars(it.loops) for it in model.interps}
+        self.set_interp(model.interp_funcs[id(model.interp)])
         self.events = []
         self.wrap_func = None
         self.on_closure = None
@@ -591,6 +597,9 @@ class PE:
         self.regknown = {}
         self.nregs = None
         self.keyfn_override = {}
+        self.known_reads = set()
+        self.use_numknown = False
+        self.model_writes = 0
         self.keyfn_used = set()
         self.volatile = set()       # paths of loader-state tables whose scalar fields change at run time
         for l in model.loops:
@@ -654,10 +663,16 @@ class PE:
                 for e in st[1]:
                     walk_expr(e, p2)
 
-        walk_block(self.model.interp.body, [])
+        for it in self.model.interps:
+            walk_block(it.func.body, [])
         return res
 
-    def _classify_state_vars(self):
+    def set_interp(self, it):
+        """Select which interpreter's variable classification applies (names clash between interpreters)."""
+        self.cur_interp = it
+        self.fvars, self.fstack, self.openups = self.state_sets[it.index]
+
+    def _classify_state_vars(self, loops):
         """Find interpreter-level locals used as for-loop state / open-upvalue map."""
         fvars = set()
         fstack = set()
@@ -681,7 +696,7 @@ class PE:
             for sub in substmts(st):
                 visit(sub)
 
-        for l in self.model.loops:
+        for l in loops:
             for st in l[2]:
                 visit(st)
         return fvars, fstack, openups
@@ -751,9 +766,12 @@ class PE:
     def read_reg(self, n):
         self.check_reg(n)
         t = self.regknown.get(n)
-        if t is not None:
+        if t is not None and n != '__captured__' and (self.use_numknown or isinstance(t, KNum) or
+                                                      not (is_num(t) or isinstance(t, bool))):
             # the register is known to hold one of the program's own code/constant arrays
-            # (self-modifying code): keep it concrete so the patch can be applied to the model
+            # (self-modifying code): keep it concrete so the patch can be applied to the model.
+            # Plain numbers are only used to resolve jumps through a register (use_numknown).
+            self.known_reads.add(n)
             return t
         return self.emit_expr(('r', n), ('r', n))
 
@@ -866,8 +884,8 @@ class PE:
         if t == 'ifexpr':
             c = self.eval1(e[1], scope)
             if isinstance(c, Sym):
-                # vararg count clamp: if (nargs - k) < 0 then -1 else (nargs - k)
-                raise PEError('symbolic if-expression')
+                # decided like a branch: the instruction is lifted once per outcome
+                return self.eval1(e[2], scope) if self.cond(c) else self.eval1(e[3], scope)
             if isinstance(c, tuple) and c[0] == 'linlt0':
                 a = self.eval1(e[2], scope)
                 b = self.eval1(e[3], scope)
@@ -941,9 +959,9 @@ class PE:
             return UpRef(key)
         if isinstance(obj, UpRef):
             if keyast is not None and keyast[0] == 'num':
-                if key == 1:
+                if key == self.model.cells[0]:
                     return UpBox(obj.n)
-                if key == 3:
+                if key == self.model.cells[1]:
                     return UpKey(obj.n)
             return self.emit_expr(('index', ('upcell', obj.n), self.atom(key)))
         if isinstance(obj, UpBox):
@@ -1000,6 +1018,8 @@ class PE:
                 self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
                 self.state_writes.add((obj.path, key))
                 return
+            if not obj.fresh:
+                self.model_writes += 1
             obj.set(key, val)
             return
         if obj is REGS:
@@ -1173,6 +1193,8 @@ class PE:
             return self.call_builtin(f.name, args, want)
         if isinstance(f, LFn):
             return self.call_lfn(f, args, want)
+        if isinstance(f, ProtoRef):
+            return [self.make_closure([f] + list(args))]
         if isinstance(f, Sym):
             return self.emit_call(f.e, args, want)
         if f is FORITER or f is FSTATE:
@@ -1257,6 +1279,8 @@ class PE:
             if name in PURE and all(is_num(a) for a in args):
                 return [keyed(norm(PURE[name](*args)), *args)]
             if name in BUF and args and isinstance(args[0], Buffer):
+                if 'write' in name:
+                    self.model_writes += 1
                 return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))
@@ -1264,7 +1288,7 @@ class PE:
 
     def call_lfn(self, f, args, want):
         # the vararg packer: f(...) -> count, {...}
-        if args and isinstance(args[-1], MultiTail) and f.func is not self.model.interp and (f.func is None or f.func.vararg):
+        if args and isinstance(args[-1], MultiTail) and id(f.func) not in self.model.interp_funcs and (f.func is None or f.func.vararg):
             mid = args[-1].id
             if len(args) == 1:
                 return [LinSym(mid, 0), PackedTbl(mid) if mid != 'args' else VARARG_TBL]
@@ -1284,8 +1308,9 @@ class PE:
                 return [self.make_closure([('native', f.func.line), args[0]])]
             raise PEError('call of foreign VM closure (line %s) with %r' % (f.line, args))
         func = f.func
-        sc = Scope(f.scope, boundary=(func is self.model.interp))
-        if func is self.model.interp:
+        is_interp = id(func) in self.model.interp_funcs
+        sc = Scope(f.scope, boundary=is_interp)
+        if is_interp:
             self.interp_scope = sc
         for i, p in enumerate(func.params):
             if i < len(args) and not isinstance(args[i], MultiTail):
@@ -1334,8 +1359,8 @@ class PE:
                 n = 0
                 while n in ups.h:
                     v = ups.h[n]
-                    if isinstance(v, LuaTable) and v.h.get(1) is REGS:
-                        caps.append(('ref', v.h.get(3)))
+                    if isinstance(v, LuaTable) and v.h.get(self.model.cells[0]) is REGS:
+                        caps.append(('ref', v.h.get(self.model.cells[1])))
                     elif isinstance(v, Sym) and v.origin:
                         caps.append(('val', v.origin[1]))
                     elif isinstance(v, UpRef):
