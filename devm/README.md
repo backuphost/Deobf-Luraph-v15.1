@@ -52,8 +52,12 @@ Limits, stated plainly:
   such instructions, 5 of them in code that ran).
 * Cutting tamper branches and folding key tests relies on one run; a real `repeat ... until x == n`
   that never looped back would be cut the same way.
-* A script whose later stage is decrypted with input the harness cannot supply (loadstring6 asks a
-  server for part of its key) stops at that point: the output is the loader, not what it loads.
+* A script whose later stage is decrypted with input the harness cannot supply stops at that
+  point: the output is the loader, not what it loads. loadstring6 (a ZekeHub/Luarmor loader) mixes
+  two outside inputs into its key: the reply of `game:HttpGet(".../luarmor/precheck")`
+  (`--http-reply <value>`), and six results of a global `math_floor_precision` that neither Roblox
+  nor executors have, so an earlier loader stage must define it. All other key bytes match the
+  reference environment (`--executor`). Without that function the payload does not decrypt.
 * Functions whose control flow still comes out as thousands of lines are replaced by an
   `UNSTRUCTURED` stub.
 

@@ -560,7 +560,7 @@ def run_oracle(model, workdir, tag, options=()):
     r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] +
                        list(options), capture_output=True, text=True, errors='replace', timeout=1800)
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
-    note += [l for l in r.stderr.split('\n') if l.startswith('[http]')]
+    note += [l for l in r.stderr.split('\n') if l.startswith('[http]') or l.startswith('[env]')]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
         raise RuntimeError('oracle run failed: ' + r.stderr[-2000:])
     with open(outjson + '.oracle') as f:
