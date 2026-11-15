@@ -1,5 +1,6 @@
 """Drives the partial evaluator over every instruction of every proto -> per-proto IR graph."""
 import os
+import struct
 
 from . import pe as P
 from .pe import (PE, Scope, LFn, LuaTable, MultiTail, Sym, LinSym, NeedFork, ForOp, LoopHead, PEError,
@@ -360,7 +361,10 @@ class Lifter:
                         break
                     snap = term[2]
                     node.snap_in = snap
-            except PEError as e:
+            except (PEError, TypeError, ValueError, KeyError, IndexError, AttributeError, ZeroDivisionError,
+                    OverflowError, struct.error) as e:
+                if not isinstance(e, PEError):
+                    e = PEError('evaluator failure: %s: %s' % (type(e).__name__, e))
                 if os.environ.get('DEVM_TRACE_ERR'):
                     print('PEERR', key, key2, e, {k: (v.path if hasattr(v, 'path') else v) for k, v in known.items()})
                     print('   partial IR', self.pe.ir[-8:])

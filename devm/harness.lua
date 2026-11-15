@@ -56,6 +56,7 @@ end
 local envTable
 local enumName
 local constFns = {}
+local closEnv
 function ser(v)
 	local t = type(v)
 	if t == "nil" then return "null"
@@ -82,6 +83,9 @@ function ser(v)
 			return '{"cfn":' .. (c.value ~= nil and serNum(c.value) or "null") .. ',"k":' .. c.k .. "}"
 		end
 		if debug.info(v, "s") ~= "sample" then return '{"o":"function"}' end
+		if closEnv and closEnv[v] then
+			return '{"lfn":' .. tostring(line) .. ',"name":"' .. hex(name or "") .. '","cenv":' .. ser(closEnv[v]) .. "}"
+		end
 		return '{"lfn":' .. tostring(line) .. ',"name":"' .. hex(name or "") .. '"}'
 	elseif t == "buffer" then
 		return '{"buf":"' .. hex(buffer.tostring(v)) .. '"}'
@@ -240,6 +244,19 @@ function __LPH_PROTO(interp, names, n, ...)
 	end
 	protos[#protos + 1] = { interp = interp, vars = env }
 	return #protos
+end
+
+-- metamethod closures of the loader: remember the variables they captured
+closEnv = setmetatable({}, { __mode = "k" })
+function __LPH_CLOS(names, n, ...)
+	local vals = { ... }
+	local fn = vals[n + 1]
+	local env = {}
+	for i = 1, n do
+		env[names[i]] = vals[i]
+	end
+	closEnv[fn] = env
+	return fn
 end
 
 function __LPH_REG(pid, fn)

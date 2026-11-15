@@ -231,12 +231,13 @@ class MultiTail:
 
 
 class Scope:
-    __slots__ = ('vars', 'parent', 'boundary')
+    __slots__ = ('vars', 'parent', 'boundary', 'owner')
 
     def __init__(self, parent=None, boundary=False):
         self.vars = {}
         self.parent = parent
         self.boundary = boundary
+        self.owner = parent.owner if parent is not None else None     # id of the function it belongs to
 
     def lookup(self, name):
         s = self
@@ -472,7 +473,54 @@ BUF = {
     'buffer.len': lambda b: len(b.data),
     'buffer.readstring': lambda b, off, n: bytes(b.data[int(off):int(off) + int(n)]).decode('latin-1'),
     'buffer.tostring': lambda b: bytes(b.data).decode('latin-1'),
+    'buffer.writestring': lambda b, off, st, n=None: _buf_writestring(b, off, st, n),
+    'buffer.copy': lambda dst, doff, src, soff=0, n=None: _buf_copy(dst, doff, src, soff, n),
+    'buffer.fill': lambda b, off, v, n=None: _buf_fill(b, off, v, n),
+    'buffer.readbits': lambda b, bitoff, n: _buf_readbits(b, bitoff, n),
+    'buffer.writebits': lambda b, bitoff, n, v: _buf_writebits(b, bitoff, n, v),
 }
+
+
+def _buf_writestring(b, off, st, n):
+    raw = st.encode('latin-1')
+    if n is not None:
+        raw = raw[:int(n)]
+    off = int(off)
+    if off < 0 or off + len(raw) > len(b.data):
+        raise PEError('buffer access out of bounds')
+    b.data[off:off + len(raw)] = raw
+    return None
+
+
+def _buf_copy(dst, doff, src, soff, n):
+    soff = int(soff or 0)
+    n = len(src.data) - soff if n is None else int(n)
+    doff = int(doff)
+    if soff < 0 or doff < 0 or soff + n > len(src.data) or doff + n > len(dst.data):
+        raise PEError('buffer access out of bounds')
+    dst.data[doff:doff + n] = bytes(src.data[soff:soff + n])
+    return None
+
+
+def _buf_fill(b, off, v, n):
+    off = int(off)
+    n = len(b.data) - off if n is None else int(n)
+    b.data[off:off + n] = bytes([int(v) & 0xFF]) * n
+    return None
+
+
+def _buf_readbits(b, bitoff, n):
+    v = int.from_bytes(bytes(b.data), 'little')
+    return (v >> int(bitoff)) & ((1 << int(n)) - 1)
+
+
+def _buf_writebits(b, bitoff, n, val):
+    bitoff, n = int(bitoff), int(n)
+    v = int.from_bytes(bytes(b.data), 'little')
+    mask = ((1 << n) - 1) << bitoff
+    v = (v & ~mask) | ((int(val) << bitoff) & mask)
+    b.data[:] = v.to_bytes(len(b.data), 'little')
+    return None
 
 
 # ------------------------------------------------------------------ dump loading
@@ -499,8 +547,17 @@ class Dump:
             return Builtin(v['fn'])
         if 'lfn' in v:
             fs = self.model.func_by_line.get(v['lfn'], [])
+            if 'cenv' in v:
+                # a loader closure whose captured variables were recorded by the harness
+                fs = [x for x in fs if x.id not in self.model.toplevel] or fs
             f = LFn(fs[0] if len(fs) == 1 else None, None, v['lfn'])
             f.path = path
+            if 'cenv' in v and f.func is not None:
+                sc = Scope()
+                sc.vars = self.table(v['cenv']['t'], (path or '__LPH_CLOSENV') + '.upvalues').h
+                f.scope = sc
+            elif f.func is not None and f.func.id in self.model.toplevel:
+                f.scope = Scope()      # top-level function: nothing captured
             return f
         if 'lib' in v:
             return Lib(v['lib'])
@@ -788,22 +845,28 @@ class PE:
         s = scope.lookup(name)
         if s is None:
             raise PEError('unbound name %s' % name)
-        if name in self.openups:
-            return OPENUPS
-        if self.perm is not None and (name in self.fvars or name in self.fstack):
-            return FSTATE
-        if name in self.fvars or name in self.fstack:
-            if not self.seeking:
-                raise ForOp()
+        if s.owner == self.cur_interp.func.id:
+            # interpreter-level state variables (names are only meaningful inside the interpreter)
+            if name in self.openups:
+                return OPENUPS
+            if self.perm is not None and (name in self.fvars or name in self.fstack):
+                return FSTATE
+            if name in self.fvars or name in self.fstack:
+                if not self.seeking:
+                    raise ForOp()
         if self.track and name not in self.written and (id(s), name) in self.injected:
             self.exposed.add(name)
         return s.vars[name]
+
+    def is_state(self, scope, name):
+        s = scope.lookup(name)
+        return s is not None and s.owner == self.cur_interp.func.id
 
     def setvar(self, scope, name, v):
         s = scope.lookup(name)
         if s is None:
             raise PEError('assignment to unbound name %s' % name)
-        if name in self.fvars or name in self.fstack:
+        if s.owner == self.cur_interp.func.id and (name in self.fvars or name in self.fstack):
             if self.perm is None and not self.seeking:
                 raise ForOp()
         if self.track and (id(s), name) in self.injected:
@@ -940,6 +1003,14 @@ class PE:
             if isinstance(key, float):
                 key = norm(key)
             v = obj.h.get(key)
+            if v is None and isinstance(obj.mt, LuaTable) and not self.seeking:
+                h = obj.mt.h.get('__index')
+                if isinstance(h, LFn) and h.scope is not None:
+                    # lazily materialised entry (e.g. a constant decoded from the bytecode buffer)
+                    vals = self.call_lfn(h, [obj, key], 1)
+                    return vals[0] if vals else None
+                if isinstance(h, LuaTable):
+                    return self.index(h, key, keyast)
             if obj.path in self.volatile and (v is None or is_num(v) or isinstance(v, bool)) and not self.seeking \
                     and self.inject is not None:
                 # loader state that changes while the program runs (e.g. the stream position)
@@ -1278,9 +1349,14 @@ class PE:
                     return r
             if name in PURE and all(is_num(a) for a in args):
                 return [keyed(norm(PURE[name](*args)), *args)]
+            if name == 'buffer.create' and args and is_num(args[0]) and 0 <= args[0] <= 1 << 26:
+                return [Buffer(bytes(int(args[0])))]
+            if name == 'buffer.fromstring' and args and isinstance(args[0], str):
+                return [Buffer(args[0].encode('latin-1'))]
             if name in BUF and args and isinstance(args[0], Buffer):
-                if 'write' in name:
-                    self.model_writes += 1
+                if 'write' in name or name in ('buffer.copy', 'buffer.fill'):
+                    if args[0].path:
+                        self.model_writes += 1
                 return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))
@@ -1310,6 +1386,7 @@ class PE:
         func = f.func
         is_interp = id(func) in self.model.interp_funcs
         sc = Scope(f.scope, boundary=is_interp)
+        sc.owner = func.id
         if is_interp:
             self.interp_scope = sc
         for i, p in enumerate(func.params):
@@ -1454,12 +1531,12 @@ class PE:
                 tg = targets[0]
                 if tg[0] == 'name':
                     nm = tg[1]
-                    if nm in self.fstack and st[2][0][0] == 'table':
+                    if nm in self.fstack and st[2][0][0] == 'table' and self.is_state(scope, nm):
                         if self.perm is None:
                             raise ForOp()
                         self.events.append(('push',))
                         return None
-                    if nm in self.openups:
+                    if nm in self.openups and self.is_state(scope, nm):
                         return None
                     self.setvar(scope, nm, self.eval1(st[2][0], scope))
                 else:
@@ -1485,7 +1562,7 @@ class PE:
         if t == 'opassign':
             tg = st[2]
             if tg[0] == 'name':
-                if tg[1] in self.fvars:
+                if tg[1] in self.fvars and self.is_state(scope, tg[1]):
                     if self.perm is None:
                         raise ForOp()
                     self.events.append(('fop',))

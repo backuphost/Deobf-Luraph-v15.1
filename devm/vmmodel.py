@@ -142,6 +142,8 @@ class Model:
         walk_block(self.body, [])
         if not best:
             raise RuntimeError('no Luraph dispatch loop found')
+        self.toplevel = set()
+        self._mark_toplevel()
 
         def size(item):
             chain, loops = item
@@ -181,6 +183,29 @@ class Model:
         self.loops = [l for it in self.interps for l in it.loops]
         self.interp_funcs = {id(it.func): it for it in self.interps}
         self.cells = self._cell_layout()
+
+    def _mark_toplevel(self):
+        """Functions that are not nested in another function have no upvalues to worry about."""
+        nested = set()
+        spans = sorted((f.kw_pos, f.end_pos, f.id) for f in self.funcs if hasattr(f, 'kw_pos'))
+        stack = []
+        for start, end, fid in spans:
+            while stack and stack[-1] <= start:
+                stack.pop()
+            if stack:
+                nested.add(fid)
+            stack.append(end)
+        self.toplevel = {f.id for f in self.funcs if f.id not in nested}
+
+    def meta_closures(self):
+        """Closures installed as metamethods (`__index = function ...`): the lifter must be able to
+        call them, so their captured variables are recorded at run time."""
+        out = []
+        for f in self.funcs:
+            head = self.src[max(0, f.kw_pos - 24):f.kw_pos]
+            if re.search(r'__(index|newindex|call)\s*=\s*$', head) and f.id not in self.toplevel:
+                out.append(f)
+        return out
 
     def _cell_layout(self):
         """(box key, slot key) of upvalue cells: the interpreter reads them as cell[a][cell[b]]."""
@@ -326,6 +351,11 @@ class Model:
             names = self.visible
             lst = '{' + ','.join('"%s"' % n for n in names) + '}'
             edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
+        for f in self.meta_closures():
+            names = [n for n in self._visible_names(f) if n != '...'][:200]
+            lst = '{' + ','.join('"%s"' % n for n in names) + '}'
+            edits.append((f.kw_pos, '__LPH_CLOS(%s,%d,%s' % (lst, len(names), ''.join(n + ',' for n in names))))
+            edits.append((f.end_pos, ')'))
         edits.sort(key=lambda x: -x[0])
         for pos, text in edits:
             src = src[:pos] + text + ' ' + src[pos:]
