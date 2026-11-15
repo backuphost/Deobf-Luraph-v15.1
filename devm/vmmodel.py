@@ -369,7 +369,7 @@ class Model:
 
     def regs_name(self, it):
         """Name of the interpreter's register array: the local initialised with `create(nregs)`."""
-        for st in it.func.body[:6]:
+        for st in it.func.body[:16]:
             if st[0] != 'local':
                 continue
             for name, e in zip(st[1], st[2]):

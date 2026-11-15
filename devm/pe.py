@@ -656,6 +656,8 @@ class PE:
         self.pcvars = {}
         self.state_writes = set()
         self.regknown = {}
+        self.regdirty = set()
+        self.regdirty_all = False
         self.nregs = None
         self.keyfn_override = {}
         self.known_reads = set()
@@ -778,6 +780,11 @@ class PE:
         return ('t', '%s_%d' % (self.tprefix, self.tcount))
 
     def emit(self, st):
+        # a register written by this instruction no longer holds the value known on entry
+        if st[0] == 'set' and st[1][0] == 'r':
+            self.regdirty.add(st[1][1])
+        elif st[0] in ('setlist', 'params') or (st[0] == 'set' and st[1][0] not in ('t', 'r')):
+            self.regdirty_all = True
         self.ir.append(st)
 
     def emit_expr(self, e, origin=None):
@@ -837,6 +844,8 @@ class PE:
     def read_reg(self, n):
         self.check_reg(n)
         t = self.regknown.get(n)
+        if n in self.regdirty or self.regdirty_all:
+            t = None
         if t is not None and n != '__captured__' and (self.use_numknown or isinstance(t, KNum) or
                                                       not (is_num(t) or isinstance(t, bool))):
             # the register is known to hold one of the program's own code/constant arrays

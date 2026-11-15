@@ -7,6 +7,10 @@ return function(G, fnames, libnames)
 	local M = {}
 	local typeNames = setmetatable({}, { __mode = "k" })
 
+	-- Mock functions stand in for C functions.  They must not cost more C stack than those do
+	-- (scripts recurse to within a few calls of the limit), so they are not wrapped in pcall:
+	-- argument errors are raised with error(msg, 2), which puts the position of a calling Lua
+	-- function in front of the message exactly as luaL_error does.
 	local function named(name, f)
 		fnames[f] = name
 		return f
@@ -390,25 +394,20 @@ return function(G, fnames, libnames)
 	M.script = script
 
 	-- ------------------------------------------------------------ libraries
+	-- Library tables are plain tables, as in Roblox: scripts test getmetatable(Vector2) == nil.
 	local function lib(name, tname)
-		local l
-		l = setmetatable({}, {
-			__index = function(t, k)
-				if type(k) ~= "string" then return nil end
-				local full = name .. "." .. k
-				local f = function() return stub(full .. "()", tname or name) end
-				fnames[f] = full
-				rawset(t, k, f)
-				return f
-			end,
-		})
+		local l = {}
 		libnames[l] = name
 		return l
 	end
 	M.lib = lib
 
-	local Instance = lib("Instance")
+	-- a plain table like the real one: scripts test getmetatable(Instance) == nil
+	local Instance = {}
+	libnames[Instance] = "Instance"
 	rawset(Instance, "new", named("Instance.new", function(class, parent)
+		if class == nil then error("Argument 1 missing or nil", 2) end
+		if rawType(class) ~= "string" then error("invalid argument #1 to 'new' (string expected, got " .. rawTypeof(class) .. ")", 2) end
 		local i = newInstance(class)
 		if parent then setParent(i, parent) end
 		return i
@@ -913,24 +912,201 @@ return function(G, fnames, libnames)
 			local ok, name = pcall(function() return item.Name end)
 			return (ok and axes[name]) or L.zero
 		end
-		L.FromAxis = named("Vector3.FromAxis", fromEnum)
-		L.FromNormalId = named("Vector3.FromNormalId", fromEnum)
+		-- like the real constructors these reject a missing argument (scripts call them bare
+		-- inside xpcall and expect the error to come from the builtin itself)
+		L.FromAxis = named("Vector3.FromAxis", function(e)
+			if e == nil then error("Argument 1 missing or nil", 2) end
+			return fromEnum(e)
+		end)
+		L.FromNormalId = named("Vector3.FromNormalId", function(e)
+			if e == nil then error("Argument 1 missing or nil", 2) end
+			return fromEnum(e)
+		end)
 		L.fromAxis, L.fromNormalId = L.FromAxis, L.FromNormalId
 		M.Vector3 = L
 		M.vectorTypeName = "Vector3"
+
+		-- CFrame: position + rotation matrix.  Scripts only exercise the API (construct, convert,
+		-- combine); the numbers are right for the common cases but nothing here is bit-exact.
+		local CF = {}
+		libnames[CF] = "CFrame"
+		local cfMT = {}
+		local function cf(p, r)
+			local t = setmetatable({ p = p or create(0, 0, 0), r = r or { 1, 0, 0, 0, 1, 0, 0, 0, 1 } }, cfMT)
+			typeNames[t] = "CFrame"
+			return t
+		end
+		local function isvec(v) return rawType(v) == "vector" end
+		local function iscf(v) return rawType(v) == "table" and typeNames[v] == "CFrame" end
+		local function mulmat(a, b)
+			local o = {}
+			for i = 0, 2 do
+				for j = 0, 2 do
+					o[i * 3 + j + 1] = a[i * 3 + 1] * b[j + 1] + a[i * 3 + 2] * b[j + 4] + a[i * 3 + 3] * b[j + 7]
+				end
+			end
+			return o
+		end
+		local function rotvec(r, v)
+			return create(r[1] * v.x + r[2] * v.y + r[3] * v.z, r[4] * v.x + r[5] * v.y + r[6] * v.z, r[7] * v.x + r[8] * v.y + r[9] * v.z)
+		end
+		local function transpose(r) return { r[1], r[4], r[7], r[2], r[5], r[8], r[3], r[6], r[9] } end
+		local function rx(a) local c, s_ = math.cos(a), math.sin(a) return { 1, 0, 0, 0, c, -s_, 0, s_, c } end
+		local function ry(a) local c, s_ = math.cos(a), math.sin(a) return { c, 0, s_, 0, 1, 0, -s_, 0, c } end
+		local function rz(a) local c, s_ = math.cos(a), math.sin(a) return { c, -s_, 0, s_, c, 0, 0, 0, 1 } end
+		local function num(x) return rawType(x) == "number" and x or 0 end
+		local function axisAngle(axis, angle)
+			local m = vec.magnitude(axis)
+			if m == 0 then return { 1, 0, 0, 0, 1, 0, 0, 0, 1 } end
+			local x, y, z = axis.x / m, axis.y / m, axis.z / m
+			local c, s_ = math.cos(angle), math.sin(angle)
+			local t = 1 - c
+			return { t * x * x + c, t * x * y - s_ * z, t * x * z + s_ * y, t * x * y + s_ * z, t * y * y + c, t * y * z - s_ * x,
+				t * x * z - s_ * y, t * y * z + s_ * x, t * z * z + c }
+		end
+		local function fromColumns(pos, right, up, back)
+			return cf(pos, { right.x, up.x, back.x, right.y, up.y, back.y, right.z, up.z, back.z })
+		end
+		local function look(pos, dir, upv)
+			upv = isvec(upv) and upv or create(0, 1, 0)
+			if not isvec(dir) or vec.magnitude(dir) == 0 then return cf(pos) end
+			local back = -vec.normalize(dir)
+			local right = vec.cross(upv, back)
+			if vec.magnitude(right) == 0 then right = create(1, 0, 0) else right = vec.normalize(right) end
+			return fromColumns(pos, right, vec.cross(back, right), back)
+		end
+		local function eulerXYZ(x, y, z) return mulmat(mulmat(rx(num(x)), ry(num(y))), rz(num(z))) end
+		local function eulerYXZ(x, y, z) return mulmat(mulmat(ry(num(y)), rx(num(x))), rz(num(z))) end
+		CF.new = named("CFrame.new", function(...)
+			local n = select("#", ...)
+			local a, b = ...
+			if n == 0 then return cf() end
+			if isvec(a) and isvec(b) then return look(a, b - a) end
+			if isvec(a) then return cf(a) end
+			if n == 3 then return cf(create(num(a), num(b), num((select(3, ...))))) end
+			if n == 7 then
+				local x, y, z, qx, qy, qz, qw = ...
+				local m = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+				if m == 0 then return cf(create(x, y, z)) end
+				qx, qy, qz, qw = qx / m, qy / m, qz / m, qw / m
+				return cf(create(x, y, z), { 1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw),
+					2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw),
+					2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy) })
+			end
+			if n == 12 then
+				local t = { ... }
+				return cf(create(t[1], t[2], t[3]), { unpack(t, 4, 12) })
+			end
+			error("Invalid number of arguments: " .. n, 2)
+		end)
+		CF.identity = cf()
+		CF.Angles = named("CFrame.Angles", function(x, y, z) return cf(nil, eulerXYZ(x, y, z)) end)
+		CF.fromEulerAnglesXYZ = named("CFrame.fromEulerAnglesXYZ", function(x, y, z) return cf(nil, eulerXYZ(x, y, z)) end)
+		CF.fromEulerAnglesYXZ = named("CFrame.fromEulerAnglesYXZ", function(x, y, z) return cf(nil, eulerYXZ(x, y, z)) end)
+		CF.fromOrientation = named("CFrame.fromOrientation", function(x, y, z) return cf(nil, eulerYXZ(x, y, z)) end)
+		CF.fromEulerAngles = named("CFrame.fromEulerAngles", function(x, y, z) return cf(nil, eulerXYZ(x, y, z)) end)
+		CF.fromAxisAngle = named("CFrame.fromAxisAngle", function(axis, angle) return cf(nil, axisAngle(axis, num(angle))) end)
+		CF.fromMatrix = named("CFrame.fromMatrix", function(pos, vx, vy, vz)
+			if not isvec(vz) then vz = vec.cross(vx, vy) end
+			return fromColumns(pos, vx, vy, vz)
+		end)
+		CF.lookAt = named("CFrame.lookAt", function(at, target, upv) return look(at, target - at, upv) end)
+		CF.lookAlong = named("CFrame.lookAlong", function(at, dir, upv) return look(at, dir, upv) end)
+		CF.fromRotationBetweenVectors = named("CFrame.fromRotationBetweenVectors", function(a, b)
+			local axis = vec.cross(a, b)
+			local ma, mb = vec.magnitude(a), vec.magnitude(b)
+			if ma == 0 or mb == 0 or vec.magnitude(axis) == 0 then return cf() end
+			return cf(nil, axisAngle(axis, math.acos(math.clamp(vec.dot(a, b) / (ma * mb), -1, 1))))
+		end)
+		local cfm = {}
+		local function toXYZ(r)
+			local y = math.asin(math.clamp(r[3], -1, 1))
+			return math.atan2(-r[6], r[9]), y, math.atan2(-r[2], r[1])
+		end
+		local function toYXZ(r)
+			local x = math.asin(math.clamp(-r[6], -1, 1))
+			return x, math.atan2(r[3], r[9]), math.atan2(r[4], r[5])
+		end
+		local function toAxis(r)
+			local angle = math.acos(math.clamp((r[1] + r[5] + r[9] - 1) / 2, -1, 1))
+			local axis = create(r[8] - r[6], r[3] - r[7], r[4] - r[2])
+			if vec.magnitude(axis) == 0 then return create(1, 0, 0), angle end
+			return vec.normalize(axis), angle
+		end
+		cfm.Inverse = function(a) local t = transpose(a.r) return cf(-rotvec(t, a.p), t) end
+		cfm.Orthonormalize = function(a) return cf(a.p, a.r) end
+		cfm.Lerp = function(a, b, t)
+			local rel = mulmat(transpose(a.r), b.r)
+			local axis, angle = toAxis(rel)
+			return cf(a.p + (b.p - a.p) * t, mulmat(a.r, axisAngle(axis, angle * t)))
+		end
+		cfm.ToWorldSpace = function(a, b) return cf(a.p + rotvec(a.r, b.p), mulmat(a.r, b.r)) end
+		cfm.ToObjectSpace = function(a, b) return cfm.ToWorldSpace(cfm.Inverse(a), b) end
+		cfm.PointToWorldSpace = function(a, v) return a.p + rotvec(a.r, v) end
+		cfm.PointToObjectSpace = function(a, v) return rotvec(transpose(a.r), v - a.p) end
+		cfm.VectorToWorldSpace = function(a, v) return rotvec(a.r, v) end
+		cfm.VectorToObjectSpace = function(a, v) return rotvec(transpose(a.r), v) end
+		cfm.ToEulerAnglesXYZ = function(a) return toXYZ(a.r) end
+		cfm.ToEulerAnglesYXZ = function(a) return toYXZ(a.r) end
+		cfm.ToOrientation = function(a) return toYXZ(a.r) end
+		cfm.ToEulerAngles = function(a) return toXYZ(a.r) end
+		cfm.GetComponents = function(a) return a.p.x, a.p.y, a.p.z, unpack(a.r, 1, 9) end
+		cfm.components = cfm.GetComponents
+		cfm.ToAxisAngle = function(a) return toAxis(a.r) end
+		cfm.FuzzyEq = function(a, b, eps)
+			eps = eps or 1e-5
+			if vec.magnitude(a.p - b.p) > eps then return false end
+			for i = 1, 9 do
+				if math.abs(a.r[i] - b.r[i]) > eps then return false end
+			end
+			return true
+		end
+		cfm.AngleBetween = function(a, b) return (select(2, toAxis(mulmat(transpose(a.r), b.r)))) end
+		for k, f in pairs(cfm) do
+			cfm[k] = named(k, function(self, ...)
+				if not iscf(self) then error("Expected ':' not '.' calling member function " .. k, 2) end
+				return f(self, ...)
+			end)
+		end
+		cfMT.__index = function(a, k)
+			if k == "Position" or k == "p" then return a.p end
+			if k == "Rotation" then return cf(nil, a.r) end
+			if k == "X" then return a.p.x elseif k == "Y" then return a.p.y elseif k == "Z" then return a.p.z end
+			if k == "RightVector" or k == "XVector" then return create(a.r[1], a.r[4], a.r[7]) end
+			if k == "UpVector" or k == "YVector" then return create(a.r[2], a.r[5], a.r[8]) end
+			if k == "ZVector" then return create(a.r[3], a.r[6], a.r[9]) end
+			if k == "LookVector" then return create(-a.r[3], -a.r[6], -a.r[9]) end
+			local m = cfm[k]
+			if m ~= nil then return m end
+			error(tostring(k) .. " is not a valid member of CFrame", 2)
+		end
+		cfMT.__mul = function(a, b)
+			if iscf(a) and iscf(b) then return cfm.ToWorldSpace(a, b) end
+			if iscf(a) and isvec(b) then return a.p + rotvec(a.r, b) end
+			error("attempt to perform arithmetic (mul) on CFrame", 2)
+		end
+		cfMT.__add = function(a, b) return cf(a.p + b, a.r) end
+		cfMT.__sub = function(a, b) return cf(a.p - b, a.r) end
+		cfMT.__eq = function(a, b) return cfm.FuzzyEq(a, b, 0) end
+		cfMT.__tostring = function(a) return table.concat({ cfm.GetComponents(a) }, ", ") end
+		cfMT.__metatable = "The metatable is locked"
+		M.CFrame = CF
 	end
 
 	-- task
 	do
 		local task = {}
 		local queue = {}
+		-- Roblox's scheduler resumes threads without a parent, so a spawned thread has the whole
+		-- C stack budget; coroutine.resume would pass on the depth of the caller (scripts measure it).
+		local resume = G.resumetop or coroutine.resume
 		local function run(f, ...)
 			if type(f) == "thread" then
-				coroutine.resume(f, ...)
+				resume(f, ...)
 				return f
 			end
 			local co = coroutine.create(f)
-			coroutine.resume(co, ...)
+			resume(co, ...)
 			return co
 		end
 		task.spawn = named("task.spawn", run)
@@ -943,6 +1119,9 @@ return function(G, fnames, libnames)
 			return type(f) == "thread" and f or coroutine.create(f)
 		end)
 		task.wait = named("task.wait", function(t)
+			if t ~= nil and rawType(t) ~= "number" then
+				error("invalid argument #1 to 'wait' (number expected, got " .. rawTypeof(t) .. ")", 2)
+			end
 			local co = coroutine.running()
 			if M.mainThread and co ~= M.mainThread and coroutine.isyieldable() then
 				-- a coroutine of the script: really yield (it shows as "suspended" until the scheduler,
@@ -953,11 +1132,16 @@ return function(G, fnames, libnames)
 			local q = queue
 			queue = {}
 			for _, item in ipairs(q) do
-				if coroutine.status(item[1]) == "suspended" then coroutine.resume(unpack(item)) end
+				if coroutine.status(item[1]) == "suspended" then resume(unpack(item)) end
 			end
 			return t or 0.03
 		end)
-		task.cancel = named("task.cancel", function(co)
+		task.cancel = named("task.cancel", function(...)
+			if select("#", ...) == 0 then error("missing argument #1 to 'cancel' (thread expected)", 2) end
+			local co = ...
+			if rawType(co) ~= "thread" then
+				error("invalid argument #1 to 'cancel' (thread expected, got " .. rawTypeof(co) .. ")", 2)
+			end
 			if type(co) == "thread" and coroutine.status(co) == "suspended" then coroutine.close(co) end
 		end)
 		task.synchronize = named("task.synchronize", function() end)
@@ -996,14 +1180,18 @@ return function(G, fnames, libnames)
 	M.UserSettings = named("UserSettings", function() return stub("UserSettings") end)
 	M.shared = {}
 	libnames[M.shared] = "shared"
-	M.typeof = named("typeof", function(v)
+	M.typeof = named("typeof", function(...)
+		if select("#", ...) == 0 then error("missing argument #1", 2) end
+		local v = ...
 		local tn = typeNames[v]
 		if tn then return tn end
 		tn = rawTypeof(v)
 		if tn == "vector" and M.vectorTypeName then return M.vectorTypeName end
 		return tn
 	end)
-	M.type = named("type", function(v)
+	M.type = named("type", function(...)
+		if select("#", ...) == 0 then error("missing argument #1", 2) end
+		local v = ...
 		if getmetatable(v) == stubMT then return "userdata" end
 		return rawType(v)
 	end)
