@@ -531,7 +531,9 @@ function populateSandbox()
 		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
 		"TweenInfo", "NumberRange", "NumberSequence", "ColorSequence", "BrickColor", "Ray", "Region3", "Font",
 		"Path2DControlPoint", "DateTime", "PhysicalProperties", "Axes", "Faces", "Vector3int16", "Vector2int16",
-		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable" }) do
+		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable",
+		-- executor-specific globals probed by environment-fingerprinting scripts
+		"math_floor_precision" }) do
 		if rawget(sandbox, n) == nil then
 			local v = fallback[n]
 			if v ~= nil then rawset(sandbox, n, v) end

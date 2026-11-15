@@ -330,6 +330,10 @@ return function(G, fnames, libnames)
 	m("GetAsync", function() error("HttpService is not allowed to send requests", 0) end)
 	m("PostAsync", function() error("HttpService is not allowed to send requests", 0) end)
 	m("RequestAsync", function() error("HttpService is not allowed to send requests", 0) end)
+	-- game:HttpGet() is a DataModel shorthand used by some executor-bundled scripts.
+	-- Return an empty string so the script can continue past the network gate without crashing.
+	m("HttpGet", function() return "" end)
+	m("HttpPost", function() return "" end)
 	m("GenerateGUID", function() return "00000000-0000-0000-0000-000000000000" end)
 	m("JSONEncode", function() return "{}" end)
 	m("JSONDecode", function() return {} end)
@@ -996,5 +1000,14 @@ return function(G, fnames, libnames)
 		return rawType(v)
 	end)
 	M.typeNames = typeNames
+
+	-- Executor-specific globals probed by some scripts to fingerprint the host environment.
+	-- Providing passthrough stubs prevents nil-call crashes while keeping the analysis running.
+	-- math_floor_precision: ZekeHub executor precision helper used in key-derivation routines.
+	M.math_floor_precision = named("math_floor_precision", function(v, p)
+		local factor = 10 ^ (p or 0)
+		return math.floor(v * factor + 0.5) / factor
+	end)
+
 	return M
 end
