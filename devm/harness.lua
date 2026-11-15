@@ -258,6 +258,7 @@ local budgetAt = math.huge
 local probing = false      -- true while the poke pass runs
 local pidAlias = {}        -- pid of a probe's copy of a proto -> pid of the proto itself
 local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
+local mfpDelta = nil       -- option mfpdelta=<n>: math_floor_precision(seed) - expected(seed) comes out as n
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
 local orcLast = setmetatable({}, { __mode = "k" })
@@ -346,6 +347,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "watch" then watchPid[tonumber(v)] = true
 	elseif k == "watchlive" then watchLive = tonumber(v) ~= 0
 	elseif k == "httpreply" then httpReply = v
+	elseif k == "mfpdelta" then mfpDelta = tonumber(v)
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
 if oracleOn then traceMode = true end
@@ -710,8 +712,12 @@ local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(
 mockRef = mock
 if scriptPath then mock.placeScript(scriptPath) end
 mock.serverSide = serverSide
+mock.mfpDelta = mfpDelta
 mock.onMfp = function(i, v)
-	if i == 1 then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it\n") end
+	if i == 1 and not mfpDelta then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it\n") end
+end
+mock.onMfpExpected = function(i, v, e)
+	ewrite("[env] math_floor_precision call " .. i .. ": seed " .. tostring(v) .. ", expected " .. tostring(e) .. ", answering expected+" .. tostring(mfpDelta) .. "\n")
 end
 mock.onHttp = function(method, url)
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
