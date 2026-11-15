@@ -18,7 +18,7 @@ def is_dispatch_loop(st):
     if len(body) < 2:
         return False
     s0 = body[0]
-    if s0[0] != 'local' or len(s0[1]) != 1 or len(s0[2]) != 1:
+    if s0[0] != 'local' or len(s0[1]) < 1 or len(s0[2]) != 1:
         return False
     e = s0[2][0]
     if e[0] != 'index' or e[1][0] != 'name' or e[2][0] != 'name':
@@ -26,6 +26,7 @@ def is_dispatch_loop(st):
     return body[1][0] == 'if'
 
 
+LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)local\s+\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*if\b')
 CELL_RE = re.compile(r'\b(\w+)\[(\d+)\]\[(\w+)\[(\d+)\]\]')
 
 
@@ -41,14 +42,22 @@ class Interp:
 class Model:
     """Static description of where the interpreter lives."""
 
-    def __init__(self, src):
+    def __init__(self, src, oneline=False):
         self.src = src
+        self.oneline = oneline      # src is a reflowed copy of a single-line script
         self.body, self.funcs = luparse.parse(src)
+        # stable function ids (source order); the harness reports closures by id when lines are useless
+        self.funcs_by_id = sorted((f for f in self.funcs if hasattr(f, 'kw_pos')), key=lambda f: f.kw_pos)
+        for i, f in enumerate(self.funcs_by_id):
+            f.fid = i
         self.interp = None          # Func: the closure that contains the dispatch loop(s)
         self.chain = []             # enclosing Funcs, outermost first, ending with interp
         self.visible = []           # names visible at interp definition
         self.loops = []             # dispatch loop statements
         self.func_by_line = {}
+        # decompiler output uses `_` for discarded values (possibly several per scope); minified
+        # originals use it as an ordinary identifier
+        self.underscore_is_name = bool(re.search(r'[^\w]_\s*[\[(.]', src))
         for f in self.funcs:
             self.func_by_line.setdefault(f.line, []).append(f)
         self._find()
@@ -183,6 +192,7 @@ class Model:
         self.loops = [l for it in self.interps for l in it.loops]
         self.interp_funcs = {id(it.func): it for it in self.interps}
         self.cells = self._cell_layout()
+        self.up_base = self._upvalue_base()
 
     def _mark_toplevel(self):
         """Functions that are not nested in another function have no upvalues to worry about."""
@@ -206,6 +216,20 @@ class Model:
             if re.search(r'__(index|newindex|call)\s*=\s*$', head) and f.id not in self.toplevel:
                 out.append(f)
         return out
+
+    def _upvalue_base(self):
+        """Index of the first entry of an upvalue list (0 or 1), read off the non-virtualised
+        functions, which unpack their upvalue list with literal indices."""
+        from . import luprint
+        lo = None
+        for f in self.funcs:
+            shape = luprint.native_shape(f)
+            if shape and shape[1]:
+                m = min(shape[1].values())
+                lo = m if lo is None else min(lo, m)
+        if lo in (0, 1):
+            return lo
+        return 1 if re.search(r'for (\w+)=1,\w+,1 do local \w+=\(\1-1\)\*3', self.src) else 0
 
     def _cell_layout(self):
         """(box key, slot key) of upvalue cells: the interpreter reads them as cell[a][cell[b]]."""
@@ -297,8 +321,14 @@ class Model:
                 return walk_exprs(st[2], scope) or walk_block(st[3], scope + st[1])
             if t == 'localfunc':
                 scope.append(st[1])
+                if st[2] is target:
+                    found.extend(scope)
+                    return True
                 return walk_block(st[2].body, scope + st[2].params)
             if t == 'funcstmt':
+                if st[2] is target:
+                    found.extend(scope)
+                    return True
                 return walk_block(st[2].body, scope + st[2].params)
             if t == 'return':
                 return walk_exprs(st[1], scope)
@@ -307,7 +337,7 @@ class Model:
         walk_block(self.body, [])
         seen = []
         for n in found:
-            if n != '_' and n not in seen:
+            if (n != '_' or self.underscore_is_name) and n not in seen:
                 seen.append(n)
         return seen
 
@@ -327,9 +357,98 @@ class Model:
         return self.src[mid.kw_pos - 6:mid.kw_pos].strip() == 'local' or \
             self.src[max(0, mid.kw_pos - 16):mid.kw_pos].rstrip().endswith('local')
 
-    def patched_source(self):
+    def loop_positions(self):
+        """Source offset of the first statement inside every dispatch loop, in self.loops order."""
+        out = []
+        for it in self.interps:
+            found = [mm.end(1) for mm in LOOP_HEAD_RE.finditer(self.src, it.func.body_pos, it.func.end_pos)]
+            if len(found) != len(it.loops):
+                raise RuntimeError('cannot locate the dispatch loops of interpreter %d in the source' % it.index)
+            out.extend(found)
+        return out
+
+    def regs_name(self, it):
+        """Name of the interpreter's register array: the local initialised with `create(nregs)`."""
+        for st in it.func.body[:6]:
+            if st[0] != 'local':
+                continue
+            for name, e in zip(st[1], st[2]):
+                if e[0] == 'call' and e[1][0] == 'name' and len(e[2]) == 1 and e[2][0][0] == 'name':
+                    return name
+        return 'nil'
+
+    def cond_sites(self):
+        """[(start, end, kind)] of every branch condition inside an interpreter that reads a register.
+
+        kind ranks how likely the condition is a decision of the *program* rather than part of a
+        flattened state machine: 1 truth test, 2 register == register, 3 register == something,
+        4 register < register, 5 register < immediate (what state dispatch looks like)."""
+        toks = luparse.tokenize(self.src)
+        out = []
+        for it in self.interps:
+            regs = self.regs_name(it)
+            if regs == 'nil':
+                continue
+            lo, hi = it.func.body_pos, it.func.end_pos
+            uses = re.compile(r'\b%s\[' % re.escape(regs))
+            stack = []
+            for i, (kind, val, _line, pos) in enumerate(toks):
+                if pos < lo:
+                    continue
+                if pos >= hi:
+                    break
+                if kind == 'kw' and val in ('if', 'elseif'):
+                    stack.append(pos + len(val))
+                elif kind == 'kw' and val == 'then' and stack:
+                    start = stack.pop()
+                    text = self.src[start:pos]
+                    n = len(uses.findall(text))
+                    if not n:
+                        continue
+                    if re.search(r'==|~=', text):
+                        k = 2 if n >= 2 else 3
+                    elif re.search(r'[<>]', text):
+                        k = 4 if n >= 2 else 5
+                    else:
+                        k = 1
+                    out.append((start, pos, k))
+        return out
+
+    def patched_source(self, step=False, conds=False, flow=False):
+        """The script with hooks inserted.
+
+        Always: the interpreter-entry hook (inlined counter; __LPH_RUN is only called for stubbed
+        protos and from the entry at which the VM state is to be dumped).
+        flow:   per-instruction counter, ring of executed instructions and the branch-inversion
+                flag, all inlined (no calls).
+        conds:  with flow, the discovery variant: branch conditions additionally go through __LPH_C.
+        step:   debugging aid, calls __LPH_STEP(pid, loop, pc, registers) for every instruction.
+        """
         src = self.src
         edits = []   # (pos, text)
+        if flow:
+            for start, end, k in self.cond_sites():
+                if conds:
+                    edits.append((start, ' __LPH_C(%d,' % k))
+                    edits.append((end, ')~=__LPH_N.f ' if k != 5 else ')'))
+                elif k != 5:
+                    edits.append((start, ' (('))
+                    edits.append((end, ')and true or false)~=__LPH_N.f '))
+        if step or flow:
+            pos = self.loop_positions()
+            li = 0
+            for it in self.interps:
+                regs = self.regs_name(it)
+                for l in it.loops:
+                    pcv = l[2][0][2][0][2][1]
+                    text = ''
+                    if flow:
+                        text += ('__LPH_N.s=__LPH_N.s+1;__LPH_N.f=__LPH_X[__LPH_N.s]==true;'
+                                 '__LPH_R[__LPH_N.s%%4096]=__pid*268435456+%d+%s;' % (li * 16777216, pcv))
+                    if step:
+                        text += '__LPH_STEP(__pid,%d,%s,%s);' % (li, pcv, regs)
+                    edits.append((pos[li], text))
+                    li += 1
         if self.factory_style:
             for it in self.interps:
                 outer, mid = it.chain[-3], it.chain[-2]
@@ -341,12 +460,14 @@ class Model:
                     it.index, olst, len(oparams), ','.join(oparams))))
                 if mid.name_stmt:
                     # `local function NAME(...) ... end`: register right after the declaration
-                    edits.append((mid.end_pos, ' __LPH_REG(__pid,%s);' % mid.name_stmt))
+                    edits.append((mid.end_pos, ' __LPH_REG(__pid,%s)' % mid.name_stmt))
                 else:
                     edits.append((mid.kw_pos, '__LPH_REG(__pid,'))
                     edits.append((mid.end_pos, ')'))
-                edits.append((it.func.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
-                    lst, len(names), ','.join(names))))
+                edits.append((it.func.body_pos,
+                              '__LPH_N.c=__LPH_N.c+1;if __LPH_S[__pid]or __LPH_N.c>=__LPH_N.t then '
+                              'local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
+                                  lst, len(names), ','.join(names))))
         else:
             names = self.visible
             lst = '{' + ','.join('"%s"' % n for n in names) + '}'
@@ -356,10 +477,26 @@ class Model:
             lst = '{' + ','.join('"%s"' % n for n in names) + '}'
             edits.append((f.kw_pos, '__LPH_CLOS(%s,%d,%s' % (lst, len(names), ''.join(n + ',' for n in names))))
             edits.append((f.end_pos, ')'))
+        if self.oneline:
+            for f in self.funcs_by_id:
+                if f.name_stmt:
+                    edits.append((f.end_pos, ' __LPH_F(%d,%s)' % (f.fid, f.name_stmt)))
+                elif self._is_expression(f):
+                    edits.append((f.kw_pos, '__LPH_F(%d,' % f.fid))
+                    edits.append((f.end_pos, ')'))
         edits.sort(key=lambda x: -x[0])
         for pos, text in edits:
             src = src[:pos] + text + ' ' + src[pos:]
+        if self.oneline:
+            from . import normalize
+            src = normalize.unflow(src)
         return src
+
+    def _is_expression(self, f):
+        """False for `function a.b() end` statements (nothing to wrap)."""
+        head = self.src[max(0, f.kw_pos - 64):f.kw_pos].rstrip()
+        return bool(head) and (head[-1] in '=,({[' or head.endswith('return') or head[-1] in '+-*/%^.<>~' or
+                               head.endswith(' and') or head.endswith(' or') or head.endswith(' not'))
 
 
 def find_luau():

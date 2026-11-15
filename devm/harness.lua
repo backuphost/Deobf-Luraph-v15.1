@@ -8,6 +8,11 @@ local traceMode = string.sub(outPath, -6) == ".trace"
 local trace = {}
 
 local ABORT = "__LPH_ABORT__"
+local aborted = false
+local function abort()
+	aborted = true
+	error(ABORT, 0)
+end
 
 -- ---------------------------------------------------------------- names of builtins
 local fnames = {}
@@ -55,6 +60,11 @@ end
 
 local envTable
 local enumName
+local fidOf = setmetatable({}, { __mode = "k" })
+function __LPH_F(id, fn)
+	fidOf[fn] = id
+	return fn
+end
 local constFns = {}
 local closEnv
 function ser(v)
@@ -83,6 +93,14 @@ function ser(v)
 			return '{"cfn":' .. (c.value ~= nil and serNum(c.value) or "null") .. ',"k":' .. c.k .. "}"
 		end
 		if debug.info(v, "s") ~= "sample" then return '{"o":"function"}' end
+		local id = fidOf[v]
+		if id then
+			-- single-line scripts: closures are identified by the id injected around their definition
+			if closEnv and closEnv[v] then
+				return '{"lfn":0,"fid":' .. id .. ',"name":"' .. hex(name or "") .. '","cenv":' .. ser(closEnv[v]) .. "}"
+			end
+			return '{"lfn":0,"fid":' .. id .. ',"name":"' .. hex(name or "") .. '"}'
+		end
 		if closEnv and closEnv[v] then
 			return '{"lfn":' .. tostring(line) .. ',"name":"' .. hex(name or "") .. '","cenv":' .. ser(closEnv[v]) .. "}"
 		end
@@ -210,7 +228,186 @@ end
 
 -- called at the entry of the interpreter closure: names = {"a","b"}, vals = {a, b} (n values)
 local sandbox
+-- optional per-instruction hook (model.patched_source(step=True)): ring buffer of the last steps
+local stepCount, stepLimit, ring, ringN = 0, math.huge, {}, 4000
+local traceFrom, traceTo = math.huge, math.huge
+local dumpAt = 1          -- dump the VM state at the n-th interpreter entry
+local stubs = {}          -- protos replaced by a no-op (tamper responses)
+local condCount, condRing, condRingN = 0, {}, 512
+local condStep = {}
+local runCount = 0
+local stopAtFail = false
+local showErrors = false
+local runLog = false
+local dumpEnd = false      -- dump the VM state when the script ends (normally or with an error)
+local stubHits = 0
+local mockRef = nil
+-- State read and written by code inlined into the sample (no calls: scripts measure the depth of
+-- both the Lua call stack and the C stack, so instrumentation must not add frames):
+--   __LPH_N.c  interpreter-closure entries so far     __LPH_N.t  entry number from which __LPH_RUN is called
+--   __LPH_N.s  VM instructions executed so far         __LPH_N.f  true while the current instruction's
+--   __LPH_S    protos replaced by a no-op                         branch decision is to be inverted
+--   __LPH_X    instruction numbers whose decision is inverted
+--   __LPH_R    ring of the last instructions (pid, loop, pc)
+__LPH_N = { c = 0, s = 0, f = false, t = 1 }
+__LPH_S = stubs
+__LPH_X = {}
+__LPH_R = {}
+local RINGN = 4096
+while layers[1] and string.match(layers[1], "^%w+=%d+$") do
+	local k, v = string.match(table.remove(layers, 1), "^(%w+)=(%d+)$")
+	if k == "steps" then stepLimit = tonumber(v) elseif k == "dumpat" then dumpAt = tonumber(v)
+	elseif k == "stub" then stubs[tonumber(v)] = true
+	elseif k == "flipstep" then __LPH_X[tonumber(v)] = true
+	elseif k == "stopatfail" then stopAtFail = tonumber(v) ~= 0
+	elseif k == "errors" then showErrors = tonumber(v) ~= 0
+	elseif k == "runlog" then runLog = tonumber(v) ~= 0
+	elseif k == "dumpend" then dumpEnd = tonumber(v) ~= 0
+	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
+end
+__LPH_N.t = (traceMode or dumpEnd) and (runLog and 0 or math.huge) or dumpAt
+local shadowOf, shadow = nil, nil
+local prevRec, prevPc = nil, nil
+local function brief(v)
+	local t = type(v)
+	if t == "number" then return string.format("%.17g", v)
+	elseif t == "string" then return string.format("%q", #v > 48 and string.sub(v, 1, 48) .. "..." or v)
+	elseif t == "table" then
+		local n = rawlen(v)
+		if n > 0 and n <= 18 then
+			local parts = {}
+			for i = 1, n do
+				local x = rawget(v, i)
+				if type(x) ~= "number" and type(x) ~= "boolean" then parts = nil break end
+				parts[i] = tostring(x)
+			end
+			if parts then return "{" .. table.concat(parts, ",") .. "}" end
+		end
+		if n == 0 then
+			-- dictionary: show (some of) its string keys
+			local keys, cnt = {}, 0
+			local k = next(v)
+			while k ~= nil do
+				cnt += 1
+				if #keys < 70 then keys[#keys + 1] = type(k) == "string" and k or ("[" .. tostring(k) .. "]") end
+				k = next(v, k)
+			end
+			if cnt > 0 then
+				table.sort(keys)
+				return "table{" .. table.concat(keys, ",") .. (cnt > #keys and ",..." or "") .. "}"
+			end
+		end
+		return "table#" .. tostring(n)
+	elseif t == "function" then return "fn:" .. tostring(fnames[v] or (protoOfFn[v] and "P" .. protoOfFn[v]) or (fidOf[v] and "F" .. fidOf[v]) or debug.info(v, "l"))
+	else return (string.gsub(string.sub(tostring(v), 1, 40), "%s+", " ")) end
+end
+local function ringText(n)
+	local parts = {}
+	for i = math.max(1, stepCount - n + 1), stepCount do
+		local v = ring[i % ringN]
+		parts[#parts + 1] = string.format("%d:%d:%d", v // 2 ^ 32, (v // 2 ^ 24) % 256, v % 2 ^ 24)
+	end
+	return table.concat(parts, " ")
+end
+-- branch-condition hook of the discovery variant (model.patched_source(conds=True)): records which
+-- instructions take data-dependent decisions; inverting them is done by the inlined flag
+function __LPH_C(kind, cond)
+	condCount += 1
+	local v = not not cond
+	condRing[condCount % condRingN] = kind * 2 + (v and 1 or 0)
+	condStep[condCount % condRingN] = __LPH_N.s
+	return v
+end
+local function condText(n)
+	local parts = {}
+	for i = math.max(1, condCount - n + 1), condCount do
+		local x = condRing[i % condRingN]
+		parts[#parts + 1] = string.format("%d:%d:%d", condStep[i % condRingN], x // 2, x % 2)
+	end
+	return table.concat(parts, " ")
+end
+local function flowText(n)
+	local parts = {}
+	local last = __LPH_N.s
+	for i = math.max(1, last - n + 1), last do
+		local v = __LPH_R[i % RINGN]
+		if v then parts[#parts + 1] = string.format("%d:%d:%d", v // 2 ^ 28, (v // 2 ^ 24) % 16, v % 2 ^ 24) end
+	end
+	return table.concat(parts, " ")
+end
+
+local lastRegs, seenErr = nil, {}
+function __LPH_STEP(pid, loop, pc, regs)
+	if aborted then error(ABORT, 0) end
+	stepCount += 1
+	ring[stepCount % ringN] = pid * 2 ^ 32 + loop * 2 ^ 24 + pc
+	if showErrors and regs ~= lastRegs and regs then
+		-- back in another activation: report error messages a protected call left in its registers
+		lastRegs = regs
+		for i = 0, 300 do
+			local v = rawget(regs, i)
+			if type(v) == "string" and #v < 400 and not seenErr[v] and string.find(v, "^[%w_%.%[%]\" /=]*:%d+: ") then
+				seenErr[v] = true
+				ewrite("[error] step " .. stepCount .. " pid " .. pid .. ": " .. v .. "\n")
+			end
+		end
+	end
+	if stepCount >= traceFrom and regs then
+		-- value trace: registers that changed since the previous step of the same activation
+		if shadowOf ~= regs then
+			shadowOf, shadow = regs, {}
+			ewrite("[enter] pid=" .. pid .. "\n")
+		end
+		local parts = {}
+		for i = 0, 400 do
+			local v = rawget(regs, i)
+			if v ~= shadow[i] then
+				shadow[i] = v
+				parts[#parts + 1] = "R" .. i .. "=" .. brief(v)
+			end
+		end
+		-- constants the previous instruction decoded on demand (visible only after it ran)
+		if prevRec then
+			local ks = {}
+			local name, arr = next(prevRec.vars)      -- no generic-for here: the iterator call would use C stack
+			while name ~= nil do
+				if type(arr) == "table" and arr ~= prevRec.self and getmetatable(arr) then
+					local x = rawget(arr, prevPc)
+					if x ~= nil then ks[#ks + 1] = name .. "=" .. brief(x) end
+				end
+				name, arr = next(prevRec.vars, name)
+			end
+			if #ks > 0 then
+				table.sort(ks)
+				ewrite("      k{" .. table.concat(ks, " ") .. "}\n")
+			end
+		end
+		prevRec, prevPc = protos[pid], pc
+		-- the instruction's own fields (opcode / operand / constant arrays of the proto)
+		local ins = {}
+		local rec = protos[pid]
+		if rec then
+			local name, arr = next(rec.vars)
+			while name ~= nil do
+				if type(arr) == "table" then
+					local x = rawget(arr, pc)
+					if x ~= nil and type(x) ~= "function" and arr ~= rec.self then ins[#ins + 1] = name .. "=" .. brief(x) end
+				end
+				name, arr = next(rec.vars, name)
+			end
+			table.sort(ins)
+		end
+		ewrite(string.format("[t] %d %d:%d:%d  {%s}  %s\n", stepCount, pid, loop, pc, table.concat(ins, " "), table.concat(parts, " ")))
+		if stepCount >= traceTo then abort() end
+	end
+	if stepCount >= stepLimit then
+		ewrite("[steps] " .. stepCount .. " last: " .. ringText(ringN) .. "\n")
+		abort()
+	end
+end
+
 function __LPH_RUN(names, n, ...)
+	if aborted then error(ABORT, 0) end
 	local vals = { ... }
 	local env = {}
 	for i = 1, n do
@@ -229,20 +426,44 @@ function __LPH_RUN(names, n, ...)
 		setfenv(fn, sandbox)
 		return fn
 	end
-	if traceMode then return nil end
+	if __LPH_N.c > runCount then runCount = __LPH_N.c else runCount += 1 end
+	if stubs[env.__pid] then
+		stubHits += 1
+		if stubHits <= 200 then
+			ewrite("[stub] tamper response " .. tostring(env.__pid) .. " suppressed (entry " .. runCount .. ", step " ..
+				math.max(stepCount, __LPH_N.s) .. ")\n")
+		end
+		if stopAtFail then
+			ewrite("[fail] step=" .. __LPH_N.s .. " run=" .. runCount .. "\n")
+			ewrite("[flow] " .. flowText(1200) .. "\n")
+			ewrite("[conds] " .. condText(condRingN) .. "\n")
+			abort()
+		end
+		return function() end
+	end
+	if traceMode then
+		if runLog and runCount <= 3000 then
+			ewrite("[run] pid=" .. tostring(env.__pid) .. " n=" .. runCount .. " steps=" .. math.max(stepCount, __LPH_N.s) .. "\n")
+		end
+		return nil
+	end
+	if runCount < dumpAt then return nil end
 	local root = { kind = "run", vars = env }
 	finish(root)
-	error(ABORT, 0)
+	abort()
 end
 
 -- factory-style VMs: record every proto instantiation
 function __LPH_PROTO(interp, names, n, ...)
+	if aborted then error(ABORT, 0) end
 	local vals = { ... }
 	local env = {}
 	for i = 1, n do
 		env[names[i]] = vals[i]
 	end
-	protos[#protos + 1] = { interp = interp, vars = env }
+	protos[#protos + 1] = { interp = interp, vars = env, self = vals[1] }
+	if #protos == 1 and mockRef then mockRef.mainThread = coroutine.running() end
+	if traceMode and runLog then ewrite("[proto] pid=" .. #protos .. " interp=" .. interp .. "\n") end
 	return #protos
 end
 
@@ -267,6 +488,7 @@ end
 -- ---------------------------------------------------------------- environment (Roblox mock)
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
+mockRef = mock
 enumName = mock.enumName
 local rbxLibs = {}
 local function rbxLib(name)
@@ -276,19 +498,46 @@ local function rbxLib(name)
 	rbxLibs[name] = lib
 	return lib
 end
-sandbox = setmetatable({}, {
+-- The script's environment is a plain table, as in Roblox: reading an existing global must not run
+-- a metamethod (scripts measure the remaining C stack, and a Lua __index handler costs a level).
+-- Only names that are not predefined fall through to the lazy Roblox-library fallback.
+local fallback = setmetatable({}, {
 	__index = function(t, k)
-		if traceMode and #trace < 200000 and string.sub(tostring(k), 1, 5) ~= "__LPH" then trace[#trace + 1] = tostring(k) end
+		if traceMode and string.sub(tostring(k), 1, 5) ~= "__LPH" then ewrite("[global] " .. tostring(k) .. "\n") end
 		local v = mock[k]
-		if v ~= nil then return v end
-		v = _G[k]
-		if v ~= nil then return v end
-		if type(k) == "string" and string.match(k, "^%u") and k ~= "LPH_NO_VIRTUALIZE" and string.sub(k, 1, 4) ~= "LPH_" then
-			return rbxLib(k)
+		if v == nil then v = _G[k] end
+		if v == nil and type(k) == "string" and string.match(k, "^%u") and k ~= "LPH_NO_VIRTUALIZE" and string.sub(k, 1, 4) ~= "LPH_" then
+			v = rbxLib(k)
 		end
-		return nil
+		return v
 	end,
 })
+sandbox = setmetatable({}, { __index = fallback })
+function populateSandbox()
+	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
+		"rawset", "rawlen", "select", "setmetatable", "tonumber", "tostring", "type", "typeof", "ipairs", "pairs",
+		"pcall", "xpcall", "unpack", "require", "string", "table", "math", "bit32", "buffer", "coroutine", "os",
+		"utf8", "debug", "vector", "_VERSION", "loadstring",
+		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
+		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R",
+		"__LPH_CRASH", "__LPH_ENV" }) do
+		local v = _G[n]
+		if v ~= nil then rawset(sandbox, n, v) end
+	end
+	for k, v in pairs(mock) do
+		if type(k) == "string" then rawset(sandbox, k, v) end
+	end
+	for _, n in ipairs({ "game", "workspace", "script", "Enum", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim",
+		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
+		"TweenInfo", "NumberRange", "NumberSequence", "ColorSequence", "BrickColor", "Ray", "Region3", "Font",
+		"Path2DControlPoint", "DateTime", "PhysicalProperties", "Axes", "Faces", "Vector3int16", "Vector2int16",
+		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable" }) do
+		if rawget(sandbox, n) == nil then
+			local v = fallback[n]
+			if v ~= nil then rawset(sandbox, n, v) end
+		end
+	end
+end
 
 -- utf8.nfcnormalize / utf8.nfdnormalize (tables generated by unidata.py next to the output file)
 do
@@ -369,7 +618,29 @@ do
 	for k, v in pairs(utf8) do u[k] = v end
 	u.nfdnormalize = function(s) return enc(nfd(s)) end
 	u.nfcnormalize = function(s) return enc(nfc(s)) end
-	u.graphemes = function(s, i, j) return utf8.codes(s) end
+	-- utf8.graphemes(s, i, j): stateful iterator over (first byte, last byte) of each grapheme cluster;
+	-- a cluster is approximated as a starter followed by combining marks / joiners
+	u.graphemes = function(s, i, j)
+		i = i or 1
+		j = j or #s
+		local pos = i
+		local function width(p)
+			local b = string.byte(s, p)
+			return b < 0x80 and 1 or (b < 0xE0 and 2 or (b < 0xF0 and 3 or 4))
+		end
+		local function extends(p)
+			local ok, cp = pcall(utf8.codepoint, s, p)
+			if not ok then return false end
+			return (U.ccc[cp] or 0) ~= 0 or (cp >= 0x300 and cp <= 0x36F) or cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F)
+		end
+		return function()
+			if pos > j then return nil end
+			local first = pos
+			pos += width(pos)
+			while pos <= j and extends(pos) do pos += width(pos) end
+			return first, pos - 1
+		end
+	end
 	for k, v in pairs(u) do
 		if type(v) == "function" then fnames[v] = "utf8." .. k end
 	end
@@ -501,15 +772,36 @@ if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
 	error("compile")
 end
+populateSandbox()
 setfenv(fn, sandbox)
 envTable = sandbox
-local ok, e = xpcall(fn, function(m) return tostring(m) .. "\n" .. debug.traceback() end)
-if traceMode then
-	trace[#trace + 1] = "RESULT " .. tostring(ok) .. " " .. tostring(e)
-	writefile(outPath, table.concat(trace, "\n") .. "\n")
-	return
+-- Run at the call depth of an ordinary script thread (Lua frames and C calls alike): scripts probe
+-- how much of either stack is left.  A CLI built with luau_cli.patch runs the function this script
+-- returns as the main function of a fresh top-level thread; a stock CLI gets a plain call, one
+-- frame deeper than the real thing.
+function __LPH_AFTER(ok, message)
+	if dumpEnd and not done then
+		ewrite("[end] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
+			" after " .. __LPH_N.c .. " closure entries\n")
+		finish({ kind = "end", vars = { __pid = 1 } })
+		return
+	end
+	if not ok and not aborted then
+		ewrite(tostring(message) .. "\n")
+		ewrite("[end] error after " .. math.max(stepCount, __LPH_N.s) .. " instructions, " .. __LPH_N.c .. " closure entries\n")
+	end
+	if traceMode then
+		if ok then ewrite("[done] script returned normally\n") end
+		return
+	end
+	if not done then
+		ewrite("NOT REACHED: the script ended without entering the VM hook\n")
+		error("hook not reached")
+	end
 end
-if not done then
-	ewrite("NOT REACHED: " .. tostring(e) .. "\n")
-	error("hook not reached")
+if __LPH_RUNMAIN then
+	return fn
 end
+local ok, message = true, ""
+fn()
+__LPH_AFTER(true, "")

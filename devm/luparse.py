@@ -22,7 +22,7 @@ import re
 
 
 class Func:
-    __slots__ = ('params', 'vararg', 'body', 'line', 'body_pos', 'end_line', 'id', 'kw_pos', 'end_pos', 'name_stmt')
+    __slots__ = ('params', 'vararg', 'body', 'line', 'body_pos', 'end_line', 'id', 'kw_pos', 'end_pos', 'name_stmt', 'fid')
     _n = 0
 
     def __init__(self, params, vararg, body, line, body_pos, end_line):

@@ -1,8 +1,8 @@
 diff --git a/CLI/src/Repl.cpp b/CLI/src/Repl.cpp
-index 7ecaabc..2551b4c 100644
+index 7ecaabc..77e2dbe 100644
 --- a/CLI/src/Repl.cpp
 +++ b/CLI/src/Repl.cpp
-@@ -120,6 +120,43 @@ static int lua_loadstring(lua_State* L)
+@@ -120,6 +120,53 @@ static int lua_loadstring(lua_State* L)
      return 2;          // return nil plus error message
  }
  
@@ -43,16 +43,76 @@ index 7ecaabc..2551b4c 100644
 +    return 0;
 +}
 +
++// devm: the vector type has one metatable for all values and it can only be set through the C API
++static int lua_setvectormetatable_(lua_State* L)
++{
++    luaL_checktype(L, 1, LUA_TTABLE);
++    lua_pushvector(L, 0.0f, 0.0f, 0.0f);
++    lua_pushvalue(L, 1);
++    lua_setmetatable(L, -2);
++    return 0;
++}
++
  static int lua_collectgarbage(lua_State* L)
  {
      const char* option = luaL_optstring(L, 1, "collect");
-@@ -218,6 +255,9 @@ void setupState(lua_State* L)
+@@ -218,6 +265,11 @@ void setupState(lua_State* L)
      static const luaL_Reg funcs[] = {
          {"loadstring", lua_loadstring},
          {"collectgarbage", lua_collectgarbage},
 +        {"readfile", lua_readfile_},
 +        {"writefile", lua_writefile_},
 +        {"ewrite", lua_ewrite_},
++        {"setvectormetatable", lua_setvectormetatable_},
++        {"__LPH_RUNMAIN", lua_ewrite_},     // presence marks a CLI that runs a returned function as a main thread
  #ifdef CALLGRIND
          {"callgrind", lua_callgrind},
  #endif
+@@ -680,6 +732,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
+ 
+         setupArguments(L, program_argc, program_argv);
+         status = lua_resume(L, NULL, program_argc);
++
++        // devm: a script that returns a function asks for it to be run as the main function of a
++        // fresh top-level thread, i.e. at the call depth (Lua frames and C calls) of a script started
++        // by a scheduler. Afterwards the script's global __LPH_AFTER(ok, message) is called, if any.
++        if (status == 0 && lua_gettop(L) >= 1 && lua_isfunction(L, 1))
++        {
++            lua_State* T = lua_newthread(GL);
++            lua_pushvalue(L, 1);
++            lua_xmove(L, T, 1);
++            int mainStatus = lua_resume(T, NULL, 0);
++            std::string message;
++            if (mainStatus != 0)
++            {
++                if (mainStatus == LUA_YIELD)
++                    message = "thread yielded unexpectedly";
++                else if (const char* str = lua_tostring(T, -1))
++                    message = str;
++                message += "\nstacktrace:\n";
++                message += lua_debugtrace(T);
++            }
++            lua_getglobal(L, "__LPH_AFTER");
++            if (lua_isfunction(L, -1))
++            {
++                lua_pushboolean(L, mainStatus == 0);
++                lua_pushlstring(L, message.data(), message.size());
++                if (lua_pcall(L, 2, 0, 0) != 0)
++                {
++                    fprintf(stderr, "%s\n", lua_tostring(L, -1) ? lua_tostring(L, -1) : "error in __LPH_AFTER");
++                    lua_pop(L, 1);
++                    status = LUA_ERRRUN;
++                }
++            }
++            else
++            {
++                lua_pop(L, 1);
++                if (mainStatus != 0)
++                    fprintf(stderr, "%s", message.c_str());
++            }
++            lua_pop(GL, 1);
++            lua_settop(L, 0);
++        }
+     }
+     else
+     {

@@ -546,7 +546,11 @@ class Dump:
         if 'fn' in v:
             return Builtin(v['fn'])
         if 'lfn' in v:
-            fs = self.model.func_by_line.get(v['lfn'], [])
+            if 'fid' in v:
+                fs = [self.model.funcs_by_id[v['fid']]]
+                v = dict(v, lfn=fs[0].line)
+            else:
+                fs = self.model.func_by_line.get(v['lfn'], [])
             if 'cenv' in v:
                 # a loader closure whose captured variables were recorded by the harness
                 fs = [x for x in fs if x.id not in self.model.toplevel] or fs
@@ -658,6 +662,9 @@ class PE:
         self.use_numknown = False
         self.model_writes = 0
         self.keyfn_used = set()
+        self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
+        from . import luprint
+        self.native_ids = {id(f) for f in model.funcs if luprint.native_shape(f)}
         self.volatile = set()       # paths of loader-state tables whose scalar fields change at run time
         for l in model.loops:
             self.pcvars[id(l)] = l[2][0][2][0][2][1]
@@ -1007,7 +1014,11 @@ class PE:
                 h = obj.mt.h.get('__index')
                 if isinstance(h, LFn) and h.scope is not None:
                     # lazily materialised entry (e.g. a constant decoded from the bytecode buffer)
-                    vals = self.call_lfn(h, [obj, key], 1)
+                    self.lazy_depth += 1
+                    try:
+                        vals = self.call_lfn(h, [obj, key], 1)
+                    finally:
+                        self.lazy_depth -= 1
                     return vals[0] if vals else None
                 if isinstance(h, LuaTable):
                     return self.index(h, key, keyast)
@@ -1027,7 +1038,7 @@ class PE:
         if obj is UPVALS:
             if not isinstance(key, int):
                 raise PEError('upvalue index %r' % (key,))
-            return UpRef(key)
+            return UpRef(key - self.model.up_base)
         if isinstance(obj, UpRef):
             if keyast is not None and keyast[0] == 'num':
                 if key == self.model.cells[0]:
@@ -1194,7 +1205,8 @@ class PE:
             if not (is_num(a) and is_num(b)):
                 if self.perm is not None:
                     return FSTATE
-                if isinstance(a, (Special, UpRef, Builtin, LuaTable)) or isinstance(b, (Special, UpRef, Builtin, LuaTable)):
+                if isinstance(a, (Special, UpRef, Builtin, LuaTable, GlobalPath, Opaque)) or \
+                        isinstance(b, (Special, UpRef, Builtin, LuaTable, GlobalPath, Opaque)):
                     return self.emit_expr(('bin', op, self.atom(a), self.atom(b)))
                 raise PEError('arith %r %s %r' % (a, op, b))
             try:
@@ -1297,8 +1309,16 @@ class PE:
                 if args and is_num(args[0]):
                     self.nregs = int(args[0])
                 return [REGS]
+            if self.lazy_depth:
+                # the loader building a constant (e.g. a capture list): part of the model, not of the program
+                return [LuaTable()]
             n = args[0] if args and is_num(args[0]) else 0
             return [self.emit_expr(('newtable', n))]
+        if name == 'setmetatable' and self.lazy_depth and len(args) == 2 and isinstance(args[0], LuaTable) \
+                and (args[1] is None or isinstance(args[1], LuaTable)):
+            # the loader wiring up the lazy constant tables of a proto it has just deserialized
+            args[0].mt = args[1]
+            return [args[0]]
         if name == 'getfenv':
             return [ENV]
         if name == 'setfenv':
@@ -1329,6 +1349,15 @@ class PE:
                 a = args[1] if len(args) > 1 and args[1] is not None else 1
                 b = args[2] if len(args) > 2 and args[2] is not None else t.length()
                 return [t.h.get(i) for i in range(a, b + 1)]
+        if name == 'table.move' and len(args) == 5 and args[4] is REGS and is_num(args[1]) and is_num(args[2]) \
+                and is_num(args[3]) and (args[0] is VARARG_TBL or (isinstance(args[0], PackedTbl) and args[0].id == 'args')):
+            # function prologue: the fixed parameters are copied into a block of registers
+            if args[1] == 1:
+                self.emit(('params', int(args[3]), int(args[2])))
+            else:
+                for i in range(int(args[1]), int(args[2]) + 1):
+                    self.emit(('set', ('r', int(args[3]) + i - int(args[1])), ('arg', i)))
+            return [REGS]
         if name == 'table.move' and len(args) == 5 and args[0] is REGS:
             vals = self.regs_range(args[1], args[2])
             tail = None
@@ -1360,6 +1389,9 @@ class PE:
                 return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))
+        if self.lazy_depth and not sym and all(is_num(a) or isinstance(a, (str, bool)) or a is None for a in args):
+            # the loader materialising a constant of a Roblox datatype, e.g. Vector3.new(x, y, z)
+            return [GlobalPath('%s(%s)' % (name, ', '.join(const_text(a) for a in args)))]
         return self.emit_call(('kfn', name), args, want)
 
     def call_lfn(self, f, args, want):
@@ -1370,6 +1402,11 @@ class PE:
                 return [LinSym(mid, 0), PackedTbl(mid) if mid != 'args' else VARARG_TBL]
         if f.func is None:
             raise PEError('call of unresolved VM closure (line %s)' % f.line)
+        if id(f.func) in self.native_ids and len(args) <= 3 and not self.lazy_depth \
+                and all(a is None or a is False or (isinstance(a, LuaTable) and a.fresh) for a in args):
+            # non-virtualised function instantiated like a proto: native(nil, upvalue_list, nil)
+            ups = [a for a in args if isinstance(a, LuaTable)]
+            return [self.make_closure([('native', f.func.line), ups[0] if ups else None])]
         if f.func is self.wrap_func and f.scope is None or (f.func is self.wrap_func and len(args) == 2 and isinstance(args[0], LuaTable)):
             return [self.make_closure(args)]
         if f.scope is None:
@@ -1382,6 +1419,10 @@ class PE:
             if len(args) == 1 and (isinstance(args[0], LuaTable) and args[0].fresh or args[0] is False):
                 # non-virtualised function: native(upvalue_table) -> closure
                 return [self.make_closure([('native', f.func.line), args[0]])]
+            ups = [a for a in args if a is not None]
+            if len(args) == 3 and len(ups) <= 1 and all(isinstance(a, LuaTable) and a.fresh for a in ups):
+                # same, called like a proto wrapper: native(nil, upvalue_table, nil)
+                return [self.make_closure([('native', f.func.line), ups[0] if ups else None])]
             raise PEError('call of foreign VM closure (line %s) with %r' % (f.line, args))
         func = f.func
         is_interp = id(func) in self.model.interp_funcs
@@ -1433,7 +1474,7 @@ class PE:
             proto, ups = st[2][1], st[2][2]
             caps = []
             if isinstance(ups, LuaTable):
-                n = 0
+                n = self.model.up_base
                 while n in ups.h:
                     v = ups.h[n]
                     if isinstance(v, LuaTable) and v.h.get(self.model.cells[0]) is REGS:
@@ -1747,6 +1788,25 @@ class PE:
         if r[0] == 'break':
             return None
         return r
+
+
+def const_text(v):
+    """Lua literal for a constant argument; float32-valued numbers print in their short form."""
+    if v is None:
+        return 'nil'
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if isinstance(v, str):
+        return '"%s"' % ''.join(c if 32 <= ord(c) < 127 and c not in '"\\' else '\\%d' % ord(c) for c in v)
+    if isinstance(v, float) and not v.is_integer() and math.isfinite(v):
+        f32 = struct.unpack('<f', struct.pack('<f', v))[0] if abs(v) < 3e38 else None
+        if f32 == v:
+            for prec in range(1, 10):
+                t = '%.*g' % (prec, v)
+                if struct.unpack('<f', struct.pack('<f', float(t)))[0] == v:
+                    return t
+        return repr(v)
+    return lua_tostr(v)
 
 
 def substmts(st):

@@ -27,7 +27,12 @@ Pipeline (`run.py`):
 | proto-table (`wrap(proto, upvalues)`) | HookScript, ClientSynchronizer | complete, 0 lift errors |
 | factory, multi-interpreter (`factory(...)(upvalues)`) | Net, TeleportGuard | work in progress |
 
-The factory layout already has: multi-interpreter model, harness hooks, `FactoryLifter`,
-lift-time constant propagation, trampoline-jump specialisation and self-rewriting instructions.
-Still missing: evaluating the lazy constant metatable (`__index` closures of the loader), lazily
-loaded child protos, and the second stage for that layout.
+The factory layout (also the raw single-line form Luraph ships) now has: multi-interpreter model,
+lazily loaded protos and constants, native closures, per-proto pristine lifting, unflattening of the
+state-machine idioms, and a harness that runs the script at the call depth of a real script thread
+(needs the CLI built with `luau_cli.patch`). The startup helpers decompile and every explicit
+environment check passes under the mock.
+
+Still missing: the startup code mixes environment-computed values into the key that decrypts the
+rest of the program, and the mock is not yet bit-exact for all of them, so the program body of such
+scripts is not recovered. `antitamper.py` predates the inlined instrumentation and is not wired in.

@@ -216,6 +216,13 @@ def _isnum(e):
     return e[0] == 'k' and isinstance(e[1], (int, float)) and not isinstance(e[1], bool)
 
 
+def _isboolexpr(e):
+    if (e[0] == 'bin' and e[1] in _CMPS) or (e[0] == 'un' and e[1] == 'not'):
+        return True
+    # lookup in a {[true] = false, [false] = true} style table: Luraph's spelling of `not`
+    return e[0] == 'index' and _isboolexpr(e[2])
+
+
 def _reads_of(st):
     """[(register, used only in a comparison against a numeric constant)] for a statement."""
     out = []
@@ -299,7 +306,16 @@ class ProtoCFG:
         self.vararg = False
         self.captured_ref = set()
         self.warnings = []
+        self.param_regs = None
         self._build()
+        eb = self.blocks[self.entry]
+        for i, st in enumerate(eb.stmts):
+            if st[0] == 'params':
+                # explicit parameter block (register base, count) emitted by the function prologue
+                self.param_regs = list(range(st[1], st[1] + st[2]))
+                self.nparams = st[2]
+                del eb.stmts[i]
+                break
         self._thread()
         self._to_exprs()
         self._dead_stores()
@@ -399,6 +415,13 @@ class ProtoCFG:
 
     # -- control-flow unflattening
     def _unflatten(self):
+        # A state register is sometimes loaded with a run-time value that is only truth-tested
+        # (`state = t[x]; if state then state = 3 else state = 7 end`).  Splitting on such values is
+        # tried first; if a state compare then meets a boolean the assumption was wrong.
+        if self._unflatten_(True) is False:
+            self._unflatten_(False)
+
+    def _unflatten_(self, split_any):
         """Remove Luraph's state-machine obfuscation.
 
         A "state" register only ever receives numeric constants (or is the control variable of a
@@ -467,7 +490,14 @@ class ProtoCFG:
             b = blocks[bid]
             cur = dict(IN[bid])
             for i, st in list(enumerate(b.stmts)) + [('T', b.term)]:
-                for r, iscmp in reads_of(st):
+                rs = reads_of(st)
+                if i == 'T' and st[0] == 'br':
+                    c = st[1]
+                    while c[0] == 'un' and c[1] == 'not':
+                        c = c[2]
+                    if c[0] == 'r':
+                        rs = [(c[1], True)]      # truth test of a state register
+                for r, iscmp in rs:
                     ds = cur.get(r) or frozenset([('ENTRY', r)])
                     first = None
                     for d in ds:
@@ -481,6 +511,8 @@ class ProtoCFG:
                     else:
                         bad.add(first)
                         if DEBUG_UNFLATTEN:
+                            if str(r) == os.environ.get('DEVM_DEBUG_REG'):
+                                print('bad use of', r, bid, i, repr(st)[:200], sorted(ds, key=repr)[:6])
                             for d in ds:
                                 if d[0] != 'ENTRY' and d[1] != 'T':
                                     sd = blocks[d[0]].stmts[d[1]]
@@ -492,18 +524,47 @@ class ProtoCFG:
                     cur[r] = frozenset([d])
                 if ws:
                     find(d)
-                    if st[0] == 'set' and isnum(st[2]):
+                    if st[0] == 'set' and (isnum(st[2]) or (st[2][0] == 'k' and st[2][1] in (None, True, False))):
                         defkind[d] = 'const'
+                    elif st[0] == 'set' and _isboolexpr(st[2]):
+                        defkind[d] = 'bool'      # state = (condition): explored once per outcome
                     elif st[0] == 'forbr' and st[1] == 'num' and isinstance(st[2][0], int) \
                             and prep_bases.get(st[2][0] - 3) and all(prep_bases[st[2][0] - 3]):
                         defkind[d] = 'for'
+                    elif st[0] == 'set' and split_any and st[1][0] == 'r':
+                        defkind[d] = 'split'
                     else:
                         defkind[d] = 'other'
+        if split_any:
+            # only webs that also receive numeric constants are state machines
+            has_const = {find(d) for d, k in defkind.items() if k == 'const'}
+            for d, k in defkind.items():
+                if k == 'split' and find(d) not in has_const:
+                    defkind[d] = 'other'
         badroots = {find(d) for d in bad}
         for d in list(parent):
             if d[0] == 'ENTRY' or defkind.get(d, 'other') == 'other':
                 badroots.add(find(d))
         usedroots = {find(d) for d in used}
+        if DEBUG_UNFLATTEN and os.environ.get('DEVM_DEBUG_REG'):
+            rr = int(os.environ['DEVM_DEBUG_REG'])
+            groups = {}
+            for d in parent:
+                groups.setdefault(find(d), []).append(d)
+            for root, ds in groups.items():
+                regs = set()
+                for d in ds:
+                    if d[0] == 'ENTRY':
+                        regs.add(d[1])
+                    else:
+                        st = blocks[d[0]].term if d[1] == 'T' else blocks[d[0]].stmts[d[1]]
+                        regs |= set(writes_of(st))
+                if rr in regs:
+                    kinds = {}
+                    for d in ds:
+                        kinds.setdefault('ENTRY' if d[0] == 'ENTRY' else defkind.get(d, 'other'), []).append(d)
+                    print('web', len(ds), {k: len(v) for k, v in kinds.items()}, 'badread', root in {find(d) for d in bad},
+                          'used', root in usedroots, 'others', kinds.get('other', [])[:4], kinds.get('ENTRY', [])[:3])
         state_defs = {d for d in parent if d[0] != 'ENTRY' and find(d) not in badroots and find(d) in usedroots}
         if not state_defs:
             return
@@ -551,30 +612,30 @@ class ProtoCFG:
         work = []
         limit = 40 * len(blocks) + 2000
 
-        def node(bid, env):
+        def node(bid, env, start=0):
             keep = {}
             li = live_in.get(bid, ())
             for k, v in env.items():
                 if isinstance(k, tuple):
                     if bid in for_live.get(k[1], ()):
                         keep[k] = v
-                elif k in li:
+                elif start or k in li:
                     keep[k] = v
-            key = (bid, tuple(sorted(keep.items(), key=repr)))
+            key = (bid, start, tuple(sorted(keep.items(), key=repr)))
             nid = ids.get(key)
             if nid is None:
-                if not keep:
+                if not keep and not start:
                     nid = bid
                 else:
                     counter[0] += 1
                     nid = (bid, 'u', counter[0])
                 ids[key] = nid
-                work.append((nid, bid, keep))
+                work.append((nid, bid, keep, start))
             return nid
 
         entry = node(self.entry, {})
         while work:
-            nid, bid, env = work.pop()
+            nid, bid, env, start = work.pop()
             if len(ids) > limit:
                 self.warnings.append('unflatten: state explosion, pass skipped')
                 return
@@ -591,7 +652,10 @@ class ProtoCFG:
                 return map_expr(e, fn)
 
             origin = []
+            split = False
             for i, st in enumerate(b.stmts):
+                if i < start:
+                    continue
                 d = (bid, i)
                 if d in prep_info and prep_info[d][0] in unroll:
                     base, init, lim, step, idxs = prep_info[d]
@@ -602,6 +666,17 @@ class ProtoCFG:
                     nb.stmts = [s2 for _, s2 in keep]
                     continue
                 if d in state_defs:
+                    if defkind[d] in ('bool', 'split'):
+                        c = sub(st[2]) if env else st[2]
+                        if c[0] != 'k':
+                            envT, envF = dict(env), dict(env)
+                            envT[st[1][1]] = True
+                            envF[st[1][1]] = False
+                            nb.term = ('br', c, node(bid, envT, i + 1), node(bid, envF, i + 1))
+                            split = True
+                            break
+                        env[st[1][1]] = c[1]
+                        continue
                     env[st[1][1]] = st[2][1]
                     continue
                 st2 = map_stmt(st, lambda x: ('k', env[x[1]]) if x[0] == 'r' and x[1] in env else fold(x)) if env else st
@@ -610,7 +685,9 @@ class ProtoCFG:
                 nb.stmts.append(st2)
                 origin.append(i)
             t = b.term
-            if t[0] == 'goto':
+            if split:
+                pass
+            elif t[0] == 'goto':
                 nb.term = ('goto', node(t[1], env))
             elif t[0] == 'br':
                 c = sub(t[1]) if env else t[1]
@@ -640,6 +717,43 @@ class ProtoCFG:
                 nb.term = map_stmt(t, lambda x: ('k', env[x[1]]) if x[0] == 'r' and x[1] in env else fold(x)) if env else t
             else:
                 nb.term = t
+        if split_any:
+            # A state compare (state <= n) that received a boolean cannot execute: it only shows up
+            # on paths the split made look possible (the value had just been tested the other way).
+            # Such blocks are dead ends; branches into them are resolved towards the other side.
+            def boolcmp(e):
+                return e[0] == 'bin' and e[1] in CMPS and e[1] not in ('==', '~=') and (
+                    (e[2][0] == 'k' and isinstance(e[2][1], bool)) or (e[3][0] == 'k' and isinstance(e[3][1], bool)))
+            dead = set()
+            for nb in new_blocks.values():
+                if nb.term[0] == 'br' and boolcmp(nb.term[1]) and not nb.stmts:
+                    dead.add(nb.id)
+                else:
+                    for st in nb.stmts + [nb.term]:
+                        for e in stmt_exprs(st)[0]:
+                            if any(boolcmp(x) for x in walk_expr(e, [])):
+                                if DEBUG_UNFLATTEN:
+                                    print('unflatten: boolean reached a state compare in', nb.id, repr(st)[:200])
+                                return False
+            changed = True
+            while changed:
+                changed = False
+                for nb in new_blocks.values():
+                    if nb.id in dead:
+                        continue
+                    t = nb.term
+                    if t[0] == 'br' and (t[2] in dead) != (t[3] in dead):
+                        nb.term = ('goto', t[3] if t[2] in dead else t[2])
+                        changed = True
+                    elif (t[0] == 'br' and t[2] in dead and t[3] in dead) or (t[0] == 'goto' and t[1] in dead):
+                        if nb.stmts:
+                            return False
+                        dead.add(nb.id)
+                        changed = True
+            if entry in dead:
+                return False
+            for d in dead:
+                del new_blocks[d]
         self.blocks = new_blocks
         self.entry = entry
         self._thread()
@@ -964,8 +1078,10 @@ class ProtoCFG:
                 n += 1
             else:
                 break
-        self.nparams = n
-        b.stmts = b.stmts[n:]
+        if self.param_regs is None:
+            self.nparams = n
+            b.stmts = b.stmts[n:]
+            self.param_regs = list(range(1, n + 1))
         for blk in self.blocks.values():
             for st in blk.stmts + [blk.term]:
                 for e in stmt_exprs(st)[0]:

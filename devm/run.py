@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from . import bootstrap, cleanup, lifter, pe, pipeline, structure, unidata, vmmodel
+from . import bootstrap, cleanup, lifter, normalize, pe, pipeline, structure, unidata, vmmodel
 
 sys.setrecursionlimit(100000)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -121,7 +121,11 @@ def deobfuscate(path, workdir, log=print):
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
         src = f.read()
-    stage = pipeline.Stage(src, workdir, tag, log=log)
+    oneline = normalize.needs_reflow(src)
+    if oneline:
+        src = normalize.reflow(src)
+        log('[%s] minified input: reflowed to %d lines for analysis (it still runs as shipped)' % (tag, src.count('\n') + 1))
+    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=oneline)
     text1 = stage.run()
     boot_text, info = bootstrap.patch(text1)
     if not info['fixkey']:
