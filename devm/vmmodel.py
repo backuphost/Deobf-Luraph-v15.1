@@ -349,8 +349,16 @@ class Model:
 
     def _is_proto_table_style(self):
         parent = self.chain[-2]
-        return len([p for p in parent.params if p != '_']) == 2 and parent.body and parent.body[-1][0] == 'return' \
-            and parent.body[-1][1] and parent.body[-1][1][0][0] == 'func' and parent.body[-1][1][0][1] is self.interp
+        if not (len([p for p in parent.params if p != '_']) == 2 and parent.body and parent.body[-1][0] == 'return'
+                and parent.body[-1][1] and parent.body[-1][1][0][0] == 'func' and parent.body[-1][1][0][1] is self.interp):
+            return False
+        # wrap(proto, upvalues) unpacks the proto table into locals; a factory's upvalue closure that
+        # happens to take two parameters (function(H, d) local d, p, ... = L, D, ...) does not
+        for st in parent.body:
+            if st[0] == 'local' and len(st[2]) == 1 and st[2][0][0] == 'index' and st[2][0][1][0] == 'name' \
+                    and st[2][0][1][1] in parent.params:
+                return True
+        return False
 
     def _mid_is_statement(self, mid):
         """True when the middle closure is declared with `local function`."""
@@ -484,7 +492,7 @@ class Model:
                 outer, mid = it.chain[-3], it.chain[-2]
                 names = it.visible + ['__pid']
                 lst = '{' + ','.join('"%s"' % n for n in names) + '}'
-                oparams = [p for p in outer.params if p != '_']
+                oparams = [p for p in outer.params if p != '_' or self.underscore_is_name]
                 olst = '{' + ','.join('"%s"' % n for n in oparams) + '}'
                 edits.append((outer.body_pos, 'local __pid = __LPH_PROTO(%d,%s,%d,%s);' % (
                     it.index, olst, len(oparams), ','.join(oparams))))
