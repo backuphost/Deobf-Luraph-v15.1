@@ -125,7 +125,10 @@ def deobfuscate(path, workdir, log=print):
     if oneline:
         src = normalize.reflow(src)
         log('[%s] minified input: reflowed to %d lines for analysis (it still runs as shipped)' % (tag, src.count('\n') + 1))
-    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=oneline)
+    # Luraph ships one line and the script checks that (line numbers in its own error messages and
+    # in debug.info must all agree), so the copy that is executed is always laid out as one line,
+    # also when the input is a decompiler's multi-line rendering of the bytecode.
+    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
     if stage.model.factory_style:
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced)
         text = stage.run_traced()

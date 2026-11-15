@@ -59,10 +59,11 @@ return function(G, fnames, libnames)
 			typeNames[c] = "RBXScriptConnection"
 			local state = { Connected = true }
 			conns[c] = fn
-			state.Disconnect = function()
+			state.Disconnect = named("Disconnect", function(self)
+				if self ~= c then error("Expected ':' not '.' calling member function Disconnect", 2) end
 				state.Connected = false
 				conns[c] = nil
-			end
+			end)
 			cmt.__index = function(_, k) return state[k] end
 			cmt.__type = "RBXScriptConnection"
 			cmt.__tostring = function() return "Connection" end
@@ -86,7 +87,16 @@ return function(G, fnames, libnames)
 			sigCore[sig] = core
 			smt.__index = function(_, k)
 				local m = methods[k]
-				if m then return function(...) return m(...) end end
+				if m then
+					-- a fresh closure per read, named and strict about its arguments like the real method
+					return named(k, function(self, ...)
+						if sigCore[self] ~= core then error("Expected ':' not '.' calling member function " .. k, 2) end
+						if k ~= "Wait" and rawType((...)) ~= "function" then
+							error("Attempt to connect failed: Passed value is not a function", 2)
+						end
+						return m(self, ...)
+					end)
+				end
 				return nil
 			end
 			smt.__eq = sigEq
@@ -328,6 +338,10 @@ return function(G, fnames, libnames)
 	m("IsStudio", function() return false end)
 	m("IsClient", function() return true end)
 	m("IsServer", function() return false end)
+	m("IsPropertyModified", function(self, name)
+		if rawType(name) ~= "string" then error("Unable to cast " .. rawTypeof(name) .. " to string", 3) end
+		return false
+	end)
 	m("IsRunning", function() return true end)
 	m("IsRunMode", function() return false end)
 	m("IsEdit", function() return false end)
@@ -395,9 +409,27 @@ return function(G, fnames, libnames)
 
 	-- ------------------------------------------------------------ libraries
 	-- Library tables are plain tables, as in Roblox: scripts test getmetatable(Vector2) == nil.
+	-- Constructors of datatypes the mock does not model return permissive stubs of that type.
+	local known = {
+		Color3 = { "new", "fromRGB", "fromHSV", "fromHex" },
+		CFrame = { "new" }, Rect = { "new" }, Random = { "new" }, UDim = { "new" }, UDim2 = { "new", "fromScale", "fromOffset" },
+		TweenInfo = { "new" }, NumberRange = { "new" }, NumberSequence = { "new" }, ColorSequence = { "new" },
+		BrickColor = { "new", "random", "palette", "White", "Gray", "DarkGray", "Black", "Red", "Yellow", "Green", "Blue" },
+		Ray = { "new" }, Region3 = { "new" }, Region3int16 = { "new" }, Font = { "new", "fromEnum", "fromName", "fromId" },
+		DateTime = { "now", "fromUnixTimestamp", "fromUnixTimestampMillis", "fromUniversalTime", "fromLocalTime", "fromIsoDate" },
+		PhysicalProperties = { "new" }, Axes = { "new" }, Faces = { "new" }, Vector3int16 = { "new" }, Vector2int16 = { "new" },
+		NumberSequenceKeypoint = { "new" }, ColorSequenceKeypoint = { "new" }, OverlapParams = { "new" }, RaycastParams = { "new" },
+		PathWaypoint = { "new" }, CatalogSearchParams = { "new" }, FloatCurveKey = { "new" }, RotationCurveKey = { "new" },
+		SharedTable = { "new", "clear", "clone", "cloneAndFreeze", "increment", "isFrozen", "size", "update" },
+		Content = { "fromUri", "fromObject", "fromAssetId" }, Secret = {}, ValueCurveKey = { "new" },
+	}
 	local function lib(name, tname)
 		local l = {}
 		libnames[l] = name
+		for _, k in ipairs(known[name] or { "new" }) do
+			local full = name .. "." .. k
+			l[k] = named(full, function() return stub(full .. "()", tname or name) end)
+		end
 		return l
 	end
 	M.lib = lib
@@ -528,6 +560,12 @@ return function(G, fnames, libnames)
 		M.Vector2 = L
 		L = lib("Path2DControlPoint")
 		rawset(L, "new", named("Path2DControlPoint.new", function(pos, left, right)
+			for i = 1, 3 do
+				local a = (i == 1 and pos) or (i == 2 and left) or right
+				if typeNames[a] ~= "UDim2" and (i == 1 or a ~= nil) then
+					error("invalid argument #" .. i .. " to 'new' (UDim2 expected, got " .. (typeNames[a] or rawTypeof(a)) .. ")", 2)
+				end
+			end
 			local t = { Position = pos or udim2(0, 0, 0, 0), LeftTangent = left or udim2(0, 0, 0, 0),
 				RightTangent = right or udim2(0, 0, 0, 0) }
 			typeNames[t] = "Path2DControlPoint"
@@ -698,7 +736,10 @@ return function(G, fnames, libnames)
 			local mt = getmetatable(u)
 			typeNames[u] = "EnumItem"
 			local props = { Name = name, Value = value, EnumType = et }
-			props.IsA = named("IsA", function(_, n) return n == etName end)
+			props.IsA = named("IsA", function(self, n)
+				if self ~= u then error("Expected ':' not '.' calling member function IsA", 2) end
+				return n == etName
+			end)
 			mt.__index = function(_, k) return props[k] end
 			mt.__tostring = function() return "Enum." .. etName .. "." .. name end
 			mt.__type = "EnumItem"
@@ -730,13 +771,22 @@ return function(G, fnames, libnames)
 				item("Ball", 0) item("Block", 1) item("Cylinder", 2)
 			end
 			local ms = {}
-			ms.GetEnumItems = named("GetEnumItems", function()
+			ms.GetEnumItems = named("GetEnumItems", function(self)
+				if self ~= et then error("Expected ':' not '.' calling member function GetEnumItems", 2) end
 				local o = {}
 				for _, it in pairs(items) do o[#o + 1] = it end
 				return o
 			end)
-			ms.FromName = named("FromName", function(_, name) return item(name) end)
-			ms.FromValue = named("FromValue", function(_, v) return byValue[v] or item("Value" .. tostring(v), v) end)
+			ms.FromName = named("FromName", function(self, name)
+				if self ~= et then error("Expected ':' not '.' calling member function FromName", 2) end
+				if rawType(name) ~= "string" then error("Argument 1 missing or nil", 2) end
+				return item(name)
+			end)
+			ms.FromValue = named("FromValue", function(self, v)
+				if self ~= et then error("Expected ':' not '.' calling member function FromValue", 2) end
+				if rawType(v) ~= "number" then error("Argument 1 missing or nil", 2) end
+				return byValue[v] or item("Value" .. tostring(v), v)
+			end)
 			mt.__index = function(_, k)
 				if ms[k] then return ms[k] end
 				if type(k) ~= "string" then return nil end
@@ -837,6 +887,9 @@ return function(G, fnames, libnames)
 			return r, draw, function(h, l) hi, lo = h, l end, function() return hi, lo end
 		end
 		rawset(Random, "new", named("Random.new", function(seed)
+			if seed ~= nil and rawType(seed) ~= "number" then
+				error("invalid argument #1 to 'new' (number expected, got " .. rawTypeof(seed) .. ")", 2)
+			end
 			seed = math.floor(tonumber(seed) or 0)
 			local r, draw, set, get = construct(0, 0)
 			draw()

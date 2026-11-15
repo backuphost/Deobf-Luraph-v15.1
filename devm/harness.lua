@@ -348,7 +348,10 @@ local function brief(v)
 			local k = next(v)
 			while k ~= nil do
 				cnt += 1
-				if #keys < 70 then keys[#keys + 1] = type(k) == "string" and k or ("[" .. tostring(k) .. "]") end
+				if #keys < 70 then
+					keys[#keys + 1] = type(k) == "string" and k or ("[" .. tostring(k) .. "]")
+					if k == "n" and type(rawget(v, "n")) == "number" then keys[#keys] = "n=" .. rawget(v, "n") end
+				end
 				k = next(v, k)
 			end
 			if cnt > 0 then
