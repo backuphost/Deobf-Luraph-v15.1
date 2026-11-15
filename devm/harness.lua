@@ -259,6 +259,8 @@ local probing = false      -- true while the poke pass runs
 local pidAlias = {}        -- pid of a probe's copy of a proto -> pid of the proto itself
 local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
 local mfpDelta = nil       -- option mfpdelta=<n>: math_floor_precision(seed) - expected(seed) comes out as n
+local showGlobals = false   -- globals=1: when the script ends, list the globals it defined
+local baseGlobals = {}
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
 local orcLast = setmetatable({}, { __mode = "k" })
@@ -348,6 +350,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "watchlive" then watchLive = tonumber(v) ~= 0
 	elseif k == "httpreply" then httpReply = v
 	elseif k == "mfpdelta" then mfpDelta = tonumber(v)
+	elseif k == "globals" then showGlobals = tonumber(v) ~= 0
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
 if oracleOn then traceMode = true end
@@ -1232,6 +1235,7 @@ if not fn then
 	error("compile")
 end
 populateSandbox()
+for k, v in pairs(sandbox) do baseGlobals[k] = v end
 setfenv(fn, sandbox)
 envTable = sandbox
 -- Run at the call depth of an ordinary script thread (Lua frames and C calls alike): scripts probe
@@ -1363,6 +1367,12 @@ local function pokePass()
 end
 
 function __LPH_AFTER(ok, message)
+	if showGlobals then
+		ewrite("[globals] script " .. (ok and "returned" or "stopped: " .. tostring(message)) .. "\n")
+		for k, v in pairs(sandbox) do
+			if baseGlobals[k] ~= v then ewrite("[globals] " .. tostring(k) .. " = " .. type(v) .. " " .. brief(v) .. "\n") end
+		end
+	end
 	if exercise and not aborted then
 		local okx, errx = pcall(exercisePayload)
 		if not okx then ewrite("[exercise] stopped: " .. tostring(errx) .. "\n") end
