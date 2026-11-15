@@ -1426,6 +1426,12 @@ return function(G, fnames, libnames)
 	M.math_floor_precision = named("math_floor_precision", function(v)
 		M.mfpCalls += 1
 		if M.onMfp then M.onMfp(M.mfpCalls, v) end
+		if M.mfpDelta then
+			return setmetatable({}, { __sub = function(_, expected)
+				if M.onMfpExpected then M.onMfpExpected(M.mfpCalls, v, expected) end
+				return M.mfpDelta
+			end })
+		end
 		return v
 	end)
 

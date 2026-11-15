@@ -258,6 +258,9 @@ local budgetAt = math.huge
 local probing = false      -- true while the poke pass runs
 local pidAlias = {}        -- pid of a probe's copy of a proto -> pid of the proto itself
 local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto first runs
+local mfpDelta = nil       -- option mfpdelta=<n>: math_floor_precision(seed) - expected(seed) comes out as n
+local showGlobals = false   -- globals=1: when the script ends, list the globals it defined
+local baseGlobals = {}
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
 local orcLast = setmetatable({}, { __mode = "k" })
@@ -346,6 +349,8 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "watch" then watchPid[tonumber(v)] = true
 	elseif k == "watchlive" then watchLive = tonumber(v) ~= 0
 	elseif k == "httpreply" then httpReply = v
+	elseif k == "mfpdelta" then mfpDelta = tonumber(v)
+	elseif k == "globals" then showGlobals = tonumber(v) ~= 0
 	elseif k == "tracefrom" then traceFrom = tonumber(v) elseif k == "traceto" then traceTo = tonumber(v) end
 end
 if oracleOn then traceMode = true end
@@ -710,8 +715,12 @@ local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(
 mockRef = mock
 if scriptPath then mock.placeScript(scriptPath) end
 mock.serverSide = serverSide
+mock.mfpDelta = mfpDelta
 mock.onMfp = function(i, v)
-	if i == 1 then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it\n") end
+	if i == 1 and not mfpDelta then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it\n") end
+end
+mock.onMfpExpected = function(i, v, e)
+	ewrite("[env] math_floor_precision call " .. i .. ": seed " .. tostring(v) .. ", expected " .. tostring(e) .. ", answering expected+" .. tostring(mfpDelta) .. "\n")
 end
 mock.onHttp = function(method, url)
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
@@ -748,9 +757,19 @@ if cwrap then
 end
 sandbox = setmetatable({}, { __index = fallback })
 function populateSandbox()
+	-- math: use a copy built by iterating the native table, matching the reference
+	-- tool's wrapLib which also creates a new table from pairs(math).  The copy
+	-- has the same keys inserted in the same order, so pairs(mathCopy) gives the
+	-- same iteration sequence as the reference environment's pairs(math).
+	do
+		local mathCopy = {}
+		for k, v in pairs(math) do mathCopy[k] = v end
+		libnames[mathCopy] = "math"
+		rawset(sandbox, "math", mathCopy)
+	end
 	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
 		"rawset", "rawlen", "select", "setmetatable", "tonumber", "tostring", "type", "typeof", "ipairs", "pairs",
-		"pcall", "xpcall", "unpack", "require", "string", "table", "math", "bit32", "buffer", "coroutine", "os",
+		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
 		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R",
@@ -1216,6 +1235,7 @@ if not fn then
 	error("compile")
 end
 populateSandbox()
+for k, v in pairs(sandbox) do baseGlobals[k] = v end
 setfenv(fn, sandbox)
 envTable = sandbox
 -- Run at the call depth of an ordinary script thread (Lua frames and C calls alike): scripts probe
@@ -1347,6 +1367,12 @@ local function pokePass()
 end
 
 function __LPH_AFTER(ok, message)
+	if showGlobals then
+		ewrite("[globals] script " .. (ok and "returned" or "stopped: " .. tostring(message)) .. "\n")
+		for k, v in pairs(sandbox) do
+			if baseGlobals[k] ~= v then ewrite("[globals] " .. tostring(k) .. " = " .. type(v) .. " " .. brief(v) .. "\n") end
+		end
+	end
 	if exercise and not aborted then
 		local okx, errx = pcall(exercisePayload)
 		if not okx then ewrite("[exercise] stopped: " .. tostring(errx) .. "\n") end
