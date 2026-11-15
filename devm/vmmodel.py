@@ -377,6 +377,32 @@ class Model:
                     return name
         return 'nil'
 
+    def step_vars(self):
+        """{loop index: [interpreter locals in scope at the dispatch loop]} for the oracle run."""
+        def contains(node, target):
+            if node is target:
+                return True
+            if isinstance(node, (tuple, list)):
+                return any(contains(x, target) for x in node)
+            return False
+
+        out = {}
+        li = 0
+        for it in self.interps:
+            regs = self.regs_name(it)
+            for l in it.loops:
+                names = []
+                for st in it.func.body:
+                    if contains(st, l):
+                        break
+                    if st[0] == 'local':
+                        for n in st[1]:
+                            if n not in names and n != regs and (n != '_' or self.underscore_is_name):
+                                names.append(n)
+                out[li] = names
+                li += 1
+        return out
+
     def cond_sites(self):
         """[(start, end, kind)] of every branch condition inside an interpreter that reads a register.
 
@@ -414,7 +440,7 @@ class Model:
                     out.append((start, pos, k))
         return out
 
-    def patched_source(self, step=False, conds=False, flow=False):
+    def patched_source(self, step=False, conds=False, flow=False, stepvars=None):
         """The script with hooks inserted.
 
         Always: the interpreter-entry hook (inlined counter; __LPH_RUN is only called for stubbed
@@ -446,7 +472,11 @@ class Model:
                         text += ('__LPH_N.s=__LPH_N.s+1;__LPH_N.f=__LPH_X[__LPH_N.s]==true;'
                                  '__LPH_R[__LPH_N.s%%4096]=__pid*268435456+%d+%s;' % (li * 16777216, pcv))
                     if step:
-                        text += '__LPH_STEP(__pid,%d,%s,%s);' % (li, pcv, regs)
+                        names = (stepvars or {}).get(li)
+                        if names:
+                            text += '__LPH_STEP(__pid,%d,%s,%s,"%s",%s);' % (li, pcv, regs, ','.join(names), ','.join(names))
+                        else:
+                            text += '__LPH_STEP(__pid,%d,%s,%s);' % (li, pcv, regs)
                     edits.append((pos[li], text))
                     li += 1
         if self.factory_style:
@@ -506,6 +536,39 @@ def find_luau():
         if c and (os.path.isfile(c) or shutil.which(c)):
             return c
     raise RuntimeError('luau binary not found; set LUAU_BIN')
+
+
+def run_oracle(model, workdir, tag, options=()):
+    """Run the script to its end with per-instruction recording.
+
+    Returns (dump of the VM state at the end, oracle, note) where oracle maps (pid, loop, pc) of
+    every executed instruction to a dict: r/v = numbers held by registers / interpreter locals on
+    entry (same on every visit), vers = [(step, instruction text)] per version executed, final =
+    the instruction text at the end of the run."""
+    patched = os.path.join(workdir, tag + '.step.lua')
+    outjson = os.path.join(workdir, tag + '.end.json')
+    with open(patched, 'w', encoding='latin-1') as f:
+        f.write(model.patched_source(step=True, stepvars=model.step_vars()))
+    for p in (outjson, outjson + '.oracle'):
+        if os.path.exists(p):
+            os.remove(p)
+    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] +
+                       list(options), capture_output=True, text=True, errors='replace', timeout=1800)
+    note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
+    note += [l for l in r.stderr.split('\n') if l.startswith('[http]')]
+    if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
+        raise RuntimeError('oracle run failed: ' + r.stderr[-2000:])
+    with open(outjson + '.oracle') as f:
+        raw = json.load(f)
+    out = {}
+    for k, rec in raw.items():
+        pid, loop, pc = (int(x) for x in k.split(':'))
+        rec['r'] = {int(i): v for i, v in rec['r'].items()}
+        rec['succ'] = {tuple(x) for x in rec['succ']}
+        out[(pid, loop, pc)] = rec
+    with open(outjson) as f:
+        dump = json.load(f)
+    return dump, out, note
 
 
 def run_dump(model, workdir, tag, layers=()):

@@ -663,6 +663,13 @@ class PE:
         self.model_writes = 0
         self.keyfn_used = set()
         self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
+        # Lifting a dump taken at the end of a run: instructions that were executed have already
+        # left their mark on the VM state (decrypted code, decoded constants), so their writes to
+        # that state are dropped (frozen).  Writes of the other instructions are applied and
+        # journalled, so that lifting an instruction again starts from the same state.
+        self.frozen = False
+        self.journal = None
+        self.protect = None         # (path prefix of the proto's code arrays, executed pcs): known-final code
         from . import luprint
         self.native_ids = {id(f) for f in model.funcs if luprint.native_shape(f)}
         self.volatile = set()       # paths of loader-state tables whose scalar fields change at run time
@@ -1091,6 +1098,12 @@ class PE:
                 raise PEError('store into escaped table')
             if isinstance(key, float):
                 key = norm(key)
+            if not obj.fresh and self.frozen and obj.path not in self.volatile:
+                return
+            if not obj.fresh and self.protect is not None and key in self.protect[1] and obj.path \
+                    and obj.path.startswith(self.protect[0]):
+                # an instruction that never ran must not rewrite one that did (and is in its final form)
+                return
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
                 raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key))
             if obj.path and not obj.fresh and not self.seeking and self.inject is not None \
@@ -1102,6 +1115,8 @@ class PE:
                 return
             if not obj.fresh:
                 self.model_writes += 1
+                if self.journal is not None:
+                    self.journal.append((obj, key, obj.h.get(key)))
             obj.set(key, val)
             return
         if obj is REGS:
@@ -1385,7 +1400,11 @@ class PE:
             if name in BUF and args and isinstance(args[0], Buffer):
                 if 'write' in name or name in ('buffer.copy', 'buffer.fill'):
                     if args[0].path:
+                        if self.frozen:
+                            return [None]
                         self.model_writes += 1
+                        if self.journal is not None and not any(j[0] is args[0] for j in self.journal if j[1] is None):
+                            self.journal.append((args[0], None, bytes(args[0].data)))    # once per instruction
                 return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))

@@ -332,8 +332,16 @@ return function(G, fnames, libnames)
 	m("RequestAsync", function() error("HttpService is not allowed to send requests", 0) end)
 	-- game:HttpGet() is a DataModel shorthand used by some executor-bundled scripts.
 	-- Return an empty string so the script can continue past the network gate without crashing.
-	m("HttpGet", function() return "" end)
-	m("HttpPost", function() return "" end)
+	-- The harness logs every request and can supply a canned reply (option httpreply=<number>):
+	-- loaders that mix a server-provided number into their decryption key can then be traced further.
+	m("HttpGet", function(_, url)
+		if M.onHttp then return M.onHttp("GET", url) end
+		return ""
+	end)
+	m("HttpPost", function(_, url)
+		if M.onHttp then return M.onHttp("POST", url) end
+		return ""
+	end)
 	m("GenerateGUID", function() return "00000000-0000-0000-0000-000000000000" end)
 	m("JSONEncode", function() return "{}" end)
 	m("JSONDecode", function() return {} end)

@@ -273,11 +273,125 @@ def rpo(cfg):
     return post
 
 
+def _sccs(nodes, succs):
+    """Strongly connected components (Tarjan, iterative) of the subgraph induced by `nodes`."""
+    index, low, on, stack, out = {}, {}, set(), [], []
+    counter = 0
+    for root in nodes:
+        if root in index:
+            continue
+        work = [(root, iter(succs(root)))]
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on.add(root)
+        while work:
+            v, it = work[-1]
+            adv = False
+            for w in it:
+                if w not in nodes:
+                    continue
+                if w not in index:
+                    index[w] = low[w] = counter
+                    counter += 1
+                    stack.append(w)
+                    on.add(w)
+                    work.append((w, iter(succs(w))))
+                    adv = True
+                    break
+                if w in on:
+                    low[v] = min(low[v], index[w])
+            if adv:
+                continue
+            work.pop()
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[v])
+            if low[v] == index[v]:
+                comp = set()
+                while True:
+                    w = stack.pop()
+                    on.discard(w)
+                    comp.add(w)
+                    if w == v:
+                        break
+                out.append(comp)
+    return out
+
+
+def make_reducible(cfg, limit=300):
+    """Node splitting for cycles with more than one entry.
+
+    Unflattening a state machine can leave a loop that is entered both at its head and in its
+    middle (the flattener shares the loop-step code of the first and of later iterations).  The
+    part of the cycle between a secondary entry and the head is copied, so that jumps from outside
+    run the copy and join the loop at its head."""
+    from .ircfg import Block
+    blocks = cfg.blocks
+    nsplit = 0
+
+    def succs(n):
+        return blocks[n].succs()
+
+    for _ in range(limit):
+        cfg.compute_preds()
+        order = rpo(cfg)
+        idx = {b: i for i, b in enumerate(order)}
+        todo = [set(order)]
+        split = None
+        while todo and split is None:
+            nodes = todo.pop()
+            for comp in _sccs(sorted(nodes, key=idx.get), succs):
+                if len(comp) == 1:
+                    n = next(iter(comp))
+                    if n not in succs(n):
+                        continue
+                entries = {n for n in comp if n == cfg.entry or any(p not in comp and p in idx for p in blocks[n].preds)}
+                if not entries:
+                    continue
+                head = min(entries, key=idx.get)
+                if len(entries) > 1:
+                    split = (comp, head, entries - {head})
+                    break
+                todo.append(comp - {head})
+        if split is None:
+            return
+        comp, head, others = split
+        for e in sorted(others, key=idx.get):
+            region = set()
+            stack = [e]
+            while stack:
+                x = stack.pop()
+                if x in region or x == head or x not in comp:
+                    continue
+                region.add(x)
+                stack.extend(succs(x))
+            nsplit += 1
+            names = {n: (n, 'dup', nsplit) for n in region}
+            for n in region:
+                nb = Block(names[n])
+                nb.stmts = list(blocks[n].stmts)
+                nb.term = blocks[n].term
+                blocks[names[n]] = nb
+            for n in region:
+                for t in set(blocks[n].succs()):
+                    if t in names:
+                        blocks[names[n]].retarget(t, names[t])
+            for p in list(blocks[e].preds):
+                if p not in comp and p in idx:
+                    blocks[p].retarget(e, names[e])
+            if cfg.entry == e:
+                cfg.entry = names[e]
+            if len(blocks) > 60000:
+                raise Unstructured('irreducible control flow (splitting explodes)')
+    raise Unstructured('irreducible control flow')
+
+
 # ------------------------------------------------------------------ structuring
 class Structurer:
     def __init__(self, cfg):
         self.cfg = cfg
         self.blocks = cfg.blocks
+        make_reducible(cfg)
         cfg.compute_preds()
         self.order = rpo(cfg)
         self.rpo_idx = {b: i for i, b in enumerate(self.order)}
@@ -285,6 +399,8 @@ class Structurer:
         self._loops()
         self.emitted = {}
         self.depth = 0
+        self.pending = {}
+        self.njumps = 0
         self.live_in, _ = cfg.liveness()
 
     def _dominators(self):
@@ -362,6 +478,50 @@ class Structurer:
                     best = c
         return best
 
+    def merge_children(self, b):
+        """Join points immediately dominated by b, in reverse post-order."""
+        ms = [c for c in self.children.get(b, ()) if self.fwd_preds[c] >= 2]
+        ms.sort(key=self.rpo_idx.get)
+        return ms
+
+    def emit_merges(self, cond, t, f, merges, stop, ctx, out):
+        """A branch whose arms meet at several join points m1 < m2 < ... (reverse post-order).
+
+        Every join point follows a block that can be left early:
+
+            repeat                  -- leaving this block continues at m2
+                repeat              -- leaving this block continues at m1
+                    if cond then ... else ... end
+                until true
+                <m1>
+            until true
+            <m2>
+
+        so no join point has to be emitted more than once."""
+        cs = []
+        c = ctx
+        for m in reversed(merges):
+            c = (None, m, c)
+            cs.append(c)
+        cs.reverse()
+        T = self.arm(t, merges[0], cs[0])
+        F = self.arm(f, merges[0], cs[0])
+        cur = [make_if(cond, T, F)]
+        for j, m in enumerate(merges):
+            nxt = []
+            if has_break(cur) or id(cs[j]) in self.pending:
+                nxt.append(['repeat', cur, ('k', True), None])
+            else:
+                nxt.extend(cur)
+            self.after_loop(cs[j], nxt)
+            if j + 1 == len(merges):
+                out.extend(nxt)
+                return self.jump(m, stop, ctx, out)
+            nb = self.jump(m, merges[j + 1], cs[j + 1], nxt)
+            if nb is not None:
+                self.build(nb, merges[j + 1], cs[j + 1], nxt)
+            cur = nxt
+
     # -- building
     def run(self):
         return self.build(self.cfg.entry, None, None)
@@ -377,11 +537,27 @@ class Structurer:
                 out.append(['break'])
                 return None
             c = ctx[2]
+            through = [ctx]
             while c is not None:
                 if x == c[0] or x == c[1]:
-                    raise Unstructured('jump to outer loop')
+                    # continue / break of an enclosing loop: Luau has no labelled jumps, so leave the
+                    # inner loops with a flag that each of them checks right after its `end`
+                    self.njumps += 1
+                    flag = ('r', 'exit%d' % self.njumps)
+                    for l in through:
+                        self.pending.setdefault(id(l), []).append(
+                            (flag, ('continue' if x == c[0] else 'break') if l[2] is c else 'break'))
+                    out.append(['assign', [flag], [('k', True)]])
+                    out.append(['break'])
+                    return None
+                through.append(c)
                 c = c[2]
         return x
+
+    def after_loop(self, lctx, out):
+        """Checks for the multi-level exits that pass through the loop just emitted."""
+        for flag, kind in self.pending.pop(id(lctx), ()):
+            out.append(make_if(flag, [[kind]], []))
 
     def build(self, b, stop, ctx, out=None):
         if out is None:
@@ -423,6 +599,10 @@ class Structurer:
                 pass
             elif t == 'error':
                 out.append(['comment', 'LIFT ERROR: ' + st[1]])
+            elif t == 'trap':
+                out.append(['comment', 'tamper response (never taken in the traced run)'])
+            elif t == 'cold':
+                pass
             elif t == 'setlist':
                 out.append(['setlist', st[1], st[2], st[3], st[4]])
             elif t in ('numforprep', 'genforprep'):
@@ -446,6 +626,9 @@ class Structurer:
             _, c, t, f = term
             if t == f:
                 return self.jump(t, stop, ctx, out)
+            merges = self.merge_children(b)
+            if len(merges) >= 2:
+                return self.emit_merges(c, t, f, merges, stop, ctx, out)
             follow = self.if_follow(b)
             if follow is not None:
                 T = self.arm(t, follow, ctx)
@@ -454,7 +637,7 @@ class Structurer:
                 return self.jump(follow, stop, ctx, out)
             T = self.arm(t, stop, ctx)
             F = self.arm(f, stop, ctx)
-            if terminates(T):
+            if terminates(T) and not (terminates(F) and size(F) < size(T)):
                 out.append(make_if(c, T, []))
                 out.extend(F)
             elif terminates(F):
@@ -496,6 +679,7 @@ class Structurer:
                     while len(exprs) > 1 and exprs[-1] == ('k', None):
                         exprs.pop()
                 out.append(['forin', list(term[2]), exprs, body, h])
+            self.after_loop(lctx, out)
             return self.jump(follow, stop, ctx, out)
         # exits
         targets = {}
@@ -514,12 +698,14 @@ class Structurer:
                 cond = term[1] if inside == term[2] else negate(term[1])
                 body = self.arm(inside, h, lctx)
                 out.append(['while', cond, body, h])
-                return self.jump(follow, stop, ctx, out)
+                self.after_loop(lctx, out)
+            return self.jump(follow, stop, ctx, out)
         body = []
         nb = self.emit_block(h, h, lctx, body)
         if nb is not None:
             self.build(nb, h, lctx, body)
         out.append(['while', ('k', True), body, h])
+        self.after_loop(lctx, out)
         if follow is None:
             return None
         return self.jump(follow, stop, ctx, out)
@@ -529,6 +715,17 @@ def make_if(c, T, F):
     if not T and F:
         return ['if', negate(c), F, None]
     return ['if', c, T, F if F else None]
+
+
+def size(stmts):
+    """Number of statements, nested ones included."""
+    n = 0
+    for st in stmts:
+        n += 1
+        for x in st[1:]:
+            if isinstance(x, list) and x and isinstance(x[0], list):
+                n += size(x)
+    return n
 
 
 def terminates(stmts):
@@ -568,6 +765,17 @@ def cleanup(stmts, in_loop_tail=False):
             st[3] = cleanup(strip_tail_continue(st[3]))
         out.append(st)
     return out
+
+
+def has_break(stmts):
+    """True if a `break` in stmts would leave the construct that directly encloses them."""
+    for st in stmts:
+        if st[0] == 'break':
+            return True
+        if st[0] == 'if':
+            if has_break(st[2]) or (st[3] and has_break(st[3])):
+                return True
+    return False
 
 
 def has_continue(stmts):
