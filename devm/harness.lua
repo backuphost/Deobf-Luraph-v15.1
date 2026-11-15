@@ -748,9 +748,19 @@ if cwrap then
 end
 sandbox = setmetatable({}, { __index = fallback })
 function populateSandbox()
+	-- math: use a copy built by iterating the native table, matching the reference
+	-- tool's wrapLib which also creates a new table from pairs(math).  The copy
+	-- has the same keys inserted in the same order, so pairs(mathCopy) gives the
+	-- same iteration sequence as the reference environment's pairs(math).
+	do
+		local mathCopy = {}
+		for k, v in pairs(math) do mathCopy[k] = v end
+		libnames[mathCopy] = "math"
+		rawset(sandbox, "math", mathCopy)
+	end
 	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
 		"rawset", "rawlen", "select", "setmetatable", "tonumber", "tostring", "type", "typeof", "ipairs", "pairs",
-		"pcall", "xpcall", "unpack", "require", "string", "table", "math", "bit32", "buffer", "coroutine", "os",
+		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
 		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R",
