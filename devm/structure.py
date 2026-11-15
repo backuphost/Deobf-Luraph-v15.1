@@ -1403,6 +1403,10 @@ class Decompiler:
         plist = list(params) + (['...'] if vararg else [])
         head = 'function%s(%s)' % (' ' + name if name else '', ', '.join(plist))
         p.block(ast)
+        if len(p.lines) > 4000:
+            # control flow that could not be untangled: thousands of lines of flag juggling help nobody
+            self.stats['unstructured'] += 1
+            return 'function(...) --[[ UNSTRUCTURED: %d lines of unrecovered control flow omitted ]] end' % len(p.lines)
         return head + '\n' + '\n'.join(p.lines) + '\n' + '\t' * printer.level + 'end'
 
     def run(self):
