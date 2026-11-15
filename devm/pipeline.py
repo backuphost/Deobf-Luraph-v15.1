@@ -9,13 +9,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class Stage:
-    def __init__(self, src, workdir, tag, layers=(), log=print):
+    def __init__(self, src, workdir, tag, layers=(), log=print, oneline=False):
         self.src = src
         self.workdir = workdir
         self.tag = tag
         self.layers = list(layers)
         self.log = log
-        self.model = vmmodel.Model(src)
+        self.model = vmmodel.Model(src, oneline=oneline)
         self.patched_path = os.path.join(workdir, tag + '.patched.lua')
 
     def run(self):
@@ -47,7 +47,7 @@ def _native_text(self, line, upnames, level):
     fs = self.model.func_by_line.get(line, [])
     if len(fs) != 1:
         return None
-    return luprint.native_closure_text(fs[0], upnames, level)
+    return luprint.native_closure_text(fs[0], upnames, level, self.model.cells, self.model.up_base)
 
 
 Stage.native_text = _native_text

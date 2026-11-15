@@ -557,6 +557,18 @@ class FactoryLifter(Lifter):
             if isinstance(v, LuaTable) and v.path:
                 self.pe.volatile.add(v.path)
 
+    def upvalue_param(self, mid):
+        """Index of the wrapper parameter that receives the upvalue list.
+
+        Minified builds repeat parameter names (the last one wins) and shadow the unused ones with
+        the wrapper's first `local` statement; decompiler output marks unused ones with `_`."""
+        shadowed = set()
+        if mid.body and mid.body[0][0] == 'local':
+            shadowed = set(mid.body[0][1])
+        cands = [i for i, p in enumerate(mid.params)
+                 if p not in shadowed and p not in mid.params[i + 1:] and (p != '_' or self.model.underscore_is_name)]
+        return cands[0] if cands else None
+
     def proto_key(self, proto):
         if isinstance(proto, P.ProtoRef):
             return proto.pid
@@ -564,6 +576,28 @@ class FactoryLifter(Lifter):
 
     def register(self, key):
         pass
+
+    def lift_all(self, root_key):
+        """Every proto is lifted against a pristine copy of the dumped VM state.
+
+        Lifting evaluates instructions that modify state shared by all protos (one-shot decryption
+        of pooled constants inside the bytecode buffer).  A proto that is still partly encrypted
+        (hash-keyed code that has not run yet) lifts garbage on those paths, and garbage writes
+        must not leak into the constants of the other protos."""
+        queue = [root_key]
+        done = {}
+        while queue:
+            k = queue.pop(0)
+            if k in done:
+                continue
+            fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
+            fresh.pe.keyfn_override = self.pe.keyfn_override
+            pir = fresh.lift_proto(k)
+            pir.keyfns = set(pir.keyfns)
+            done[k] = pir
+            queue.extend(c for c in pir.children if c not in done)
+        self.protos = done
+        return done
 
     def instantiate(self, key):
         idx, env = self.records[key - 1]
@@ -585,12 +619,11 @@ class FactoryLifter(Lifter):
             raise PEError('factory did not return the wrapper closure')
         midfn = r[1][0]
         sc2 = Scope(midfn.scope)
-        first = True
-        for p in mid.params:
-            if p == '_':
-                continue
-            sc2.vars[p] = UPVALS if first else None
-            first = False
+        up = self.upvalue_param(mid)
+        for i, p in enumerate(mid.params):
+            sc2.vars[p] = None
+        if up is not None:
+            sc2.vars[mid.params[up]] = UPVALS
         r = pe.exec_block(mid.body, sc2)
         if not r or r[0] != 'return' or not isinstance(r[1][0], LFn):
             raise PEError('wrapper did not return the interpreter closure')

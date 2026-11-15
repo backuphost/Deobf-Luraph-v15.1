@@ -133,36 +133,53 @@ class SrcPrinter:
             raise ValueError('print stmt ' + t)
 
 
-def native_closure_text(func, upnames, level):
-    """func: `function(upvals) local a = upvals[0] ... return function(...) ... end end`."""
+def native_shape(func, underscore_is_name=False):
+    """(upvalue-list parameter, {alias: index}, inner Func) for a non-virtualised function kept by
+    Luraph: `function(up) local a = up[i] ... return function(...) ... end end`; None otherwise.
+    Minified builds repeat parameter names (the last one wins) and shadow the unused ones."""
     if not func.params:
         return None
-    up = func.params[0]
     alias = {}
     inner = None
+    ups = set()
     for st in func.body:
         if st[0] == 'local' and len(st[1]) == 1 and len(st[2]) == 1 and st[2][0][0] == 'index' \
-                and st[2][0][1] == ('name', up) and st[2][0][2][0] == 'num':
+                and st[2][0][1][0] == 'name' and st[2][0][2][0] == 'num':
             alias[st[1][0]] = st[2][0][2][1]
+            ups.add(st[2][0][1][1])
         elif st[0] == 'return' and len(st[1]) == 1 and st[1][0][0] == 'func':
             inner = st[1][0][1]
         else:
             return None
-    if inner is None:
+    if inner is None or len(ups) > 1:
         return None
+    up = next(iter(ups)) if ups else func.params[0]
+    if up not in func.params:
+        return None
+    return up, alias, inner
+
+
+def native_closure_text(func, upnames, level, cells=(1, 3), base=0):
+    """Source of the inner function with upvalue-cell accesses replaced by the captured names."""
+    shape = native_shape(func)
+    if shape is None:
+        return None
+    up, alias, inner = shape
+    alias = {k: v - base for k, v in alias.items()}
+    box, slot = ('num', cells[0]), ('num', cells[1])
 
     def upname(i):
-        return upnames[i] if i < len(upnames) else 'UPVAL_%d' % i
+        return upnames[i] if 0 <= i < len(upnames) else 'UPVAL_%d' % i
 
     def rewrite(e):
-        # box access: a[1][a[3]]
-        if e[0] == 'index' and e[1][0] == 'index' and e[1][2] == ('num', 1) and e[1][1][0] == 'name' \
-                and e[1][1][1] in alias and e[2] == ('index', e[1][1], ('num', 3)):
+        # box access: a[box][a[slot]]
+        if e[0] == 'index' and e[1][0] == 'index' and e[1][2] == box and e[1][1][0] == 'name' \
+                and e[1][1][1] in alias and e[2] == ('index', e[1][1], slot):
             return upname(alias[e[1][1][1]])
         if e[0] == 'name' and e[1] in alias:
             return upname(alias[e[1]])
         if e[0] == 'index' and e[1] == ('name', up) and e[2][0] == 'num':
-            return upname(e[2][1])
+            return upname(e[2][1] - base)
         return None
 
     p = SrcPrinter(rewrite)

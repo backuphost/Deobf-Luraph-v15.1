@@ -41,11 +41,13 @@ return function(G, fnames, libnames)
 	M.stub = stub
 
 	-- ------------------------------------------------------------ signals
+	-- Like Roblox, every read of a signal property yields a new wrapper object: two reads are
+	-- equal under == (shared __eq) but are different table keys, and so are their method closures.
+	local sigCore = setmetatable({}, { __mode = "k" })
+	local function sigEq(a, b) return sigCore[a] ~= nil and sigCore[a] == sigCore[b] end
 	local function newSignal(name)
 		local conns = {}
-		local sig = newproxy(true)
-		local smt = getmetatable(sig)
-		typeNames[sig] = "RBXScriptSignal"
+		local core = {}
 		local methods = {}
 		methods.Connect = function(_, fn)
 			local c = newproxy(true)
@@ -66,17 +68,35 @@ return function(G, fnames, libnames)
 		methods.connect = methods.Connect
 		methods.Once = methods.Connect
 		methods.ConnectParallel = methods.Connect
-		methods.Wait = function() return nil end
-		smt.__index = function(_, k) return methods[k] end
-		smt.__type = "RBXScriptSignal"
-		smt.__tostring = function() return "Signal " .. name end
-		smt.__metatable = "The metatable is locked"
+		methods.Wait = function()
+			-- inside a coroutine of the script the wait really suspends it (nothing ever fires here)
+			if M.mainThread and coroutine.running() ~= M.mainThread and coroutine.isyieldable() then
+				return coroutine.yield()
+			end
+			return nil
+		end
+		local function make()
+			local sig = newproxy(true)
+			local smt = getmetatable(sig)
+			typeNames[sig] = "RBXScriptSignal"
+			sigCore[sig] = core
+			smt.__index = function(_, k)
+				local m = methods[k]
+				if m then return function(...) return m(...) end end
+				return nil
+			end
+			smt.__eq = sigEq
+			smt.__type = "RBXScriptSignal"
+			smt.__tostring = function() return "Signal " .. name end
+			smt.__metatable = "The metatable is locked"
+			return sig
+		end
 		local function fire(...)
 			local list = {}
 			for _, fn in pairs(conns) do list[#list + 1] = fn end
 			for _, fn in ipairs(list) do pcall(fn, ...) end
 		end
-		return sig, fire
+		return make, fire
 	end
 
 	-- ------------------------------------------------------------ instances
@@ -97,8 +117,8 @@ return function(G, fnames, libnames)
 	local function getSignal(d, k)
 		local s = d.signals[k]
 		if not s then
-			local sig, fire = newSignal(k)
-			s = { sig = sig, fire = fire }
+			local make, fire = newSignal(k)
+			s = { make = make, fire = fire }
 			d.signals[k] = s
 		end
 		return s
@@ -133,7 +153,7 @@ return function(G, fnames, libnames)
 			local v = d.props[k]
 			if v ~= nil then return v end
 			if k == "Parent" then return nil end
-			if signalProps[k] then return getSignal(d, k).sig end
+			if signalProps[k] then return getSignal(d, k).make() end
 			v = methods[k]
 			if v ~= nil then return v end
 			for _, c in ipairs(d.children) do
@@ -161,8 +181,15 @@ return function(G, fnames, libnames)
 	end
 	M.newInstance = newInstance
 
+	-- Methods insist on an Instance as `self`, like the real ones (scripts call them with other
+	-- values on purpose and expect the error).
 	local function m(name, f)
-		methods[name] = named(name, f)
+		methods[name] = named(name, function(self, ...)
+			if not data[self] then
+				error("Expected ':' not '.' calling member function " .. name, 2)
+			end
+			return f(self, ...)
+		end)
 	end
 	m("GetChildren", function(self)
 		local out = {}
@@ -205,6 +232,35 @@ return function(G, fnames, libnames)
 		local c = data[self].props.ClassName
 		return c == cls or cls == "Instance"
 	end)
+	local function ancestor(self, pred)
+		local p = data[self].props.Parent
+		while p and data[p] do
+			if pred(p) then return p end
+			p = data[p].props.Parent
+		end
+		return nil
+	end
+	m("FindFirstAncestor", function(self, name)
+		return ancestor(self, function(p) return data[p].props.Name == name end)
+	end)
+	m("FindFirstAncestorOfClass", function(self, class)
+		return ancestor(self, function(p) return data[p].props.ClassName == class end)
+	end)
+	m("FindFirstAncestorWhichIsA", function(self, class)
+		return ancestor(self, function(p) return methods.IsA(p, class) end)
+	end)
+	m("FindFirstChildWhichIsA", function(self, class, recursive)
+		for _, c in ipairs(recursive and methods.GetDescendants(self) or data[self].children) do
+			if methods.IsA(c, class) then return c end
+		end
+		return nil
+	end)
+	m("FindFirstDescendant", function(self, name)
+		for _, c in ipairs(methods.GetDescendants(self)) do
+			if data[c].props.Name == name then return c end
+		end
+		return nil
+	end)
 	m("IsDescendantOf", function(self, other)
 		local p = data[self].props.Parent
 		while p do
@@ -243,7 +299,7 @@ return function(G, fnames, libnames)
 		end
 		return table.concat(parts, ".")
 	end)
-	m("GetPropertyChangedSignal", function(self, prop) return getSignal(data[self], "Changed:" .. tostring(prop)).sig end)
+	m("GetPropertyChangedSignal", function(self, prop) return getSignal(data[self], "Changed:" .. tostring(prop)).make() end)
 	m("GetAttribute", function(self, k) return data[self].attrs[k] end)
 	m("SetAttribute", function(self, k, v) data[self].attrs[k] = v end)
 	m("GetAttributes", function(self)
@@ -251,7 +307,7 @@ return function(G, fnames, libnames)
 		for k, v in pairs(data[self].attrs) do o[k] = v end
 		return o
 	end)
-	m("GetAttributeChangedSignal", function(self, k) return getSignal(data[self], "Attr:" .. tostring(k)).sig end)
+	m("GetAttributeChangedSignal", function(self, k) return getSignal(data[self], "Attr:" .. tostring(k)).make() end)
 	local game
 	m("GetService", function(self, name)
 		local s = services[name]
@@ -398,6 +454,46 @@ return function(G, fnames, libnames)
 	Vec2MT.__div = function(a, b)
 		if type(b) == "number" then return vec2(a.X / b, a.Y / b) end
 		return vec2(a.X / b.X, a.Y / b.Y)
+	end
+	Vec2MT.__idiv = function(a, b)
+		if type(b) == "number" then return vec2(a.X // b, a.Y // b) end
+		return vec2(a.X // b.X, a.Y // b.Y)
+	end
+	local function sign(x) return x > 0 and 1 or (x < 0 and -1 or 0) end
+	local vec2Methods = {
+		Abs = function(a) return vec2(math.abs(a.X), math.abs(a.Y)) end,
+		Ceil = function(a) return vec2(math.ceil(a.X), math.ceil(a.Y)) end,
+		Floor = function(a) return vec2(math.floor(a.X), math.floor(a.Y)) end,
+		Sign = function(a) return vec2(sign(a.X), sign(a.Y)) end,
+		Dot = function(a, b) return a.X * b.X + a.Y * b.Y end,
+		Cross = function(a, b) return a.X * b.Y - a.Y * b.X end,
+		Angle = function(a, b, signed)
+			local ang = math.atan2(a.X * b.Y - a.Y * b.X, a.X * b.X + a.Y * b.Y)
+			return signed and ang or math.abs(ang)
+		end,
+		FuzzyEq = function(a, b, eps)
+			eps = eps or 1e-5
+			return math.abs(a.X - b.X) <= eps and math.abs(a.Y - b.Y) <= eps
+		end,
+		Lerp = function(a, b, t) return vec2(a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t) end,
+		Max = function(a, ...)
+			local x, y = a.X, a.Y
+			for _, b in ipairs({ ... }) do x, y = math.max(x, b.X), math.max(y, b.Y) end
+			return vec2(x, y)
+		end,
+		Min = function(a, ...)
+			local x, y = a.X, a.Y
+			for _, b in ipairs({ ... }) do x, y = math.min(x, b.X), math.min(y, b.Y) end
+			return vec2(x, y)
+		end,
+	}
+	for k, f in pairs(vec2Methods) do named(k, f) end
+	Vec2MT.__index = function(a, k)
+		if k == "Unit" then
+			local m = rawget(a, "Magnitude")
+			return m > 0 and vec2(a.X / m, a.Y / m) or vec2(0 / 0, 0 / 0)
+		end
+		return vec2Methods[k]
 	end
 	Vec2MT.__unm = function(a) return vec2(-a.X, -a.Y) end
 	Vec2MT.__eq = function(a, b) return a.X == b.X and a.Y == b.Y end
@@ -710,6 +806,10 @@ return function(G, fnames, libnames)
 			ms.NextUnitVector = named("NextUnitVector", function()
 				draw()
 				draw()
+				if M.Vector3 then
+					-- (the direction itself is not derived from the generator state)
+					return M.Vector3.new(0, 1, 0)
+				end
 				return stub("Vector3", "Vector3")
 			end)
 			ms.Shuffle = named("Shuffle", function(_, t)
@@ -743,6 +843,71 @@ return function(G, fnames, libnames)
 		M.Random = Random
 	end
 
+	-- Vector3: the native vector type, as in Roblox (type() == "vector", typeof() == "Vector3").
+	-- Needs setvectormetatable from the patched CLI; without it Vector3 stays a permissive stub.
+	if G.setvectormetatable and G.vector then
+		local vec = G.vector
+		local create = vec.create
+		local function v3(x, y, z) return create(x or 0, y or 0, z or 0) end
+		local function sign(x) return x > 0 and 1 or (x < 0 and -1 or 0) end
+		local methods = {
+			Abs = function(a) return vec.abs(a) end,
+			Ceil = function(a) return vec.ceil(a) end,
+			Floor = function(a) return vec.floor(a) end,
+			Sign = function(a) return create(sign(a.x), sign(a.y), sign(a.z)) end,
+			Dot = function(a, b) return vec.dot(a, b) end,
+			Cross = function(a, b) return vec.cross(a, b) end,
+			Angle = function(a, b, axis)
+				local ang = math.atan2(vec.magnitude(vec.cross(a, b)), vec.dot(a, b))
+				if axis and vec.dot(vec.cross(a, b), axis) < 0 then ang = -ang end
+				return ang
+			end,
+			FuzzyEq = function(a, b, eps)
+				eps = eps or 1e-5
+				local d = a - b
+				return math.abs(d.x) <= eps and math.abs(d.y) <= eps and math.abs(d.z) <= eps
+			end,
+			Lerp = function(a, b, t) return a + (b - a) * t end,
+			Max = function(a, ...)
+				for _, b in ipairs({ ... }) do a = vec.max(a, b) end
+				return a
+			end,
+			Min = function(a, ...)
+				for _, b in ipairs({ ... }) do a = vec.min(a, b) end
+				return a
+			end,
+		}
+		for k, f in pairs(methods) do named(k, f) end
+		G.setvectormetatable({
+			__index = function(v, k)
+				-- (a computed key does not take the VM's built-in x/y/z path)
+				if k == "X" or k == "x" then return v.x end
+				if k == "Y" or k == "y" then return v.y end
+				if k == "Z" or k == "z" then return v.z end
+				if k == "Magnitude" then return vec.magnitude(v) end
+				if k == "Unit" then return vec.normalize(v) end
+				return methods[k]
+			end,
+			__type = "Vector3",
+		})
+		local L = {}
+		libnames[L] = "Vector3"
+		L.new = named("Vector3.new", v3)
+		L.zero, L.one = create(0, 0, 0), create(1, 1, 1)
+		L.xAxis, L.yAxis, L.zAxis = create(1, 0, 0), create(0, 1, 0), create(0, 0, 1)
+		local axes = { X = L.xAxis, Y = L.yAxis, Z = L.zAxis, Right = L.xAxis, Top = L.yAxis, Back = L.zAxis,
+			Left = -L.xAxis, Bottom = -L.yAxis, Front = -L.zAxis }
+		local function fromEnum(item)
+			local ok, name = pcall(function() return item.Name end)
+			return (ok and axes[name]) or L.zero
+		end
+		L.FromAxis = named("Vector3.FromAxis", fromEnum)
+		L.FromNormalId = named("Vector3.FromNormalId", fromEnum)
+		L.fromAxis, L.fromNormalId = L.FromAxis, L.FromNormalId
+		M.Vector3 = L
+		M.vectorTypeName = "Vector3"
+	end
+
 	-- task
 	do
 		local task = {}
@@ -766,6 +931,13 @@ return function(G, fnames, libnames)
 			return type(f) == "thread" and f or coroutine.create(f)
 		end)
 		task.wait = named("task.wait", function(t)
+			local co = coroutine.running()
+			if M.mainThread and co ~= M.mainThread and coroutine.isyieldable() then
+				-- a coroutine of the script: really yield (it shows as "suspended" until the scheduler,
+				-- i.e. the next wait of the main thread, resumes it)
+				queue[#queue + 1] = { co, t or 0.03 }
+				return coroutine.yield()
+			end
 			local q = queue
 			queue = {}
 			for _, item in ipairs(q) do
@@ -785,6 +957,24 @@ return function(G, fnames, libnames)
 		M.delay = named("delay", function() end)
 	end
 
+	-- debug: Roblox adds profiling / memory-category helpers to Luau's info and traceback
+	do
+		local d = {}
+		for k, v in pairs(G.debug) do d[k] = v end
+		local category = "Default"
+		d.profilebegin = named("debug.profilebegin", function() end)
+		d.profileend = named("debug.profileend", function() end)
+		d.getmemorycategory = named("debug.getmemorycategory", function() return category end)
+		d.setmemorycategory = named("debug.setmemorycategory", function(c)
+			local old = category
+			category = tostring(c)
+			return old
+		end)
+		d.resetmemorycategory = named("debug.resetmemorycategory", function() category = "Default" end)
+		libnames[d] = "debug"
+		M.debug = d
+	end
+
 	M.tick = named("tick", os.clock)
 	M.time = named("time", os.clock)
 	M.elapsedTime = named("elapsedTime", os.clock)
@@ -797,7 +987,9 @@ return function(G, fnames, libnames)
 	M.typeof = named("typeof", function(v)
 		local tn = typeNames[v]
 		if tn then return tn end
-		return rawTypeof(v)
+		tn = rawTypeof(v)
+		if tn == "vector" and M.vectorTypeName then return M.vectorTypeName end
+		return tn
 	end)
 	M.type = named("type", function(v)
 		if getmetatable(v) == stubMT then return "userdata" end
