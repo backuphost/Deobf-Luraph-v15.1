@@ -145,6 +145,8 @@ def _double_not(text):
 
 def tidy(text):
     text = _double_not(text)
+    # in a condition only truthiness counts
+    text = re.sub(r'(?m)^(\t*(?:if|elseif|while) )not not ((?:[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*)*)( (?:then|do))$', r'\1\2\3', text)
     # stores into a table nothing else can see (a VM scratch array that was never bound to a variable)
     text = '\n'.join(ln for ln in text.split('\n') if not re.match(r'^\s*\(\{\}\)\[\d+\] = [-\w.]+$', ln))
     text = _loop_artifacts(text)

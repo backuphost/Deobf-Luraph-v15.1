@@ -178,6 +178,62 @@ local function forceLazy(root)
 	end
 end
 
+-- Constant pools.  In some builds a proto's constant table is {[-1] = keys, [-2] = index array} with
+-- an __index metamethod (itself VM code) that decodes pool entry index[pc] from the bytecode the
+-- first time an instruction asks for it.  Instructions that never ran never asked, so the whole
+-- pool is read out here through the live metamethod: pools[id of keys table][index] = value.
+local poolsJson = nil
+local function dumpPools(root, extra)
+	local seen, queue = {}, { root }
+	for _, t in ipairs(extra or {}) do
+		if type(t) == "table" then queue[#queue + 1] = t end
+	end
+	local qi = 1
+	local groups, order = {}, {}
+	while qi <= #queue do
+		local t = queue[qi]
+		qi += 1
+		local mt = getmetatable(t)
+		if type(mt) == "table" and type(rawget(mt, "__index")) == "function" and type(rawget(t, -1)) == "table"
+			and type(rawget(t, -2)) == "table" and not groups[rawget(t, -1)] then
+			groups[rawget(t, -1)] = t
+			order[#order + 1] = rawget(t, -1)
+		end
+		for k, v in next, t do
+			if type(v) == "table" and not seen[v] and not libnames[v] and v ~= envTable then
+				seen[v] = true
+				queue[#queue + 1] = v
+			end
+		end
+	end
+	local parts = {}
+	for _, keys in ipairs(order) do
+		local t = groups[keys]
+		local idx = rawget(t, -2)
+		local K = 1073741823
+		local saved = rawget(idx, K)
+		local entries, misses, n = {}, 0, 0
+		local i = 0
+		while misses < 4096 and i < 1048576 do
+			rawset(idx, K, i)
+			local ok, v = pcall(function() return t[K] end)
+			rawset(t, K, nil)
+			if ok and v ~= nil then
+				entries[#entries + 1] = '"' .. i .. '":' .. ser(v)
+				misses = 0
+				n += 1
+			else
+				misses += 1
+			end
+			i += 1
+		end
+		rawset(idx, K, saved)
+		ewrite("[pool] " .. n .. " constants read from the pool of table " .. tostring(tblIds[keys]) .. "\n")
+		parts[#parts + 1] = ser(keys):match("%d+") and ('"' .. ser(keys):match("%d+") .. '":{' .. table.concat(entries, ",") .. "}") or nil
+	end
+	poolsJson = "{" .. table.concat(parts, ",") .. "}"
+end
+
 -- The bootstrap installs tables of small functions that ignore their arguments and return a fixed
 -- number (runtime "key" material for self-modifying code). Record their values so the lifter can
 -- fold calls to them.
@@ -222,7 +278,10 @@ local function finish(root)
 	done = true
 	forceLazy(root)
 	findConstFns(root)
+	local okp, errp = pcall(dumpPools, root, protos)
+	if not okp then ewrite("[pool] failed: " .. tostring(errp) .. "\n") end
 	emit("{")
+	if poolsJson then emit('"pools":' .. poolsJson .. ",") end
 	emit('"root":' .. ser(root) .. ",")
 	local ps = {}
 	for i, p in ipairs(protos) do ps[i] = ser(p) end

@@ -554,6 +554,15 @@ class Dump:
         self.tables = {}
         self.by_path = {}
         self.raw = data['tables']
+        self._pools = None
+
+    @property
+    def pools(self):
+        """id of a constant pool's key table -> {index: constant} (harness dumpPools)"""
+        if self._pools is None:
+            self._pools = {int(tid): {int(i): self.conv(v) for i, v in ent.items()}
+                           for tid, ent in (self.data.get('pools') or {}).items()}
+        return self._pools
 
     def conv(self, v, path=None):
         if v is None or isinstance(v, (bool, int)):
@@ -1098,6 +1107,13 @@ class PE:
                     return vals[0] if vals else None
                 if isinstance(h, LuaTable):
                     return self.index(h, key, keyast)
+                kt, et = obj.h.get(-1), obj.h.get(-2)
+                if isinstance(kt, LuaTable) and isinstance(et, LuaTable) and kt.id in self.dump.pools:
+                    # constant pool read out by the harness (the metamethod is VM code): the entry
+                    # this instruction's index selects
+                    idx = et.h.get(key)
+                    if is_num(idx) and not isinstance(idx, bool):
+                        return self.dump.pools[kt.id].get(int(idx))
             if obj.path in self.volatile and (v is None or is_num(v) or isinstance(v, bool)) and not self.seeking \
                     and self.inject is not None:
                 # loader state that changes while the program runs (e.g. the stream position)

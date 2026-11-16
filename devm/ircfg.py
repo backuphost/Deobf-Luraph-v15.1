@@ -328,7 +328,11 @@ class ProtoCFG:
                 break
         self._thread()
         self._to_exprs()
+        if self._thread_same_test():
+            self._thread()
         self._dead_stores()
+        if self._thread_same_test():
+            self._thread()
         self._detect_params()
         self._cut_cold_magic()
         if UNFLATTEN and not os.environ.get('DEVM_NO_UNFLATTEN'):
@@ -338,6 +342,10 @@ class ProtoCFG:
             self._merge_tables()
         self._merge_conds()
         self._fold_regs()
+        if self._thread_same_test():
+            self._thread()
+            self._merge_conds()
+            self._fold_regs()
         if self._cut_cold_edges():
             self._dead_stores()
             for _ in range(2):
@@ -357,6 +365,10 @@ class ProtoCFG:
                 self._thread()
                 self._dead_stores()
                 self._fold_regs()
+        if self._thread_same_test():
+            self._thread()
+            self._merge_conds()
+            self._fold_regs()
         self._open_upcells()
         self._dead_stores()
 
@@ -1460,6 +1472,110 @@ class ProtoCFG:
                         blocks[x].preds.add(b.id)
                     changed = True
         self.compute_preds()
+
+    def _thread_same_test(self):
+        """`if r then A else goto B end` where B is nothing but `if r then C else D end`: on that
+        edge r is known, so it goes straight to D (to C from the true arm).  Value-producing
+        and/or chains (`x = a and b and c; if x then`) re-test the register at their join."""
+        if os.environ.get('DEVM_NO_SAMETEST'):
+            return False
+        blocks = self.blocks
+
+        def test(c):
+            neg = False
+            while c[0] == 'un' and c[1] == 'not':
+                c = c[2]
+                neg = not neg
+            return (c, neg) if c[0] == 'r' else (None, False)
+
+        def known_edge(q, target, reg):
+            if q.term[0] != 'br' or q.term[2] == q.term[3]:
+                return False
+            r, _ = test(q.term[1])
+            return r == reg and target in (q.term[2], q.term[3])
+
+        changed = False
+        self.compute_preds()
+        for _ in range(8):
+            again = False
+            for b in list(blocks.values()):
+                if b.id not in blocks or b.term[0] != 'br':
+                    continue
+                reg, neg = test(b.term[1])
+                if reg is None:
+                    continue
+                arms = [b.term[2], b.term[3]]
+                for i in (0, 1):
+                    truth = (i == 0) != neg          # value of the register on this edge
+                    seen = set()
+                    while arms[i] in blocks and arms[i] not in seen:
+                        seen.add(arms[i])
+                        t = blocks[arms[i]]
+                        if t.stmts or t.term[0] != 'br' or t.id == b.id:
+                            break
+                        reg2, neg2 = test(t.term[1])
+                        if reg2 != reg:
+                            break
+                        # only when the join then disappears: if something else still reaches it
+                        # with the value unknown (`x = a and b or c`), the join is the shape the
+                        # and/or recovery looks for and stays as it is
+                        if not all(known_edge(blocks[q], t.id, reg) for q in t.preds if q in blocks):
+                            break
+                        arms[i] = t.term[2] if truth != neg2 else t.term[3]
+                if arms != [b.term[2], b.term[3]]:
+                    b.term = ('br', b.term[1], arms[0], arms[1]) + tuple(b.term[4:])
+                    again = changed = True
+                # the same when the arm does some work first but is only reached from here and
+                # leaves the register alone: its own test of the register is already decided
+                if arms[0] != arms[1] and not os.environ.get('DEVM_NO_ARMTEST'):
+                    for i in (0, 1):
+                        truth = (i == 0) != neg
+                        t = blocks.get(arms[i])
+                        if t is None or t.id == b.id or t.term[0] != 'br' or t.preds != {b.id}:
+                            continue
+                        reg2, neg2 = test(t.term[1])
+                        if reg2 is None or reg[1] in self.captured_ref or reg2[1] in self.captured_ref:
+                            continue
+                        # which registers hold the tested value at the end of the arm
+                        same = {reg[1]}
+                        bad = False
+                        for st in t.stmts:
+                            if st[0] in ('setmulti', 'multiset'):
+                                bad = True
+                                break
+                            ws = _writes_of(st)
+                            if st[0] == 'set' and st[1][0] == 'r' and isinstance(st[2], tuple) and st[2][0] == 'r' \
+                                    and st[2][1] in same:
+                                same.add(st[1][1])
+                            else:
+                                same.difference_update(ws)
+                        if bad or reg2[1] not in same:
+                            continue
+                        t.term = ('goto', t.term[2] if truth != neg2 else t.term[3])
+                        again = changed = True
+            if again:
+                self._prune()
+                self.compute_preds()
+            if not again:
+                break
+        # tail merging: a block ending in the very test an empty block consists of goes there
+        # instead (`if a then x = f() end; if p then` lifted with the second test in both arms)
+        empties = {}
+        for t in blocks.values():
+            if os.environ.get('DEVM_NO_TAILMERGE'):
+                break
+            if not t.stmts and t.term[0] == 'br' and len(t.term) == 4:
+                empties.setdefault(repr(t.term[1:]), t.id)
+        for b in blocks.values():
+            if b.term[0] == 'br' and len(b.term) == 4 and b.stmts:
+                e = empties.get(repr(b.term[1:]))
+                if e is not None and e != b.id:
+                    b.term = ('goto', e)
+                    changed = True
+        if changed:
+            self._prune()
+            self.compute_preds()
+        return changed
 
     def _prune(self):
         seen = set()
