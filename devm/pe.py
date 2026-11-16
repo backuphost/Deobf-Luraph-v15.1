@@ -1834,6 +1834,13 @@ class PE:
                     raise PEError('runaway for')
             return None
         if t == 'forin':
+            if len(st[2]) == 3 and st[2][2] == ('nil',) and st[2][0][0] == 'name' and st[2][1][0] == 'name':
+                # `for k[, v] in next, open_upvalues, nil do v[4] = ...; v[6] = ...; open_upvalues[k] = nil end`
+                # (handlers that leave the function close its upvalues inline): no counterpart in
+                # the lifted code
+                txt = repr(st[3])
+                if "('num', 4)" in txt and "('num', 6)" in txt and "[('nil',)]" in txt:
+                    return None
             it = self.evalargs(st[2], scope)
             if it and it[0] is OPENUPS:
                 self.emit(('close', self.close_base(st, scope)))
