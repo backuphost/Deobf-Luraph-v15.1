@@ -168,9 +168,18 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         log('[%s] no encrypted second stage found: the first program is the script' % tag)
         return cleanup.tidy(text1)
     data = run_bootstrap(stage, boot_text, workdir, tag, log)
-    L, protos, overrides = solve_keyfns(stage.model, data, log)
+    # First with the key function values the bootstrap replay produced.  Junk arms behind opaque
+    # predicates do not lift cleanly and must not be mistaken for wrong keys, so they are cut
+    # before anything is solved for.
+    overrides = {}
+    L = make_lifter(stage.model, data, overrides)
+    protos = L.lift_all(L.root_key)
     cuts = {}
     cut = opaque.prune_ir(protos, cuts)
+    if any(p.errors and p.keyfns for p in protos.values()):
+        L, protos, overrides = solve_keyfns(stage.model, data, log)
+        cuts = {}
+        cut = opaque.prune_ir(protos, cuts)
     for _ in range(4):
         if not cuts:
             break
