@@ -77,10 +77,13 @@ return function(G, fnames, libnames)
 
 	-- ------------------------------------------------------------ permissive value stub
 	local stubMT = {}
+	M.recentStubs, M.recentN = {}, 0     -- names of the last permissive stubs handed out (diagnosis)
 	local function stub(name, tname)
 		local t = setmetatable({}, stubMT)
 		typeNames[t] = tname or "userdata"
 		rawset(t, "__name", name)
+		M.recentStubs[M.recentN % 8 + 1] = name
+		M.recentN += 1
 		return t
 	end
 	stubMT.__index = function(t, k)
@@ -222,6 +225,18 @@ return function(G, fnames, libnames)
 		end
 	end
 
+	local propDefaults = {
+		FieldOfView = 70, WalkSpeed = 16, JumpPower = 50, JumpHeight = 7.2, Health = 100, MaxHealth = 100,
+		HipHeight = 2, Transparency = 0, BackgroundTransparency = 0, TextTransparency = 0, ImageTransparency = 0,
+		Rotation = 0, ZIndex = 1, LayoutOrder = 0, TextSize = 14, Volume = 0.5, TimePosition = 0, PlaybackSpeed = 1,
+		HoldDuration = 0, MaxActivationDistance = 10, Brightness = 1, Range = 16, Thickness = 1, Reflectance = 0,
+		UserId = 1, AccountAge = 365, PlaceId = 1, GameId = 1, JobId = "00000000-0000-0000-0000-000000000000",
+		Enabled = true, Visible = true, Active = true, Anchored = false, CanCollide = true, Massless = false,
+		Text = "", ActionText = "", ObjectText = "", DisplayName = "Player", Value = 0,
+	}
+	local vec2Props = { ViewportSize = { 1920, 1080 }, AbsoluteSize = { 100, 100 }, AbsolutePosition = { 0, 0 },
+		AbsoluteContentSize = { 100, 100 }, AbsoluteWindowSize = { 100, 100 }, CanvasPosition = { 0, 0 },
+		TextBounds = { 50, 14 } }
 	function newInstance(class, name)
 		local u = newproxy(true)
 		local mt = getmetatable(u)
@@ -240,6 +255,13 @@ return function(G, fnames, libnames)
 			end
 			if class == "DataModel" and type(k) == "string" and services[k] then return services[k] end
 			if type(k) ~= "string" then return nil end
+			-- well-known properties get a value of the right type (scripts do arithmetic on them)
+			v = propDefaults[k]
+			if v == nil and vec2Props[k] and M.Vector2 then v = M.Vector2.new(vec2Props[k][1], vec2Props[k][2]) end
+			if v ~= nil then
+				d.props[k] = v
+				return v
+			end
 			-- unknown member: hand out a permissive stub so the script keeps going
 			v = stub(d.props.Name .. "." .. k)
 			d.props[k] = v
@@ -629,6 +651,60 @@ return function(G, fnames, libnames)
 	seal(UDimMT)
 	seal(UDim2MT)
 	seal(Vec2MT)
+	-- Color3: scripts read the channels, lerp and convert, so it has to be a real value
+	do
+		local C3MT = {}
+		local function color3(r, g, b)
+			local t = setmetatable({ R = r or 0, G = g or 0, B = b or 0 }, C3MT)
+			t.r, t.g, t.b = t.R, t.G, t.B
+			typeNames[t] = "Color3"
+			return t
+		end
+		local function toHSV(c)
+			local mx, mn = math.max(c.R, c.G, c.B), math.min(c.R, c.G, c.B)
+			local d = mx - mn
+			local h = 0
+			if d > 0 then
+				if mx == c.R then h = ((c.G - c.B) / d) % 6
+				elseif mx == c.G then h = (c.B - c.R) / d + 2
+				else h = (c.R - c.G) / d + 4 end
+				h /= 6
+			end
+			return h, mx == 0 and 0 or d / mx, mx
+		end
+		local function fromHSV(h, s, v)
+			h, s, v = h or 0, s or 0, v or 0
+			local i = math.floor(h * 6)
+			local f = h * 6 - i
+			local p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+			i %= 6
+			if i == 0 then return color3(v, t, p) elseif i == 1 then return color3(q, v, p)
+			elseif i == 2 then return color3(p, v, t) elseif i == 3 then return color3(p, q, v)
+			elseif i == 4 then return color3(t, p, v) end
+			return color3(v, p, q)
+		end
+		C3MT.__index = {
+			Lerp = function(a, b, t) return color3(a.R + (b.R - a.R) * t, a.G + (b.G - a.G) * t, a.B + (b.B - a.B) * t) end,
+			ToHSV = toHSV,
+			ToHex = function(c)
+				return string.format("%02x%02x%02x", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+			end,
+		}
+		C3MT.__eq = function(a, b) return a.R == b.R and a.G == b.G and a.B == b.B end
+		C3MT.__tostring = function(c) return c.R .. ", " .. c.G .. ", " .. c.B end
+		seal(C3MT)
+		local L = lib("Color3")
+		rawset(L, "new", named("Color3.new", color3))
+		rawset(L, "fromRGB", named("Color3.fromRGB", function(r, g, b) return color3((r or 0) / 255, (g or 0) / 255, (b or 0) / 255) end))
+		rawset(L, "fromHSV", named("Color3.fromHSV", fromHSV))
+		rawset(L, "toHSV", named("Color3.toHSV", toHSV))
+		rawset(L, "fromHex", named("Color3.fromHex", function(hex)
+			hex = string.gsub(tostring(hex), "#", "")
+			return color3((tonumber(string.sub(hex, 1, 2), 16) or 0) / 255, (tonumber(string.sub(hex, 3, 4), 16) or 0) / 255,
+				(tonumber(string.sub(hex, 5, 6), 16) or 0) / 255)
+		end))
+		M.Color3 = L
+	end
 	do
 		local L = lib("UDim")
 		rawset(L, "new", named("UDim.new", udim))

@@ -881,6 +881,40 @@ function populateSandbox()
 		for _, n in ipairs({ "setclipboard", "toclipboard" }) do
 			if rawget(globals, n) == nil then rawset(globals, n, function() end) end
 		end
+		-- require(ModuleScript): the game's modules do not exist here; hand out a permissive stub
+		do
+			local realRequire = rawget(globals, "require")
+			local function impl(m)
+				if type(m) == "string" and realRequire then return realRequire(m) end
+				return mock.stub("require(" .. tostring(m) .. ")")
+			end
+			local f = cwrap and cwrap("require", impl) or impl
+			fnames[f] = "require"
+			rawset(globals, "require", f)
+		end
+		-- the rest of the usual executor API, inert: hooks install nothing, fire* do nothing
+		local genv = setmetatable({}, { __index = globals })
+		local noop = function() end
+		local ex = {
+			getgenv = function() return genv end, getrenv = function() return globals end,
+			newcclosure = function(f) return f end, clonefunction = function(f) return f end,
+			hookfunction = function(f) return f end, replaceclosure = function(f) return f end,
+			hookmetamethod = function() return function() end end,
+			checkcaller = function() return true end, getnamecallmethod = function() return "" end,
+			cloneref = function(x) return x end, compareinstances = function(a, b) return a == b end,
+			gethui = function() return fallback.game:GetService("CoreGui") end,
+			getconnections = function() return {} end, getgc = function() return {} end,
+			getinstances = function() return {} end, getnilinstances = function() return {} end,
+			getloadedmodules = function() return {} end, getrunningscripts = function() return {} end,
+			isexecutorclosure = function() return false end, getcustomasset = function() return "" end,
+			getthreadidentity = function() return 8 end, setthreadidentity = noop,
+			fireproximityprompt = noop, firetouchinterest = noop, fireclickdetector = noop, firesignal = noop,
+			setfpscap = noop, queue_on_teleport = noop, setclipboard = noop, toclipboard = noop,
+			sethiddenproperty = noop, gethiddenproperty = noop, setsimulationradius = noop,
+		}
+		for n, f in pairs(ex) do
+			if rawget(globals, n) == nil then rawset(globals, n, f) end
+		end
 		-- executor file system: empty and read-only
 		local fs = { isfile = function() return false end, isfolder = function() return false end,
 			listfiles = function() return {} end, writefile = function() end, appendfile = function() end,
@@ -1491,6 +1525,11 @@ function __LPH_AFTER(ok, message)
 		if not okx then ewrite("[poke] stopped: " .. tostring(errx) .. "\n") end
 	end
 	if oracleOn then
+		if not ok and showErrors and mock.recentStubs then
+			local names = {}
+			for j = 0, 7 do names[#names + 1] = mock.recentStubs[(mock.recentN + j) % 8 + 1] end
+			ewrite("[stubs] last permissive stubs: " .. table.concat(names, ", ") .. "\n")
+		end
 		ewrite("[oracle] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. stepCount .. " instructions\n")
 		writeOracle()
