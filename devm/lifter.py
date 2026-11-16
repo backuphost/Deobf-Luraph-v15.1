@@ -698,7 +698,7 @@ class FactoryLifter(Lifter):
         # loader state lives in the VM's own table (first factory parameter)
         for idx, env in self.records:
             it = model.interps[idx]
-            first = [p for p in it.chain[-3].params if p != '_'][0]
+            first = [p for p in it.chain[-3].params if p != '_' or model.underscore_is_name][0]
             v = env.get(first)
             if isinstance(v, LuaTable) and v.path:
                 self.pe.volatile.add(v.path)
@@ -760,7 +760,7 @@ class FactoryLifter(Lifter):
         pe.wrap_func = None
         sc = Scope()
         for p in outer.params:
-            if p != '_':
+            if p != '_' or self.model.underscore_is_name:
                 sc.vars[p] = env.get(p)
         sc.vars['__pid'] = key
         r = pe.exec_block(outer.body, sc)
@@ -769,6 +769,7 @@ class FactoryLifter(Lifter):
         midfn = r[1][0]
         sc2 = Scope(midfn.scope)
         up = self.upvalue_param(mid)
+        pe.upvals_list = self.dump.proto_upvals(key) if self.end_state else None
         for i, p in enumerate(mid.params):
             sc2.vars[p] = None
         if up is not None:

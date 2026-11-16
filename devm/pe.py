@@ -628,6 +628,16 @@ class Dump:
             out.append((rec.get('interp'), rec['vars'].h if isinstance(rec.get('vars'), LuaTable) else {}))
         return out
 
+    def proto_upvals(self, pid):
+        """The first table a proto's closure was bound to (harness: protos[pid].ups), or None."""
+        rec = self.conv(self.data['protos'][pid - 1], '__LPH_PROTOS[%d]' % pid).h
+        ups = rec.get('ups')
+        if isinstance(ups, LuaTable):
+            for i in sorted(k for k in ups.h if isinstance(k, int)):
+                if isinstance(ups.h[i], LuaTable):
+                    return ups.h[i].h
+        return None
+
 
 # ------------------------------------------------------------------ evaluator
 ARITH = {'+', '-', '*', '/', '//', '%', '^'}
@@ -763,14 +773,19 @@ class PE:
 
         def visit(st):
             t = st[0]
-            if t == 'assign' and len(st[1]) == 1 and st[1][0][0] == 'name' and len(st[2]) == 1 and st[2][0][0] == 'table':
-                nm = st[1][0][1]
-                vals = [v for _, _, v in st[2][0][1]]
-                if any(v == ('name', nm) for v in vals):
-                    fstack.add(nm)
-                    for v in vals:
-                        if v[0] == 'name':
-                            fvars.add(v[1])
+            if t == 'assign' and len(st[1]) == len(st[2]):
+                # `stack = {..., stack}`, also as one target of a multiple assignment
+                # (`stack, a = {[9]=limit, [7]=stack, ...}, operand[pc]`)
+                for tg, val in zip(st[1], st[2]):
+                    if tg[0] != 'name' or val[0] != 'table':
+                        continue
+                    nm = tg[1]
+                    vals = [v for _, _, v in val[1]]
+                    if any(v == ('name', nm) for v in vals):
+                        fstack.add(nm)
+                        for v in vals:
+                            if v[0] == 'name':
+                                fvars.add(v[1])
             if t == 'forin' and len(st[2]) == 1 and st[2][0][0] == 'name' and len(st[1]) == 2:
                 body = st[3]
                 txt = repr(body)
@@ -853,7 +868,7 @@ class PE:
         raise PEError('cannot atomize %r' % (v,))
 
     def check_reg(self, n):
-        if isinstance(n, int) and (n < 0 or (self.nregs is not None and n > self.nregs + 64)):
+        if isinstance(n, int) and (n < 0 or (self.nregs is not None and n > self.nregs + 4096)):
             raise PEError('register %d out of range (bad self-modifying patch?)' % n)
 
     def read_reg(self, n):
@@ -1071,6 +1086,13 @@ class PE:
         if obj is UPVALS:
             if not isinstance(key, int):
                 raise PEError('upvalue index %r' % (key,))
+            ups = getattr(self, 'upvals_list', None)
+            if ups is not None:
+                # plain-value upvalue lists (the payload interpreter of some builds): numbers and
+                # library functions bound once by the bootstrap
+                v = ups.get(key)
+                if is_num(v) or isinstance(v, (str, bool, Builtin, Lib, GlobalPath)):
+                    return v
             return UpRef(key - self.model.up_base)
         if isinstance(obj, UpRef):
             if keyast is not None and keyast[0] == 'num':
@@ -1564,6 +1586,9 @@ class PE:
                         caps.append(('val', v.origin[1]))
                     elif isinstance(v, UpRef):
                         caps.append(('up', v.n))
+                    elif (is_num(v) or isinstance(v, (str, bool))) and not isinstance(v, Sym):
+                        # captured by value from a register whose content is a known constant
+                        caps.append(('const', v))
                     else:
                         raise PEError('unknown upvalue capture %r' % (v,))
                     n += 1
@@ -1665,6 +1690,19 @@ class PE:
                     obj = self.eval1(tg[1], scope)
                     key = self.eval1(tg[2], scope)
                     self.setindex(obj, key, self.eval1(st[2][0], scope), tg[2])
+                return None
+            if len(targets) == len(st[2]) and any(
+                    tg[0] == 'name' and tg[1] in self.fstack and e[0] == 'table' and self.is_state(scope, tg[1])
+                    for tg, e in zip(targets, st[2])):
+                # for-state push as one target of a multiple assignment
+                if self.perm is None:
+                    raise ForOp()
+                self.events.append(('push',))
+                rest = [(tg, e) for tg, e in zip(targets, st[2])
+                        if not (tg[0] == 'name' and tg[1] in self.fstack and e[0] == 'table')]
+                vals = [self.eval1(e, scope) for _, e in rest]
+                for (tg, _), v in zip(rest, vals):
+                    self.assign_target(tg, v, scope)
                 return None
             vals = self.adjust(self.evalargs(st[2], scope), len(targets))
             for tg, v in zip(targets, vals):

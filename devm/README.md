@@ -61,6 +61,20 @@ Limits, stated plainly:
 * Functions whose control flow still comes out as thousands of lines are replaced by an
   `UNSTRUCTURED` stub.
 
+Later findings on the two Luarmor samples (see `deobfuscated/loadstring5.lua`, `loadstring6.lua`):
+
+* loadstring6's script does decrypt and run: its strings come out right and it requests
+  `.../luarmor/precheck`. It stops because the reply (a number mixed into the next key) is not
+  available offline; a made-up `--http-reply` only yields garbage further on.
+* loadstring5 (the Luarmor bootstrapper) keeps its script in a proto of the *bootstrap* interpreter,
+  so the automatic payload choice is wrong: use `--root 38 --no-exercise`. `--no-exercise` matters
+  when a script stops early: calling its functions again afterwards made it scramble its own code.
+  The script needs the global `_bsdata0` from an earlier loader stage.
+* A payload interpreter can read plain values (jump states, numbers) out of the list its closure was
+  bound to; the harness records that list (`binds=1`, implied by `exercise=1`) and the lifter folds them.
+* A function the structurer gives up on is printed as a state machine (one `if state == n` per
+  basic block) instead of being dropped.
+
 `antitamper.py` predates the inlined instrumentation and is not wired in.
 
 ## Environment fidelity (newer factory builds)
