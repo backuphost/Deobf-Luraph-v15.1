@@ -1645,7 +1645,7 @@ class PE:
         if isinstance(v, tuple):
             raise PEError('unsupported condition %r' % (v,))
         if isinstance(v, LinSym):
-            raise PEError('condition on symbolic count')
+            return True         # a count is a number, and every number is truthy
         return truthy(v)
 
     def exec_block(self, block, scope):

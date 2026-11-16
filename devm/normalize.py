@@ -159,11 +159,51 @@ def inline_protected_raw(src):
     def is_(i, kind, val):
         return 0 <= i < n and toks[i][0] == kind and toks[i][1] == val
 
+    # Luau if-expressions (`x = if a then b else c`) have no `end`
+    exprif = set()
+    st = []             # open ifs: True for an expression
+    for q in range(n):
+        k, v = toks[q][0], toks[q][1]
+        if k != 'kw':
+            continue
+        if v == 'if':
+            pk, pv = toks[q - 1][0], toks[q - 1][1] if q else (None, None)
+            if pk == 'op' and pv not in (';', ')', ']', '}', '...'):
+                expr = True
+            elif pk == 'kw' and pv in ('return', 'and', 'or', 'not'):
+                expr = True
+            elif pk == 'kw' and pv in ('then', 'else') and st and st[-1] in (True, 'chain'):
+                if st[-1] == 'chain':
+                    st.pop()
+                expr = True
+            else:
+                expr = False
+            if expr:
+                exprif.add(q)
+            st.append(expr)
+        elif v == 'elseif' and st and st[-1] is True:
+            pass
+        elif v == 'else' and st and st[-1] is True:
+            # the else arm ends the expression unless it goes on with another if
+            if not is_(q + 1, 'kw', 'if'):
+                st.pop()
+            else:
+                st.pop()        # `else if ...` : the nested if is pushed as an expression next
+                st.append('chain')
+        elif v in ('function', 'do', 'repeat'):
+            st.append(None)
+        elif v in ('end', 'until') and st:
+            st.pop()
+    # (`else if` inside an expression: the marker makes the following `if` an expression too)
+
     def match_block(i):
         """Index of the token closing the block opened at toks[i]."""
         depth = 0
         while i < n:
             k, v = toks[i][0], toks[i][1]
+            if k == 'kw' and i in exprif:
+                i += 1
+                continue
             if k == 'kw':
                 if v in ('function', 'if', 'do', 'repeat'):
                     depth += 1
@@ -174,30 +214,70 @@ def inline_protected_raw(src):
             i += 1
         raise ValueError('unbalanced block')
 
+    # innermost function literal around every token
+    encl = [None] * n
+    stack = []
+    for q in range(n):
+        k, v = toks[q][0], toks[q][1]
+        encl[q] = next((x for x in reversed(stack) if x is not None), None)
+        if k == 'kw' and q not in exprif:
+            if v == 'function':
+                stack.append(q)
+            elif v in ('if', 'do', 'repeat'):
+                stack.append(None)
+            elif v in ('end', 'until') and stack:
+                stack.pop()
+
+    def loop_head(i):
+        """repeat local OP[, X] = CODE[PC]   |   while true do local OP[, X] = CODE[PC]"""
+        if is_(i, 'kw', 'repeat'):
+            q = i + 1
+        elif is_(i, 'kw', 'while') and is_(i + 1, 'kw', 'true') and is_(i + 2, 'kw', 'do'):
+            q = i + 3
+        else:
+            return False
+        if not (is_(q, 'kw', 'local') and toks[q + 1][0] == 'name'):
+            return False
+        q += 2
+        if is_(q, 'op', ',') and toks[q + 1][0] == 'name':
+            q += 2
+        return is_(q, 'op', '=') and toks[q + 1][0] == 'name' and is_(q + 2, 'op', '[') \
+            and toks[q + 3][0] == 'name' and is_(q + 4, 'op', ']')
+
     edits = []          # (start pos, end pos, replacement)
     count = 0
+    done = set()
     i = 0
     while i < n:
-        # repeat local OP = CODE[PC]; if
-        if not (is_(i, 'kw', 'repeat') and is_(i + 1, 'kw', 'local') and toks[i + 2][0] == 'name' and is_(i + 3, 'op', '=')
-                and toks[i + 4][0] == 'name' and is_(i + 5, 'op', '[') and toks[i + 6][0] == 'name' and is_(i + 7, 'op', ']')):
+        if not loop_head(i):
             i += 1
             continue
         rep = i
-        unt = match_block(rep)
-        if not is_(unt + 1, 'kw', 'false'):
-            i += 1
+        i += 1
+        if is_(rep, 'kw', 'repeat'):
+            unt = match_block(rep)
+            if not is_(unt + 1, 'kw', 'false'):
+                continue
+        else:
+            unt = None
+        # enclosing closure: ... = F(function([...]) <locals>; <loop>
+        f = encl[rep]
+        if f is None or f < 1 or not is_(f - 1, 'op', '(') or not is_(f + 1, 'op', '('):
             continue
-        # enclosing closure: ... = F(function() <locals>; repeat
-        f = rep - 1
-        while f >= 0 and not is_(f, 'kw', 'function'):
-            f -= 1
-        if f < 1 or not (is_(f - 1, 'op', '(') and is_(f + 1, 'op', '(') and is_(f + 2, 'op', ')')):
-            i += 1
+        body0 = f + 3 if is_(f + 2, 'op', ')') else f + 4 if (is_(f + 2, 'op', '...') and is_(f + 3, 'op', ')')) else None
+        if body0 is None:
             continue
         fend = match_block(f)
-        if not is_(fend + 1, 'op', ')'):
-            i += 1
+        if is_(fend + 1, 'op', ')'):
+            after = fend + 2
+        elif is_(fend + 1, 'op', ',') and is_(fend + 2, 'op', '...') and is_(fend + 3, 'op', ')'):
+            after = fend + 4
+        else:
+            continue
+        if unt is not None:
+            edits.append((toks[rep][3], toks[rep][3] + len('repeat'), 'while true do'))
+            edits.append((toks[unt][3], toks[unt + 1][3] + len('false'), 'end'))
+        if f in done:
             continue
         # statement start: local OK, A, B, C = <callee>(
         s = f - 1
@@ -211,21 +291,22 @@ def inline_protected_raw(src):
             if is_(k, 'op', ','):
                 k += 1
         if len(names) < 2 or not is_(k, 'op', '='):
-            i += 1
             continue
         ok, vals = names[0], names[1:]
         # if OK then <success> else <failure> end
-        j = fend + 2
+        j = after
         if is_(j, 'op', ';'):
             j += 1
         if not (is_(j, 'kw', 'if') and toks[j + 1] [1] == ok and is_(j + 2, 'kw', 'then')):
-            i += 1
             continue
+        done.add(f)
         ifend = match_block(j)
         depth = 0
         els = None
         for q in range(j, ifend):
             kk, vv = toks[q][0], toks[q][1]
+            if kk == 'kw' and q in exprif:
+                continue
             if kk == 'kw':
                 if vv in ('function', 'if', 'do', 'repeat'):
                     depth += 1
@@ -237,11 +318,9 @@ def inline_protected_raw(src):
         succ_end = toks[els][3] if els is not None else toks[ifend][3]
         success = src[toks[j + 3][3]:succ_end].rstrip().rstrip(';')
         # rewrite the closure body
-        edits.append((toks[s][3], toks[f + 3][3], 'local %s;' % ','.join(vals)))
-        edits.append((toks[rep][3], toks[rep][3] + len('repeat'), 'while true do'))
-        edits.append((toks[unt][3], toks[unt + 1][3] + len('false'), 'end'))
+        edits.append((toks[s][3], toks[body0][3], 'local %s;' % ','.join(vals)))
         depth = 0
-        q = f + 3
+        q = body0
         while q < fend:
             kk, vv = toks[q][0], toks[q][1]
             if kk == 'kw' and vv == 'function':
@@ -277,7 +356,6 @@ def inline_protected_raw(src):
             tail = toks[ifend + 1][3] + 1
         edits.append((toks[fend][3], tail, ''))
         count += 1
-        i = ifend + 1
     if not count:
         return src, 0
     edits.sort()

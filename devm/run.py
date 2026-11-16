@@ -116,7 +116,7 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=False, mfp_delta=None, exercise=True):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=False, mfp_delta=None, exercise=True, http_map=None):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
@@ -141,7 +141,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
         # code decrypts itself too.
-        stage.harness_options = (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
+        stage.harness_options = (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
         text = stage.run_traced()
         # Paths that never ran keep encrypted instructions and constants.  Execute each lifted
         # instruction that did not run once, from the interpreter state the lifter found for it,
@@ -214,6 +214,7 @@ def main(argv=None):
     ap.add_argument('--work', default=None, help='directory for intermediate files')
     ap.add_argument('--mfp-delta', type=int, default=None, help='make math_floor_precision(seed) equal the script\'s own expected value plus this constant')
     ap.add_argument('--http-reply', default=None, help='what game:HttpGet returns (scripts that mix a server reply into their key)')
+    ap.add_argument('--http-map', default=None, help='file of <url substring><TAB><reply body> lines: canned replies for the offline request mock')
     ap.add_argument('--executor', action='store_true', help='provide executor globals (identifyexecutor, iscclosure, islclosure)')
     ap.add_argument('--root', type=int, default=None, help='proto number to lift from (1 = the first program)')
     ap.add_argument('--script-path', default=None,
@@ -223,7 +224,7 @@ def main(argv=None):
     ap.add_argument('--no-exercise', action='store_true', help='do not call the script\'s uncalled functions after the run (the calls can make a script that stopped early scramble its code)')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
-    text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise)
+    text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map)
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
     with open(out, 'w', encoding='utf-8') as f:
         f.write(text)

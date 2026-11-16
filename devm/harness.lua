@@ -264,6 +264,7 @@ local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto
 local mfpDelta = nil       -- option mfpdelta=<n>: math_floor_precision(seed) - expected(seed) comes out as n
 local showGlobals = false   -- globals=1: when the script ends, list the globals it defined
 local baseGlobals = {}
+local httpMap, httpMapPath = nil, nil    -- httpmap=<file> of `<url substring><TAB><reply body>` lines
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
 local orcLast = setmetatable({}, { __mode = "k" })
@@ -327,7 +328,11 @@ local scriptPath = nil
 for i = #layers, 1, -1 do
 	local sp = string.match(layers[i], "^scriptpath=(.+)$")
 	local pk = string.match(layers[i], "^poke=(.+)$")
-	if sp then
+	local hm = string.match(layers[i], "^httpmap=(.+)$")
+	if hm then
+		httpMapPath = hm
+		table.remove(layers, i)
+	elseif sp then
 		scriptPath = sp
 		table.remove(layers, i)
 	elseif pk then
@@ -769,6 +774,23 @@ mock.onMfpExpected = function(i, v, e)
 	ewrite("[env] math_floor_precision call " .. i .. ": seed " .. tostring(v) .. ", expected " .. tostring(e) .. ", answering expected+" .. tostring(mfpDelta) .. "\n")
 end
 mock.onHttp = function(method, url)
+	if httpMapPath and not httpMap then
+		httpMap = {}
+		local okm, text = pcall(readfile, httpMapPath)
+		if not okm then ewrite("[http] cannot read reply map: " .. tostring(text) .. "\n") text = "" end
+		for line in string.gmatch(text, "[^\n]+") do
+			local key, body = string.match(line, "^([^\t]+)\t(.*)$")
+			if key then table.insert(httpMap, { key, body }) end
+		end
+	end
+	if httpMap and type(url) == "string" then
+		for _, e in ipairs(httpMap) do
+			if string.find(url, e[1], 1, true) then
+				ewrite("[http] " .. method .. " " .. url .. " -> canned reply for '" .. e[1] .. "' [step " .. tostring(stepCount) .. "]\n")
+				return e[2]
+			end
+		end
+	end
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. " [step " .. tostring(stepCount) .. "]\n")
 	return httpReply or ""
 end
@@ -844,6 +866,30 @@ function populateSandbox()
 	-- anti-cheat code treats an environment that only inherits _G / shared as an executor's.
 	local globals = sandbox
 	rawset(globals, "_G", {})       -- the scripts' shared table, not the CLI's own globals
+	if executorEnv and rawget(globals, "request") == nil then
+		-- executor HTTP: nothing is sent.  Every call is logged and answered with a canned reply
+		-- (httpreply=<text>, default empty body), so the script's handling of it can be traced.
+		local function request(opts)
+			local url = type(opts) == "table" and (opts.Url or opts.url) or opts
+			local method = type(opts) == "table" and (opts.Method or opts.method) or "GET"
+			local body = mock.onHttp(tostring(method), url)
+			return { StatusCode = 200, StatusMessage = "OK", Success = true, Body = body, Headers = {} }
+		end
+		for _, n in ipairs({ "request", "http_request" }) do rawset(globals, n, request) end
+		-- other executor functions scripts expect to exist; inert stand-ins
+		if rawget(globals, "gethwid") == nil then rawset(globals, "gethwid", function() return "devm-offline-hwid" end) end
+		for _, n in ipairs({ "setclipboard", "toclipboard" }) do
+			if rawget(globals, n) == nil then rawset(globals, n, function() end) end
+		end
+		-- executor file system: empty and read-only
+		local fs = { isfile = function() return false end, isfolder = function() return false end,
+			listfiles = function() return {} end, writefile = function() end, appendfile = function() end,
+			makefolder = function() end, delfile = function() end, delfolder = function() end,
+			readfile = function(path) error("file does not exist: " .. tostring(path), 2) end }
+		for n, f in pairs(fs) do
+			if rawget(globals, n) == nil then rawset(globals, n, f) end
+		end
+	end
 	if not executorEnv then
 		-- a plain Roblox client has none of these; scripts with their own anti-cheat look for them
 		for _, n in ipairs({ "identifyexecutor", "iscclosure", "islclosure" }) do
