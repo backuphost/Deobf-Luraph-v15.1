@@ -1477,7 +1477,7 @@ class Decompiler:
         plist = list(params) + (['...'] if vararg else [])
         head = 'function%s(%s)' % (' ' + name if name else '', ', '.join(plist))
         p.block(ast)
-        if len(p.lines) > 4000:
+        if len(p.lines) > 4000 and sum(1 for ln in p.lines if re.match(r'\s*(local exit\d+|if exit\d+ then|exit\d+ = true)', ln)) * 20 > len(p.lines):
             # control flow that could not be untangled: thousands of lines of flag juggling help nobody
             self.stats['unstructured'] += 1
             return 'function(...) --[[ UNSTRUCTURED: %d lines of unrecovered control flow omitted ]] end' % len(p.lines)

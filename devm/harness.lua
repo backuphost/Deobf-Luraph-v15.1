@@ -60,6 +60,7 @@ end
 
 local envTable
 local enumName
+local describeValue     -- Roblox datatype value -> constructor expression (set once the mock is loaded)
 local fidOf = setmetatable({}, { __mode = "k" })
 function __LPH_F(id, fn)
 	fidOf[fn] = id
@@ -76,6 +77,8 @@ function ser(v)
 	elseif t == "table" then
 		if v == envTable then return '{"env":true}' end
 		if libnames[v] then return '{"lib":"' .. libnames[v] .. '"}' end
+		local dv = describeValue and describeValue(v)
+		if dv then return '{"g":"' .. dv .. '"}' end
 		local id = tblIds[v]
 		if not id then
 			id = #tblList + 1
@@ -110,6 +113,9 @@ function ser(v)
 	else
 		local en = enumName and enumName(v)
 		if en then return '{"g":"' .. en .. '"}' end
+		if t == "vector" and v.X == v.X and v.Y == v.Y and v.Z == v.Z then
+			return '{"g":"Vector3.new(' .. string.format("%.14g, %.14g, %.14g", v.X, v.Y, v.Z) .. ')"}'
+		end
 		return '{"o":"' .. t .. '"}'
 	end
 end
@@ -772,6 +778,54 @@ mock.onMfp = function(i, v)
 end
 mock.onMfpExpected = function(i, v, e)
 	ewrite("[env] math_floor_precision call " .. i .. ": seed " .. tostring(v) .. ", expected " .. tostring(e) .. ", answering expected+" .. tostring(mfpDelta) .. "\n")
+end
+do
+	-- A script's constants can be datatype values (Luraph caches `Color3.fromRGB(1, 2, 3)` in the
+	-- instruction that built it).  In the dump they are written as the expression that makes them.
+	local function n(x)
+		if x ~= x or x == math.huge or x == -math.huge then return nil end
+		if x == math.floor(x) and math.abs(x) < 2 ^ 53 then return string.format("%d", x) end
+		return string.format("%.14g", x)
+	end
+	local function all(...)
+		local out = {}
+		for i = 1, select("#", ...) do
+			local v = select(i, ...)
+			if type(v) ~= "number" then return nil end
+			local t = n(v)
+			if not t then return nil end
+			out[i] = t
+		end
+		return table.concat(out, ", ")
+	end
+	describeValue = function(v)
+		local tn = mock.typeNames and mock.typeNames[v]
+		if tn == "Color3" then
+			local r, g, b = rawget(v, "R"), rawget(v, "G"), rawget(v, "B")
+			if type(r) ~= "number" or type(g) ~= "number" or type(b) ~= "number" then return nil end
+			local R, G, B = r * 255, g * 255, b * 255
+			if math.abs(R - math.floor(R + 0.5)) < 1e-6 and math.abs(G - math.floor(G + 0.5)) < 1e-6 and math.abs(B - math.floor(B + 0.5)) < 1e-6 then
+				return "Color3.fromRGB(" .. all(math.floor(R + 0.5), math.floor(G + 0.5), math.floor(B + 0.5)) .. ")"
+			end
+			local a = all(r, g, b)
+			return a and "Color3.new(" .. a .. ")"
+		elseif tn == "Vector3" then
+			local a = all(rawget(v, "X"), rawget(v, "Y"), rawget(v, "Z"))
+			return a and "Vector3.new(" .. a .. ")"
+		elseif tn == "Vector2" then
+			local a = all(rawget(v, "X"), rawget(v, "Y"))
+			return a and "Vector2.new(" .. a .. ")"
+		elseif tn == "UDim" then
+			local a = all(rawget(v, "Scale"), rawget(v, "Offset"))
+			return a and "UDim.new(" .. a .. ")"
+		elseif tn == "UDim2" then
+			local x, y = rawget(v, "X"), rawget(v, "Y")
+			if type(x) ~= "table" or type(y) ~= "table" then return nil end
+			local a = all(rawget(x, "Scale"), rawget(x, "Offset"), rawget(y, "Scale"), rawget(y, "Offset"))
+			return a and "UDim2.new(" .. a .. ")"
+		end
+		return nil
+	end
 end
 mock.onHttp = function(method, url)
 	if httpMapPath and not httpMap then
