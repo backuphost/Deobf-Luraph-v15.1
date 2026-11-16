@@ -123,6 +123,9 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         src = f.read()
     oneline = normalize.needs_reflow(src)
     if oneline:
+        src, n = normalize.inline_protected_raw(src)
+        if n:
+            log('[%s] %d interpreter(s) ran their dispatch loops inside pcall: inlined for lifting' % (tag, n))
         src = normalize.reflow(src)
     else:
         src, n = normalize.inline_protected(src)

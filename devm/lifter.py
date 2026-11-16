@@ -274,6 +274,12 @@ class Lifter:
         if 'push' in kinds:
             return (([('numforprep', min(reads))], endT)), ex, wr
         if 'fop' in kinds:
+            writesF = [s[1][1] for s in irF if s[0] == 'set' and s[1][0] == 'r']
+            if not writes and writesF and endF[0] == 'goto':
+                # the handler tests the negated condition (`if not continue then else R[A+3] = i ...`):
+                # the permissive "false" run is the one that stays in the loop
+                endT, endF = endF, endT
+                writes = writesF
             if endF[0] != 'goto' or not writes:
                 raise PEError('bad numeric for loop op')
             return (([], ('forbr', 'num', min(writes) - 3, ([], endT), ([], endF)))), ex, wr
@@ -629,8 +635,13 @@ class TableProtoLifter(Lifter):
         # which wrap parameter is the proto?
         counts = {}
         for st in self.wrap.body:
-            if st[0] == 'local' and len(st[2]) == 1 and st[2][0][0] == 'index' and st[2][0][1][0] == 'name':
-                counts[st[2][0][1][1]] = counts.get(st[2][0][1][1], 0) + 1
+            if st[0] != 'local':
+                continue
+            for e in st[2]:
+                if e[0] == 'paren':
+                    e = e[1]
+                if e[0] == 'index' and e[1][0] == 'name' and e[1][1] in self.wrap.params:
+                    counts[e[1][1]] = counts.get(e[1][1], 0) + 1
         self.proto_param = max(counts, key=counts.get)
         # tables handed to the wrapper's enclosing functions are loader state, not program data
         program = set()
