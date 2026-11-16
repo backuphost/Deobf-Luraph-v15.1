@@ -6,6 +6,10 @@ from . import beautify
 from .ircfg import ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
 
 
+DUP_LIMIT = 40
+DEPTH_LIMIT = 400
+
+
 class Unstructured(Exception):
     pass
 
@@ -563,12 +567,12 @@ class Structurer:
         if out is None:
             out = []
         self.depth += 1
-        if self.depth > 400:
+        if self.depth > DEPTH_LIMIT:
             raise Unstructured('too deep')
         while b is not None:
             n = self.emitted.get(b, 0) + 1
             self.emitted[b] = n
-            if n > 40:
+            if n > DUP_LIMIT:
                 raise Unstructured('block duplicated too often')
             if b in self.loop_nodes or self.blocks[b].term[0] == 'forbr':
                 b = self.emit_loop(b, stop, ctx, out)
@@ -1351,6 +1355,60 @@ class Printer:
             self.emit('-- ?? ' + repr(st)[:100])
 
 
+FLAT_FALLBACK = True
+
+
+def flat_ast(st, why, params=()):
+    """Fallback for a function the structurer gives up on: a state machine with one `if` per basic
+    block, in reverse post-order.  `state` holds the number of the block to run next.  For-loops
+    keep the VM's own form: the setup is shown as a comment, the step-and-test as FOR_NEXT(var)."""
+    order = sorted(st.blocks, key=lambda b: st.rpo_idx.get(b, 1 << 30))
+    num = {b: i + 1 for i, b in enumerate(order)}
+    state = ('r', 'state')
+
+    def go(target):
+        return ['assign', [state], [('k', num[target])]]
+
+    names = set()
+    body = []
+    for b in order:
+        blk = st.blocks[b]
+        out = []
+        st.conv_stmts(b, out)
+        for x in out:
+            if x[0] == 'assign':
+                names.update(t[1] for t in x[1] if t[0] == 'r' and isinstance(t[1], str))
+        term = blk.term
+        if term[0] == 'goto':
+            out.append(go(term[1]))
+        elif term[0] == 'ret':
+            vals = list(term[1])
+            if term[2]:
+                vals.append(term[2])
+            out.append(['return', vals])
+        elif term[0] == 'br':
+            if term[2] == term[3]:
+                out.append(go(term[2]))
+            else:
+                out.append(['if', term[1], [go(term[2])], [go(term[3])]])
+        elif term[0] == 'forbr':
+            cond = ('call', ('global', 'FOR_NEXT'), [('r', x) for x in term[2]], None)
+            names.update(x for x in term[2] if isinstance(x, str))
+            out.append(['if', cond, [go(term[3])], [go(term[4])]])
+        else:
+            out.append(['comment', 'unknown terminator ' + repr(term[0])])
+        body.append(['if', ('bin', '==', state, ('k', num[b])), out, None])
+    # every variable lives across iterations of the dispatch loop, so all are declared up front
+    # (more than Luau's 200 locals in a big function: the listing is for reading, not for running)
+    decl = sorted(names - set(params), key=natural)
+    head = [['comment', 'control flow not structured (%s): %d basic blocks as a state machine' % (why, len(order))]]
+    for i in range(0, len(decl), 12):
+        head.append(['local', decl[i:i + 12], []])
+    return head + [
+            ['local', ['state'], [('k', num[st.cfg.entry])]],
+            ['while', ('k', True), body, None]]
+
+
 class Decompiler:
     def __init__(self, protos, root_key, native_text=None):
         self.protos = protos
@@ -1367,7 +1425,15 @@ class Decompiler:
             cfg = ProtoCFG(pir)
             params = assign_variables(cfg, self.namer, coalesce)
             st = Structurer(cfg)
-            ast = st.run()
+            try:
+                ast = st.run()
+            except (Unstructured, RecursionError) as ex:
+                if not FLAT_FALLBACK:
+                    raise
+                # control flow that does not reduce to loops and ifs: one arm per basic block
+                self.stats['flat'] = self.stats.get('flat', 0) + 1
+                ast = flat_ast(Structurer(cfg), str(ex), params)
+                break
             ast = cleanup(ast)
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
@@ -1386,6 +1452,8 @@ class Decompiler:
         for c in caps:
             if c[0] in ('ref', 'val'):
                 upnames.append(c[1][1] if isinstance(c[1], tuple) else 'REG_%s' % (c[1],))
+            elif c[0] == 'const':
+                upnames.append(lua_number(c[1]) if isinstance(c[1], (int, float)) and not isinstance(c[1], bool) else ('true' if c[1] is True else 'false' if c[1] is False else lua_string(c[1])))
             else:
                 upnames.append(printer.upnames[c[1]] if c[1] < len(printer.upnames) else 'UPVAL_%d' % c[1])
         if isinstance(key, tuple) and key[0] == 'native':

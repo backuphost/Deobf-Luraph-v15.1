@@ -253,6 +253,8 @@ local cGlobals = nil        -- environment of C functions as seen by getfenv(lev
 local serverSide = false   -- server=1: RunService:IsServer() is true
 local executorEnv = false  -- executor=1: provide identifyexecutor / iscclosure / islclosure
 local pokePath = nil       -- poke=<file>: instructions to execute once after the run (see pokePass)
+local mfpLog = false       -- mfplog=1: report every math_floor_precision call
+local recordBinds = false  -- binds=1: remember what payload closures were bound to, without exercising them
 local exercise = false     -- exercise=1: after the script ends, call every payload function once
 local budgetAt = math.huge
 local probing = false      -- true while the poke pass runs
@@ -344,6 +346,8 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "server" then serverSide = tonumber(v) ~= 0
 	elseif k == "executor" then executorEnv = tonumber(v) ~= 0
 	elseif k == "exercise" then exercise = tonumber(v) ~= 0
+	elseif k == "mfplog" then mfpLog = tonumber(v) ~= 0
+	elseif k == "binds" then recordBinds = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
 	elseif k == "watch" then watchPid[tonumber(v)] = true
@@ -686,13 +690,16 @@ local lastBind = {}        -- pid -> arguments of the last upvalue binding of th
 local regList = {}         -- every VM closure made, in order (exercise=1 calls the payload's)
 function __LPH_REG(pid, fn)
 	protoOfFn[fn] = pid
-	if (exercise or pokePath) and protos[pid] and protos[1] and protos[pid].interp ~= protos[1].interp then
+	if (exercise or pokePath or recordBinds) and protos[pid] and protos[1] and protos[pid].interp ~= protos[1].interp then
 		-- fn binds upvalues and returns the callable closure: remember every closure it makes
 		-- (payload only: the bootstrap counts the frames of its own calls)
 		local bind = fn
 		fn = function(...)
 			local closure = bind(...)
 			lastBind[pid] = table.pack(...)
+			-- end-state dump: the values the closure was bound to (builds whose payload reads its
+			-- jump states and library functions straight out of this list)
+			if protos[pid].ups == nil then protos[pid].ups = { ... } end
 			if type(closure) == "function" then
 				protoOfFn[closure] = pid
 				regList[#regList + 1] = closure
@@ -728,13 +735,14 @@ if scriptPath then mock.placeScript(scriptPath) end
 mock.serverSide = serverSide
 mock.mfpDelta = mfpDelta
 mock.onMfp = function(i, v)
-	if i == 1 and not mfpDelta then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it\n") end
+	if i == 1 and not mfpDelta then ewrite("[env] the script calls the global math_floor_precision, which only an earlier loader stage defines; its key cannot be reproduced without it [step " .. tostring(stepCount) .. "]\n") end
+	if mfpLog then ewrite("[mfp] call " .. i .. " arg " .. tostring(v) .. " [step " .. tostring(stepCount) .. "]\n") end
 end
 mock.onMfpExpected = function(i, v, e)
 	ewrite("[env] math_floor_precision call " .. i .. ": seed " .. tostring(v) .. ", expected " .. tostring(e) .. ", answering expected+" .. tostring(mfpDelta) .. "\n")
 end
 mock.onHttp = function(method, url)
-	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. "\n")
+	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. " [step " .. tostring(stepCount) .. "]\n")
 	return httpReply or ""
 end
 enumName = mock.enumName

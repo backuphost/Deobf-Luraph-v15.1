@@ -769,6 +769,7 @@ class FactoryLifter(Lifter):
         midfn = r[1][0]
         sc2 = Scope(midfn.scope)
         up = self.upvalue_param(mid)
+        pe.upvals_list = self.dump.proto_upvals(key) if self.end_state else None
         for i, p in enumerate(mid.params):
             sc2.vars[p] = None
         if up is not None:
