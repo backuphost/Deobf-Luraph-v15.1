@@ -141,3 +141,13 @@ against these changes: their inputs are not in the repository.
   split loops on the script's own boolean flags).
 
 Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
+
+### Names
+
+`renamer.py` runs last in `cleanup.tidy` and can be used on its own
+(`python -m devm.renamer in.lua -o out.lua`).  It re-derives names for generated identifiers from
+how a value is made and used: initialisers (`:Clone()`, `tonumber(x.Field)`, getter calls, table
+contents), function bodies (`getX`, `safeRequire`, `create`, the one remote or method a function
+wraps), event handler parameters (`dt`, `character`, `input`), loop variables (`_, child`) and
+counters (`elapsed`, `count`).  Generated names are unique per file, so this is a token
+substitution; what no rule covers keeps its number.

@@ -155,7 +155,8 @@ def tidy(text):
         if new == text:
             break
         text = new
-    return text
+    from . import renamer       # (imports this module)
+    return renamer.humanize(text)
 
 
 def drop_unused(text):
