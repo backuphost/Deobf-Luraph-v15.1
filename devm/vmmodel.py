@@ -27,7 +27,17 @@ def is_dispatch_loop(st):
 
 
 LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)local\s+\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*if\b')
-CELL_RE = re.compile(r'\b(\w+)\[(\d+)\]\[(\w+)\[(\d+)\]\]')
+_NUM = r'(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*)'
+CELL_RE = re.compile(r'\b(\w+)\[' + _NUM + r'\]\[(\w+)\[' + _NUM + r'\]\]')
+
+
+def _int(text):
+    t = text.replace('_', '')
+    if t[:2] in ('0x', '0X'):
+        return int(t, 16)
+    if t[:2] in ('0b', '0B'):
+        return int(t[2:], 2)
+    return int(t)
 
 
 class Interp:
@@ -237,7 +247,7 @@ class Model:
         for it in self.interps:
             for m in CELL_RE.finditer(self.src, it.func.body_pos, it.func.end_pos):
                 if m.group(1) == m.group(3):
-                    k = (int(m.group(2)), int(m.group(4)))
+                    k = (_int(m.group(2)), _int(m.group(4)))
                     counts[k] = counts.get(k, 0) + 1
         if not counts:
             return (1, 3)
@@ -349,14 +359,22 @@ class Model:
 
     def _is_proto_table_style(self):
         parent = self.chain[-2]
-        if not (len([p for p in parent.params if p != '_']) == 2 and parent.body and parent.body[-1][0] == 'return'
-                and parent.body[-1][1] and parent.body[-1][1][0][0] == 'func' and parent.body[-1][1][0][1] is self.interp):
+        if len([p for p in parent.params if p != '_']) != 2 or not parent.body or parent.body[-1][0] != 'return' \
+                or not parent.body[-1][1]:
+            return False
+        ret = parent.body[-1][1][0]
+        if ret[0] == 'func':
+            if ret[1] is not self.interp:
+                return False
+        elif ret[0] != 'name':
+            # raw layout: `Z = (function(...) ... end); return Z`
             return False
         # wrap(proto, upvalues) unpacks the proto table into locals; a factory's upvalue closure that
         # happens to take two parameters (function(H, d) local d, p, ... = L, D, ...) does not
         for st in parent.body:
-            if st[0] == 'local' and len(st[2]) == 1 and st[2][0][0] == 'index' and st[2][0][1][0] == 'name' \
-                    and st[2][0][1][1] in parent.params:
+            if st[0] == 'local' and st[2] and all(
+                    e[0] == 'paren' and e[1][0] == 'index' and e[1][1][0] == 'name' and e[1][1][1] in parent.params
+                    or e[0] == 'index' and e[1][0] == 'name' and e[1][1] in parent.params for e in st[2]):
                 return True
         return False
 
@@ -448,7 +466,21 @@ class Model:
                     out.append((start, pos, k))
         return out
 
-    def patched_source(self, step=False, conds=False, flow=False, stepvars=None):
+    def proto_param(self):
+        """Proto-table layout: the wrap parameter that receives the proto table."""
+        wrap = self.chain[-2]
+        counts = {}
+        for st in wrap.body:
+            if st[0] != 'local':
+                continue
+            for e in st[2]:
+                if e[0] == 'paren':
+                    e = e[1]
+                if e[0] == 'index' and e[1][0] == 'name' and e[1][1] in wrap.params:
+                    counts[e[1][1]] = counts.get(e[1][1], 0) + 1
+        return max(counts, key=counts.get) if counts else None
+
+    def patched_source(self, step=False, conds=False, flow=False, stepvars=None, newproto=False):
         """The script with hooks inserted.
 
         Always: the interpreter-entry hook (inlined counter; __LPH_RUN is only called for stubbed
@@ -509,7 +541,13 @@ class Model:
         else:
             names = self.visible
             lst = '{' + ','.join('"%s"' % n for n in names) + '}'
-            edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
+            if newproto:
+                # hook only closures of protos the harness has not seen (a table lookup, no call:
+                # the bootstrap measures its own call stack)
+                edits.append((self.interp.body_pos, 'if not __LPH_T[%s] then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
+                    self.proto_param(), lst, len(names), ','.join(names))))
+            else:
+                edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         for f in self.meta_closures():
             names = [n for n in self._visible_names(f) if n != '...'][:200]
             lst = '{' + ','.join('"%s"' % n for n in names) + '}'
@@ -582,6 +620,31 @@ def run_oracle(model, workdir, tag, options=()):
     with open(outjson) as f:
         dump = json.load(f)
     return dump, out, note
+
+
+def run_dump_script(model, workdir, tag, options=()):
+    """Proto-table layout whose bootstrap passes its checks under the harness: let the VM run the
+    bootstrap and dump the state when the first closure of a proto that did not exist at the start
+    is entered, i.e. when the decrypted script starts.  Returns the dump or None."""
+    patched = os.path.join(workdir, tag + '.newproto.lua')
+    outjson = os.path.join(workdir, tag + '.script.json')
+    with open(patched, 'w', encoding='latin-1') as f:
+        f.write(model.patched_source(newproto=True))
+    if os.path.exists(outjson):
+        os.remove(outjson)
+    nf = os.path.join(workdir, 'nfdata.lua')
+    if not os.path.exists(nf):
+        from . import unidata
+        unidata.generate(nf)
+    try:
+        r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1'] + list(options),
+                           capture_output=True, text=True, errors='replace', timeout=900)
+    except subprocess.TimeoutExpired:
+        return None
+    if not os.path.exists(outjson):
+        return None
+    with open(outjson) as f:
+        return json.load(f)
 
 
 def run_dump(model, workdir, tag, layers=()):

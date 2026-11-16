@@ -149,6 +149,20 @@ class GlobalPath:
         self.text = text
 
 
+FREE_LIBS = {'string', 'table', 'math', 'bit32', 'buffer', 'coroutine', 'debug', 'os', 'utf8', 'task', 'vector'}
+FREE_FUNCS = {'select', 'type', 'typeof', 'tostring', 'tonumber', 'pcall', 'xpcall', 'error', 'assert', 'next', 'pairs',
+              'ipairs', 'rawget', 'rawset', 'rawequal', 'rawlen', 'setmetatable', 'getmetatable', 'unpack', 'getfenv',
+              'setfenv', 'print', 'warn', 'require', 'newproxy', 'loadstring', 'gcinfo', 'tick', 'time', 'wait',
+              'spawn', 'delay', 'elapsedTime', 'collectgarbage', 'islclosure', 'iscclosure', 'identifyexecutor'}
+FREE_GLOBALS = {'game', 'workspace', 'script', 'shared', '_G', 'plugin'}
+
+
+def _unparen(e):
+    while e[0] == 'paren':
+        e = e[1]
+    return e
+
+
 class KNum(float):
     """A number derived from the loader's key functions. Unlike ordinary values it is tracked
     across instructions, because self-modifying code uses it as patch address / patch value."""
@@ -682,6 +696,7 @@ class PE:
         self.keyfn_override = {}
         self.known_reads = set()
         self.use_numknown = False
+        self.write_log = None
         self.model_writes = 0
         self.keyfn_used = set()
         self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
@@ -777,6 +792,8 @@ class PE:
                 # `stack = {..., stack}`, also as one target of a multiple assignment
                 # (`stack, a = {[9]=limit, [7]=stack, ...}, operand[pc]`)
                 for tg, val in zip(st[1], st[2]):
+                    while val[0] == 'paren':
+                        val = val[1]
                     if tg[0] != 'name' or val[0] != 'table':
                         continue
                     nm = tg[1]
@@ -890,7 +907,7 @@ class PE:
     def regs_range(self, a, b):
         """values of R[a..b] where b may be symbolic top."""
         if isinstance(b, LinSym):
-            vals = [self.read_reg(i) for i in range(a, b.k + 1)]
+            vals = [self.read_reg(i) for i in range(int(a), int(b.k) + 1)]
             vals.append(MultiTail(b.id))
             return vals
         return [self.read_reg(i) for i in range(int(a), int(b) + 1)]
@@ -899,6 +916,14 @@ class PE:
     def getvar(self, scope, name):
         s = scope.lookup(name)
         if s is None:
+            # raw (not decompiled) scripts name globals directly in their handlers
+            if name in FREE_LIBS:
+                return Lib(name)
+            if name in FREE_FUNCS:
+                return Builtin(name)
+            if self.model.oneline:
+                # Roblox datatypes and executor functions (gethui, fireproximityprompt, ...)
+                return GlobalPath(name)
             raise PEError('unbound name %s' % name)
         if s.owner == self.cur_interp.func.id:
             # interpreter-level state variables (names are only meaningful inside the interpreter)
@@ -1171,6 +1196,8 @@ class PE:
                 return
             if not obj.fresh:
                 self.model_writes += 1
+                if self.write_log is not None and obj.path and obj.h.get(key) != val:
+                    self.write_log.append((id(obj), key))
                 if self.journal is not None:
                     self.journal.append((obj, key, obj.h.get(key)))
             obj.set(key, val)
@@ -1549,8 +1576,8 @@ class PE:
         """(start, stop) for the VM's unpack-like helper, from `p = p or 1` in its body."""
         start_param = None
         for st in func.body:
-            if st[0] == 'assign' and st[1][0][0] == 'name' and st[2][0][0] == 'bin' and st[2][0][1] == 'or' \
-                    and st[2][0][3] == ('num', 1):
+            if st[0] == 'assign' and st[1][0][0] == 'name' and _unparen(st[2][0])[0] == 'bin' and _unparen(st[2][0])[1] == 'or' \
+                    and _unparen(st[2][0])[3] == ('num', 1):
                 start_param = st[1][0][1]
         if start_param in func.params:
             i = func.params.index(start_param)
@@ -1678,7 +1705,7 @@ class PE:
                 tg = targets[0]
                 if tg[0] == 'name':
                     nm = tg[1]
-                    if nm in self.fstack and st[2][0][0] == 'table' and self.is_state(scope, nm):
+                    if nm in self.fstack and _unparen(st[2][0])[0] == 'table' and self.is_state(scope, nm):
                         if self.perm is None:
                             raise ForOp()
                         self.events.append(('push',))
@@ -1855,6 +1882,8 @@ class PE:
         kname = st[1][0]
         if body and body[0][0] == 'if':
             c = body[0][1][0][0]
+            while c[0] == 'paren' or (c[0] == 'un' and c[1] == 'not'):
+                c = c[-1]
             if c[0] == 'bin':
                 if c[2] == ('name', kname):
                     return self.eval1(c[3], scope)

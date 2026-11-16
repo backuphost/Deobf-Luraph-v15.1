@@ -254,6 +254,7 @@ local serverSide = false   -- server=1: RunService:IsServer() is true
 local executorEnv = false  -- executor=1: provide identifyexecutor / iscclosure / islclosure
 local pokePath = nil       -- poke=<file>: instructions to execute once after the run (see pokePass)
 local mfpLog = false       -- mfplog=1: report every math_floor_precision call
+local dumpNew = false
 local recordBinds = false  -- binds=1: remember what payload closures were bound to, without exercising them
 local exercise = false     -- exercise=1: after the script ends, call every payload function once
 local budgetAt = math.huge
@@ -318,6 +319,7 @@ end
 --   __LPH_R    ring of the last instructions (pid, loop, pc)
 __LPH_N = { c = 0, s = 0, f = false, t = 1 }
 __LPH_S = stubs
+__LPH_T = setmetatable({}, { __mode = "k" })   -- protos already seen (dumpnew=1)
 __LPH_X = {}
 __LPH_R = {}
 local RINGN = 4096
@@ -347,6 +349,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "executor" then executorEnv = tonumber(v) ~= 0
 	elseif k == "exercise" then exercise = tonumber(v) ~= 0
 	elseif k == "mfplog" then mfpLog = tonumber(v) ~= 0
+	elseif k == "dumpnew" then dumpNew = tonumber(v) ~= 0
 	elseif k == "binds" then recordBinds = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
@@ -643,7 +646,31 @@ function __LPH_RUN(names, n, ...)
 		end
 		return nil
 	end
-	if runCount < dumpAt then return nil end
+	if dumpNew then
+		-- dumpnew=1 (sample patched with newproto): this is called for closures of protos not in
+		-- __LPH_T only.  The first call registers every table of the first program; a later call
+		-- whose proto and code arrays are all new means the bootstrap has started the script.
+		local first = next(__LPH_T) == nil
+		local fresh = 0
+		for _, v in env do
+			if type(v) == "table" and not __LPH_T[v] then fresh += 1 end
+		end
+		local queue = {}
+		for _, v in env do if type(v) == "table" then queue[#queue + 1] = v end end
+		local qi = 1
+		while qi <= #queue do
+			local t = queue[qi]
+			qi += 1
+			if not __LPH_T[t] and not libnames[t] and t ~= envTable then
+				__LPH_T[t] = true
+				for _, v in next, t do
+					if type(v) == "table" and not __LPH_T[v] then queue[#queue + 1] = v end
+				end
+			end
+		end
+		if first or fresh < 4 then return nil end
+		ewrite("[dumpnew] the script starts at interpreter entry " .. runCount .. "\n")
+	elseif runCount < dumpAt then return nil end
 	local root = { kind = "run", vars = env }
 	finish(root)
 	abort()
@@ -791,7 +818,7 @@ function populateSandbox()
 		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
-		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R",
+		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T",
 		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN" }) do
 		local v = _G[n]
 		if v ~= nil then rawset(sandbox, n, v) end

@@ -6,6 +6,8 @@ the file, which makes a token-level rename safe.
 """
 import re
 
+from . import opaque
+
 KEYWORDS = {
     'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'if', 'in', 'local', 'nil', 'not',
     'or', 'repeat', 'return', 'then', 'true', 'until', 'while', 'continue', 'type', 'export',
@@ -97,10 +99,56 @@ def suggest(rhs):
     return None
 
 
+def _double_not(text):
+    """not not (a < b)  ->  a < b   (a comparison is a boolean already)"""
+    out = []
+    i = 0
+    key = 'not not ('
+    while True:
+        j = text.find(key, i)
+        if j < 0:
+            out.append(text[i:])
+            return ''.join(out)
+        if j and (text[j - 1].isalnum() or text[j - 1] == '_'):
+            out.append(text[i:j + 4])
+            i = j + 4
+            continue
+        k = j + len(key)
+        depth = 1
+        quote = None
+        while k < len(text) and depth:
+            c = text[k]
+            if quote:
+                if c == '\\':
+                    k += 1
+                elif c == quote:
+                    quote = None
+            elif c in '"\'':
+                quote = c
+            elif c in '([{':
+                depth += 1
+            elif c in ')]}':
+                depth -= 1
+            elif c == '\n':
+                break
+            k += 1
+        inner = text[j + len(key):k - 1]
+        flat = re.sub(r'"(?:\\.|[^"\\])*"|\([^()]*\)', '', inner)
+        flat = re.sub(r'\([^()]*\)', '', flat)
+        if depth == 0 and re.search(r'[<>]=?|[=~]=', flat) and not re.search(r'\b(and|or|not)\b', flat):
+            out.append(text[i:j])
+            out.append(inner)
+        else:
+            out.append(text[i:k])
+        i = k
+
+
 def tidy(text):
+    text = _double_not(text)
     # stores into a table nothing else can see (a VM scratch array that was never bound to a variable)
     text = '\n'.join(ln for ln in text.split('\n') if not re.match(r'^\s*\(\{\}\)\[\d+\] = [-\w.]+$', ln))
     text = _loop_artifacts(text)
+    text = opaque.strip(text)
     text = drop_unused(text)
     for _ in range(4):
         new = rename(text)

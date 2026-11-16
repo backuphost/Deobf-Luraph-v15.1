@@ -10,6 +10,11 @@ CELLS = (1, 3)        # upvalue cell layout of the VM being lifted (set by the l
 DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
 
 
+# Undo state-machine control flow (see ProtoCFG._unflatten).  Scripts protected from source have
+# none in their payload, and there the pass only splits loops on the script's own boolean flags.
+UNFLATTEN = True
+
+
 class Block:
     __slots__ = ('id', 'stmts', 'term', 'preds')
 
@@ -326,7 +331,7 @@ class ProtoCFG:
         self._dead_stores()
         self._detect_params()
         self._cut_cold_magic()
-        if not os.environ.get('DEVM_NO_UNFLATTEN'):
+        if UNFLATTEN and not os.environ.get('DEVM_NO_UNFLATTEN'):
             self._unflatten()
         for _ in range(4):
             self._fold_regs()

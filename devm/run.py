@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from . import bootstrap, cleanup, lifter, normalize, pe, pipeline, structure, unidata, vmmodel
+from . import bootstrap, cleanup, ircfg, lifter, normalize, opaque, pe, pipeline, structure, unidata, vmmodel
 
 sys.setrecursionlimit(100000)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +123,9 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         src = f.read()
     oneline = normalize.needs_reflow(src)
     if oneline:
+        src, n = normalize.inline_protected_raw(src)
+        if n:
+            log('[%s] %d interpreter(s) ran their dispatch loops inside pcall: inlined for lifting' % (tag, n))
         src = normalize.reflow(src)
     else:
         src, n = normalize.inline_protected(src)
@@ -165,13 +168,42 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         log('[%s] no encrypted second stage found: the first program is the script' % tag)
         return cleanup.tidy(text1)
     data = run_bootstrap(stage, boot_text, workdir, tag, log)
-    L, protos, overrides = solve_keyfns(stage.model, data, log)
+    # First with the key function values the bootstrap replay produced.  Junk arms behind opaque
+    # predicates do not lift cleanly and must not be mistaken for wrong keys, so they are cut
+    # before anything is solved for.
+    overrides = {}
+    L = make_lifter(stage.model, data, overrides)
+    protos = L.lift_all(L.root_key)
+    cuts = {}
+    cut = opaque.prune_ir(protos, cuts)
+    if any(p.errors and p.keyfns for p in protos.values()):
+        L, protos, overrides = solve_keyfns(stage.model, data, log)
+        cuts = {}
+        cut = opaque.prune_ir(protos, cuts)
+    for _ in range(4):
+        if not cuts:
+            break
+        # lift again without entering the junk arms: they patch instructions too, and applying
+        # patches that never happen at run time damages the real code
+        n0 = sum(len(t) for c in cuts.values() for t in c.values())
+        L = make_lifter(stage.model, data, overrides)
+        L.blocked = cuts
+        protos = L.lift_all(L.root_key)
+        cut += opaque.prune_ir(protos, cuts)
+        if sum(len(t) for c in cuts.values() for t in c.values()) == n0:
+            break
+    if cut:
+        log('[%s] %d opaque predicates resolved (junk branches removed)' % (tag, cut))
     errs = [(k, e) for k, p in protos.items() for e in p.errors]
     log('[%s] real program: %d functions, %d instructions, %d lift errors' % (
         tag, len(protos), sum(len(p.nodes) for p in protos.values()), len(errs)))
     for k, e in errs[:20]:
         log('    error in proto %s: %s' % (k, e))
-    text, stats = decompile(stage, L, protos)
+    ircfg.UNFLATTEN = not oneline
+    try:
+        text, stats = decompile(stage, L, protos)
+    finally:
+        ircfg.UNFLATTEN = True
     return cleanup.tidy(text)
 
 

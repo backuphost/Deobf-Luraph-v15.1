@@ -703,7 +703,8 @@ class Structurer:
                 body = self.arm(inside, h, lctx)
                 out.append(['while', cond, body, h])
                 self.after_loop(lctx, out)
-            return self.jump(follow, stop, ctx, out)
+                return self.jump(follow, stop, ctx, out)
+            # the loop test leaves to somewhere other than the loop's follow block: general loop
         body = []
         nb = self.emit_block(h, h, lctx, body)
         if nb is not None:
@@ -1268,6 +1269,8 @@ class Printer:
     level = 0
 
     def emit(self, text):
+        if text.startswith('('):
+            text = ';' + text       # a statement that starts with `(` would continue the previous one
         self.lines.append('\t' * self.level + text)
 
     def block(self, stmts):
@@ -1336,7 +1339,10 @@ class Printer:
             self.block(st[1])
             self.emit('until %s' % self.expr(st[2]))
         elif t == 'fornum':
-            self.emit('for %s = %s do' % (st[1], ', '.join(self.expr(e) for e in st[2])))
+            bounds = [self.expr(e) for e in st[2]]
+            if len(bounds) < 2:
+                bounds.append('nil --[[bounds not recovered]]')      # keeps the text parseable
+            self.emit('for %s = %s do' % (st[1], ', '.join(bounds)))
             self.block(st[3])
             self.emit('end')
         elif t == 'forin':
