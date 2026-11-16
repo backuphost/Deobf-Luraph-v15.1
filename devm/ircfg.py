@@ -408,7 +408,9 @@ class ProtoCFG:
     def _dead_stores(self):
         """Drop register definitions that nothing reads (Luraph pads the code with them, and the
         loads feeding its self-modifying patches become dead once the patches are applied)."""
-        PURE = ('k', 'outer', 'constfn', 'upcell', 'r', 'kfn', 'global', 'env', 'closure', 'newtable', 'opaque')
+        # (a closure nothing reads is a function the script defines and never calls: that is the
+        # author's code, not padding, and it stays)
+        PURE = ('k', 'outer', 'constfn', 'upcell', 'r', 'kfn', 'global', 'env', 'newtable', 'opaque')
         captured = set()
         for b in self.blocks.values():
             for st in b.stmts + [b.term]:

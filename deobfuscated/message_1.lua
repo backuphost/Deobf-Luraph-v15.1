@@ -1,6 +1,6 @@
 -- message_1 -- recovered from its Luraph v15.1 VM (bootstrap replayed, payload lifted and decompiled).
 --
--- Complete: all 131 functions of the protected program, no lift errors, no unstructured control flow.
+-- Complete: all 131 functions of the protected program (including three it defines but never calls), no lift errors, no unstructured control flow.
 -- The file parses as Luau; it was not run in the game.
 --
 -- What is and is not original:
@@ -165,9 +165,9 @@ local v40 = function()
 				result3.Looped = track.Looped
 				result3:Play(0.05, math.max(track.WeightTarget, 0.01), track.Speed)
 			end)
-			local v243 = nil
-			v243 = track.Stopped:Connect(function()
-				v243:Disconnect()
+			local v248 = nil
+			v248 = track.Stopped:Connect(function()
+				v248:Disconnect()
 				pcall(function()
 					result3:Stop(0.1)
 				end)
@@ -190,29 +190,57 @@ local v40 = function()
 		humanoid2.Health = 0
 	end))
 end
-local v41 = function()
+local v42 = function()
+	v33()
+	local character5 = localPlayer.Character
+	local original = v26.Original
+	local clone = v26.Clone
+	v26.Original = nil
+	v26.Clone = nil
+	if original and clone and character5 and original.Parent == nil and clone.Parent == character5 then
+		original.Parent = character5
+		workspace.CurrentCamera.CameraSubject = original
+		getControls(original)
+		pcall(function()
+			clone:Destroy()
+		end)
+		v32(character5)
+	end
+end
+local v43 = function()
 	v40()
 	local elapsed9 = 0
 	v26.Connection = RunService.Heartbeat:Connect(function(dt)
 		elapsed9 += dt
-		local character5 = localPlayer.Character
-		if (not (v26.Clone and character5 and v26.Clone.Parent == character5) and 0.25 or 3) <= elapsed9 then
+		local character6 = localPlayer.Character
+		if (not (v26.Clone and character6 and v26.Clone.Parent == character6) and 0.25 or 3) <= elapsed9 then
 			elapsed9 = 0
 			v40()
 		end
 	end)
-	v26.Added = localPlayer.CharacterAdded:Connect(function(character10)
+	v26.Added = localPlayer.CharacterAdded:Connect(function(character11)
 		v33()
 		v26.Original = nil
 		v26.Clone = nil
 		task.spawn(function()
-			character10:WaitForChild("Humanoid", 10)
+			character11:WaitForChild("Humanoid", 10)
 			task.wait(1)
-			if v26.Connection and localPlayer.Character == character10 then
+			if v26.Connection and localPlayer.Character == character11 then
 				v40()
 			end
 		end)
 	end)
+end
+local v46 = function()
+	if v26.Connection then
+		v26.Connection:Disconnect()
+		v26.Connection = nil
+	end
+	if v26.Added then
+		v26.Added:Disconnect()
+		v26.Added = nil
+	end
+	v42()
 end
 local state = {
 	Carrying = false,
@@ -227,22 +255,22 @@ local state = {
 }
 if type(EggState) == "table" and type(EggState.CarryChanged) == "table" and type(EggState.CarryChanged.Connect) == "function" then
 	EggState.CarryChanged:Connect(function(p9)
-		local v274 = type(p9) == "table" and p9.IsCarrying == true
-		if v274 and p9.GuardDisabled == true then
-			v274 = false
+		local v291 = type(p9) == "table" and p9.IsCarrying == true
+		if v291 and p9.GuardDisabled == true then
+			v291 = false
 		end
 		state.GuessedDrop = false
-		if v274 then
+		if v291 then
 			state.HeldSeen = os.clock()
 		end
-		if v274 and type(p9.Uid) == "string" then
+		if v291 and type(p9.Uid) == "string" then
 			state.Uid = p9.Uid
 			local speedMultiplier = tonumber(p9.SpeedMultiplier)
 			if speedMultiplier and 0 < speedMultiplier then
 				state.Mult = speedMultiplier
 			end
 		end
-		state.Carrying = v274
+		state.Carrying = v291
 	end)
 end
 pcall(function()
@@ -267,38 +295,38 @@ local dropFieldEgg = function()
 		pcall(EggState.DropFieldEgg, "PlayerRequest")
 	end
 end
-local v49 = function(p12, p13)
-	local v290 = nil
-	local v291 = p13
+local v54 = function(p12, p13)
+	local v307 = nil
+	local v308 = p13
 	for _, child in ipairs(workspace:GetChildren()) do
 		if child.Name == "SmartPromptPart" and child:IsA("BasePart") then
 			local carryAreaEgg = child:FindFirstChild("CarryAreaEgg")
 			if carryAreaEgg and carryAreaEgg:IsA("ProximityPrompt") then
 				local distance = (child.Position - p12).Magnitude
-				if distance < v291 then
-					v290 = carryAreaEgg
-					v291 = distance
+				if distance < v308 then
+					v307 = carryAreaEgg
+					v308 = distance
 				end
 			end
 		end
 	end
-	return v290
+	return v307
 end
-local v50 = function(p14)
-	local character6 = localPlayer.Character
-	if type(p14) ~= "string" or not character6 then
+local v55 = function(p14)
+	local character7 = localPlayer.Character
+	if type(p14) ~= "string" or not character7 then
 		return false
 	end
-	local v304 = workspace:FindFirstChild(p14)
-	if not v304 then
+	local v321 = workspace:FindFirstChild(p14)
+	if not v321 then
 		return false
 	end
-	for _, descendant in ipairs(v304:GetDescendants()) do
+	for _, descendant in ipairs(v321:GetDescendants()) do
 		if descendant:IsA("WeldConstraint") or descendant:IsA("JointInstance") then
-			local v313, v314, v315 = pcall(function()
+			local v330, v331, v332 = pcall(function()
 				return descendant.Part0, descendant.Part1
 			end)
-			if v313 and (v314 and v314:IsDescendantOf(character6) or v315 and v315:IsDescendantOf(character6)) then
+			if v330 and (v331 and v331:IsDescendantOf(character7) or v332 and v332:IsDescendantOf(character7)) then
 				return true
 			end
 		end
@@ -309,13 +337,13 @@ task.spawn(function()
 	while true do
 		task.wait(0.2)
 		if state.Carrying then
-			if v50(state.Uid) then
+			if v55(state.Uid) then
 				state.HeldSeen = os.clock()
 			elseif 0.8 < os.clock() - state.HeldSeen then
 				state.Carrying = false
 				state.GuessedDrop = true
 			end
-		elseif state.GuessedDrop and v50(state.Uid) then
+		elseif state.GuessedDrop and v55(state.Uid) then
 			local now = os.clock()
 			state.GuessedDrop = false
 			state.Carrying = true
@@ -339,7 +367,7 @@ local askFieldEggSnapshot = function()
 	end
 	return list
 end
-local v53 = function(p15)
+local v58 = function(p15)
 	for _, item in ipairs(askFieldEggSnapshot()) do
 		if item.Uid == p15 then
 			return item.BottomCFrame.Position
@@ -347,10 +375,10 @@ local v53 = function(p15)
 	end
 	return nil
 end
-local v54 = function(p16)
+local v59 = function(p16)
 	local directory = type(Assets) == "table" and Assets.Directory or nil
-	local v336 = type(directory) == "table" and directory[tostring(p16.AssetCategory)] or nil
-	local v337 = {
+	local v353 = type(directory) == "table" and directory[tostring(p16.AssetCategory)] or nil
+	local v354 = {
 		Uid = p16.Uid,
 		Category = tostring(p16.AssetCategory),
 		Name = tostring(p16.AssetCategory),
@@ -358,31 +386,31 @@ local v54 = function(p16)
 		Rarity = 0,
 		Value = 0,
 	}
-	if type(v336) == "table" then
-		v337.Name = tostring(v336.DisplayName or p16.AssetCategory)
-		local icon = v336.Icon
+	if type(v353) == "table" then
+		v354.Name = tostring(v353.DisplayName or p16.AssetCategory)
+		local icon = v353.Icon
 		if icon ~= nil and tostring(icon) ~= "" then
 			local text2 = tostring(icon)
-			local v345 = tonumber(text2) and "rbxassetid://" .. text2 or text2
-			v337.Icon = v345
+			local v362 = tonumber(text2) and "rbxassetid://" .. text2 or text2
+			v354.Icon = v362
 		end
-		if type(v336.Rarity) == "table" then
-			local v348 = tonumber(v336.Rarity.RarityNumber or v336.Rarity.Rank) or 0
-			v337.Rarity = v348
+		if type(v353.Rarity) == "table" then
+			local v365 = tonumber(v353.Rarity.RarityNumber or v353.Rarity.Rank) or 0
+			v354.Rarity = v365
 		end
 		local assetScale = tonumber(p16.AssetScale) or 1
-		local v350 = assetScale > 5 and (assetScale / 5) ^ 1.2 * 19.637875755794113 or assetScale ^ 1.85
-		local v351 = 1
+		local v367 = assetScale > 5 and (assetScale / 5) ^ 1.2 * 19.637875755794113 or assetScale ^ 1.85
+		local v368 = 1
 		if type(Mutations) == "table" and type(Mutations.EarningsFor) == "function" then
 			local ok5, result5 = pcall(Mutations.EarningsFor, type(p16.Mutations) == "table" and p16.Mutations or {})
 			if ok5 and type(result5) == "number" then
-				v351 = result5
+				v368 = result5
 			end
 		end
-		local earningRate = tonumber(v336.EarningRate) or 0
-		v337.Value = earningRate * v350 * v351
+		local earningRate = tonumber(v353.EarningRate) or 0
+		v354.Value = earningRate * v367 * v368
 	end
-	return v337
+	return v354
 end
 local formatText = function(p17)
 	for _, item2 in ipairs({ { 1000000000000, "T" }, { 1000000000, "B" }, { 1000000, "M" }, { 1000, "K" } }) do
@@ -392,9 +420,9 @@ local formatText = function(p17)
 	end
 	return string.format("$%d/s", math.floor(p17 + 0.5))
 end
-local v57 = function(message2)
+local v62 = function(message2)
 end
-local v58 = function()
+local v63 = function()
 	local currentCamera = workspace.CurrentCamera
 	if not currentCamera then
 		return function()
@@ -413,50 +441,50 @@ local v58 = function()
 	end
 end
 local count = 0
-local v62 = function()
+local v67 = function()
 	if typeof(setfpscap) ~= "function" then
 		return
 	end
 	count += 1
-	local v383 = count
+	local v400 = count
 	task.spawn(function()
-		local v386 = true
+		local v403 = true
 		local now2 = os.clock()
-		while count == v383 and os.clock() - now2 < 60 do
-			pcall(setfpscap, v386 and v13[1] or v13[2])
-			v386 = not v386
+		while count == v400 and os.clock() - now2 < 60 do
+			pcall(setfpscap, v403 and v13[1] or v13[2])
+			v403 = not v403
 			task.wait(v13[3])
 		end
 	end)
 end
-local v65 = function()
+local v70 = function()
 	count += 1
 	if typeof(setfpscap) == "function" then
 		pcall(setfpscap, 240)
 	end
 end
-local v66 = nil
-local v67 = function()
-	local v395 = v66
-	v66 = nil
-	if v395 then
+local v71 = nil
+local v72 = function()
+	local v412 = v71
+	v71 = nil
+	if v412 then
 		pcall(function()
-			v395:Destroy()
+			v412:Destroy()
 		end)
 	end
 end
-local v68 = function()
-	v67()
-	local character7 = localPlayer.Character
-	if not character7 then
+local v73 = function()
+	v72()
+	local character8 = localPlayer.Character
+	if not character8 then
 		return
 	end
-	local archivable = character7.Archivable
-	character7.Archivable = true
-	local character7Clone = character7:Clone()
-	character7.Archivable = archivable
-	if character7Clone then
-		for _, descendant2 in ipairs(character7Clone:GetDescendants()) do
+	local archivable = character8.Archivable
+	character8.Archivable = true
+	local character8Clone = character8:Clone()
+	character8.Archivable = archivable
+	if character8Clone then
+		for _, descendant2 in ipairs(character8Clone:GetDescendants()) do
 			if descendant2:IsA("LuaSourceContainer") or descendant2:IsA("Humanoid") then
 				pcall(function()
 					descendant2:Destroy()
@@ -468,19 +496,19 @@ local v68 = function()
 				descendant2.CanQuery = false
 			end
 		end
-		character7Clone.Name = "Clone"
-		character7Clone.Parent = workspace
-		v66 = character7Clone
+		character8Clone.Name = "Clone"
+		character8Clone.Parent = workspace
+		v71 = character8Clone
 	end
 end
-local v71 = function()
+local v76 = function()
 	local objects = workspace:FindFirstChild("World") or workspace:FindFirstChild("__OBJECTS")
 	local areas = objects and objects:FindFirstChild("Areas")
 	local separationLine = areas and areas:FindFirstChild("SeparationLine")
-	local v419 = separationLine and separationLine:IsA("BasePart")
-	return v419 and separationLine.Position.X or 552.2, v419 and separationLine.Position.Y or 67.67
+	local v436 = separationLine and separationLine:IsA("BasePart")
+	return v436 and separationLine.Position.X or 552.2, v436 and separationLine.Position.Y or 67.67
 end
-local v74 = function()
+local v79 = function()
 	for key8, value8 in ipairs({
 		{ { "GearGiver_Slap", "Podium" }, Vector3.new(-16.415, 21.072, -6.106) },
 		{
@@ -492,12 +520,12 @@ local v74 = function()
 		Vector3.new(-26.776, 1.75, 18.665),
 	},
 	}) do
-		local v430 = workspace
+		local v447 = workspace
 		for _, item3 in ipairs(value8[1]) do
-			v430 = v430 and v430:FindFirstChild(item3) or nil
+			v447 = v447 and v447:FindFirstChild(item3) or nil
 		end
-		if v430 and v430:IsA("BasePart") then
-			return v430.CFrame:PointToWorldSpace(value8[2])
+		if v447 and v447:IsA("BasePart") then
+			return v447.CFrame:PointToWorldSpace(value8[2])
 		end
 	end
 	return Vector3.new(528.7, 70.57, -364.11)
@@ -513,16 +541,16 @@ local angles = function(p19)
 		rootPart.AssemblyAngularVelocity = Vector3.zero
 	end)
 end
-local v76 = {}
-local v77 = 0
-local v80 = function()
-	if os.clock() - v77 < 1 then
-		return v76
+local v81 = {}
+local v82 = 0
+local v85 = function()
+	if os.clock() - v82 < 1 then
+		return v81
 	end
-	v77 = os.clock()
+	v82 = os.clock()
 	local list2 = {}
-	local v447 = function(instance)
-		local v480, v481, v482 = pcall(function()
+	local v464 = function(instance)
+		local v497, v498, v499 = pcall(function()
 			if instance:IsA("Model") then
 				return instance:GetBoundingBox()
 			end
@@ -530,20 +558,20 @@ local v80 = function()
 				return instance.CFrame, instance.Size
 			end
 		end)
-		if v480 and v481 and v482 then
-			local v483 = Vector3.new(math.abs(v482.X), 0, math.abs(v482.Z)) * 0.5
-			local v484 = (v481 - v481.Position):VectorToWorldSpace(v483)
-			local v485 = math.max(math.abs(v484.X), v483.X, v483.Z)
-			local v486 = math.max(math.abs(v484.Z), v483.X, v483.Z)
+		if v497 and v498 and v499 then
+			local v500 = Vector3.new(math.abs(v499.X), 0, math.abs(v499.Z)) * 0.5
+			local v501 = (v498 - v498.Position):VectorToWorldSpace(v500)
+			local v502 = math.max(math.abs(v501.X), v500.X, v500.Z)
+			local v503 = math.max(math.abs(v501.Z), v500.X, v500.Z)
 			list2[#list2 + 1] = {
-				MinX = v481.Position.X - v485,
-				MaxX = v481.Position.X + v485,
-				MinZ = v481.Position.Z - v486,
-				MaxZ = v481.Position.Z + v486,
+				MinX = v498.Position.X - v502,
+				MaxX = v498.Position.X + v502,
+				MinZ = v498.Position.Z - v503,
+				MaxZ = v498.Position.Z + v503,
 			}
 		end
 	end
-	local v450 = function(p21)
+	local v467 = function(p21)
 		if p21 == "ScrambleLocalVisuals" or p21 == "DrScrambleEvent" then
 			return false
 		end
@@ -551,13 +579,13 @@ local v80 = function()
 		return string.find(lowered, "portal", 1, true) or string.find(lowered, "teleport", 1, true) or string.find(lowered, "mech", 1, true) or string.find(lowered, "arena", 1, true) or string.find(lowered, "scramble", 1, true)
 	end
 	for _, child2 in ipairs(workspace:GetChildren()) do
-		if (child2:IsA("Model") or child2:IsA("BasePart") or child2:IsA("Folder")) and v450(child2.Name) then
+		if (child2:IsA("Model") or child2:IsA("BasePart") or child2:IsA("Folder")) and v467(child2.Name) then
 			if child2:IsA("Folder") then
 				for _, child3 in ipairs(child2:GetChildren()) do
-					v447(child3)
+					v464(child3)
 				end
 			else
-				v447(child2)
+				v464(child2)
 			end
 		end
 	end
@@ -565,75 +593,75 @@ local v80 = function()
 	local build = world and world:FindFirstChild("Build")
 	if build then
 		for _, child4 in ipairs(build:GetChildren()) do
-			if v450(child4.Name) then
+			if v467(child4.Name) then
 				for _, child5 in ipairs(child4:GetChildren()) do
-					v447(child5)
+					v464(child5)
 				end
 			end
 		end
 	end
-	v76 = list2
+	v81 = list2
 	return list2
 end
-local v81 = function(p22, p23)
-	for _, item4 in ipairs(v80()) do
-		local v499 = item4.MinX - 12
-		local v500 = item4.MaxX + 12
-		local v501 = item4.MinZ - 12
-		local v502 = item4.MaxZ + 12
-		if not (p22.X >= v499 and p22.X <= v500 and p22.Z >= v501 and p22.Z <= v502) then
-			local v504 = 0
-			local v505 = 1
-			local v506 = true
-			for _, item5 in ipairs({ { p22.X, p23.X - p22.X, v499, v500 }, { p22.Z, p23.Z - p22.Z, v501, v502 } }) do
-				local v518 = item5[1]
-				local v519 = item5[2]
-				local v520 = item5[3]
-				local v521 = item5[4]
-				if math.abs(v519) < 1e-06 then
-					if v518 < v520 or v521 < v518 then
-						v506 = false
+local v86 = function(p22, p23)
+	for _, item4 in ipairs(v85()) do
+		local v516 = item4.MinX - 12
+		local v517 = item4.MaxX + 12
+		local v518 = item4.MinZ - 12
+		local v519 = item4.MaxZ + 12
+		if not (p22.X >= v516 and p22.X <= v517 and p22.Z >= v518 and p22.Z <= v519) then
+			local v521 = 0
+			local v522 = 1
+			local v523 = true
+			for _, item5 in ipairs({ { p22.X, p23.X - p22.X, v516, v517 }, { p22.Z, p23.Z - p22.Z, v518, v519 } }) do
+				local v535 = item5[1]
+				local v536 = item5[2]
+				local v537 = item5[3]
+				local v538 = item5[4]
+				if math.abs(v536) < 1e-06 then
+					if v535 < v537 or v538 < v535 then
+						v523 = false
 					end
 				else
-					local v522 = (v520 - v518) / v519
-					local v523 = (v521 - v518) / v519
-					if v523 < v522 then
-						local v524 = v522
-						v522 = v523
-						v523 = v524
+					local v539 = (v537 - v535) / v536
+					local v540 = (v538 - v535) / v536
+					if v540 < v539 then
+						local v541 = v539
+						v539 = v540
+						v540 = v541
 					end
-					v504 = math.max(v504, v522)
-					v505 = math.min(v505, v523)
-					if v505 < v504 then
-						v506 = false
+					v521 = math.max(v521, v539)
+					v522 = math.min(v522, v540)
+					if v522 < v521 then
+						v523 = false
 					end
 				end
 			end
-			if v506 then
-				local v512 = v501 - 2
-				local v513 = v502 + 2
-				local v514 = math.abs(p22.Z - v512) <= math.abs(p22.Z - v513) and v512 or v513
-				if v514 < -440 or -290 < v514 then
-					v514 = v514 == v512 and v513 or v512
+			if v523 then
+				local v529 = v518 - 2
+				local v530 = v519 + 2
+				local v531 = math.abs(p22.Z - v529) <= math.abs(p22.Z - v530) and v529 or v530
+				if v531 < -440 or -290 < v531 then
+					v531 = v531 == v529 and v530 or v529
 				end
-				local v516 = math.abs(p22.X - v499) <= math.abs(p22.X - v500) and v499 or v500
-				if math.abs(p22.Z - v514) < 3 then
-					v516 = math.abs(p23.X - v499) <= math.abs(p23.X - v500) and v499 or v500
+				local v533 = math.abs(p22.X - v516) <= math.abs(p22.X - v517) and v516 or v517
+				if math.abs(p22.Z - v531) < 3 then
+					v533 = math.abs(p23.X - v516) <= math.abs(p23.X - v517) and v516 or v517
 				end
-				return Vector3.new(v516, p23.Y, v514)
+				return Vector3.new(v533, p23.Y, v531)
 			end
 		end
 	end
 	return p23
 end
-local v83 = function(p24, p25)
-	local v526 = v71()
-	local v527 = v74()
-	local character8 = localPlayer.Character
-	local humanoid3 = character8 and character8:FindFirstChildOfClass("Humanoid")
+local v88 = function(p24, p25)
+	local v543 = v76()
+	local v544 = v79()
+	local character9 = localPlayer.Character
+	local humanoid3 = character9 and character9:FindFirstChildOfClass("Humanoid")
 	if humanoid3 then
 		humanoid3.PlatformStand = false
-		if character8:FindFirstChildWhichIsA("Tool") then
+		if character9:FindFirstChildWhichIsA("Tool") then
 			pcall(function()
 				humanoid3:UnequipTools()
 			end)
@@ -643,14 +671,14 @@ local v83 = function(p24, p25)
 	if not rootPart2 then
 		return false
 	end
-	local v531 = "field"
-	if rootPart2.Position.X < v526 - 2 and 20 < Vector3.new(rootPart2.Position.X - v527.X, 0, rootPart2.Position.Z - v527.Z).Magnitude then
-		v531 = "safe"
+	local v548 = "field"
+	if rootPart2.Position.X < v543 - 2 and 20 < Vector3.new(rootPart2.Position.X - v544.X, 0, rootPart2.Position.Z - v544.Z).Magnitude then
+		v548 = "safe"
 	end
 	local now3 = os.clock()
 	local now4 = os.clock()
 	local position = rootPart2.Position
-	local v535 = 0
+	local v552 = 0
 	while true do
 		if os.clock() - now3 < 120 and not state.Cancel then
 			rootPart2 = getHumanoidRootPart()
@@ -658,21 +686,21 @@ local v83 = function(p24, p25)
 				break
 			end
 			local vector = Vector3.new(p25.X - rootPart2.Position.X, 0, p25.Z - rootPart2.Position.Z)
-			if v531 ~= "field" or not (vector.Magnitude <= 2.5) then
-				local v540 = p25
-				if v531 == "safe" then
-					if not (Vector3.new(v527.X - rootPart2.Position.X, 0, v527.Z - rootPart2.Position.Z).Magnitude <= 6) then
-						v540 = v527
+			if v548 ~= "field" or not (vector.Magnitude <= 2.5) then
+				local v557 = p25
+				if v548 == "safe" then
+					if not (Vector3.new(v544.X - rootPart2.Position.X, 0, v544.Z - rootPart2.Position.Z).Magnitude <= 6) then
+						v557 = v544
 					else
-						v531 = "field"
+						v548 = "field"
 					end
 				end
-				local v542 = v81(rootPart2.Position, v540)
-				local vector2 = Vector3.new(v542.X - rootPart2.Position.X, 0, v542.Z - rootPart2.Position.Z)
+				local v559 = v86(rootPart2.Position, v557)
+				local vector2 = Vector3.new(v559.X - rootPart2.Position.X, 0, v559.Z - rootPart2.Position.Z)
 				local zero = vector2.Magnitude > 0.01 and vector2.Unit or Vector3.zero
-				local v545 = zero * math.min(math.max(getWalkSpeed() * config.SpeedCap, 8), vector2.Magnitude / 0.05)
+				local v562 = zero * math.min(math.max(getWalkSpeed() * config.SpeedCap, 8), vector2.Magnitude / 0.05)
 				pcall(function()
-					rootPart2.AssemblyLinearVelocity = Vector3.new(v545.X, rootPart2.AssemblyLinearVelocity.Y, v545.Z)
+					rootPart2.AssemblyLinearVelocity = Vector3.new(v562.X, rootPart2.AssemblyLinearVelocity.Y, v562.Z)
 					if humanoid3 and 0 < zero.Magnitude then
 						humanoid3:Move(zero, false)
 					end
@@ -686,8 +714,8 @@ local v83 = function(p24, p25)
 					position = rootPart2.Position
 					now4 = os.clock()
 				end
-				if v531 == "field" and vector.Magnitude <= 9 and 0.1 < os.clock() - v535 then
-					v535 = os.clock()
+				if v548 == "field" and vector.Magnitude <= 9 and 0.1 < os.clock() - v552 then
+					v552 = os.clock()
 					carryFieldEgg(p24)
 				end
 				RunService.Heartbeat:Wait()
@@ -708,12 +736,12 @@ local v83 = function(p24, p25)
 	return false
 end
 local getPos = function(p26, p27)
-	local v553 = workspace:FindFirstChild(p26)
+	local v570 = workspace:FindFirstChild(p26)
 	local areaEggSlotsClient = workspace:FindFirstChild("AreaEggSlotsClient")
-	local v557 = v553 or areaEggSlotsClient and areaEggSlotsClient:FindFirstChild(p26)
-	if v557 then
+	local v574 = v570 or areaEggSlotsClient and areaEggSlotsClient:FindFirstChild(p26)
+	if v574 then
 		local ok6, result6 = pcall(function()
-			return v557:GetPivot().Position
+			return v574:GetPivot().Position
 		end)
 		if ok6 and result6 then
 			local now5 = os.clock()
@@ -724,47 +752,47 @@ local getPos = function(p26, p27)
 	end
 	if 0.5 <= os.clock() - p27.At then
 		p27.At = os.clock()
-		local pos = v53(p26) or p27.Pos
+		local pos = v58(p26) or p27.Pos
 		p27.Pos = pos
 	end
 	return p27.Pos
 end
-local v87 = function(p28, p29)
-	local v566 = { At = 0 }
-	local v569 = 0
-	local v570 = 1
-	while not state.Carrying and v569 < p29 and not state.Cancel do
+local v92 = function(p28, p29)
+	local v583 = { At = 0 }
+	local v586 = 0
+	local v587 = 1
+	while not state.Carrying and v586 < p29 and not state.Cancel do
 		local rootPart3 = getHumanoidRootPart()
-		local pos2 = getPos(p28, v566)
-		local v574 = math.max(RunService.Heartbeat:Wait(), 0.004166666666666667)
-		v569 += v574
-		v570 += v574
+		local pos2 = getPos(p28, v583)
+		local v591 = math.max(RunService.Heartbeat:Wait(), 0.004166666666666667)
+		v586 += v591
+		v587 += v591
 		if not rootPart3 or not pos2 then
-			if config.GrabInterval <= v570 then
-				v570 = 0
+			if config.GrabInterval <= v587 then
+				v587 = 0
 				task.spawn(carryFieldEgg, p28)
 			end
 		else
 			local position2 = pos2 - rootPart3.Position
 			if 2 < position2.Magnitude then
-				local v576 = math.max(getWalkSpeed() * config.SpeedCap, 16)
-				local v577 = position2 / math.max(0.08, v574)
-				if v576 < v577.Magnitude then
-					v577 = v577.Unit * v576
+				local v593 = math.max(getWalkSpeed() * config.SpeedCap, 16)
+				local v594 = position2 / math.max(0.08, v591)
+				if v593 < v594.Magnitude then
+					v594 = v594.Unit * v593
 				end
 				pcall(function()
-					rootPart3.AssemblyLinearVelocity = v577 + Vector3.new(0, workspace.Gravity * v574 * 0.5, 0)
+					rootPart3.AssemblyLinearVelocity = v594 + Vector3.new(0, workspace.Gravity * v591 * 0.5, 0)
 					rootPart3.AssemblyAngularVelocity = Vector3.zero
 				end)
 			end
-			if config.GrabInterval <= v570 then
-				v570 = 0
-				local v579 = v49(pos2 - Vector3.new(0, 3, 0), 10)
-				if v579 and typeof(fireproximityprompt) == "function" then
+			if config.GrabInterval <= v587 then
+				v587 = 0
+				local v596 = v54(pos2 - Vector3.new(0, 3, 0), 10)
+				if v596 and typeof(fireproximityprompt) == "function" then
 					pcall(function()
-						v579.HoldDuration = 0
+						v596.HoldDuration = 0
 					end)
-					pcall(fireproximityprompt, v579)
+					pcall(fireproximityprompt, v596)
 				end
 				task.spawn(carryFieldEgg, p28)
 			end
@@ -778,22 +806,22 @@ local v87 = function(p28, p29)
 	end
 	return state.Carrying and state.Uid == p28
 end
-local v88 = function(p30)
+local v93 = function(p30)
 	if state.Carrying then
 		return true
 	end
 	local rootPart5 = getHumanoidRootPart()
-	local v586 = v53(p30)
-	if not rootPart5 or not v586 or not (config.RegrabFar < Vector3.new(rootPart5.Position.X - v586.X, 0, rootPart5.Position.Z - v586.Z).Magnitude) then
-		v57("The egg fell close, taking it back")
+	local v603 = v58(p30)
+	if not rootPart5 or not v603 or not (config.RegrabFar < Vector3.new(rootPart5.Position.X - v603.X, 0, rootPart5.Position.Z - v603.Z).Magnitude) then
+		v62("The egg fell close, taking it back")
 	else
-		v57("The egg fell far behind, teleporting onto it")
-		angles(v586 + Vector3.new(0, 3, 0))
+		v62("The egg fell far behind, teleporting onto it")
+		angles(v603 + Vector3.new(0, 3, 0))
 	end
-	return v87(p30, 3)
+	return v92(p30, 3)
 end
 local raycast = function(p31, p32)
-	local v588 = p32
+	local v605 = p32
 	pcall(function()
 		local raycastParams = RaycastParams.new()
 		raycastParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -801,72 +829,72 @@ local raycast = function(p31, p32)
 		raycastParams.IgnoreWater = true
 		local raycastResult = workspace:Raycast(p31 + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), raycastParams)
 		if raycastResult and raycastResult.Material ~= Enum.Material.Water and math.abs(raycastResult.Position.Y - p32) < 40 then
-			v588 = raycastResult.Position.Y + 3.5
+			v605 = raycastResult.Position.Y + 3.5
 		end
 	end)
-	return v588
+	return v605
 end
-local v93 = function(p33)
+local v98 = function(p33)
 	local walkSpeed2 = getWalkSpeed()
 	local mult = walkSpeed2 * math.min(config.CarryRatio, config.SpeedCap) * state.Mult
-	local v596 = mult * 1.5
-	local v597 = 5.5 * mult
-	local v598 = v596
-	if p33 and v597 < p33 then
-		v598 = math.min(v596, mult * p33 / (p33 - v597))
+	local v613 = mult * 1.5
+	local v614 = 5.5 * mult
+	local v615 = v613
+	if p33 and v614 < p33 then
+		v615 = math.min(v613, mult * p33 / (p33 - v614))
 	end
-	return math.min(math.max(math.min(mult * config.EasyRatio, v598), mult), math.max(walkSpeed2 * config.SpeedCap, mult))
+	return math.min(math.max(math.min(mult * config.EasyRatio, v615), mult), math.max(walkSpeed2 * config.SpeedCap, mult))
 end
-local v96 = function(p34, p35)
+local v101 = function(p34, p35)
 	local now6 = os.clock()
-	local v601 = v74()
-	local v602 = p34 - 7
+	local v618 = v79()
+	local v619 = p34 - 7
 	local height = config.Height
-	local v604 = math.clamp(config.ClimbShare, 0.1, 0.9)
-	local v605 = height * math.sqrt(1 - v604 * v604) / v604
-	local character9 = localPlayer.Character
-	local humanoid4 = character9 and character9:FindFirstChildOfClass("Humanoid")
+	local v621 = math.clamp(config.ClimbShare, 0.1, 0.9)
+	local v622 = height * math.sqrt(1 - v621 * v621) / v621
+	local character10 = localPlayer.Character
+	local humanoid4 = character10 and character10:FindFirstChildOfClass("Humanoid")
 	if humanoid4 then
 		humanoid4.PlatformStand = false
 	end
 	local rootPart6 = getHumanoidRootPart()
-	if rootPart6 and character9 and 0.5 < height and rootPart6.Position.Y < v601.Y + height - 2 then
+	if rootPart6 and character10 and 0.5 < height and rootPart6.Position.Y < v618.Y + height - 2 then
 		pcall(function()
-			character9:PivotTo(CFrame.new(Vector3.new(rootPart6.Position.X, v601.Y + height, rootPart6.Position.Z)) * rootPart6.CFrame.Rotation)
+			character10:PivotTo(CFrame.new(Vector3.new(rootPart6.Position.X, v618.Y + height, rootPart6.Position.Z)) * rootPart6.CFrame.Rotation)
 			rootPart6.AssemblyLinearVelocity = Vector3.zero
 			rootPart6.AssemblyAngularVelocity = Vector3.zero
 		end)
 	end
 	local rootPart7 = getHumanoidRootPart()
-	local v613 = v93(rootPart7 and Vector3.new(rootPart7.Position.X - v601.X, 0, rootPart7.Position.Z - v601.Z).Magnitude + math.max(0, height) * 2 or nil)
+	local v630 = v98(rootPart7 and Vector3.new(rootPart7.Position.X - v618.X, 0, rootPart7.Position.Z - v618.Z).Magnitude + math.max(0, height) * 2 or nil)
 	local now7 = os.clock()
-	local v615 = 0
-	v57("Safe zone")
+	local v632 = 0
+	v62("Safe zone")
 	while true do
-		if state.Carrying and state.Delivered < now6 and not state.Cancel and v615 < 25 then
+		if state.Carrying and state.Delivered < now6 and not state.Cancel and v632 < 25 then
 			rootPart6 = getHumanoidRootPart()
 			if not rootPart6 then
 				break
 			end
 			local now8 = os.clock()
-			local v620 = math.max(now8 - now7, 0.004166666666666667)
+			local v637 = math.max(now8 - now7, 0.004166666666666667)
 			now7 = now8
-			v615 += v620
-			local v621 = rootPart6.Position.X <= v602 + 2
-			local v622 = v621 and v601 or Vector3.new(v602, v601.Y, p35)
-			if not v621 or not (Vector3.new(v601.X - rootPart6.Position.X, 0, v601.Z - rootPart6.Position.Z).Magnitude < 2) then
-				local v623 = v81(rootPart6.Position, v622)
-				local vector3 = Vector3.new(v623.X - rootPart6.Position.X, 0, v623.Z - rootPart6.Position.Z)
-				local v625 = v621 and 0 or math.max(0, rootPart6.Position.X - v602)
-				local v626 = v601.Y + height
-				if v621 or v625 <= v605 then
-					v626 = v601.Y + height * math.clamp(v625 / math.max(v605, 1), 0, 1)
+			v632 += v637
+			local v638 = rootPart6.Position.X <= v619 + 2
+			local v639 = v638 and v618 or Vector3.new(v619, v618.Y, p35)
+			if not v638 or not (Vector3.new(v618.X - rootPart6.Position.X, 0, v618.Z - rootPart6.Position.Z).Magnitude < 2) then
+				local v640 = v86(rootPart6.Position, v639)
+				local vector3 = Vector3.new(v640.X - rootPart6.Position.X, 0, v640.Z - rootPart6.Position.Z)
+				local v642 = v638 and 0 or math.max(0, rootPart6.Position.X - v619)
+				local v643 = v618.Y + height
+				if v638 or v642 <= v622 then
+					v643 = v618.Y + height * math.clamp(v642 / math.max(v622, 1), 0, 1)
 				end
-				local v627 = math.clamp((v626 - rootPart6.Position.Y) / 0.12, -v613 * v604, v613 * v604)
-				local v628 = math.sqrt(math.max(v613 * v613 - v627 * v627, 0))
-				local zero2 = vector3.Magnitude > 0.01 and vector3.Unit * math.min(v628, vector3.Magnitude / 0.05) or Vector3.zero
+				local v644 = math.clamp((v643 - rootPart6.Position.Y) / 0.12, -v630 * v621, v630 * v621)
+				local v645 = math.sqrt(math.max(v630 * v630 - v644 * v644, 0))
+				local zero2 = vector3.Magnitude > 0.01 and vector3.Unit * math.min(v645, vector3.Magnitude / 0.05) or Vector3.zero
 				pcall(function()
-					rootPart6.AssemblyLinearVelocity = Vector3.new(zero2.X, v627, zero2.Z)
+					rootPart6.AssemblyLinearVelocity = Vector3.new(zero2.X, v644, zero2.Z)
 				end)
 				RunService.Heartbeat:Wait()
 				continue
@@ -893,36 +921,36 @@ local v96 = function(p34, p35)
 	end
 	return false
 end
-local v99 = function(p36)
+local v104 = function(p36)
 	local now9 = os.clock()
-	local v636, v637 = v71()
+	local v653, v654 = v76()
 	local rootPart8 = getHumanoidRootPart()
 	if not rootPart8 then
 		return false
 	end
-	local v639 = math.clamp(rootPart8.Position.Z, -425, -300)
-	local vector4 = Vector3.new(v636 + config.LandOffset, v637 + 3.35, v639)
-	local v641 = math.max(getWalkSpeed() * config.HopRatio, config.HopMin)
+	local v656 = math.clamp(rootPart8.Position.Z, -425, -300)
+	local vector4 = Vector3.new(v653 + config.LandOffset, v654 + 3.35, v656)
+	local v658 = math.max(getWalkSpeed() * config.HopRatio, config.HopMin)
 	local hopLift = rootPart8.Position.Y + config.HopLift
 	local x = rootPart8.Position.X
 	local count2 = 0
-	local v645 = v58()
-	state.ReleaseCamera = v645
-	pcall(v68)
-	v62()
-	while vector4.X < x - v641 and not state.Cancel do
+	local v662 = v63()
+	state.ReleaseCamera = v662
+	pcall(v73)
+	v67()
+	while vector4.X < x - v658 and not state.Cancel do
 		if state.Carrying then
-			local v647 = x - v641
-			v57(string.format("Instant TP: hopping home, X %d", math.floor(v647)))
+			local v664 = x - v658
+			v62(string.format("Instant TP: hopping home, X %d", math.floor(v664)))
 			local pulledAt = state.PulledAt
 			local elapsed3 = 0
 			while elapsed3 < config.HopGap do
-				angles(Vector3.new(v647, hopLift, v639))
+				angles(Vector3.new(v664, hopLift, v656))
 				elapsed3 += RunService.Heartbeat:Wait()
 			end
 			local rootPart9 = getHumanoidRootPart()
-			if not (state.PulledAt > pulledAt or rootPart9 ~= nil and (rootPart9.Position.X - v647 > 10 or rootPart9.AssemblyLinearVelocity.Magnitude > 150)) or not state.Carrying or state.Cancel then
-				x = v647
+			if not (state.PulledAt > pulledAt or rootPart9 ~= nil and (rootPart9.Position.X - v664 > 10 or rootPart9.AssemblyLinearVelocity.Magnitude > 150)) or not state.Carrying or state.Cancel then
+				x = v664
 				config.HopGap = math.max(config.HopGapMin, config.HopGap - 0.01)
 			else
 				count2 += 1
@@ -930,15 +958,15 @@ local v99 = function(p36)
 				if config.HopRetries < count2 then
 					break
 				end
-				v57(string.format("Instant TP: pulled back, retry %d/%d", count2, config.HopRetries))
+				v62(string.format("Instant TP: pulled back, retry %d/%d", count2, config.HopRetries))
 				local elapsed4 = 0
 				while elapsed4 < 0.12 and not state.Cancel do
-					angles(Vector3.new(x, hopLift, v639))
+					angles(Vector3.new(x, hopLift, v656))
 					elapsed4 += RunService.Heartbeat:Wait()
 				end
 			end
 		else
-			if not v88(p36) then
+			if not v93(p36) then
 				break
 			end
 			local rootPart10 = getHumanoidRootPart()
@@ -947,9 +975,9 @@ local v99 = function(p36)
 			end
 		end
 	end
-	v57("Instant TP: landing next to the line")
+	v62("Instant TP: landing next to the line")
 	local vector5 = Vector3.new(vector4.X, raycast(vector4, vector4.Y), vector4.Z)
-	local v658 = function()
+	local v675 = function()
 		local rootPart11 = getHumanoidRootPart()
 		if not rootPart11 or not (rootPart11.Position.X <= vector5.X + 1) or not (vector5.Y - 25 < rootPart11.Position.Y) then
 			angles(vector5)
@@ -959,7 +987,7 @@ local v99 = function(p36)
 			rootPart11.AssemblyLinearVelocity = Vector3.zero
 		end)
 	end
-	v658()
+	v675()
 	for i = 1, 3 do
 		local elapsed5 = 0
 		while elapsed5 < config.LandSettle and not state.Cancel do
@@ -969,16 +997,16 @@ local v99 = function(p36)
 		if not state.Carrying or not rootPart12 or not (12 < rootPart12.Position.X - vector5.X) and not (rootPart12.Position.Y < vector5.Y - 25) then
 			break
 		end
-		v57("Instant TP: landing retry " .. i)
-		v658()
+		v62("Instant TP: landing retry " .. i)
+		v675()
 	end
-	v67()
+	v72()
 	if state.Carrying and not state.Cancel then
 		local elapsed6 = 0
 		while elapsed6 < config.DropDelay do
 			elapsed6 += RunService.Heartbeat:Wait()
 		end
-		v57("Instant TP: dropping the egg")
+		v62("Instant TP: dropping the egg")
 		dropFieldEgg()
 		local elapsed7 = 0
 		while state.Carrying and elapsed7 < 1 and not state.Cancel do
@@ -991,25 +1019,25 @@ local v99 = function(p36)
 				rootPart13.AssemblyAngularVelocity = Vector3.zero
 			end)
 		end
-		v645()
-		v67()
-		v57("Instant TP: taking the egg back")
-		if not v87(p36, 3) and not v88(p36) then
-			v65()
-			v57("Could not take the egg back")
+		v662()
+		v72()
+		v62("Instant TP: taking the egg back")
+		if not v92(p36, 3) and not v93(p36) then
+			v70()
+			v62("Could not take the egg back")
 			return false
 		end
-		v67()
+		v72()
 	end
-	v645()
-	local v666 = false
+	v662()
+	local v683 = false
 	if state.Carrying then
-		v666 = v96(v636, v639)
+		v683 = v101(v653, v656)
 	end
-	v65()
-	return v666 or state.Delivered >= now9
+	v70()
+	return v683 or state.Delivered >= now9
 end
-local v100 = function(p37)
+local v105 = function(p37)
 	if state.Busy then
 		return
 	end
@@ -1017,10 +1045,10 @@ local v100 = function(p37)
 	state.Cancel = false
 	task.spawn(function()
 		local ok7, result7 = pcall(function()
-			v57("Looking for the egg")
-			local v688 = v53(p37)
-			if not v688 then
-				v57("That egg is gone")
+			v62("Looking for the egg")
+			local v705 = v58(p37)
+			if not v705 then
+				v62("That egg is gone")
 				return
 			end
 			if state.Carrying and state.Uid ~= p37 then
@@ -1030,29 +1058,29 @@ local v100 = function(p37)
 					elapsed8 += RunService.Heartbeat:Wait()
 				end
 			end
-			v62()
-			v57("Going to the egg")
-			if not v83(p37, v688) then
-				v65()
-				v57("Could not reach the egg")
+			v67()
+			v62("Going to the egg")
+			if not v88(p37, v705) then
+				v70()
+				v62("Could not reach the egg")
 				return
 			end
-			v57("Taking the egg")
-			if not v87(p37, 4) then
-				v65()
-				v57("The egg would not come free")
+			v62("Taking the egg")
+			if not v92(p37, 4) then
+				v70()
+				v62("The egg would not come free")
 				return
 			end
-			v57(v99(p37) and "Delivered" or "Delivery failed")
+			v62(v104(p37) and "Delivered" or "Delivery failed")
 		end)
-		v65()
-		v67()
+		v70()
+		v72()
 		if state.ReleaseCamera then
 			pcall(state.ReleaseCamera)
 			state.ReleaseCamera = nil
 		end
 		if not ok7 then
-			v57("Error: " .. tostring(result7))
+			v62("Error: " .. tostring(result7))
 		end
 		state.Busy = false
 	end)
@@ -1072,7 +1100,7 @@ local colors = {
 	OFF_BG = Color3.fromRGB(30, 45, 80),
 	OFF_TEXT = Color3.fromRGB(120, 160, 220),
 }
-local v102 = {
+local v107 = {
 	Color3.fromRGB(190, 190, 190),
 	Color3.fromRGB(110, 210, 110),
 	Color3.fromRGB(90, 160, 255),
@@ -1092,35 +1120,35 @@ local getCoreGui = function()
 	return CoreGui
 end
 local create = function(className, props)
-	local v698 = Instance.new(className)
+	local v715 = Instance.new(className)
 	for key16, value16 in pairs(props or {}) do
-		v698[key16] = value16
+		v715[key16] = value16
 	end
-	return v698
+	return v715
 end
-local v108 = function(p40, p41)
-	local v707 = create
-	local v708 = "UICorner"
-	local v709 = {}
-	v709.CornerRadius = UDim.new(0, p41 or 6)
-	local v713 = v707(v708, v709)
-	v713.Parent = p40
-	return v713
+local v113 = function(p40, p41)
+	local v724 = create
+	local v725 = "UICorner"
+	local v726 = {}
+	v726.CornerRadius = UDim.new(0, p41 or 6)
+	local v730 = v724(v725, v726)
+	v730.Parent = p40
+	return v730
 end
-local v110 = function(p42, p43, p44, p45)
-	local v715 = create
-	local v716 = "UIStroke"
-	local v717 = { Color = p43 }
-	v717.Thickness = p44 or 1
-	v717.Transparency = p45 or 0
-	v717.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	local v720 = v715(v716, v717)
-	v720.Parent = p42
-	return v720
+local v115 = function(p42, p43, p44, p45)
+	local v732 = create
+	local v733 = "UIStroke"
+	local v734 = { Color = p43 }
+	v734.Thickness = p44 or 1
+	v734.Transparency = p45 or 0
+	v734.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	local v737 = v732(v733, v734)
+	v737.Parent = p42
+	return v737
 end
 local tween = function(p46, p47, p48, p49, p50)
-	local v724 = TweenService
-	v724:Create(p46, TweenInfo.new(p47 or 0.2, p49 or Enum.EasingStyle.Quint, p50 or Enum.EasingDirection.Out), p48):Play()
+	local v741 = TweenService
+	v741:Create(p46, TweenInfo.new(p47 or 0.2, p49 or Enum.EasingStyle.Quint, p50 or Enum.EasingDirection.Out), p48):Play()
 end
 local tokinuEgg = getCoreGui():FindFirstChild("TokinuEgg")
 if tokinuEgg then
@@ -1145,8 +1173,8 @@ local tokinuEggFrame = create("Frame", {
 	Active = true,
 })
 tokinuEggFrame.Parent = tokinuEggGui
-v108(tokinuEggFrame, 18)
-v110(tokinuEggFrame, colors.AQUA_STROKE, 1.2, 0.3)
+v113(tokinuEggFrame, 18)
+v115(tokinuEggFrame, colors.AQUA_STROKE, 1.2, 0.3)
 create("ImageLabel", {
 	Name = "Shadow",
 	AnchorPoint = Vector2.new(0.5, 0.5),
@@ -1204,30 +1232,30 @@ create("UIGradient", {
 }),
 }).Parent = dividerFrame
 ;(function(p51, p52)
-	local v733 = nil
-	local v734 = nil
+	local v750 = nil
+	local v751 = nil
 	local position3 = nil
 	local position4 = nil
-	local v737 = function(p53)
-		local v739 = p53 - position3
-		p51.Position = UDim2.new(position4.X.Scale, position4.X.Offset + v739.X, position4.Y.Scale, position4.Y.Offset + v739.Y)
+	local v754 = function(p53)
+		local v756 = p53 - position3
+		p51.Position = UDim2.new(position4.X.Scale, position4.X.Offset + v756.X, position4.Y.Scale, position4.Y.Offset + v756.Y)
 	end
 	p52.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			v733 = true
-			v734 = input
+			v750 = true
+			v751 = input
 			position3 = input.Position
 			position4 = p51.Position
 			input.Changed:Connect(function()
 				if input.UserInputState == Enum.UserInputState.End then
-					v733 = false
+					v750 = false
 				end
 			end)
 		end
 	end)
 	UserInputService.InputChanged:Connect(function(input2)
-		if v733 and (input2.UserInputType == Enum.UserInputType.MouseMovement or input2.UserInputType == Enum.UserInputType.Touch) then
-			v737(input2.Position)
+		if v750 and (input2.UserInputType == Enum.UserInputType.MouseMovement or input2.UserInputType == Enum.UserInputType.Touch) then
+			v754(input2.Position)
 		end
 	end)
 end)(tokinuEggFrame, headerFrame)
@@ -1246,15 +1274,15 @@ local foldButton = create("TextButton", {
 	ZIndex = 105,
 })
 foldButton.Parent = headerFrame
-v108(foldButton, 7)
-local v122 = v110(foldButton, colors.AQUA_STROKE, 1, 0.5)
+v113(foldButton, 7)
+local v127 = v115(foldButton, colors.AQUA_STROKE, 1, 0.5)
 foldButton.MouseEnter:Connect(function()
 	tween(foldButton, 0.14, { BackgroundColor3 = Color3.fromRGB(40, 65, 115), BackgroundTransparency = 0.05 })
-	tween(v122, 0.14, { Transparency = 0.3 })
+	tween(v127, 0.14, { Transparency = 0.3 })
 end)
 foldButton.MouseLeave:Connect(function()
 	tween(foldButton, 0.14, { BackgroundColor3 = colors.OFF_BG, BackgroundTransparency = 0.1 })
-	tween(v122, 0.14, { Transparency = 0.5 })
+	tween(v127, 0.14, { Transparency = 0.5 })
 end)
 local contentBoxFrame = create("Frame", {
 	Name = "ContentBox",
@@ -1266,8 +1294,8 @@ local contentBoxFrame = create("Frame", {
 	ZIndex = 101,
 })
 contentBoxFrame.Parent = tokinuEggFrame
-v108(contentBoxFrame, 16)
-v110(contentBoxFrame, colors.AQUA_STROKE, 1, 0.4)
+v113(contentBoxFrame, 16)
+v115(contentBoxFrame, colors.AQUA_STROKE, 1, 0.4)
 local innerFrame = create("Frame", {
 	Name = "Inner",
 	Size = UDim2.new(1, -10, 1, -10),
@@ -1276,11 +1304,11 @@ local innerFrame = create("Frame", {
 	ZIndex = 102,
 })
 innerFrame.Parent = contentBoxFrame
-local v126 = false
+local v131 = false
 local size = nil
 foldButton.MouseButton1Click:Connect(function()
-	v126 = not v126
-	if v126 then
+	v131 = not v131
+	if v131 then
 		contentBoxFrame.Visible = false
 		size = tokinuEggFrame.Size
 		tokinuEggFrame.Size = UDim2.fromOffset(240, 44)
@@ -1343,17 +1371,17 @@ local stealButton = create("TextButton", {
 	ZIndex = 104,
 })
 stealButton.Parent = innerFrame
-v108(stealButton, 11)
-local v131 = v110(stealButton, colors.AQUA_STROKE, 1, 0.5)
+v113(stealButton, 11)
+local v136 = v115(stealButton, colors.AQUA_STROKE, 1, 0.5)
 stealButton.MouseEnter:Connect(function()
 	tween(stealButton, 0.14, { BackgroundColor3 = Color3.fromRGB(40, 65, 115), BackgroundTransparency = 0.05 })
-	tween(v131, 0.14, { Transparency = 0.3 })
+	tween(v136, 0.14, { Transparency = 0.3 })
 end)
 stealButton.MouseLeave:Connect(function()
 	tween(stealButton, 0.14, { BackgroundColor3 = colors.OFF_BG, BackgroundTransparency = 0.1 })
-	tween(v131, 0.14, { Transparency = 0.5 })
+	tween(v136, 0.14, { Transparency = 0.5 })
 end)
-local v134 = {
+local v139 = {
 	["Pick a pet"] = true,
 	["Looking for the egg"] = true,
 	["Going to the egg"] = true,
@@ -1365,9 +1393,9 @@ local v134 = {
 	["The egg would not come free"] = true,
 	Cancelling = true,
 }
-v57 = function(p56)
+v62 = function(p56)
 	local text3 = tostring(p56)
-	if v134[text3] or string.sub(text3, 1, 9) == "Selected:" then
+	if v139[text3] or string.sub(text3, 1, 9) == "Selected:" then
 		statusLabel.Text = text3
 	elseif string.sub(text3, 1, 5) == "Error" then
 		statusLabel.Text = "Something went wrong"
@@ -1375,18 +1403,18 @@ v57 = function(p56)
 		statusLabel.Text = "Delivering"
 	end
 end
-local v135 = {}
-local v136 = nil
-local v138 = function(p57)
-	v136 = p57
-	for key17, value17 in pairs(v135) do
-		local v761 = key17 == p57
-		value17.Stroke.Thickness = v761 and 1.5 or 1
-		value17.Stroke.Color = v761 and colors.AQUA_STROKE or colors.OFF_BG
-		value17.Stroke.Transparency = v761 and 0.2 or 0.45
+local v140 = {}
+local v141 = nil
+local v143 = function(p57)
+	v141 = p57
+	for key17, value17 in pairs(v140) do
+		local v778 = key17 == p57
+		value17.Stroke.Thickness = v778 and 1.5 or 1
+		value17.Stroke.Color = v778 and colors.AQUA_STROKE or colors.OFF_BG
+		value17.Stroke.Transparency = v778 and 0.2 or 0.45
 	end
 end
-local v139 = function(p58)
+local v144 = function(p58)
 	local eggRowButton = create("TextButton", {
 		Name = "EggRow",
 		Size = UDim2.new(1, 0, 0, 28),
@@ -1398,8 +1426,8 @@ local v139 = function(p58)
 		ZIndex = 103,
 	})
 	eggRowButton.Parent = eggListScroll
-	v108(eggRowButton, 11)
-	local v770 = v110(eggRowButton, colors.OFF_BG, 1, 0.45)
+	v113(eggRowButton, 11)
+	local v787 = v115(eggRowButton, colors.OFF_BG, 1, 0.45)
 	local imageLabel = create("ImageLabel", {
 		Size = UDim2.fromOffset(22, 22),
 		Position = UDim2.fromOffset(3, 3),
@@ -1409,9 +1437,9 @@ local v139 = function(p58)
 		ZIndex = 104,
 	})
 	imageLabel.Parent = eggRowButton
-	local v773 = create
-	local v774 = "TextLabel"
-	local v775 = {
+	local v790 = create
+	local v791 = "TextLabel"
+	local v792 = {
 		Size = UDim2.new(1, -30, 0, 13),
 		Position = UDim2.fromOffset(28, 2),
 		BackgroundTransparency = 1,
@@ -1421,11 +1449,11 @@ local v139 = function(p58)
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Text = p58.Name,
 	}
-	local text4 = v102[math.clamp(p58.Rarity, 1, #v102)] or colors.TEXT
-	v775.TextColor3 = text4
-	v775.ZIndex = 104
-	local v777 = v773(v774, v775)
-	v777.Parent = eggRowButton
+	local text4 = v107[math.clamp(p58.Rarity, 1, #v107)] or colors.TEXT
+	v792.TextColor3 = text4
+	v792.ZIndex = 104
+	local v794 = v790(v791, v792)
+	v794.Parent = eggRowButton
 	local textLabel = create("TextLabel", {
 		Size = UDim2.new(1, -30, 0, 11),
 		Position = UDim2.fromOffset(28, 15),
@@ -1439,20 +1467,20 @@ local v139 = function(p58)
 	})
 	textLabel.Parent = eggRowButton
 	eggRowButton.MouseButton1Click:Connect(function()
-		v138(p58.Uid)
-		v57("Selected: " .. p58.Name)
+		v143(p58.Uid)
+		v62("Selected: " .. p58.Name)
 	end)
 	eggRowButton.MouseEnter:Connect(function()
 		tween(eggRowButton, 0.14, { BackgroundColor3 = Color3.fromRGB(40, 65, 115), BackgroundTransparency = 0.05 })
-		tween(v770, 0.14, { Transparency = 0.3 })
+		tween(v787, 0.14, { Transparency = 0.3 })
 	end)
 	eggRowButton.MouseLeave:Connect(function()
 		tween(eggRowButton, 0.14, { BackgroundColor3 = colors.SURF2, BackgroundTransparency = colors.SURF2_TRANS })
-		tween(v770, 0.14, { Transparency = 0.45 })
+		tween(v787, 0.14, { Transparency = 0.45 })
 	end)
-	return { Frame = eggRowButton, Stroke = v770, Icon = imageLabel, Name = v777, Value = textLabel, Info = p58 }
+	return { Frame = eggRowButton, Stroke = v787, Icon = imageLabel, Name = v794, Value = textLabel, Info = p58 }
 end
-local v142 = function(p59, p60)
+local v147 = function(p59, p60)
 	p59.Info = p60
 	if p59.Icon.Image ~= p60.Icon then
 		p59.Icon.Image = p60.Icon
@@ -1460,19 +1488,19 @@ local v142 = function(p59, p60)
 	if p59.Name.Text ~= p60.Name then
 		p59.Name.Text = p60.Name
 	end
-	local text5 = v102[math.clamp(p60.Rarity, 1, #v102)] or colors.TEXT
+	local text5 = v107[math.clamp(p60.Rarity, 1, #v107)] or colors.TEXT
 	if p59.Name.TextColor3 ~= text5 then
 		p59.Name.TextColor3 = text5
 	end
-	local v787 = formatText(p60.Value)
-	if p59.Value.Text ~= v787 then
-		p59.Value.Text = v787
+	local v804 = formatText(p60.Value)
+	if p59.Value.Text ~= v804 then
+		p59.Value.Text = v804
 	end
 end
-local v143 = function()
+local v148 = function()
 	local list3 = {}
 	for _, item6 in ipairs(askFieldEggSnapshot()) do
-		list3[#list3 + 1] = v54(item6)
+		list3[#list3 + 1] = v59(item6)
 	end
 	table.sort(list3, function(a, b)
 		return a.Value > b.Value
@@ -1480,47 +1508,47 @@ local v143 = function()
 	local seen2 = {}
 	for index, item7 in ipairs(list3) do
 		seen2[item7.Uid] = true
-		local v811 = v135[item7.Uid]
-		if v811 then
-			v142(v811, item7)
-			if v811.Frame.LayoutOrder ~= index then
-				v811.Frame.LayoutOrder = index
+		local v828 = v140[item7.Uid]
+		if v828 then
+			v147(v828, item7)
+			if v828.Frame.LayoutOrder ~= index then
+				v828.Frame.LayoutOrder = index
 			end
 		else
-			local v813 = v139(item7)
-			v813.Frame.LayoutOrder = index
-			v135[item7.Uid] = v813
+			local v830 = v144(item7)
+			v830.Frame.LayoutOrder = index
+			v140[item7.Uid] = v830
 		end
 	end
-	for key20, value20 in pairs(v135) do
+	for key20, value20 in pairs(v140) do
 		if not seen2[key20] then
 			value20.Frame:Destroy()
-			v135[key20] = nil
+			v140[key20] = nil
 		end
 	end
 	if #list3 == 0 then
-		v57("Pick a pet")
+		v62("Pick a pet")
 	end
 end
 task.spawn(function()
 	while tokinuEggGui.Parent do
 		task.wait(4)
 		if not state.Busy then
-			pcall(v143)
+			pcall(v148)
 		end
 	end
 end)
 stealButton.MouseButton1Click:Connect(function()
 	if state.Busy then
 		state.Cancel = true
-		v57("Cancelling")
+		v62("Cancelling")
 		return
 	end
-	if not v136 then
-		v57("Pick a pet")
+	if not v141 then
+		v62("Pick a pet")
 		return
 	end
-	v100(v136)
+	v105(v141)
 end)
 task.spawn(function()
 	while tokinuEggGui.Parent do
@@ -1528,37 +1556,37 @@ task.spawn(function()
 		stealButton.Text = state.Busy and "CANCEL" or "STEAL"
 	end
 end)
-v143()
-v41()
-local v146 = {
+v148()
+v43()
+local v151 = {
 	{
 	find = "You stole an EGG",
 	replace = "<font color=\"#ffffff\"><stroke color=\"#000000\" thickness=\"2\" joins=\"round\">You stole an <font color=\"#23272e\">EGG</font> using <font color=\"#4287f5\">Tokinu Hub</font></stroke></font>",
 },
 }
-local v147 = { lt = "<", gt = ">", amp = "&", quot = "\"", apos = "'" }
+local v152 = { lt = "<", gt = ">", amp = "&", quot = "\"", apos = "'" }
 local seen3 = {}
-local v151 = function(p63)
-	local v819 = p63:gsub("<[^>]->", ""):gsub("&(%a+);", v147):gsub("%s+", " "):match("^%s*(.-)%s*$")
-	return v819
+local v156 = function(p63)
+	local v836 = p63:gsub("<[^>]->", ""):gsub("&(%a+);", v152):gsub("%s+", " "):match("^%s*(.-)%s*$")
+	return v836
 end
-local v154 = function(p64, p65, p66)
-	local v821, v822 = p64:find(p65, 1, true)
-	if v821 then
-		return p64:sub(1, v821 - 1) .. p66 .. p64:sub(v822 + 1)
+local v159 = function(p64, p65, p66)
+	local v838, v839 = p64:find(p65, 1, true)
+	if v838 then
+		return p64:sub(1, v838 - 1) .. p66 .. p64:sub(v839 + 1)
 	end
 	return p66
 end
-local v155 = function(p67)
+local v160 = function(p67)
 	pcall(function()
 		local text = p67.Text
-		local v831 = v151(text)
-		if v831:lower() == "invalid code" then
-			p67.Text = v154(text, v831, "this code is invalid boi")
+		local v848 = v156(text)
+		if v848:lower() == "invalid code" then
+			p67.Text = v159(text, v848, "this code is invalid boi")
 			return
 		end
-		for _, item8 in ipairs(v146) do
-			if v831 == item8.find then
+		for _, item8 in ipairs(v151) do
+			if v848 == item8.find then
 				if item8.replace:find("<[^>]+>") and not p67.RichText then
 					p67.RichText = true
 				end
@@ -1568,21 +1596,21 @@ local v155 = function(p67)
 		end
 	end)
 end
-local v157 = function(instance2)
-	local v841 = false
+local v162 = function(instance2)
+	local v858 = false
 	pcall(function()
-		v841 = instance2:IsA("TextLabel") or instance2:IsA("TextButton") or instance2:IsA("TextBox")
+		v858 = instance2:IsA("TextLabel") or instance2:IsA("TextButton") or instance2:IsA("TextBox")
 	end)
-	if not v841 or seen3[instance2] then
+	if not v858 or seen3[instance2] then
 		return
 	end
 	seen3[instance2] = true
-	v155(instance2)
+	v160(instance2)
 	instance2:GetPropertyChangedSignal("Text"):Connect(function()
-		v155(instance2)
+		v160(instance2)
 	end)
 end
 for _, descendant3 in ipairs(game:GetDescendants()) do
-	v157(descendant3)
+	v162(descendant3)
 end
-game.DescendantAdded:Connect(v157)
+game.DescendantAdded:Connect(v162)
