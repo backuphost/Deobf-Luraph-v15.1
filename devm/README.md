@@ -121,3 +121,23 @@ State of the two samples of this build:
 
 The two proto-table samples recovered earlier (HookScript, ClientSynchronizer) were not re-run
 against these changes: their inputs are not in the repository.
+
+### Scripts protected from source (the minified original Luraph layout)
+
+`message_1` is not a decompiler rendering but Luraph's own one-line output.  Differences handled:
+
+* the interpreter's dispatch loop sits in `pcall(function() repeat ... until false end)`:
+  `normalize.inline_protected_raw` rewrites it into a plain loop before the model is built;
+* the payload patches its own instructions while it runs.  A jump is first aimed at a stub that
+  rewrites operands (and the jump itself) and only afterwards at the real code, with the patch
+  values kept as counters in operand slots.  The lifter follows constants through registers
+  (`known_after`), applies such patches and lifts the patched instructions again;
+* every function is guarded by opaque predicates over number variables that only ever hold large
+  constants; the false arm scrambles those numbers and runs garbage.  `opaque.prune_ir` cuts the
+  arms that lead straight into scrambling, the program is lifted a second time without entering
+  them (their patches must not be applied), and `opaque.strip` removes what is left of the
+  numbers from the text;
+* the payload has no state-machine flattening, so `ircfg.UNFLATTEN` is off for it (the pass would
+  split loops on the script's own boolean flags).
+
+Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).

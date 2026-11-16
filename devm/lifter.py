@@ -2,6 +2,7 @@
 import os
 import struct
 
+from . import opaque
 from . import pe as P
 from .pe import (PE, Scope, LFn, LuaTable, MultiTail, Sym, LinSym, NeedFork, ForOp, LoopHead, PEError,
                  REGS, UPVALS)
@@ -82,6 +83,7 @@ class Lifter:
         self.queue = []
         self.proto_objs = {}
         self.pe.on_closure = self.on_closure
+        self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
         self.end_state = False      # the dump was taken at the end of the run (see PE.frozen)
@@ -155,7 +157,29 @@ class Lifter:
         def walk(tree, known):
             stmts, term = tree
             known = dict(known)
+            temps = {}
+
+            def num(e):
+                if e[0] == 'k':
+                    return e[1] if P.is_num(e[1]) and not isinstance(e[1], bool) else None
+                if e[0] == 'r':
+                    v = known.get(e[1])
+                    return v if P.is_num(v) and not isinstance(v, bool) else None
+                if e[0] == 't':
+                    return temps.get(e[1])
+                if e[0] == 'bin' and e[1] in ('+', '-', '*'):
+                    x, y = num(e[2]), num(e[3])
+                    if x is None or y is None:
+                        return None
+                    r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y
+                    return P.norm(r) if abs(r) < 2 ** 53 else None
+                return None
+
             for st in stmts:
+                if st[0] == 'set' and st[1][0] == 't' and isinstance(st[2], tuple):
+                    v = num(st[2])
+                    if v is not None:
+                        temps[st[1][1]] = v
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
                     refs = {c[1] for c in st[2][2] if c[0] == 'ref' and not isinstance(c[1], tuple)}
                     if refs:
@@ -175,6 +199,8 @@ class Lifter:
                         known[st[1][1]] = e[1]
                     elif e[0] == 'constfn':
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
+                    elif e[0] in ('t', 'bin') and num(e) is not None:
+                        known[st[1][1]] = num(e)
                     else:
                         known.pop(st[1][1], None)
                 elif st[0] == 'setmulti':
@@ -337,6 +363,10 @@ class Lifter:
                 e = PEError('evaluator failure: %s: %s' % (type(e).__name__, e))
             if self.end_state:
                 undo(self.journals.pop(key2[:2], ()))
+            if 'self-modifying store of a run-time value' in str(e) and not numknown:
+                # the patch value was computed by earlier instructions from plain constants
+                # (a counter kept in an operand slot): retry with those register constants
+                return self.lift_node(interp, node, key2, snap, known, indirect, pkey, numknown=True)
             return str(e)
         finally:
             self.pe.use_numknown = self.constprop
@@ -369,6 +399,9 @@ class Lifter:
         work = [(entry, snap, {}, None, None)]
         node_in = {}
         relifts = {}
+        patched = {}
+        pobj = getattr(self, 'proto_objs', {}).get(key)
+        ppath = {id(v) for v in pobj.h.values() if isinstance(v, LuaTable)} if isinstance(pobj, LuaTable) else None
         self.pe.use_numknown = self.constprop
         nq0 = len(self.queue)
         while work:
@@ -419,7 +452,19 @@ class Lifter:
             node.snap_in = snap
             pir.nodes[key2] = node
             self.pe.known_reads = node.kreads = set()
+            self.pe.write_log = wlog = [] if ppath and not self.end_state else None
             err = self.lift_node(interp, node, key2, snap, known, indirect, key)
+            self.pe.write_log = None
+            if wlog and err is None:
+                # the instruction rewrote instructions of its own function that were lifted
+                # already (a jump that is patched after its first use): lift those again
+                pcs = {k for oid, k in wlog if isinstance(k, int) and oid in ppath}
+                for k2 in [k for k in pir.nodes if k[1] in pcs and k != key2]:
+                    patched[k2] = patched.get(k2, 0) + 1
+                    if patched[k2] > 8:
+                        continue
+                    old = pir.nodes.pop(k2)
+                    work.insert(0, (k2, old.snap_in, node_in.get(k2, {}), None, None))
             hint = self.oracle.get((key, key2[0], key2[1])) if err and isinstance(key, int) else None
             if hint is not None and hint.get('p'):
                 hint = None      # executed by a probe only: no real register values or branch decisions
@@ -465,6 +510,11 @@ class Lifter:
                 node.tree = (stmts + [('error', err)], ('ret', [], None))
                 pir.errors.append((key2, err))
                 continue
+            cut = self.blocked.get(key, {}).get(key2[:2])
+            if cut:
+                # opaque predicate resolved by an earlier pass: the junk arm is not lifted at all,
+                # so that the instruction patches it contains cannot touch real code
+                node.tree = opaque.cut_arms(node.tree, cut)
             ends = self.known_after(node.tree, known)
             if any(end[1] in indirect for end, kn in ends):
                 # specialise jumps into a trampoline by the value it will jump through

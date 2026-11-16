@@ -696,6 +696,7 @@ class PE:
         self.keyfn_override = {}
         self.known_reads = set()
         self.use_numknown = False
+        self.write_log = None
         self.model_writes = 0
         self.keyfn_used = set()
         self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
@@ -906,7 +907,7 @@ class PE:
     def regs_range(self, a, b):
         """values of R[a..b] where b may be symbolic top."""
         if isinstance(b, LinSym):
-            vals = [self.read_reg(i) for i in range(a, b.k + 1)]
+            vals = [self.read_reg(i) for i in range(int(a), int(b.k) + 1)]
             vals.append(MultiTail(b.id))
             return vals
         return [self.read_reg(i) for i in range(int(a), int(b) + 1)]
@@ -1195,6 +1196,8 @@ class PE:
                 return
             if not obj.fresh:
                 self.model_writes += 1
+                if self.write_log is not None and obj.path and obj.h.get(key) != val:
+                    self.write_log.append((id(obj), key))
                 if self.journal is not None:
                     self.journal.append((obj, key, obj.h.get(key)))
             obj.set(key, val)

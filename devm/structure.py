@@ -703,7 +703,8 @@ class Structurer:
                 body = self.arm(inside, h, lctx)
                 out.append(['while', cond, body, h])
                 self.after_loop(lctx, out)
-            return self.jump(follow, stop, ctx, out)
+                return self.jump(follow, stop, ctx, out)
+            # the loop test leaves to somewhere other than the loop's follow block: general loop
         body = []
         nb = self.emit_block(h, h, lctx, body)
         if nb is not None:
