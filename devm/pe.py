@@ -554,15 +554,7 @@ class Dump:
         self.tables = {}
         self.by_path = {}
         self.raw = data['tables']
-        self._pools = None
-
-    @property
-    def pools(self):
-        """id of a constant pool's key table -> {index: constant} (harness dumpPools)"""
-        if self._pools is None:
-            self._pools = {int(tid): {int(i): self.conv(v) for i, v in ent.items()}
-                           for tid, ent in (self.data.get('pools') or {}).items()}
-        return self._pools
+        self.server = None      # vmmodel.PoolServer: the finished run, kept alive for pool constants
 
     def conv(self, v, path=None):
         if v is None or isinstance(v, (bool, int)):
@@ -1096,6 +1088,20 @@ class PE:
                 key = norm(key)
             v = obj.h.get(key)
             if v is None and isinstance(obj.mt, LuaTable) and not self.seeking:
+                kt, et = obj.h.get(-1), obj.h.get(-2)
+                if isinstance(kt, LuaTable) and isinstance(et, LuaTable) and is_num(et.h.get(key)):
+                    # {[-1] = pool, [-2] = index array}: the metamethod (VM code) returns
+                    # pool[index[pc]]; the harness has decoded the pool (fillPools)
+                    idx = et.h.get(key)
+                    if is_num(idx) and not isinstance(idx, bool) and float(idx).is_integer():
+                        idx = int(idx)
+                        v = kt.h.get(idx)
+                        if v is None and self.dump.server is not None and not isinstance(idx, KNum):
+                            # not decoded during the run: ask the run itself (it is still alive)
+                            raw = self.dump.server.decode(obj.id, idx)
+                            if raw is not None and not (isinstance(raw, dict) and ('t' in raw or 'o' in raw)):
+                                v = self.dump.conv(raw)
+                        return v
                 h = obj.mt.h.get('__index')
                 if isinstance(h, LFn) and h.scope is not None:
                     # lazily materialised entry (e.g. a constant decoded from the bytecode buffer)
@@ -1107,13 +1113,6 @@ class PE:
                     return vals[0] if vals else None
                 if isinstance(h, LuaTable):
                     return self.index(h, key, keyast)
-                kt, et = obj.h.get(-1), obj.h.get(-2)
-                if isinstance(kt, LuaTable) and isinstance(et, LuaTable) and kt.id in self.dump.pools:
-                    # constant pool read out by the harness (the metamethod is VM code): the entry
-                    # this instruction's index selects
-                    idx = et.h.get(key)
-                    if is_num(idx) and not isinstance(idx, bool):
-                        return self.dump.pools[kt.id].get(int(idx))
             if obj.path in self.volatile and (v is None or is_num(v) or isinstance(v, bool)) and not self.seeking \
                     and self.inject is not None:
                 # loader state that changes while the program runs (e.g. the stream position)

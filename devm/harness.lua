@@ -154,6 +154,8 @@ end
 -- ---------------------------------------------------------------- hooks
 local protos = {}
 local done = false
+local quietSteps = 0
+local quietHooks = false     -- VM code run by the harness itself (reading constant pools) is not traced
 
 -- Constant tables can carry an __index hook that decrypts entries on first use; touch every
 -- pending entry so the dump only ever sees plain values.
@@ -178,60 +180,46 @@ local function forceLazy(root)
 	end
 end
 
--- Constant pools.  In some builds a proto's constant table is {[-1] = keys, [-2] = index array} with
--- an __index metamethod (itself VM code) that decodes pool entry index[pc] from the bytecode the
--- first time an instruction asks for it.  Instructions that never ran never asked, so the whole
--- pool is read out here through the live metamethod: pools[id of keys table][index] = value.
-local poolsJson = nil
-local function dumpPools(root, extra)
-	local seen, queue = {}, { root }
-	for _, t in ipairs(extra or {}) do
-		if type(t) == "table" then queue[#queue + 1] = t end
-	end
-	local qi = 1
-	local groups, order = {}, {}
-	while qi <= #queue do
-		local t = queue[qi]
-		qi += 1
-		local mt = getmetatable(t)
-		if type(mt) == "table" and type(rawget(mt, "__index")) == "function" and type(rawget(t, -1)) == "table"
-			and type(rawget(t, -2)) == "table" and not groups[rawget(t, -1)] then
-			groups[rawget(t, -1)] = t
-			order[#order + 1] = rawget(t, -1)
-		end
-		for k, v in next, t do
-			if type(v) == "table" and not seen[v] and not libnames[v] and v ~= envTable then
-				seen[v] = true
-				queue[#queue + 1] = v
-			end
-		end
-	end
-	local parts = {}
-	for _, keys in ipairs(order) do
-		local t = groups[keys]
-		local idx = rawget(t, -2)
-		local K = 1073741823
-		local saved = rawget(idx, K)
-		local entries, misses, n = {}, 0, 0
-		local i = 0
-		while misses < 4096 and i < 1048576 do
-			rawset(idx, K, i)
-			local ok, v = pcall(function() return t[K] end)
-			rawset(t, K, nil)
-			if ok and v ~= nil then
-				entries[#entries + 1] = '"' .. i .. '":' .. ser(v)
-				misses = 0
-				n += 1
+-- Constant pools.  In some builds a proto's constant table is {[-1] = pool, [-2] = index array} with
+-- an __index metamethod (itself VM code) that decodes pool[index[pc]] from the bytecode the first
+-- time an instruction asks for it.  The index is a position in the bytecode, so only the exact
+-- values the instructions carry can be decoded, and instructions that never ran still carry
+-- encrypted ones.  With serve=<dir> the harness therefore stays alive after the dump and answers
+-- the lifter, which knows the decrypted index:
+--     <dir>/req :  "<seq> <table id in the dump> <index>"      <dir>/resp :  "<seq>\n<value>\nEND"
+local serveDir = nil
+local function servePools()
+	writefile(serveDir .. "/ready", "1")
+	local K = 1073741823
+	local last = nil
+	while true do
+		local okr, req = pcall(readfile, serveDir .. "/req")
+		if okr and type(req) == "string" and req ~= last and string.sub(req, -1) == "\n" then
+			last = req
+			local seq, id, index = string.match(req, "^(%d+) (%d+) (%-?%d+)\n$")
+			if seq == nil then
+				if string.match(req, "^quit") then return end
 			else
-				misses += 1
+				local t = tblList[tonumber(id)]
+				local out = "null"
+				if type(t) == "table" and type(rawget(t, -2)) == "table" then
+					local idx = rawget(t, -2)
+					local saved = rawget(idx, K)
+					rawset(idx, K, tonumber(index))
+					quietSteps = 0
+					quietHooks, __LPH_N.q = true, true
+					local ok, v = pcall(function() return t[K] end)
+					quietHooks, __LPH_N.q = false, false
+					rawset(t, K, nil)
+					rawset(idx, K, saved)
+					if ok and v ~= nil and (type(v) ~= "table" or (describeValue and describeValue(v))) and type(v) ~= "function" then
+						out = ser(v)
+					end
+				end
+				writefile(serveDir .. "/resp", seq .. "\n" .. out .. "\nEND")
 			end
-			i += 1
 		end
-		rawset(idx, K, saved)
-		ewrite("[pool] " .. n .. " constants read from the pool of table " .. tostring(tblIds[keys]) .. "\n")
-		parts[#parts + 1] = ser(keys):match("%d+") and ('"' .. ser(keys):match("%d+") .. '":{' .. table.concat(entries, ",") .. "}") or nil
 	end
-	poolsJson = "{" .. table.concat(parts, ",") .. "}"
 end
 
 -- The bootstrap installs tables of small functions that ignore their arguments and return a fixed
@@ -278,10 +266,7 @@ local function finish(root)
 	done = true
 	forceLazy(root)
 	findConstFns(root)
-	local okp, errp = pcall(dumpPools, root, protos)
-	if not okp then ewrite("[pool] failed: " .. tostring(errp) .. "\n") end
 	emit("{")
-	if poolsJson then emit('"pools":' .. poolsJson .. ",") end
 	emit('"root":' .. ser(root) .. ",")
 	local ps = {}
 	for i, p in ipairs(protos) do ps[i] = ser(p) end
@@ -383,7 +368,13 @@ end
 --   __LPH_S    protos replaced by a no-op                         branch decision is to be inverted
 --   __LPH_X    instruction numbers whose decision is inverted
 --   __LPH_R    ring of the last instructions (pid, loop, pc)
-__LPH_N = { c = 0, s = 0, f = false, t = 1 }
+__LPH_N = { c = 0, s = 0, f = false, t = 1, q = false }
+-- __LPH_N.q: the harness itself is calling into the loader (servePools); __LPH_W is called from every
+-- loop of the loader then and stops one that does not end (garbage in, endless decoding)
+function __LPH_W()
+	quietSteps += 1
+	if quietSteps > 20000 then error("__LPH_POOL_BUDGET", 0) end
+end
 __LPH_S = stubs
 __LPH_T = setmetatable({}, { __mode = "k" })   -- protos already seen (dumpnew=1)
 __LPH_X = {}
@@ -394,7 +385,11 @@ for i = #layers, 1, -1 do
 	local sp = string.match(layers[i], "^scriptpath=(.+)$")
 	local pk = string.match(layers[i], "^poke=(.+)$")
 	local hm = string.match(layers[i], "^httpmap=(.+)$")
-	if hm then
+	local sv = string.match(layers[i], "^serve=(.+)$")
+	if sv then
+		serveDir = sv
+		table.remove(layers, i)
+	elseif hm then
 		httpMapPath = hm
 		table.remove(layers, i)
 	elseif sp then
@@ -522,6 +517,12 @@ end
 
 local lastRegs, seenErr = nil, {}
 function __LPH_STEP(pid, loop, pc, regs, names, ...)
+	if quietHooks then
+		-- a pool read with an index that is not in the pool can decode garbage for a long time
+		quietSteps += 1
+		if quietSteps > 20000 then error("__LPH_POOL_BUDGET", 0) end
+		return
+	end
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
 	if stepCount > budgetAt then error("__LPH_BUDGET", 0) end
@@ -675,6 +676,7 @@ if cwrap and (oracleOn or traceMode or showErrors or tbPid) then
 end
 
 function __LPH_RUN(names, n, ...)
+	if quietHooks then return nil end
 	if aborted then error(ABORT, 0) end
 	local vals = { ... }
 	local env = {}
@@ -1652,6 +1654,7 @@ function __LPH_AFTER(ok, message)
 		ewrite("[end] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. __LPH_N.c .. " closure entries\n")
 		finish({ kind = "end", vars = { __pid = 1 } })
+		if serveDir then servePools() end
 		return
 	end
 	if not ok and not aborted then

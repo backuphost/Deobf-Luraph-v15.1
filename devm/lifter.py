@@ -798,6 +798,7 @@ class FactoryLifter(Lifter):
             if k in done:
                 continue
             fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
+            fresh.dump.server = self.dump.server
             fresh.pe.keyfn_override = self.pe.keyfn_override
             fresh.oracle = self.oracle
             fresh.end_state = self.end_state

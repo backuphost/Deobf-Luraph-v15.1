@@ -1,9 +1,11 @@
 """Locate the Luraph interpreter inside a (decompiled) script and patch in dump hooks."""
+import atexit
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 
 from . import luparse
 from .luparse import Func
@@ -560,6 +562,23 @@ class Model:
                 elif self._is_expression(f):
                     edits.append((f.kw_pos, '__LPH_F(%d,' % f.fid))
                     edits.append((f.end_pos, ')'))
+        if step and self.oneline:
+            # Watchdog for the loader's own loops (deserialiser state machines are not VM code, so
+            # the per-instruction hook never sees them): the harness sets __LPH_N.q while it calls
+            # into the loader itself, and __LPH_W stops a loop that does not end.
+            spans = [(it.func.body_pos, it.func.end_pos) for it in self.interps]
+            toks = [t for t in luparse.tokenize(self.src) if t[0] != 'eof']
+            heads = []
+            for t in toks:
+                if t[0] != 'kw':
+                    continue
+                if t[1] in ('while', 'for'):
+                    heads.append(t[1])
+                elif t[1] == 'do' and heads:
+                    if heads.pop() == 'while' and not any(a <= t[3] < b for a, b in spans):
+                        edits.append((t[3] + 2, ' if __LPH_N.q then __LPH_W() end;'))
+                elif t[1] == 'repeat' and not any(a <= t[3] < b for a, b in spans):
+                    edits.append((t[3] + 6, ' if __LPH_N.q then __LPH_W() end;'))
         edits.sort(key=lambda x: -x[0])
         for pos, text in edits:
             src = src[:pos] + text + ' ' + src[pos:]
@@ -584,6 +603,86 @@ def find_luau():
     raise RuntimeError('luau binary not found; set LUAU_BIN')
 
 
+class PoolServer:
+    """A finished harness run kept alive (harness.lua, serve=<dir>): decodes pool constants on request."""
+
+    def __init__(self, proc, sdir):
+        self.proc = proc
+        self.dir = sdir
+        self.seq = 0
+        self.cache = {}
+        self.dead = False
+
+    def decode(self, table_id, index):
+        """the raw dump value (see pe.Dump.conv) of pool entry `index` of constant table `table_id`"""
+        key = (table_id, index)
+        if key in self.cache:
+            return self.cache[key]
+        v = None
+        if not self.dead and self.proc.poll() is None:
+            self.seq += 1
+            tmp = os.path.join(self.dir, 'req.tmp')
+            with open(tmp, 'w') as f:
+                f.write('%d %d %d\n' % (self.seq, table_id, index))
+            os.replace(tmp, os.path.join(self.dir, 'req'))
+            resp = os.path.join(self.dir, 'resp')
+            deadline = time.time() + 30
+            head = '%d\n' % self.seq
+            while time.time() < deadline:
+                try:
+                    with open(resp) as f:
+                        text = f.read()
+                except OSError:
+                    text = ''
+                if text.startswith(head) and text.endswith('\nEND'):
+                    try:
+                        v = json.loads(text[len(head):-4])
+                    except ValueError:
+                        v = None
+                    break
+                if self.proc.poll() is not None:
+                    self.dead = True
+                    break
+                time.sleep(0.0005)
+            else:
+                self.dead = True
+        self.cache[key] = v
+        return v
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+
+SERVER = None
+
+
+def start_server(cmd, workdir):
+    """Run the harness until its dump is written and leave it serving; returns its stderr so far."""
+    global SERVER
+    if SERVER is not None:
+        SERVER.close()
+        SERVER = None
+    sdir = os.path.join(workdir, 'serve')
+    os.makedirs(sdir, exist_ok=True)
+    for n in ('ready', 'req', 'resp'):
+        if os.path.exists(os.path.join(sdir, n)):
+            os.remove(os.path.join(sdir, n))
+    errpath = os.path.join(sdir, 'stderr.txt')
+    with open(errpath, 'w') as ef:
+        proc = subprocess.Popen(cmd + ['serve=' + sdir], stdout=subprocess.DEVNULL, stderr=ef)
+    deadline = time.time() + 1800
+    while time.time() < deadline and proc.poll() is None and not os.path.exists(os.path.join(sdir, 'ready')):
+        time.sleep(0.2)
+    if proc.poll() is None and os.path.exists(os.path.join(sdir, 'ready')):
+        SERVER = PoolServer(proc, sdir)
+        atexit.register(SERVER.close)
+    elif proc.poll() is None:
+        proc.kill()
+    with open(errpath, errors='replace') as f:
+        return f.read()
+
+
 def run_oracle(model, workdir, tag, options=()):
     """Run the script to its end with per-instruction recording.
 
@@ -603,8 +702,16 @@ def run_oracle(model, workdir, tag, options=()):
     if not os.path.exists(nf):
         from . import unidata
         unidata.generate(nf)
-    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] +
-                       list(options), capture_output=True, text=True, errors='replace', timeout=1800)
+    cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] + list(options)
+    if model.oneline:
+        # keep the run alive after the dump: the lifter asks it for lazily decoded constants
+        stderr = start_server(cmd, workdir)
+    else:
+        stderr = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=1800).stderr
+
+    class r:
+        pass
+    r.stderr = stderr
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
     note += [l for l in r.stderr.split('\n') if l.startswith('[http]') or l.startswith('[env]')]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
