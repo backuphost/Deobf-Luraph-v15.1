@@ -85,6 +85,10 @@ class Lifter:
         self.pe.on_closure = self.on_closure
         self.temp_vals = {}
         self.up_nums = {}
+        self.cap_src = {}           # function key -> {upvalue index: where its creator takes it from}
+        self.cap_vals = {}          # (function key, register) -> number last stored in a shared variable
+        self.all_up_nums = {}
+        self.lifting_key = None
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
@@ -160,10 +164,10 @@ class Lifter:
         out = []
         by_path = self.dump.by_path
 
-        def walk(tree, known):
+        def walk(tree, known, temps=None, calls=None):
             stmts, term = tree
             known = dict(known)
-            temps = {}
+            temps = dict(temps or ())
 
             def num(e):
                 if e[0] == 'k':
@@ -177,11 +181,11 @@ class Lifter:
                     return self.up_nums.get(e[1])
                 if e[0] == 'mv' and e[2] == 1:
                     return calls.get(e[1])
-                if e[0] == 'bin' and e[1] in ('+', '-', '*'):
+                if e[0] == 'bin' and e[1] in ('+', '-', '*', '%'):
                     x, y = num(e[2]), num(e[3])
-                    if x is None or y is None:
+                    if x is None or y is None or (e[1] == '%' and y == 0):
                         return None
-                    r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y
+                    r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y if e[1] == '*' else x % y
                     if abs(r) >= 2 ** 53:
                         return None
                     if isinstance(x, P.UpNum) or isinstance(y, P.UpNum):
@@ -189,7 +193,8 @@ class Lifter:
                     return P.norm(r)
                 return None
 
-            calls = {}
+            calls = dict(calls or ())
+            truth = {}
             for st in stmts:
                 if st[0] == 'call' and st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.') and st[4] is None:
                     # arithmetic on the opaque state numbers, done with the bit library
@@ -199,6 +204,11 @@ class Lifter:
                         v = ircfg._opaque_eval(('call', st[2], [('k', a) for a in args], None), {})
                         if v is not None:
                             calls[st[1]] = P.UpNum(v) if any(isinstance(a, P.UpNum) for a in args) else P.norm(v)
+                if st[0] == 'set' and st[1][0] == 't' and isinstance(st[2], tuple) and st[2][0] == 'bin' \
+                        and st[2][1] in ('==', '~='):
+                    x, y = num(st[2][2]), num(st[2][3])
+                    if x is not None and y is not None:
+                        truth[st[1][1]] = (x == y) == (st[2][1] == '==')
                 if st[0] == 'set' and st[1][0] == 't' and isinstance(st[2], tuple):
                     v = num(st[2])
                     if v is not None:
@@ -206,11 +216,29 @@ class Lifter:
                         self.temp_vals[st[1][1]] = v     # (a temporary can outlive the instruction
                                                          # as the value of an interpreter local)
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
+                    # where the new function's upvalues come from: opaque numbers among them are
+                    # needed to lift it when it never ran (see instantiate)
+                    src = self.cap_src.setdefault(st[2][1], {})
+                    for i, c in enumerate(st[2][2]):
+                        if c[0] in ('ref', 'val') and not isinstance(c[1], tuple):
+                            v = known.get(c[1])
+                            v = v if P.is_num(v) and not isinstance(v, bool) else None
+                            if c[0] == 'val':
+                                if v is not None:
+                                    src[i] = ('num', v)
+                            else:
+                                src[i] = ('reg', self.lifting_key, c[1])
+                                if v is not None:
+                                    self.cap_vals[(self.lifting_key, c[1])] = v
+                        elif c[0] == 'up':
+                            src[i] = ('up', self.lifting_key, c[1])
                     refs = {c[1] for c in st[2][2] if c[0] == 'ref' and not isinstance(c[1], tuple)}
                     if refs:
                         known[CAP] = known.get(CAP, frozenset()) | refs
                         for r in refs:
-                            known.pop(r, None)
+                            # (a number stays known until something is called: see below)
+                            if not (P.is_num(known.get(r)) and not isinstance(known.get(r), bool)):
+                                known.pop(r, None)
                 if st[0] == 'call' and any(a == ('regs',) for a in st[3]):
                     # the register array itself escaped into a call: anything may have changed
                     known = {CAP: known[CAP]} if CAP in known else {}
@@ -224,6 +252,7 @@ class Lifter:
                     v = num(st[2]) if isinstance(st[2], tuple) else None
                     if v is not None:
                         known[st[1][1]] = v
+                        self.cap_vals[(self.lifting_key, st[1][1])] = v
                     else:
                         known.pop(st[1][1], None)
                     continue
@@ -242,9 +271,12 @@ class Lifter:
                 elif st[0] == 'setmulti':
                     for n in [n for n in known if n != CAP and (not isinstance(n, int) or n >= st[1])]:
                         del known[n]
-            if term[0] == 'br':
-                walk(term[2], known)
-                walk(term[3], known)
+            if term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
+                # (the not-a-number test inside a 32-bit multiply: only one side happens)
+                walk(term[2] if truth[term[1][1]] else term[3], known, temps, calls)
+            elif term[0] == 'br':
+                walk(term[2], known, temps, calls)
+                walk(term[3], known, temps, calls)
             elif term[0] == 'forbr':
                 regs = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
                 for n in regs:
@@ -437,6 +469,7 @@ class Lifter:
 
     # ---- whole proto
     def lift_proto(self, key):
+        self.lifting_key = key
         pir = ProtoIR(key)
         self.pe.keyfn_used = pir.keyfns = set()
         indirect = {}       # (loop, pc) of a jump-through-register instruction -> register
@@ -1085,6 +1118,7 @@ class FactoryLifter(Lifter):
             fresh.oracle = self.oracle
             fresh.end_state = self.end_state
             fresh.entry_override = self.entry_override
+            fresh.cap_src, fresh.cap_vals, fresh.all_up_nums = self.cap_src, self.cap_vals, self.all_up_nums
             pir = fresh.lift_proto(k)
             pir.keyfns = set(pir.keyfns)
             done[k] = pir
@@ -1123,6 +1157,20 @@ class FactoryLifter(Lifter):
                 v = box.h.get(cell.h.get(c1)) if isinstance(box, LuaTable) else None
                 if P.is_num(v) and float(v).is_integer() and abs(v) >= 65536:
                     self.up_nums[i - self.model.up_base] = P.UpNum(v)
+        # ... and, for a function that was never created in the run, the numbers its creator would
+        # have handed it
+        for i, src in self.cap_src.get(key, {}).items():
+            if i in self.up_nums:
+                continue
+            if src[0] == 'num':
+                v = src[1]
+            elif src[0] == 'reg':
+                v = self.cap_vals.get((src[1], src[2]))
+            else:
+                v = self.all_up_nums.get(src[1], {}).get(src[2])
+            if v is not None and P.is_num(v) and float(v).is_integer() and abs(v) >= 65536:
+                self.up_nums[i] = P.UpNum(v)
+        self.all_up_nums[key] = dict(self.up_nums)
         for i, p in enumerate(mid.params):
             sc2.vars[p] = None
         if up is not None:
