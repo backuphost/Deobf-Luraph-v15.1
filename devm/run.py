@@ -149,13 +149,20 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # exercise=1: functions of the script that nobody called are called once, so that their
         # code decrypts itself too.
         stage.harness_options = (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
-        text = stage.run_traced()
-        # Paths that never ran keep encrypted instructions and constants.  Execute each lifted
-        # instruction that did not run once, from the interpreter state the lifter found for it,
-        # and lift again; repeat while that uncovers more.
+        # (a script in its shipped layout keeps its source's control flow: nothing to unflatten)
+        ircfg.UNFLATTEN = not oneline
+        try:
+            text = stage.run_traced()
+        finally:
+            ircfg.UNFLATTEN = True
+        # Paths that never ran keep encrypted instructions and constants.  With the traced run
+        # kept alive (one-line builds) the lifter replays the decryption itself and asks the run
+        # for constants as it goes.  Otherwise: execute each lifted instruction that did not run
+        # once, from the interpreter state the lifter found for it, and lift again; repeat while
+        # that uncovers more.
         base = list(stage.harness_options)
         allpokes = []
-        for rnd in range(1, 41):
+        for rnd in range(1, 41 if vmmodel.SERVER is None else 0):
             new = [p for p in stage.poke_list() if p not in allpokes]
             if not new:
                 break
