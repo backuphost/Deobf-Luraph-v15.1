@@ -405,7 +405,7 @@ class Lifter:
                 # the patch value was computed by earlier instructions from plain constants
                 # (a counter kept in an operand slot): retry with those register constants
                 return self.lift_node(interp, node, key2, snap, known, indirect, pkey, numknown=True)
-            if not self.pe.use_upnum and self.up_nums and (
+            if not self.pe.use_upnum and (self.up_nums or self.temp_vals) and (
                     'self-modifying' in str(e) or 'out of range' in str(e) or 'evaluator failure' in str(e)):
                 # a key mixed from an opaque number kept in an upvalue: use the value it had
                 return self._upnum_retry(interp, node, key2, snap, known, indirect, pkey)
@@ -416,7 +416,7 @@ class Lifter:
             self.pe.journal = None
             self.pe.protect = None
         if any(not isinstance(end[1][1], int) for end, kn in self.known_after(node.tree, known)):
-            if not self.pe.use_upnum and self.up_nums:
+            if not self.pe.use_upnum and (self.up_nums or self.temp_vals):
                 r = self._upnum_retry(interp, node, key2, snap, known, indirect, pkey)
                 if r is None:
                     return None
@@ -627,6 +627,15 @@ class Lifter:
                 # at the end of the run; otherwise every instruction from the state of its path
                 switch(path if (replay or not ran) else None)
                 self.journals.pop(key2[:2], None)       # (its earlier writes are not part of this state)
+            rec = self.oracle.get((key, key2[0], key2[1])) if pathmode else None
+            if rec and not rec.get('p'):
+                # an interpreter local that holds a run-time number here (a key taken from an opaque
+                # parameter): the traced run shows which.  Kept for the instructions that did not
+                # run and need it (see _upnum_retry).
+                for name, v in rec['v'].items():
+                    cur = snap.get(name)
+                    if isinstance(cur, Sym) and isinstance(cur.e, tuple) and cur.e[0] == 't' and P.is_num(v):
+                        self.temp_vals.setdefault(cur.e[1], P.norm(v))
             node_in[key2] = known
             node = Node(key2)
             node.snap_in = snap
@@ -684,18 +693,25 @@ class Lifter:
                 # lifter could not follow.)
                 saved = []
                 arrays = self.records[key - 1][1]
+
+                def poke(t, k, val):
+                    if isinstance(t, LuaTable) and t.h.get(k) != val:
+                        saved.append((t, k, t.h.get(k)))
+                        t.h[k] = val
+                # what the instruction changed in its function's code when it first ran (a decryption
+                # step whose key the lifter could not follow) ...
+                info = (self.dump.data.get('snaps') or {}).get(str(key))
+                sv = hint.get('sv')
+                if info and isinstance(sv, int) and sv < len(info['vers']):
+                    for ti, k, v in info['vers'][sv]:
+                        poke(arrays.get(info['names'][ti - 1]), int(k), P.norm(v))
+                # ... and its own operands as they were when it last executed
                 for part in hint['final'].split():
                     name, _, val = part.partition('=')
-                    t = arrays.get(name)
                     try:
-                        val = P.norm(float(val))
+                        poke(arrays.get(name), key2[1], P.norm(float(val)))
                     except ValueError:
                         continue
-                    if isinstance(t, LuaTable) and t.h.get(key2[1]) != val:
-                        saved.append((t, t.h.get(key2[1])))
-                        t.h[key2[1]] = val
-                if os.environ.get('DEVM_TRACE_ERR'):
-                    print('FINAL', key, key2, hint['final'], [(n, type(arrays[n].h.get(key2[1])).__name__, arrays[n].h.get(key2[1])) for n in ('B', 'Q', 'Z', 'e', 'v') if isinstance(arrays.get(n), LuaTable)])
                 if saved:
                     node2 = Node(key2)
                     node2.snap_in = snap
@@ -706,15 +722,16 @@ class Lifter:
                         pir.nodes[key2] = node
                         err = None
                         pir.oracle_used.add(key2)
+                        self.journals.setdefault(key2[:2], [])[:0] = saved
                     else:
                         self.pe.known_reads = node.kreads
-                        for t, old in saved:
+                        for t, k, old in reversed(saved):
                             if old is None:
-                                t.h.pop(key2[1], None)
+                                t.h.pop(k, None)
                             else:
-                                t.h[key2[1]] = old
+                                t.h[k] = old
                     if os.environ.get('DEVM_TRACE_ERR'):
-                        print('FINAL operands', key, key2, 'resolved' if err2 is None else err2)
+                        print('RECORDED state', key, key2, 'resolved' if err2 is None else err2)
             if err is None and hint is None and isinstance(key, int):
                 hint = self.oracle.get((key, key2[0], key2[1]))
             if err is None and hint is not None and not hint.get('p') and hint.get('succ') and node.tree[1][0] == 'br':
