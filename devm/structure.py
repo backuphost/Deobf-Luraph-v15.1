@@ -6,7 +6,7 @@ import re
 from . import beautify
 from . import ircfg as ircfg_mod
 from .ircfg import prepass as ircfg_prepass
-from .ircfg import Block, ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
+from .ircfg import closes, Block, ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
 
 
 DUP_LIMIT = 40
@@ -116,7 +116,7 @@ def assign_variables(cfg, namer, coalesce=False):
                 CIN[bid] = set(cur)
                 for st in b.stmts + [b.term]:
                     if st[0] == 'close':
-                        cur = {r for r in cur if not (isinstance(r, int) and r >= st[1])}
+                        cur = {r for r in cur if not closes(st, r)}
                     for e in stmt_exprs(st)[0]:
                         for x in walk_expr(e, []):
                             if x[0] == 'closure':
@@ -153,7 +153,7 @@ def assign_variables(cfg, namer, coalesce=False):
                     if c[0] == 'ref' and c[1] == st[1][1]:
                         selfcap.add(c[1])
             if st[0] == 'close':
-                copen = {r for r in copen if not (isinstance(r, int) and r >= st[1])}
+                copen = {r for r in copen if not closes(st, r)}
             for e in reads:
                 for x in walk_expr(e, []):
                     if x[0] == 'r':
@@ -1539,10 +1539,16 @@ class Decompiler:
             ast = cleanup(ast)
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
-            if max_locals(ast) + len(params) <= 180:
+            n0 = max_locals(ast) + len(params)
+            if n0 <= 180:
                 break
-        if max_locals(ast) + len(params) > 180:
+            # too many locals for one Luau function: first try do-blocks around the short-lived
+            # ones (every variable keeps its own name); sharing variables is the last resort
             tighten_scopes(ast)
+            if os.environ.get('DEVM_TRACE_LOCALS'):
+                print('locals', key, 'coalesce' if coalesce else 'plain', n0, '->', max_locals(ast) + len(params))
+            if max_locals(ast) + len(params) <= int(os.environ.get('DEVM_LOCALS_MAX', '195')):
+                break
         self.stats['protos'] += 1
         self.stats['warnings'].extend(cfg.warnings)
         return params, cfg.vararg, ast

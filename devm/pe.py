@@ -1766,6 +1766,23 @@ class PE:
         if self.trace is not None:
             self.trace.append(repr(st)[:300])
         if t == 'if':
+            if len(st[1]) == 1 and not st[2] and len(st[1][0][1]) == 4 and st[1][0][0][0] == 'name':
+                # `local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5; open[r] = nil end`:
+                # the variable in register r goes out of scope (its upvalue cell is closed)
+                last = st[1][0][1][3]
+                if last[0] == 'assign' and len(last[1]) == 1 and last[1][0][0] == 'index' and last[2] == [('nil',)] \
+                        and "('num', 6)" in repr(st[1][0][1][2]):
+                    try:
+                        holder = self.eval1(last[1][0][1], scope)
+                    except PEError:
+                        holder = None
+                    if holder is OPENUPS:
+                        r = self.eval1(last[1][0][2], scope)
+                        if isinstance(r, float) and r.is_integer():
+                            r = int(r)
+                        if isinstance(r, int):
+                            self.emit(('close', r, r))
+                        return None
             for c, body in st[1]:
                 if self.cond(self.eval1(c, scope)):
                     return self.exec_block(body, scope)

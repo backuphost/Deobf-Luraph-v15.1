@@ -3156,9 +3156,14 @@ class ProtoCFG:
         self.compute_preds()
 
 
+def closes(st, r):
+    """('close', base) ends the scope of every register from base up; ('close', r, r) of one."""
+    return isinstance(r, int) and r >= st[1] and (len(st) < 3 or r <= st[2])
+
+
 def cap_step(cur, st):
     if st[0] == 'close':
-        cur = {r for r in cur if not (isinstance(r, int) and r >= st[1])}
+        cur = {r for r in cur if not closes(st, r)}
     for e in stmt_exprs(st)[0]:
         for x in walk_expr(e, []):
             if x[0] == 'closure':
