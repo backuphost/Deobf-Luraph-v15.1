@@ -1111,6 +1111,74 @@ def tighten_scopes(stmts):
             break
 
 
+def section_scopes(stmts, limit=150):
+    """Keep a long function under Luau's 200-local limit the way its author did: consecutive
+    sections in `do ... end`, each with the locals nothing after it uses, and the long-lived
+    locals (services, shared state, functions used throughout) at the function's own level."""
+    n = len(stmts)
+    decl, last = {}, {}
+    for i, st in enumerate(stmts):
+        for name in (st[1] if st[0] == 'local' else [st[1]] if st[0] == 'localfunction' else ()):
+            decl.setdefault(name, i)
+    if len(decl) <= limit:
+        return False
+    for j, st in enumerate(stmts):
+        for name in stmt_vars(st):
+            if name in decl and j >= decl[name]:
+                last[name] = j
+    for name in decl:
+        last.setdefault(name, decl[name])
+    by_span = sorted(decl, key=lambda x: (decl[x] - last[x], decl[x]))
+    outer = set()
+
+    def components():
+        ivs = sorted((decl[x], last[x]) for x in decl if x not in outer)
+        comps = []
+        for a, b in ivs:
+            if comps and a <= comps[-1][1]:
+                comps[-1][1] = max(comps[-1][1], b)
+                comps[-1][2] += 1
+            else:
+                comps.append([a, b, 1])
+        return comps
+
+    comps = components()
+    k = 0
+    while comps and len(outer) + max(c[2] for c in comps) > limit and k < len(by_span) and len(outer) < limit - 20:
+        # (several at a time: one long-lived local rarely splits a section on its own)
+        for x in by_span[k:k + 4]:
+            outer.add(x)
+        k += 4
+        comps = components()
+    if not comps or len(outer) + max(c[2] for c in comps) > limit + 30:
+        return False
+    out = []
+    pos = 0
+    for a, b, cnt in comps:
+        out.extend(stmts[pos:a])
+        block = []
+        for st in stmts[a:b + 1]:
+            names = st[1] if st[0] == 'local' else [st[1]] if st[0] == 'localfunction' else ()
+            if names and any(x in outer for x in names):
+                # declared inside the section but needed after it
+                out.append(['local', list(names), []])
+                if st[0] == 'local':
+                    if st[2]:
+                        block.append(['assign', [('r', x) for x in names], list(st[2])])
+                else:
+                    block.append(['assign', [('r', st[1])], [st[2]]])
+            else:
+                block.append(st)
+        if b > a and cnt >= 1:
+            out.append(['do', block])
+        else:
+            out.extend(block)
+        pos = b + 1
+    out.extend(stmts[pos:])
+    stmts[:] = out
+    return True
+
+
 def max_locals(stmts, base=0):
     """Upper bound of simultaneously declared locals."""
     cur = base
@@ -1552,7 +1620,8 @@ class Decompiler:
                 break
             # too many locals for one Luau function: first try do-blocks around the short-lived
             # ones (every variable keeps its own name); sharing variables is the last resort
-            tighten_scopes(ast)
+            if not (ircfg_mod.DROP_OPAQUE and section_scopes(ast) and max_locals(ast) + len(params) <= 195):
+                tighten_scopes(ast)
             if os.environ.get('DEVM_TRACE_LOCALS'):
                 print('locals', key, 'coalesce' if coalesce else 'plain', n0, '->', max_locals(ast) + len(params))
             if max_locals(ast) + len(params) <= int(os.environ.get('DEVM_LOCALS_MAX', '195')):
