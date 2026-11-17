@@ -151,10 +151,12 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         stage.harness_options = (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
         # (a script in its shipped layout keeps its source's control flow: nothing to unflatten)
         ircfg.UNFLATTEN = not oneline
+        ircfg.DROP_OPAQUE = oneline
         try:
             text = stage.run_traced()
         finally:
             ircfg.UNFLATTEN = True
+            ircfg.DROP_OPAQUE = False
         # Paths that never ran keep encrypted instructions and constants.  With the traced run
         # kept alive (one-line builds) the lifter replays the decryption itself and asks the run
         # for constants as it goes.  Otherwise: execute each lifted instruction that did not run

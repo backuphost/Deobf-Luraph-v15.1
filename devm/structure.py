@@ -4,6 +4,8 @@ import math
 import re
 
 from . import beautify
+from . import ircfg as ircfg_mod
+from .ircfg import prepass as ircfg_prepass
 from .ircfg import Block, ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
 
 
@@ -1542,6 +1544,8 @@ class Decompiler:
         return head + '\n' + '\n'.join(p.lines) + '\n' + '\t' * printer.level + 'end'
 
     def run(self):
+        if ircfg_mod.DROP_OPAQUE:
+            ircfg_prepass(self.protos)
         params, vararg, ast = self.proto_ast(self.root_key)
         p = Printer(self, [])
         p.level = -1

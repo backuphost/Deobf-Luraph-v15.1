@@ -6,6 +6,7 @@ PURE_LEAF = ('k', 'kfn', 'env', 'opaque', 'regs', 'arg', 'varargn', 'nargs', 'va
 
 
 import os
+import pickle
 CELLS = (1, 3)        # upvalue cell layout of the VM being lifted (set by the lifter)
 DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
 
@@ -307,6 +308,58 @@ def rpo_order(cfg):
 OPAQUE_UPS = {}
 # function key -> indexes of the upvalues that hold a function captured by value
 FUNCTION_UPS = {}
+# function key -> upvalues whose assignments may be removed (opaque, and read by nobody)
+DROP_UPS = {}
+# usage scan (see prepass): (function key, upvalue index) that some function really reads
+PREPASS = False
+USED_UPS = None
+# remove the opaque numbers themselves (traced factory builds; the two-stage builds have their
+# own pass over the lifted program)
+DROP_OPAQUE = False
+_UP_PLAIN = {}
+_UP_PASS = {}
+
+
+def prepass(protos):
+    """Find out which upvalues are read for real anywhere (as opposed to compared with magic
+    numbers and updated from themselves), before any function decides what to remove."""
+    global PREPASS, USED_UPS
+    _UP_PLAIN.clear()
+    _UP_PASS.clear()
+    OPAQUE_UPS.clear()
+    FUNCTION_UPS.clear()
+    DROP_UPS.clear()
+    PREPASS = True
+    try:
+        for key, pir in protos.items():
+            try:
+                # (on a copy: building a graph edits the lifted statements in place)
+                ProtoCFG(pickle.loads(pickle.dumps(pir, -1)))
+            except Exception:
+                _UP_PLAIN[key] = None
+    finally:
+        PREPASS = False
+    used = set()
+    unknown = {k for k, v in _UP_PLAIN.items() if v is None}
+    for k, v in _UP_PLAIN.items():
+        for j in v or ():
+            used.add((k, j))
+    changed = True
+    while changed:
+        changed = False
+        for k, ps in _UP_PASS.items():
+            for j, child, n in ps:
+                if (k, j) not in used and ((child, n) in used or child in unknown or child not in _UP_PLAIN):
+                    used.add((k, j))
+                    changed = True
+    USED_UPS = (used, unknown, set(_UP_PLAIN))
+
+
+def _up_used(child, n):
+    if USED_UPS is None:
+        return True
+    used, unknown, seen = USED_UPS
+    return (child, n) in used or child in unknown or child not in seen
 
 
 def _opaque_eval(e, ups):
@@ -385,9 +438,16 @@ class ProtoCFG:
         if self._thread_same_test():
             self._thread()
         self._detect_params()
+        if PREPASS:
+            self._scan_up_usage()
+            return
         self._cut_cold_magic()
-        if self._drop_opaque_numbers():
-            self._dead_stores()
+        if DROP_OPAQUE:
+            n = self._drop_opaque_numbers()
+            if os.environ.get('DEVM_TRACE_DROP') and n:
+                print('drop', self.pir.key, n)
+            if n and not os.environ.get('DEVM_NO_DS'):
+                self._dead_stores()
         if UNFLATTEN and not os.environ.get('DEVM_NO_UNFLATTEN'):
             self._unflatten()
         for _ in range(4):
@@ -1285,6 +1345,71 @@ class ProtoCFG:
             self.compute_preds()
         return cut
 
+    def _scan_up_usage(self):
+        """Which upvalues this function reads for something other than arithmetic and tests, and
+        which ones it hands on to the functions it creates."""
+        plain, passes = set(), []
+
+        def reads(e, allowed):
+            if e[0] in ('up', 'upcell'):
+                if not allowed:
+                    plain.add(e[1])
+            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '==', '~='):
+                reads(e[2], allowed)
+                reads(e[3], allowed)
+            elif e[0] == 'un' and e[1] == 'not':
+                reads(e[2], allowed)
+            elif e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
+                for x in e[2]:
+                    reads(x, allowed)
+            else:
+                for x in walk_expr(e, []) or ():
+                    if x[0] in ('up', 'upcell'):
+                        plain.add(x[1])
+                    elif x[0] == 'closure':
+                        for n, c in enumerate(x[2]):
+                            if c[0] not in ('val', 'ref', 'const'):
+                                passes.append((c[1], x[1], n))
+
+        def copy_ok(b, i, m):
+            for st in b.stmts[i + 1:] + [b.term]:
+                for e in stmt_exprs(st)[0]:
+                    sub = walk_expr(e, []) or ()
+                    if ('r', m) in sub:
+                        if e == ('r', m) and st[0] != 'br':
+                            if not (st[0] == 'set' and st[1][0] == 'up'):
+                                return False
+                            continue
+                        if st[0] not in ('set', 'br'):
+                            return False
+                        # only inside arithmetic and comparisons
+                        def fine(x):
+                            if x == ('r', m):
+                                return True
+                            if x[0] == 'bin' and x[1] in ('+', '-', '*', '%', '==', '~='):
+                                return fine(x[2]) and fine(x[3])
+                            if x[0] == 'un' and x[1] == 'not':
+                                return fine(x[2])
+                            if x[0] == 'call' and x[1][0] == 'kfn' and str(x[1][1]).startswith('bit32.') and len(x) > 3 and x[3] is None:
+                                return all(fine(a) for a in x[2])
+                            return ('r', m) not in (walk_expr(x, []) or ())
+                        if not fine(e):
+                            return False
+                if m in _writes_of(st):
+                    return True
+            return m not in self._scan_live_out.get(b.id, ())
+        self._scan_live_out = self.liveness()[1]
+        for b in self.blocks.values():
+            for i, st in enumerate(b.stmts + [b.term]):
+                for e in stmt_exprs(st)[0]:
+                    if e[0] in ('up', 'upcell') and st[0] == 'set' and st[1][0] == 'r' and i < len(b.stmts):
+                        if not copy_ok(b, i, st[1][1]):
+                            plain.add(e[1])
+                    else:
+                        reads(e, st[0] in ('set', 'br'))
+        _UP_PLAIN[self.pir.key] = plain
+        _UP_PASS[self.pir.key] = passes
+
     def _drop_opaque_numbers(self):
         """With the guards gone nothing reads the opaque state numbers any more, except their own
         updates.  Those assignments are removed here, where the registers are still apart (in the
@@ -1292,11 +1417,13 @@ class ProtoCFG:
         blocks = self.blocks
         self.compute_preds()
         _, _, _, def_ok, local, IN, ups = self._opaque_numbers()
+        dropups = DROP_UPS.get(self.pir.key, frozenset())
         cand = set()
         for b in blocks.values():
             for i, st in enumerate(b.stmts):
                 if st[0] == 'set' and st[1][0] == 'r' and def_ok((b.id, i)):
                     cand.add((b.id, i))
+        allok = set(cand)
 
         def defs_at(b, i, m):
             for j in range(i - 1, -1, -1):
@@ -1310,7 +1437,7 @@ class ProtoCFG:
             elif e[0] == 'closure':
                 opq = OPAQUE_UPS.get(e[1], {})
                 for n, c in enumerate(e[2]):
-                    if c[0] in ('val', 'ref') and n not in opq:
+                    if c[0] in ('val', 'ref') and (n not in opq or _up_used(e[1], n)):
                         out.add(c[1][1] if isinstance(c[1], tuple) else c[1])
             elif e[0] == 'bin':
                 plain_reads(e[2], out); plain_reads(e[3], out)
@@ -1342,7 +1469,7 @@ class ProtoCFG:
             for b in blocks.values():
                 for i, st in enumerate(b.stmts + [b.term]):
                     if i < len(b.stmts) and ((b.id, i) in cand or (
-                            st[0] == 'set' and st[1][0] == 'up' and st[1][1] in ups)):
+                            st[0] == 'set' and st[1][0] == 'up' and st[1][1] in dropups)):
                         continue
                     regs = set()
                     for e in stmt_exprs(st)[0]:
@@ -1352,6 +1479,26 @@ class ProtoCFG:
                             if d in cand:
                                 cand.discard(d)
                                 changed = True
+        # which of the captured ones the functions created here may forget about as well
+        kept = {blocks[bid].stmts[i][1][1] for bid, i in allok - cand}
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                for x in (walk_expr(st[2], []) or ()) if st[0] == 'set' else ():
+                    if x[0] != 'closure':
+                        continue
+                    got = set()
+                    opq = OPAQUE_UPS.get(x[1], {})
+                    for n, c in enumerate(x[2]):
+                        if n not in opq or _up_used(x[1], n):
+                            continue
+                        if c[0] in ('val', 'ref'):
+                            m = c[1][1] if isinstance(c[1], tuple) else c[1]
+                            ds = defs_at(b, i, m)
+                            if m not in kept and ds and all(d in cand for d in ds):
+                                got.add(n)
+                        elif c[0] != 'const' and c[1] in dropups:
+                            got.add(n)
+                    DROP_UPS[x[1]] = frozenset(got)
         drop = {}
         for bid, i in cand:
             b = blocks[bid]
@@ -1363,8 +1510,12 @@ class ProtoCFG:
         for b in blocks.values():
             d = drop.get(b.id, ())
             new = [st for i, st in enumerate(b.stmts) if i not in d
-                   and not (st[0] == 'set' and st[1][0] == 'up' and st[1][1] in ups)]
+                   and not (st[0] == 'set' and st[1][0] == 'up' and st[1][1] in dropups)]
             n += len(b.stmts) - len(new)
+            if os.environ.get('DEVM_TRACE_DROP'):
+                for st in b.stmts:
+                    if st not in new:
+                        print('   dropped', self.pir.key, b.id, str(st)[:200])
             b.stmts = new
         return n
 
