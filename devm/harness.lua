@@ -269,6 +269,7 @@ local function servePools(protos)
 				local out = "null"
 				local why = "not a constant table"
 				local npatch = 0
+				local tdiff = {}
 				if type(t) == "table" and type(rawget(t, -2)) == "table" then
 					local idx = rawget(t, -2)
 					local saved = rawget(idx, K)
@@ -298,8 +299,29 @@ local function servePools(protos)
 					end
 					quietSteps = 0
 					quietHooks, __LPH_N.q = true, true
+					local nprotos0 = #protos
 					local ok, v = pcall(function() return t[K] end)
 					quietHooks, __LPH_N.q = false, false
+					if #protos > nprotos0 then
+						-- A function was built: its entries in the loader's shared tables (encrypted
+						-- offsets of its constants) are new.  They stay (as created), and the client
+						-- is told about them; everything else goes back to the state of the run's end.
+						for _, e in ipairs(keepTabs) do
+							local tb, copy = e[1], e[2]
+							local tid = tblIds[tb]
+							local ents = nil
+							for k, x in next, tb do
+								if type(k) == "number" and type(x) == "number" and copy[k] == nil then
+									copy[k] = x
+									if tid and k == math.floor(k) and x == x and math.abs(x) ~= math.huge then
+										ents = ents or {}
+										ents[#ents + 1] = string.format("[%d,%.17g]", k, x)
+									end
+								end
+							end
+							if ents then tdiff[#tdiff + 1] = '"' .. tid .. '":[' .. table.concat(ents, ",") .. "]" end
+						end
+					end
 					restore()
 					rawset(t, K, nil)
 					rawset(idx, K, saved)
@@ -330,7 +352,7 @@ local function servePools(protos)
 					nt[#nt + 1] = '"' .. j .. '":' .. tableJson(tblList[j])
 				end
 				writefile(serveDir .. "/resp", seq .. '\n{"v":' .. out .. ',"protos":[' .. table.concat(np, ",") ..
-					'],"tables":{' .. table.concat(nt, ",") .. "}}\nEND")
+					'],"tables":{' .. table.concat(nt, ",") .. '},"tdiff":{' .. table.concat(tdiff, ",") .. "}}\nEND")
 			end
 		end
 	end

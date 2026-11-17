@@ -1152,6 +1152,13 @@ class PE:
                             if self.live_table_patches is not None:
                                 patches += tuple(self.live_table_patches())
                             raw = self.dump.server.decode(obj.id, idx, patches)
+                            # (a function built for the answer added entries to shared tables)
+                            for tid, ents in self.dump.server.tdiffs:
+                                live = self.dump.tables.get(tid)
+                                if live is not None:
+                                    for k, x in ents:
+                                        live.h.setdefault(k, norm(x))
+                            del self.dump.server.tdiffs[:]
                             if raw is not None and not (isinstance(raw, dict) and 'o' in raw):
                                 v = self.dump.conv(raw)
                         return v

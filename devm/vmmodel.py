@@ -615,6 +615,7 @@ class PoolServer:
         self.cache = {}
         self.dead = False
         self.data = None        # the dump this run produced (new protos and tables are added to it)
+        self.tdiffs = []        # (table id, [(key, number)]) additions not yet applied to live models
 
     def decode(self, table_id, index, patches=()):
         """the raw dump value (see pe.Dump.conv) of pool entry `index` of constant table `table_id`;
@@ -655,6 +656,17 @@ class PoolServer:
                             # functions the loader built to answer: new protos and their tables
                             self.data['tables'].update(ans.get('tables') or {})
                             self.data['protos'].extend(ans.get('protos') or [])
+                            # ... and the entries they added to tables the loader shares
+                            for tid, ents in (ans.get('tdiff') or {}).items():
+                                raw = self.data['tables'].get(tid)
+                                if raw is None:
+                                    continue
+                                for k, x in ents:
+                                    if 1 <= k <= len(raw['arr']):
+                                        raw['arr'][k - 1] = x
+                                    else:
+                                        raw['hash'].append([k, x])
+                                self.tdiffs.append((int(tid), ents))
                     break
                 if self.proc.poll() is not None:
                     self.dead = True
