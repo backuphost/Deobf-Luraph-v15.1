@@ -82,7 +82,93 @@ def strip(text):
         if new == text:
             break
         text = new
-    return _drop_orphans(text)
+    for _ in range(20):
+        new = _drop_opaque_params(_drop_orphans(text))
+        if new == text:
+            break
+        text = new
+    return text
+
+
+def _call_args(text, i):
+    """text[i] is the `(` of a call: [(start, end)] of its top-level arguments, and the index of the `)`."""
+    depth = 0
+    args = []
+    start = i + 1
+    j = i
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c in '"\'':
+            j += 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == '\\' else 1
+        elif c == '[' and text[j + 1:j + 2] in ('[', '='):
+            m = re.match(r'\[(=*)\[', text[j:])
+            if m:
+                end = text.find(']' + m.group(1) + ']', j)
+                if end < 0:
+                    return None, None
+                j = end + len(m.group(1)) + 1
+        elif c == '-' and text[j + 1:j + 2] == '-':
+            end = text.find('\n', j)
+            j = (end if end >= 0 else n) - 1
+        elif c in '({[':
+            depth += 1
+        elif c in ')}]':
+            depth -= 1
+            if depth == 0:
+                if text[start:j].strip():
+                    args.append((start, j))
+                return args, j
+        elif c == ',' and depth == 1:
+            args.append((start, j))
+            start = j + 1
+        j += 1
+    return None, None
+
+
+def _drop_opaque_params(text):
+    """A parameter the function never looks at, for which every caller passes one of the opaque
+    numbers: it only fed the guards that are gone.  Parameter and arguments are removed."""
+    counts = {}
+    for m in re.finditer(r'\b[vp]\d+\b', text):
+        counts[m.group(0)] = counts.get(m.group(0), 0) + 1
+    for m in re.finditer(r'(?m)^[ \t]*local (v\d+) = function\(([^)\n]*)\)', text):
+        name, params = m.group(1), [x.strip() for x in m.group(2).split(',') if x.strip()]
+        for k, prm in enumerate(params):
+            if not re.fullmatch(r'p\d+', prm) or counts.get(prm) != 1:
+                continue
+            sites = []
+            good = True
+            for u in re.finditer(r'\b%s\b' % name, text):
+                if u.start() == m.start(1):
+                    continue
+                if text[u.end():u.end() + 1] != '(' or text[max(0, u.start() - 1):u.start()] in ('.', ':'):
+                    good = False
+                    break
+                args, close = _call_args(text, u.end())
+                if args is None or len(args) <= k or not re.fullmatch(r'\s*\d{6,}\s*', text[args[k][0]:args[k][1]]):
+                    good = False
+                    break
+                sites.append((args, k))
+            if not good or not sites:
+                continue
+            cuts = []
+            for args, kk in sites:
+                a, b = args[kk]
+                if kk + 1 < len(args):
+                    cuts.append((a, args[kk + 1][0]))       # the argument and the comma after it
+                elif kk > 0:
+                    cuts.append((args[kk - 1][1], b))       # the comma before it and the argument
+                else:
+                    cuts.append((a, b))
+            new_params = ', '.join(params[:k] + params[k + 1:])
+            cuts.append((m.start(2), m.end(2), new_params))
+            for c in sorted(cuts, reverse=True):
+                text = text[:c[0]] + (c[2] if len(c) == 3 else '') + text[c[1]:]
+            return text
+    return text
 
 
 def _drop_orphans(text):
