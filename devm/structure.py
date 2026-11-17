@@ -1568,6 +1568,10 @@ class Decompiler:
         for c in caps:
             if c[0] in ('ref', 'val'):
                 upnames.append(c[1][1] if isinstance(c[1], tuple) else 'REG_%s' % (c[1],))
+            elif c[0] == 'const' and hasattr(c[1], 'text'):
+                upnames.append(c[1].text)
+            elif c[0] == 'const' and hasattr(c[1], 'name') and not isinstance(c[1], (str, int, float, bool)):
+                upnames.append(c[1].name)
             elif c[0] == 'const':
                 upnames.append(lua_number(c[1]) if isinstance(c[1], (int, float)) and not isinstance(c[1], bool) else ('true' if c[1] is True else 'false' if c[1] is False else lua_string(c[1])))
             else:

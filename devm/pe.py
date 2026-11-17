@@ -1697,6 +1697,9 @@ class PE:
                     elif (is_num(v) or isinstance(v, (str, bool))) and not isinstance(v, Sym):
                         # captured by value from a register whose content is a known constant
                         caps.append(('const', v))
+                    elif isinstance(v, (GlobalPath, Builtin)):
+                        # ... or a library function / datatype (`local insert = table.insert`)
+                        caps.append(('const', v))
                     else:
                         raise PEError('unknown upvalue capture %r' % (v,))
                     n += 1
