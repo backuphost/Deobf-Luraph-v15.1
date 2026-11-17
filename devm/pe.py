@@ -848,6 +848,14 @@ class PE:
                 txt = repr(body)
                 if "('num', 3)" in txt and "('num', 2)" in txt:
                     openups.add(st[2][0][1])
+            if t == 'if':
+                # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
+                # open[r] = nil end end`: handlers that end the scope of single registers
+                for c, body in st[1]:
+                    if c[0] == 'name' and body and body[0][0] == 'local':
+                        txt = repr(body[:3])
+                        if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
+                            openups.add(c[1])
             for sub in substmts(st):
                 visit(sub)
 
