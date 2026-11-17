@@ -491,6 +491,11 @@ class ProtoCFG:
             self._thread()
             self._merge_conds()
             self._fold_regs()
+        if DROP_OPAQUE and self._fold_value_chains():
+            self._thread()
+            self._fold_regs()
+            self._merge_conds()
+            self._fold_regs()
         if self._unsplice():
             self._table_aliases()
             for _ in range(2):
@@ -2493,6 +2498,60 @@ class ProtoCFG:
                         blocks[x].preds.add(b.id)
                     changed = True
         self.compute_preds()
+
+    def _fold_value_chains(self):
+        """`x = a or b or c` and `x = a and b` as values: a test of the register followed, on one
+        side, by a block that does nothing but assign the same register again.
+
+            A: ...; if r then goto J        A: ...; r = r or e
+            B: r = e; goto J           =>      goto J
+
+        (and the mirror image for `and`; B may end in the same test again, which chains)."""
+        blocks = self.blocks
+        changed = False
+        again = True
+        while again:
+            again = False
+            self.compute_preds()
+            for a in list(blocks.values()):
+                if a.id not in blocks or a.term[0] != 'br' or len(a.term) != 4 or a.term[2] == a.term[3]:
+                    continue
+                c = a.term[1]
+                neg = False
+                while c[0] == 'un' and c[1] == 'not':
+                    c = c[2]
+                    neg = not neg
+                if c[0] != 'r' or c[1] in self.captured_ref:
+                    continue
+                t, f = (a.term[3], a.term[2]) if neg else (a.term[2], a.term[3])
+                for op, bid, join in (('or', f, t), ('and', t, f)):
+                    b = blocks.get(bid)
+                    if b is None or b is a or b.preds != {a.id} or len(b.stmts) != 1:
+                        continue
+                    st = b.stmts[0]
+                    if st[0] != 'set' or st[1] != c or any(x[0] == 'closure' for x in walk_expr(st[2], [])):
+                        continue
+                    if b.term == ('goto', join):
+                        a.stmts.append(('set', c, (op, c, st[2])))
+                        a.term = ('goto', join)
+                    elif b.term[0] == 'br' and len(b.term) == 4:
+                        c2, neg2 = b.term[1], False
+                        while c2[0] == 'un' and c2[1] == 'not':
+                            c2 = c2[2]
+                            neg2 = not neg2
+                        t2, f2 = (b.term[3], b.term[2]) if neg2 else (b.term[2], b.term[3])
+                        if c2 != c or (t2 if op == 'or' else f2) != join:
+                            continue
+                        a.stmts.append(('set', c, (op, c, st[2])))
+                        a.term = ('br', c, t2, f2)
+                    else:
+                        continue
+                    del blocks[b.id]
+                    again = changed = True
+                    break
+        if changed:
+            self.compute_preds()
+        return changed
 
     def _unthread_tests(self):
         """`if c then goto T end; work; if c then goto T else goto F end` is compiled (or obfuscated)
