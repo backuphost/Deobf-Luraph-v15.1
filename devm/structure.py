@@ -399,6 +399,11 @@ def _all_exprs(e):
     return out
 
 
+# statements a join block may have to get a copy per way in (see Structurer._split_small_joins)
+SMALL_JOIN = int(os.environ.get('DEVM_SMALL_JOIN', '2'))
+SPLIT_ROUNDS = int(os.environ.get('DEVM_SPLIT_ROUNDS', '6'))
+
+
 class EnclosingFollow(Exception):
     def __init__(self, target):
         Exception.__init__(self, 'jump to an enclosing join')
@@ -417,7 +422,8 @@ class Structurer:
         self.rpo_idx = {b: i for i, b in enumerate(self.order)}
         self._dominators()
         self._loops()
-        for _ in range(6):
+        self.small_join = 3 if ircfg_mod.DROP_OPAQUE else SMALL_JOIN
+        for _ in range(60 if ircfg_mod.DROP_OPAQUE else SPLIT_ROUNDS):
             if not self._split_small_joins():
                 break
             cfg.compute_preds()
@@ -471,11 +477,13 @@ class Structurer:
                 continue
             for m in ms:
                 blk = blocks[m]
-                if m in self.loop_nodes or blk.term[0] not in ('goto', 'ret') or len(blk.stmts) > 2:
+                if m in self.loop_nodes or blk.term[0] not in ('goto', 'ret') or len(blk.stmts) > self.small_join:
                     continue
                 if blk.term[0] == 'goto' and blk.term[1] == m:
                     continue
-                if any(st[0] != 'set' or any(x[0] == 'closure' for x in _all_exprs(st[2])) for st in blk.stmts):
+                if any(x[0] == 'closure' for st in blk.stmts for e in stmt_exprs(st)[0] for x in _all_exprs(e)):
+                    continue
+                if self.small_join <= 2 and any(st[0] != 'set' for st in blk.stmts):
                     continue
                 preds = sorted(blk.preds, key=lambda x: self.rpo_idx.get(x, 0))
                 if len(preds) < 2 or len(preds) > 4 or self.ndup + len(preds) > 400:
