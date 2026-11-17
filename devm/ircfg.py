@@ -445,6 +445,8 @@ class ProtoCFG:
             self._scan_up_usage()
             return
         self._cut_cold_magic()
+        if DROP_OPAQUE and self._cut_loop_entries():
+            self._thread()
         if DROP_OPAQUE:
             n = self._drop_opaque_numbers()
             if os.environ.get('DEVM_TRACE_DROP') and n:
@@ -1602,6 +1604,114 @@ class ProtoCFG:
                         reads(e, st[0] in ('set', 'br'))
         _UP_PLAIN[self.pir.key] = plain
         _UP_PASS[self.pir.key] = passes
+
+    def _cut_loop_entries(self):
+        """A branch into the middle of a loop from outside it.  No source construct compiles to
+        that; it is the dead side of an opaque predicate, aimed at some unrelated block.  The
+        branch is cut when the traced run never took that side, or when the loop is a for-loop
+        (whose only way in is its own instruction)."""
+        blocks = self.blocks
+        cut = 0
+        for _ in range(8):
+            self.compute_preds()
+            # retreating edges of a depth-first walk
+            state, retreat = {}, []
+            stack = [(self.entry, iter(blocks[self.entry].succs()))]
+            state[self.entry] = 1
+            while stack:
+                n, it = stack[-1]
+                for x in it:
+                    if x not in state:
+                        state[x] = 1
+                        stack.append((x, iter(blocks[x].succs())))
+                        break
+                    if state[x] == 1:
+                        retreat.append((n, x))
+                else:
+                    state[n] = 2
+                    stack.pop()
+            done = False
+            for u, h in retreat:
+                body, todo = {h}, [u]
+                while todo:
+                    x = todo.pop()
+                    if x not in body:
+                        body.add(x)
+                        todo.extend(blocks[x].preds)
+                forloop = blocks[h].term[0] == 'forbr'
+                for y in body:
+                    if y == h:
+                        continue
+                    for x in list(blocks[y].preds):
+                        if x in body:
+                            continue
+                        src, arm = blocks[x], y
+                        cold = False
+                        if len(src.stmts) == 1 and src.stmts[0][0] == 'cold' and src.term[0] == 'goto' and len(src.preds) == 1:
+                            cold = True
+                            arm = x
+                            src = blocks[next(iter(src.preds))]
+                            if src.id in body:
+                                continue
+                        if src.term[0] != 'br' or src.term[2] == src.term[3] or arm not in (src.term[2], src.term[3]):
+                            continue
+                        if not (cold or forloop):
+                            continue
+                        src.term = ('goto', src.term[3] if arm == src.term[2] else src.term[2])
+                        cut += 1
+                        done = True
+                        break
+                    if done:
+                        break
+                if done:
+                    break
+            if not done:
+                # Likewise from the code after a for-loop back into its body: once the loop is
+                # exhausted the only way to run its body again is the loop's set-up.
+                def reach(start, stop, back=False):
+                    seen, todo = set(), list(start)
+                    while todo:
+                        x = todo.pop()
+                        if x in seen or x in stop:
+                            continue
+                        seen.add(x)
+                        todo.extend(blocks[x].preds if back else blocks[x].succs())
+                    return seen
+                for h, hb in list(blocks.items()):
+                    if hb.term[0] != 'forbr' or hb.term[3] == hb.term[4]:
+                        continue
+                    s3, s4 = hb.term[3], hb.term[4]
+                    preps = {x for x in hb.preds if any(st[0] in ('genforprep', 'numforprep') for st in blocks[x].stmts)}
+                    after = reach([s4], {h})
+                    inbody = reach([s3], {h, s4})
+                    again = reach([x for x in hb.preds if x not in preps], preps | {h}, back=True)
+                    for x in after - inbody:
+                        src = blocks[x]
+                        if src.term[0] != 'br' or src.term[2] == src.term[3]:
+                            continue
+                        def through(y):
+                            # (past the marker block of a side the traced run never took)
+                            n = 0
+                            while n < 8 and all(st[0] == 'cold' for st in blocks[y].stmts) \
+                                    and blocks[y].term[0] == 'goto' and len(blocks[y].preds) == 1:
+                                y = blocks[y].term[1]
+                                n += 1
+                            return y
+                        bad = [y for y in (src.term[2], src.term[3])
+                               if through(y) in inbody and through(y) in again and through(y) != h]
+                        if len(bad) == 1:
+                            src.term = ('goto', src.term[3] if bad[0] == src.term[2] else src.term[2])
+                            cut += 1
+                            done = True
+                            break
+                    if done:
+                        break
+            if not done:
+                break
+            self._prune()
+        if cut:
+            self.compute_preds()
+        return cut
 
     def _drop_opaque_numbers(self):
         """With the guards gone nothing reads the opaque state numbers any more, except their own
