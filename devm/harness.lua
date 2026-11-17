@@ -120,31 +120,32 @@ function ser(v)
 	end
 end
 
+local function tableJson(tb)
+	local n = 0
+	for k in next, tb do
+		if type(k) == "number" and k == math.floor(k) and k >= 1 and k > n then n = k end
+	end
+	if n > 4 * 1000 * 1000 then n = 0 end
+	local arr = {}
+	for j = 1, n do arr[j] = ser(rawget(tb, j)) end
+	local hash = {}
+	for k, v in next, tb do
+		if not (type(k) == "number" and k == math.floor(k) and k >= 1 and k <= n) then
+			hash[#hash + 1] = "[" .. ser(k) .. "," .. ser(v) .. "]"
+		end
+	end
+	local mt = getmetatable(tb)
+	local mts = "null"
+	if type(mt) == "table" then mts = ser(mt) end
+	return '{"arr":[' .. table.concat(arr, ",") .. '],"hash":[' .. table.concat(hash, ",") .. '],"mt":' .. mts .. "}"
+end
+
 local function dumpTables()
 	local i = 1
 	emit('"tables":{')
 	local first = true
 	while i <= #tblList do
-		local tb = tblList[i]
-		local parts = {}
-		local n = 0
-		for k in next, tb do
-			if type(k) == "number" and k == math.floor(k) and k >= 1 and k > n then n = k end
-		end
-		if n > 4 * 1000 * 1000 then n = 0 end
-		local arr = {}
-		for j = 1, n do arr[j] = ser(rawget(tb, j)) end
-		local hash = {}
-		for k, v in next, tb do
-			if not (type(k) == "number" and k == math.floor(k) and k >= 1 and k <= n) then
-				hash[#hash + 1] = "[" .. ser(k) .. "," .. ser(v) .. "]"
-			end
-		end
-		local mt = getmetatable(tb)
-		local mts = "null"
-		if type(mt) == "table" then mts = ser(mt) end
-		emit((first and "" or ",") .. '"' .. i .. '":{"arr":[' .. table.concat(arr, ",") .. '],"hash":[' ..
-			table.concat(hash, ",") .. '],"mt":' .. mts .. "}")
+		emit((first and "" or ",") .. '"' .. i .. '":' .. tableJson(tblList[i]))
 		first = false
 		i += 1
 	end
@@ -186,9 +187,27 @@ end
 -- values the instructions carry can be decoded, and instructions that never ran still carry
 -- encrypted ones.  With serve=<dir> the harness therefore stays alive after the dump and answers
 -- the lifter, which knows the decrypted index:
---     <dir>/req :  "<seq> <table id in the dump> <index>"      <dir>/resp :  "<seq>\n<value>\nEND"
+--     <dir>/req :  "<seq> <table id in the dump> <index> <protos known> <tables known>"      <dir>/resp :  "<seq>\n<value>\nEND"
 local serveDir = nil
-local function servePools()
+local function resolvePath(protos, path)
+	-- __LPH_PROTOS[36]["vars"]["r"][5]  (the paths the lifter gives dumped objects)
+	local n, rest = string.match(path, "^__LPH_PROTOS%[(%d+)%](.*)$")
+	local obj = n and protos[tonumber(n)]
+	while obj ~= nil and rest ~= "" do
+		local key, r2 = string.match(rest, '^%["([^"]*)"%](.*)$')
+		if not key then
+			key, r2 = string.match(rest, "^%[(%-?%d+)%](.*)$")
+			key = tonumber(key)
+		end
+		if key == nil or type(obj) ~= "table" then return nil end
+		obj, rest = rawget(obj, key), r2
+	end
+	return obj
+end
+local function servePools(protos)
+	-- A constant can be a function of the script (the closure maker of a nested function): asking
+	-- for it makes the loader build that function, which is then a new proto.  New protos and
+	-- the tables they bring are sent along with the answer.
 	writefile(serveDir .. "/ready", "1")
 	local K = 1073741823
 	local last = nil
@@ -196,27 +215,77 @@ local function servePools()
 		local okr, req = pcall(readfile, serveDir .. "/req")
 		if okr and type(req) == "string" and req ~= last and string.sub(req, -1) == "\n" then
 			last = req
-			local seq, id, index = string.match(req, "^(%d+) (%d+) (%-?%d+)\n$")
+			local seq, id, index, haveP, haveT = string.match(req, "^(%d+) (%d+) (%-?%d+) (%d+) (%d+)\n")
 			if seq == nil then
 				if string.match(req, "^quit") then return end
 			else
 				local t = tblList[tonumber(id)]
 				local out = "null"
+				local why = "not a constant table"
+				local npatch = 0
 				if type(t) == "table" and type(rawget(t, -2)) == "table" then
 					local idx = rawget(t, -2)
 					local saved = rawget(idx, K)
 					rawset(idx, K, tonumber(index))
+					-- "P <path> <offset> <hex>": the lifter's view of a bytecode buffer on this path
+					local undo = {}
+					for path, off, hx in string.gmatch(req, "\nP (%S+) (%d+) (%x+)") do
+						local b = resolvePath(protos, path)
+						off = tonumber(off)
+						if type(b) == "buffer" and off + #hx / 2 <= buffer.len(b) then
+							local raw = string.gsub(hx, "%x%x", function(h) return string.char(tonumber(h, 16)) end)
+							undo[#undo + 1] = { b, off, buffer.readstring(b, off, #raw) }
+							buffer.writestring(b, off, raw)
+							npatch += 1
+						end
+					end
+					-- "T <path> <key> <number>": an entry of a shared table as this path has left it
+					local tundo = {}
+					for path, key, val in string.gmatch(req, "\nT (%S+) (%-?%d+) (%S+)") do
+						local tb = resolvePath(protos, path)
+						if type(tb) == "table" then
+							key = tonumber(key)
+							tundo[#tundo + 1] = { tb, key, rawget(tb, key) }
+							rawset(tb, key, tonumber(val))
+							npatch += 1
+						end
+					end
 					quietSteps = 0
 					quietHooks, __LPH_N.q = true, true
 					local ok, v = pcall(function() return t[K] end)
 					quietHooks, __LPH_N.q = false, false
+					for i = #tundo, 1, -1 do rawset(tundo[i][1], tundo[i][2], tundo[i][3]) end
+					for i = #undo, 1, -1 do buffer.writestring(undo[i][1], undo[i][2], undo[i][3]) end
 					rawset(t, K, nil)
 					rawset(idx, K, saved)
-					if ok and v ~= nil and (type(v) ~= "table" or (describeValue and describeValue(v))) and type(v) ~= "function" then
+					if ok and v ~= nil and (type(v) ~= "function" or protoOfFn[v] or fnames[v]) then
 						out = ser(v)
+					else
+						why = ok and ("a " .. typeof(v)) or v
+						if ok and type(v) == "table" then
+							local mt = getmetatable(v)
+							local keys = {}
+							for k, x in next, v do
+								keys[#keys + 1] = tostring(k) .. "=" .. typeof(x)
+								if #keys > 14 then break end
+							end
+							why = why .. " mt=" .. typeof(mt) .. (type(mt) == "table" and (" __call=" .. typeof(rawget(mt, "__call")) .. " __index=" .. typeof(rawget(mt, "__index"))) or "") .. " {" .. table.concat(keys, ",") .. "}"
+						end
 					end
 				end
-				writefile(serveDir .. "/resp", seq .. "\n" .. out .. "\nEND")
+				if out == "null" then
+					ewrite("[serve] no answer for table " .. id .. " index " .. index .. ": " .. tostring(why) .. " (" .. npatch .. " buffer patches applied)\n")
+				end
+				-- everything the client does not have yet (it says how many protos and tables it knows)
+				local np, nt = {}, {}
+				for i = tonumber(haveP) + 1, #protos do np[#np + 1] = ser(protos[i]) end
+				local j = tonumber(haveT)
+				while j < #tblList do
+					j += 1
+					nt[#nt + 1] = '"' .. j .. '":' .. tableJson(tblList[j])
+				end
+				writefile(serveDir .. "/resp", seq .. '\n{"v":' .. out .. ',"protos":[' .. table.concat(np, ",") ..
+					'],"tables":{' .. table.concat(nt, ",") .. "}}\nEND")
 			end
 		end
 	end
@@ -339,9 +408,116 @@ local function insText(pid, pc)
 	end
 	return table.concat(parts, " ")
 end
+-- Code-state versions.  Scripts that decrypt a block of their own instructions before use change
+-- their code arrays while they run, so what an instruction's unexecuted successor would have seen
+-- is the code as it was when that instruction ran, not as it is at the end.  For every proto the
+-- numeric arrays of its record are copied at its first instruction (version 0); at the first
+-- execution of each further instruction they are compared with the last copy and the changes
+-- recorded as the next version.  The oracle notes each instruction's version ("sv").
+local codeState = {}
+-- Tables of numbers one level below a record entry (the loader's own state, shared by every proto:
+-- e.g. a table of encrypted bytecode offsets that instructions decrypt in place on first use).
+-- Their contents when the first proto starts are kept once, as the state to replay from.
+local sharedBase, sharedList = {}, {}
+local function codeVersion(pid)
+	local cs = codeState[pid]
+	if not cs then
+		local p = protos[pid]
+		if not p or type(p.vars) ~= "table" then return 0 end
+		cs = { names = {}, tabs = {}, shadow = {}, base = {}, vers = {}, cur = 0 }
+		for name, v in next, p.vars do
+			if type(name) == "string" and type(v) == "table" and not libnames[v] and v ~= envTable then
+				-- (not a constant table's {[-1] = pool, [-2] = index array}: that array is the
+				-- proto's own and is followed as one of its code arrays)
+				local own = rawget(v, -1) ~= nil or rawget(v, -2) ~= nil
+				for k2, w in next, v do
+					if type(w) == "table" and not own and not sharedBase[w] and (type(k2) == "number" or type(k2) == "string") then
+						local copy, n = {}, 0
+						for k, x in next, w do
+							if type(k) == "number" and type(x) == "number" then
+								copy[k] = x
+								n += 1
+								if n > 2000000 then break end
+							end
+						end
+						sharedBase[w] = copy
+						if n > 0 and n <= 2000000 then
+							sharedList[#sharedList + 1] = { name = name, key = k2, tbl = w }
+						end
+					end
+				end
+				local copy, any = {}, false
+				for k, x in next, v do
+					if type(k) == "number" and type(x) == "number" then
+						copy[k] = x
+						any = true
+					end
+				end
+				if any then
+					local n = #cs.names + 1
+					cs.names[n], cs.tabs[n], cs.shadow[n], cs.base[n] = name, v, copy, table.clone(copy)
+				end
+			end
+		end
+		codeState[pid] = cs
+		return 0
+	end
+	local diff
+	for i, t in ipairs(cs.tabs) do
+		local sh = cs.shadow[i]
+		for k, x in next, t do
+			if type(x) == "number" and sh[k] ~= x and type(k) == "number" then
+				diff = diff or {}
+				diff[#diff + 1] = string.format("[%d,%d,%.17g]", i, k, x)
+				sh[k] = x
+			end
+		end
+	end
+	if diff then
+		cs.cur += 1
+		cs.vers[cs.cur] = "[" .. table.concat(diff, ",") .. "]"
+	end
+	return cs.cur
+end
+local function writeSnaps()
+	local parts = {}
+	for pid, cs in codeState do
+		if cs.cur > 0 then
+			local names, bases = {}, {}
+			for i, n in ipairs(cs.names) do
+				names[i] = '"' .. n .. '"'
+				local ent = {}
+				for k, x in cs.base[i] do
+					if x == x and math.abs(x) ~= math.huge and k == math.floor(k) then ent[#ent + 1] = string.format('"%d":%.17g', k, x) end
+				end
+				bases[i] = "{" .. table.concat(ent, ",") .. "}"
+			end
+			parts[#parts + 1] = string.format('"%d":{"names":[%s],"base":[%s],"vers":[%s]}', pid, table.concat(names, ","),
+				table.concat(bases, ","), table.concat(cs.vers, ","))
+		end
+	end
+	-- shared tables: only the entries that changed since
+	local sh = {}
+	for _, e in ipairs(sharedList) do
+		local ent = {}
+		for k, x in sharedBase[e.tbl] do
+			local now = rawget(e.tbl, k)
+			if now ~= x and x == x and math.abs(x) ~= math.huge and k == math.floor(k) then
+				ent[#ent + 1] = string.format('"%d":%.17g', k, x)
+			end
+		end
+		if #ent > 0 then
+			sh[#sh + 1] = string.format('{"name":"%s","key":%s,"base":{%s}}', e.name,
+				type(e.key) == "number" and string.format("%d", e.key) or '"' .. e.key .. '"', table.concat(ent, ","))
+		end
+	end
+	parts[#parts + 1] = '"shared":[' .. table.concat(sh, ",") .. "]"
+	writefile(outPath .. ".snaps", "{" .. table.concat(parts, ",\n") .. "}")
+end
 local function writeOracle()
 	if not oracleOn then return end
 	oracleOn = false
+	writeSnaps()
 	local parts = {}
 	for key, rec in orc do
 		local r, v = {}, {}
@@ -355,8 +531,8 @@ local function writeOracle()
 		for i, t in rec.vers do vs[i] = string.format('[%d,"%s"]', rec.steps[i], t) end
 		local sc = {}
 		for k2 in rec.succ do sc[#sc + 1] = string.format("[%d,%d]", k2 // 2 ^ 24, k2 % 2 ^ 24) end
-		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"r":{%s},"v":{%s},"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
-			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, rec.probe and 1 or 0, table.concat(r, ","), table.concat(v, ","), table.concat(vs, ","),
+		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"sv":%d,"r":{%s},"v":{%s},"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
+			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, rec.probe and 1 or 0, rec.sv or 0, table.concat(r, ","), table.concat(v, ","), table.concat(vs, ","),
 			rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","))
 	end
 	writefile(outPath .. ".oracle", "{" .. table.concat(parts, ",\n") .. "}")
@@ -581,6 +757,7 @@ function __LPH_STEP(pid, loop, pc, regs, names, ...)
 			rec.vers = { ver }
 			rec.steps = { stepCount }
 			rec.succ = {}
+			rec.sv = codeVersion(pid)
 			rec.probe = probing      -- only ever executed by a probe: its register values mean nothing
 			orc[key] = rec
 		else
@@ -1509,19 +1686,32 @@ local function exercisePayload()
 	local calls, i = 0, 1
 	local called = {}
 	local before = stepCount
-	while i <= #regList and calls < 4000 do
+	-- A function that stops on its stand-in arguments (arithmetic or a comparison on a stub) is
+	-- called again with numbers, then strings, then nothing: each real run decrypts more of it
+	-- and creates more of its nested functions.
+	local kinds = {
+		function(j) return mockRef.stub("arg" .. j) end,
+		function(j) return j end,
+		function(j) return "arg" .. j end,
+		function(j) return nil end,
+	}
+	local t0 = os.clock()
+	while i <= #regList and calls < 200000 and os.clock() - t0 < 900 do
 		local fn = regList[i]
 		i += 1
 		local rec = protos[protoOfFn[fn]]
 		if rec and rec.interp ~= boot and not called[fn] then
 			called[fn] = true
 			calls += 1
-			local args = {}
-			for j = 1, 8 do args[j] = mockRef.stub("arg" .. j) end
-			budgetAt = stepCount + 200000
-			local co = coroutine.create(fn)
-			local _, okr, errr = pcall(coroutine.resume, co, unpack(args))
-			if not okr and calls <= 400 then ewrite("[exercise] proto " .. protoOfFn[fn] .. ": " .. string.sub(tostring(errr), 1, 160) .. "\n") end
+			for k, make in ipairs(kinds) do
+				local args = {}
+				for j = 1, 8 do args[j] = make(j) end
+				budgetAt = stepCount + 200000
+				local co = coroutine.create(fn)
+				local _, okr, errr = pcall(coroutine.resume, co, unpack(args, 1, 8))
+				if okr then break end
+				if k == 1 and calls <= 400 then ewrite("[exercise] proto " .. protoOfFn[fn] .. ": " .. string.sub(tostring(errr), 1, 160) .. "\n") end
+			end
 		end
 	end
 	budgetAt = math.huge
@@ -1654,7 +1844,7 @@ function __LPH_AFTER(ok, message)
 		ewrite("[end] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. __LPH_N.c .. " closure entries\n")
 		finish({ kind = "end", vars = { __pid = 1 } })
-		if serveDir then servePools() end
+		if serveDir then servePools(protos) end
 		return
 	end
 	if not ok and not aborted then

@@ -328,6 +328,8 @@ class Lifter:
             if pkey not in self.executed_pcs:
                 self.executed_pcs[pkey] = {k[2] for k in self.oracle if k[0] == pkey}
             self.pe.protect = ('__LPH_PROTOS[%s]["vars"]' % (pkey,), self.executed_pcs[pkey])
+            if self.pe.replay_tables:
+                self.pe.protect = None      # replayed from the initial code: every write happens in order
         base_numknown = self.constprop or numknown
         self.pe.use_numknown = base_numknown if numknown else self.pe.use_numknown
         try:
@@ -396,7 +398,98 @@ class Lifter:
                     snap[name] = P.norm(v)
             snap[pcv] = entry[1]
         pir.entry = entry
-        work = [(entry, snap, {}, None, None)]
+        work = [(entry, snap, {}, None, None, None)]
+        # Traced lifts: the writes instructions make to the code (decrypt a block, use it, encrypt
+        # it again) belong to the path they are on.  Every queued instruction remembers its path
+        # as a chain of write sets, and the model is moved to that state before it is lifted.
+        pathmode = self.end_state
+        cur_path = [None]
+
+        snap_cells = {}
+        replay_ids = set()
+
+        shared_ids = set()
+
+        def snap_cell(sv):
+            """path root for code-state version sv of this proto: the differences from the end state"""
+            if sv in snap_cells:
+                return snap_cells[sv]
+            cell = None
+            snaps = self.dump.data.get('snaps') or {}
+            info = snaps.get(str(key))
+            env = self.records[key - 1][1] if hasattr(self, 'records') and isinstance(key, int) else {}
+            # the loader's shared tables (harness sharedBase)
+            shared = []
+            for ent in snaps.get('shared') or ():
+                holder = env.get(ent['name'])
+                obj = holder.h.get(ent['key']) if isinstance(holder, LuaTable) else None
+                # (two interpreters can each have a table under the same name: the entry belongs
+                # to this one only if its keys are this table's keys)
+                if isinstance(obj, LuaTable) and ent['base'] and \
+                        sum(1 for k in ent['base'] if P.is_num(obj.h.get(int(k)))) >= 0.95 * len(ent['base']):
+                    shared_ids.add(id(obj))
+                    shared.append((obj, ent['base']))
+            if info and env:
+                writes = []
+                for obj, base in shared:
+                    for k, v in base.items():
+                        k, v = int(k), P.norm(v)
+                        cur = obj.h.get(k)
+                        if P.is_num(cur) and cur != v:
+                            writes.append((obj, k, cur, v))
+                    replay_ids.add(id(obj))
+                for i, name in enumerate(info['names']):
+                    obj = env.get(name)
+                    if not isinstance(obj, LuaTable):
+                        continue
+                    state = {int(k): v for k, v in info['base'][i].items()}
+                    for ver in info['vers'][:sv]:
+                        for ti, k, v in ver:
+                            if ti == i + 1:
+                                state[int(k)] = v
+                    for k, v in state.items():
+                        v = P.norm(v)
+                        cur = obj.h.get(k)
+                        if P.is_num(cur) and cur != v:
+                            writes.append((obj, k, cur, v))
+                    replay_ids.add(id(obj))
+                if writes:
+                    cell = (None, writes)
+            snap_cells[sv] = cell
+            return cell
+
+        def put(obj, k, v):
+            if k is None:
+                obj.data[:] = v
+            else:
+                obj.set(k, v)
+
+        def switch(to):
+            a = []
+            x = cur_path[0]
+            while x is not None:
+                a.append(x)
+                x = x[0]
+            b = []
+            x = to
+            while x is not None:
+                b.append(x)
+                x = x[0]
+            inb = {id(c) for c in b}
+            i = 0
+            while i < len(a) and id(a[i]) not in inb:
+                i += 1
+            common = a[i] if i < len(a) else None
+            j = 0
+            while j < len(b) and b[j] is not common:
+                j += 1
+            for c in a[:i]:
+                for obj, k, old, new in reversed(c[1]):
+                    put(obj, k, old)
+            for c in reversed(b[:j]):
+                for obj, k, old, new in c[1]:
+                    put(obj, k, new)
+            cur_path[0] = to
         node_in = {}
         relifts = {}
         patched = {}
@@ -404,8 +497,32 @@ class Lifter:
         ppath = {id(v) for v in pobj.h.values() if isinstance(v, LuaTable)} if isinstance(pobj, LuaTable) else None
         self.pe.use_numknown = self.constprop
         nq0 = len(self.queue)
+        if pathmode:
+            # Code that changes while it runs (blocks decrypted before use): the walk starts from
+            # the code as it was at the function's first instruction and replays every change
+            # along the path being followed, for instructions that ran and those that did not.
+            root_cell = snap_cell(0)
+            self.pe.replay_tables = set(replay_ids)
+
+            def live_patches():
+                # shared-table entries the current path has changed (not the root cell's return
+                # to the initial state): what the live run must see to decode for this path
+                cells = []
+                x = cur_path[0]
+                while x is not None and x is not root_cell:
+                    cells.append(x)
+                    x = x[0]
+                seen = {}
+                for c in reversed(cells):
+                    for obj, k, old, new in c[1]:
+                        if id(obj) in shared_ids and obj.path and isinstance(k, int) and P.is_num(new):
+                            seen[(obj.path, k)] = new
+                return [('T', pth, k, v) for (pth, k), v in seen.items()]
+            self.pe.live_table_patches = live_patches
+            if root_cell is not None:
+                work[0] = work[0][:5] + (root_cell,)
         while work:
-            key2, snap, known, pred, pend = work.pop()
+            key2, snap, known, pred, pend, path = work.pop()
             if key2 in pir.nodes and self.constprop and len(key2) == 2:
                 # a pure jump whose target comes out of a register is a trampoline shared by many
                 # jump sites: keep one copy per target instead of merging the register away
@@ -447,6 +564,13 @@ class Lifter:
                         if name in snap and not same_value(v, snap[name]):
                             pir.conflicts.append((key2, name, v, snap[name]))
                     continue
+            ran = pathmode and (key, key2[0], key2[1]) in self.oracle
+            replay = bool(self.pe.replay_tables)
+            if pathmode:
+                # without recorded code versions an instruction that ran is lifted from the state
+                # at the end of the run; otherwise every instruction from the state of its path
+                switch(path if (replay or not ran) else None)
+                self.journals.pop(key2[:2], None)       # (its earlier writes are not part of this state)
             node_in[key2] = known
             node = Node(key2)
             node.snap_in = snap
@@ -464,7 +588,8 @@ class Lifter:
                     if patched[k2] > 8:
                         continue
                     old = pir.nodes.pop(k2)
-                    work.insert(0, (k2, old.snap_in, node_in.get(k2, {}), None, None))
+                    pir.errors = [e for e in pir.errors if e[0] != k2]
+                    work.insert(0, (k2, old.snap_in, node_in.get(k2, {}), None, None, None))
             hint = self.oracle.get((key, key2[0], key2[1])) if err and isinstance(key, int) else None
             if hint is not None and hint.get('p'):
                 hint = None      # executed by a probe only: no real register values or branch decisions
@@ -525,8 +650,29 @@ class Lifter:
                         special[id(end)] = end[1] + (kn[r],)
                 node.tree = retarget_tree(node.tree, special)
                 ends = self.known_after(node.tree, known)
+            if pathmode:
+                first = {}
+                for obj, k, old in self.journals.get(key2[:2]) or ():
+                    first.setdefault((id(obj), k), (obj, k, old))
+                writes = [(obj, k, old, bytes(obj.data) if k is None else obj.h.get(k)) for obj, k, old in first.values()]
+                if writes and (replay or not ran):
+                    path = (path, writes)
+                    cur_path[0] = path
+            if pathmode and len(ends) > 1:
+                # Follow the exits the traced run took before the ones it never took: an untaken
+                # exit can be the dead arm of an opaque predicate, whose code leaves the program
+                # in a state no real path has, and it must not be first to reach shared code.
+                rec = self.oracle.get((key, key2[0], key2[1]))
+                taken = rec.get('succ') if rec else None
+
+                def cold(item):
+                    t = item[0][1]
+                    if taken is not None:
+                        return tuple(t[:2]) not in taken
+                    return (key, t[0], t[1]) not in self.oracle
+                ends = sorted(ends, key=lambda item: 0 if cold(item) else 1)
             for end, kn in ends:
-                work.append((end[1], end[2], kn, node, end))
+                work.append((end[1], end[2], kn, node, end, path))
         self.pe.regknown = {}
         self.pe.use_numknown = False
         if self.constprop:

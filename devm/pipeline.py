@@ -61,6 +61,8 @@ def _run_traced(self):
         self.log('[%s]   %s' % (self.tag, n))
     self.dump = pe.Dump(raw, m)
     self.dump.server = vmmodel.SERVER
+    if vmmodel.SERVER is not None:
+        vmmodel.SERVER.data = raw
     self.lifter = lifter.FactoryLifter(m, self.dump)
     self.lifter.oracle = oracle
     self.lifter.end_state = True

@@ -107,7 +107,32 @@ class Lib:
 class Buffer:
     def __init__(self, data):
         self.data = bytearray(data)
+        self.orig = bytes(data)         # as dumped
         self.path = None
+
+    def patches(self):
+        """[(offset, bytes)]: where the buffer differs from the dump"""
+        if self.data == self.orig:
+            return []
+        out = []
+        d, o = self.data, self.orig
+        n = min(len(d), len(o))
+        i = 0
+        while i < n:
+            j = min(n, i + 4096)
+            if d[i:j] != o[i:j]:
+                k = i
+                while k < j:
+                    if d[k] != o[k]:
+                        e = k + 1
+                        while e < j and (d[e] != o[e] or (e + 1 < j and d[e + 1] != o[e + 1])):
+                            e += 1
+                        out.append((k, bytes(d[k:e])))
+                        k = e
+                    else:
+                        k += 1
+            i = j
+        return out
 
 
 def _qs(s):
@@ -555,6 +580,7 @@ class Dump:
         self.by_path = {}
         self.raw = data['tables']
         self.server = None      # vmmodel.PoolServer: the finished run, kept alive for pool constants
+        self.buffers = []       # Buffer objects with a path (their changes go along with pool requests)
 
     def conv(self, v, path=None):
         if v is None or isinstance(v, (bool, int)):
@@ -594,6 +620,8 @@ class Dump:
         if 'buf' in v:
             b = Buffer(bytes.fromhex(v['buf']))
             b.path = path
+            if path:
+                self.buffers.append(b)
             return b
         if 'cfn' in v:
             return ConstFn(self.conv(v['cfn']), v.get('k'))
@@ -707,6 +735,8 @@ class PE:
         # that state are dropped (frozen).  Writes of the other instructions are applied and
         # journalled, so that lifting an instruction again starts from the same state.
         self.frozen = False
+        self.live_table_patches = None  # callable -> (('T', path, key, number), ...): shared-table entries this path changed
+        self.replay_tables = set()  # ids of code arrays whose changes are replayed even for instructions that ran
         self.journal = None
         self.protect = None         # (path prefix of the proto's code arrays, executed pcs): known-final code
         from . import luprint
@@ -1098,8 +1128,13 @@ class PE:
                         v = kt.h.get(idx)
                         if v is None and self.dump.server is not None and not isinstance(idx, KNum):
                             # not decoded during the run: ask the run itself (it is still alive)
-                            raw = self.dump.server.decode(obj.id, idx)
-                            if raw is not None and not (isinstance(raw, dict) and ('t' in raw or 'o' in raw)):
+                            # (with the bytecode as this path has left it: decoding a nested
+                            # function reads bytes that earlier instructions decrypt in place)
+                            patches = tuple((b.path, off, data) for b in self.dump.buffers for off, data in b.patches())
+                            if self.live_table_patches is not None:
+                                patches += tuple(self.live_table_patches())
+                            raw = self.dump.server.decode(obj.id, idx, patches)
+                            if raw is not None and not (isinstance(raw, dict) and 'o' in raw):
                                 v = self.dump.conv(raw)
                         return v
                 h = obj.mt.h.get('__index')
@@ -1197,7 +1232,7 @@ class PE:
                 raise PEError('store into escaped table')
             if isinstance(key, float):
                 key = norm(key)
-            if not obj.fresh and self.frozen and obj.path not in self.volatile:
+            if not obj.fresh and self.frozen and obj.path not in self.volatile and id(obj) not in self.replay_tables:
                 return
             if not obj.fresh and self.protect is not None and key in self.protect[1] and obj.path \
                     and obj.path.startswith(self.protect[0]):

@@ -614,10 +614,12 @@ class PoolServer:
         self.seq = 0
         self.cache = {}
         self.dead = False
+        self.data = None        # the dump this run produced (new protos and tables are added to it)
 
-    def decode(self, table_id, index):
-        """the raw dump value (see pe.Dump.conv) of pool entry `index` of constant table `table_id`"""
-        key = (table_id, index)
+    def decode(self, table_id, index, patches=()):
+        """the raw dump value (see pe.Dump.conv) of pool entry `index` of constant table `table_id`;
+        patches = ((buffer path, offset, bytes), ...) are applied to the run's buffers for the call"""
+        key = (table_id, index, patches)
         if key in self.cache:
             return self.cache[key]
         v = None
@@ -625,7 +627,13 @@ class PoolServer:
             self.seq += 1
             tmp = os.path.join(self.dir, 'req.tmp')
             with open(tmp, 'w') as f:
-                f.write('%d %d %d\n' % (self.seq, table_id, index))
+                f.write('%d %d %d %d %d\n' % (self.seq, table_id, index, len(self.data['protos']) if self.data else 10 ** 9,
+                                              len(self.data['tables']) if self.data else 10 ** 9))
+                for pt in patches:
+                    if pt[0] == 'T':
+                        f.write('T %s %d %r\n' % (pt[1], pt[2], pt[3]))
+                    else:
+                        f.write('P %s %d %s\n' % (pt[0], pt[1], pt[2].hex()))
             os.replace(tmp, os.path.join(self.dir, 'req'))
             resp = os.path.join(self.dir, 'resp')
             deadline = time.time() + 30
@@ -638,9 +646,15 @@ class PoolServer:
                     text = ''
                 if text.startswith(head) and text.endswith('\nEND'):
                     try:
-                        v = json.loads(text[len(head):-4])
+                        ans = json.loads(text[len(head):-4])
                     except ValueError:
-                        v = None
+                        ans = None
+                    if isinstance(ans, dict):
+                        v = ans.get('v')
+                        if self.data is not None:
+                            # functions the loader built to answer: new protos and their tables
+                            self.data['tables'].update(ans.get('tables') or {})
+                            self.data['protos'].extend(ans.get('protos') or [])
                     break
                 if self.proc.poll() is not None:
                     self.dead = True
@@ -728,6 +742,9 @@ def run_oracle(model, workdir, tag, options=()):
         out[(pid, loop, pc)] = rec
     with open(outjson) as f:
         dump = json.load(f)
+    if os.path.exists(outjson + '.snaps'):
+        with open(outjson + '.snaps') as f:
+            dump['snaps'] = json.load(f)        # code-state versions (harness codeVersion)
     return dump, out, note
 
 
