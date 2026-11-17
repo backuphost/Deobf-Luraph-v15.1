@@ -362,22 +362,25 @@ def _up_used(child, n):
     return (child, n) in used or child in unknown or child not in seen
 
 
-def _opaque_eval(e, ups):
+def _opaque_eval(e, ups, regs=None):
     """Value of an expression over opaque state numbers, None when it is not determined."""
     if e[0] == 'k':
         return e[1] if _isnum(e) else None
     if e[0] == 'up':
         return ups.get(e[1])
+    if e[0] == 'r':
+        v = regs.get(e[1]) if regs else None
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
     if e[0] == 'bin':
-        x, y = _opaque_eval(e[2], ups), _opaque_eval(e[3], ups)
+        x, y = _opaque_eval(e[2], ups, regs), _opaque_eval(e[3], ups, regs)
         if x is None or y is None:
             return None
         try:
-            return {'+': x + y, '-': x - y, '*': x * y}[e[1]] if e[1] != '%' else x % y
+            return {'+': x + y, '-': x - y, '*': x * y}[e[1]] if e[1] not in ('%', '//') else (x % y if e[1] == '%' else x // y)
         except (KeyError, ZeroDivisionError):
             return None
     if e[0] == 'call' and e[1][0] == 'kfn':
-        args = [_opaque_eval(x, ups) for x in e[2]]
+        args = [_opaque_eval(x, ups, regs) for x in e[2]]
         if any(x is None or x != int(x) for x in args):
             return None
         args = [int(x) & 0xFFFFFFFF for x in args]
@@ -1110,6 +1113,12 @@ class ProtoCFG:
         blocks = self.blocks
         ups = OPAQUE_UPS.get(self.pir.key, {})
         params = set(self.param_regs or ())
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                # (one result of a bit operation, written as a multiple assignment)
+                if st[0] == 'multiset' and len(st[1]) == 1 and st[1][0][0] == 'r' and st[2][0] == 'call' \
+                        and st[2][1][0] == 'kfn' and str(st[2][1][1]).startswith('bit32.') and st[2][3] is None:
+                    b.stmts[i] = ('set', st[1][0], st[2])
 
         def local(b, i, e, depth=0):
             """e with registers replaced by what the block assigned to them before statement i"""
@@ -1125,7 +1134,7 @@ class ProtoCFG:
                 return e if _isnum(e) else None
             if e[0] == 'up':
                 return e
-            if e[0] == 'bin' and e[1] in ('+', '-', '*', '%'):
+            if e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//'):
                 x, y = local(b, i, e[2], depth), local(b, i, e[3], depth)
                 return None if x is None or y is None else ('bin', e[1], x, y)
             if e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
@@ -1140,7 +1149,7 @@ class ProtoCFG:
             if e[0] == 'r':
                 if not allowed:
                     plain.add(e[1])
-            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '==', '~='):
+            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//', '==', '~='):
                 reads(e[2], allowed)
                 reads(e[3], allowed)
             elif e[0] == 'un' and e[1] == 'not':
@@ -1273,7 +1282,7 @@ class ProtoCFG:
                         elif c[0] != 'const' and c[1] in ups:
                             got[n] = ups[c[1]]
                     OPAQUE_UPS[st[2][1]] = got
-        return opaque, value, scrambles, def_ok, local, IN, ups
+        return opaque, value, scrambles, def_ok, local, IN, ups, ok
 
     def _holds_function(self, b, pos, m, IN):
         """register m holds a function created here on every path to statement pos of block b"""
@@ -1305,6 +1314,67 @@ class ProtoCFG:
             n += 1
             e = e[2]
         return n >= 2
+
+    def _opaque_flow(self, ups):
+        """Constant propagation of the opaque state numbers along the paths that can execute: a
+        guard whose outcome is known is followed on that side only, so the scrambling on its dead
+        side never mixes in.  Returns {block: {register: number or boolean}} at block entry."""
+        blocks = self.blocks
+        cap = set(self.captured_ref)
+
+        def ev(e, env):
+            if e[0] == 'r':
+                return env.get(e[1])
+            if e[0] == 'un' and e[1] == 'not':
+                v = ev(e[2], env)
+                return (not v) if isinstance(v, bool) else None
+            if e[0] == 'bin' and e[1] in ('==', '~='):
+                x, y = ev(e[2], env), ev(e[3], env)
+                if x is None or y is None or isinstance(x, bool) or isinstance(y, bool):
+                    return None
+                return (x == y) == (e[1] == '==')
+            return _opaque_eval(e, ups, env)
+
+        def run(b, env):
+            env = dict(env)
+            for st in b.stmts:
+                if st[0] == 'set' and st[1][0] == 'r':
+                    v = ev(st[2], env)
+                    if v is None or st[1][1] in cap:
+                        env.pop(st[1][1], None)
+                    else:
+                        env[st[1][1]] = v
+                else:
+                    for r in _writes_of(st):
+                        env.pop(r, None)
+            for r in _writes_of(b.term):
+                env.pop(r, None)
+            return env
+
+        IN = {self.entry: {}}
+        work = [self.entry]
+        rounds = 0
+        while work and rounds < 20 * len(blocks) + 100:
+            rounds += 1
+            bid = work.pop()
+            b = blocks[bid]
+            out = run(b, IN[bid])
+            succs = b.succs()
+            if b.term[0] == 'br':
+                c = ev(b.term[1], out)
+                if isinstance(c, bool):
+                    succs = [b.term[2] if c else b.term[3]]
+            for sid in succs:
+                if sid not in IN:
+                    IN[sid] = dict(out)
+                    work.append(sid)
+                else:
+                    cur = IN[sid]
+                    new = {r: v for r, v in cur.items() if r in out and out[r] == v and type(out[r]) == type(v)}
+                    if len(new) != len(cur):
+                        IN[sid] = new
+                        work.append(sid)
+        return IN, ev
 
     def _used_as_object(self, b, src):
         """The value `src` (an upvalue captured by value, or a register the block does not assign)
@@ -1341,7 +1411,8 @@ class ProtoCFG:
         (`game.PlaceId == 7465136166`) is the program's own."""
         blocks = self.blocks
         self.compute_preds()
-        opaque, value, scrambles, _, local, IN, _ = self._opaque_numbers()
+        opaque, value, scrambles, _, local, IN, ups, _ = self._opaque_numbers()
+        flow, flow_ev = self._opaque_flow(ups)
         cut = 0
         for b in list(blocks.values()):
             if b.term[0] != 'br' or b.term[2] == b.term[3]:
@@ -1363,6 +1434,14 @@ class ProtoCFG:
                         break
                 else:
                     break
+            if e[0] == 'bin' and e[1] in ('==', '~=') and e[2] == e[3] and e[2][0] == 'r' \
+                    and local(b, pos, e[2]) is not None:
+                # `x ~= x` on a number: never
+                keep = b.term[2] if ((e[1] == '==') != flip) else b.term[3]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
             if e[0] in ('upcell', 'r') and (flip or b.term[1][0] == 'r') and self._used_as_object(b, e):
                 # `if not not x then` right after x was indexed or called: an opaque predicate,
                 # x cannot be nil or false there
@@ -1415,11 +1494,33 @@ class ProtoCFG:
             coldside = [sid for sid in arms if blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold'
                         and len(blocks[sid].preds) == 1]
             v = value(b, n, other)
+            if v is None and b.id in flow:
+                # ... or the paths that can execute determine it
+                env = dict(flow[b.id])
+                for st in b.stmts[:n]:
+                    if st[0] == 'set' and st[1][0] == 'r':
+                        x = flow_ev(st[2], env)
+                        if x is None or st[1][1] in self.captured_ref:
+                            env.pop(st[1][1], None)
+                        else:
+                            env[st[1][1]] = x
+                    else:
+                        for r in _writes_of(st):
+                            env.pop(r, None)
+                x = flow_ev(other, env)
+                if isinstance(x, (int, float)) and not isinstance(x, bool):
+                    v = x
             known = None if v is None else arms[0 if ((v == consts[0]) == (e[1] == '==')) != flip else 1]
             if len(coldside) == 1:
                 lose = coldside[0]
             elif not proven and v is None:
-                continue
+                # Last resort, in code that never ran: the real side of a guard goes on to code
+                # of its own, the dead side jumps into code that something else leads to as well.
+                own = [sid for sid in arms if blocks[sid].preds == {b.id}]
+                if len(own) != 1 or any(blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold' for sid in arms) \
+                        or abs(consts[0]) < 2 ** 24:
+                    continue
+                lose = arms[1] if own[0] == arms[0] else arms[0]
             else:
                 scr = [sid for sid in arms if len(blocks[sid].preds) == 1 and scrambles(blocks[sid])]
                 if len(scr) == 1 and (known is None or known != scr[0]):
@@ -1444,7 +1545,7 @@ class ProtoCFG:
             if e[0] in ('up', 'upcell'):
                 if not allowed:
                     plain.add(e[1])
-            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '==', '~='):
+            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//', '==', '~='):
                 reads(e[2], allowed)
                 reads(e[3], allowed)
             elif e[0] == 'un' and e[1] == 'not':
@@ -1476,7 +1577,7 @@ class ProtoCFG:
                         def fine(x):
                             if x == ('r', m):
                                 return True
-                            if x[0] == 'bin' and x[1] in ('+', '-', '*', '%', '==', '~='):
+                            if x[0] == 'bin' and x[1] in ('+', '-', '*', '%', '//', '==', '~='):
                                 return fine(x[2]) and fine(x[3])
                             if x[0] == 'un' and x[1] == 'not':
                                 return fine(x[2])
@@ -1506,14 +1607,32 @@ class ProtoCFG:
         text they may share a variable with something real)."""
         blocks = self.blocks
         self.compute_preds()
-        _, _, _, def_ok, local, IN, ups = self._opaque_numbers()
+        _, _, _, def_ok, local, IN, ups, ok = self._opaque_numbers()
         dropups = DROP_UPS.get(self.pir.key, frozenset())
         cand = set()
+        deadcalls = set()
+
+        def test_of_opaque(b, i, e):
+            # the stored result of a guard's comparison
+            while e[0] == 'un' and e[1] == 'not':
+                e = e[2]
+            if e[0] == 'bin' and e[1] in ('==', '~='):
+                x, y = local(b, i, e[2]), local(b, i, e[3])
+                return x is not None and y is not None and ok(x, b.id) and ok(y, b.id)
+            return False
         for b in blocks.values():
             for i, st in enumerate(b.stmts):
-                if st[0] == 'set' and st[1][0] == 'r' and def_ok((b.id, i)):
+                if st[0] == 'set' and st[1][0] == 'r' and (def_ok((b.id, i)) or test_of_opaque(b, i, st[2])):
                     cand.add((b.id, i))
+                elif st[0] == 'callstmt' and st[1][0] == 'call' and st[1][1][0] == 'kfn' \
+                        and str(st[1][1][1]).startswith('bit32.') and st[1][3] is None:
+                    deadcalls.add((b.id, i))        # a bit operation whose result nobody takes
         allok = set(cand)
+        if os.environ.get('DEVM_TRACE_DROP') == str(self.pir.key):
+            for b in blocks.values():
+                for i, st in enumerate(b.stmts):
+                    if st[0] == 'set' and st[1] == ('r', 1) and (b.id, i) not in cand:
+                        print('  r1 def not opaque', b.id, i, str(st)[:200], '| resolved', str(local(b, i, st[2]))[:300])
 
         def defs_at(b, i, m):
             for j in range(i - 1, -1, -1):
@@ -1558,7 +1677,7 @@ class ProtoCFG:
             changed = False
             for b in blocks.values():
                 for i, st in enumerate(b.stmts + [b.term]):
-                    if i < len(b.stmts) and ((b.id, i) in cand or (
+                    if i < len(b.stmts) and ((b.id, i) in cand or (b.id, i) in deadcalls or (
                             st[0] == 'set' and st[1][0] == 'up' and st[1][1] in dropups)):
                         continue
                     regs = set()
@@ -1569,6 +1688,8 @@ class ProtoCFG:
                             if d in cand:
                                 cand.discard(d)
                                 changed = True
+                                if os.environ.get('DEVM_TRACE_DROP') == str(self.pir.key):
+                                    print('  keeps r%s def %s: %s %s' % (m, d, 'ROOT' if (b.id, i) not in allok else 'cascade', str(st)[:260]))
         # which of the captured ones the functions created here may forget about as well
         kept = {blocks[bid].stmts[i][1][1] for bid, i in allok - cand}
         for b in blocks.values():
@@ -1595,6 +1716,8 @@ class ProtoCFG:
             e = local(b, i, b.stmts[i][2])
             if e is not None and e[0] == 'k' and abs(e[1]) < 65536:
                 continue
+            drop.setdefault(bid, set()).add(i)
+        for bid, i in deadcalls:
             drop.setdefault(bid, set()).add(i)
         n = 0
         for b in blocks.values():
