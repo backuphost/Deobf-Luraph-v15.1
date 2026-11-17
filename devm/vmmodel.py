@@ -595,7 +595,9 @@ class Model:
 
 
 def find_luau():
-    cands = [os.environ.get('LUAU_BIN'), os.path.join(HERE, '..', 'bin', 'luau'), 'luau']
+    import platform
+    cands = [os.environ.get('LUAU_BIN'), os.path.join(HERE, '..', 'bin', 'luau'),
+             os.path.join(HERE, '..', 'bin', 'luau.' + platform.machine()), 'luau']
     import shutil
     for c in cands:
         if c and (os.path.isfile(c) or shutil.which(c)):

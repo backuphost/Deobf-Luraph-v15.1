@@ -23,10 +23,33 @@ Pipeline (`run.py`):
 
 ## Status
 
-| VM layout | Example | State |
+One command, no options: `python -m devm.run protected.lua -o recovered.lua`.  The layout, the kind
+of environment to emulate and the interpreter binary (`bin/luau.<arch>` or `LUAU_BIN`) are found
+automatically, and the run ends with a report of what, if anything, is left unrecovered.
+
+| Layout | Examples | State |
 |---|---|---|
-| proto-table (`wrap(proto, upvalues)`) | HookScript, ClientSynchronizer | complete, 0 lift errors |
-| factory, multi-interpreter (`factory(...)(upvalues)`), also the raw single-line form | loadstring6 | first stage lifts and decompiles; see below |
+| proto-table (`wrap(proto, upvalues)`), decompiled bytecode | HookScript, ClientSynchronizer | complete, 0 lift errors |
+| proto-table, Luraph's own one-line output, encrypted second stage | message_1 | complete, 0 lift errors, reproduced by `tests/regress.py` |
+| factory (`factory(...)(upvalues)`), decompiled bytecode | Net, TeleportGuard | complete up to a few constants in branches no run reached |
+| factory, one-line output, self-decrypting code and lazily decoded constants | 25ms_get | partial: all modules, but unlifted instructions and unstructured exits remain |
+
+There is no key that opens every Luraph v15.1 script.  Every protected file carries its own virtual
+machine: opcode numbers, operand layout and handlers are generated per script, the decryption keys
+are computed by the script from its environment while it runs, and in the factory layout code and
+constants are only decrypted when they are first used.  What carries over from one script to the
+next is this tool's understanding of a *layout*; a layout or option it has not met needs new support.
+
+What no tool can recover from the file alone:
+
+* code or key material the script fetches at run time (`loadstring5`, `loadstring6`: a number from a
+  server goes into the key of the next stage);
+* code behind a key system: it only decrypts after the server confirms a key, and this tool does not
+  forge that confirmation;
+* names, comments and formatting, which protection discards (`renamer.py` re-derives names from use).
+
+`python tests/regress.py DIR` re-runs the pipeline on the protected inputs in `DIR` and compares
+with the committed results (the inputs themselves are not in the repository).
 
 ### Factory layout: traced end-state lifting
 

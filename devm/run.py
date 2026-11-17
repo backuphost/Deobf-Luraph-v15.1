@@ -116,12 +116,19 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=False, mfp_delta=None, exercise=True, http_map=None):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
         src = f.read()
     oneline = normalize.needs_reflow(src)
+    if executor is None:
+        # A script in Luraph's own one-line layout is what an executor is handed, and it expects
+        # the executor's functions.  A decompiler's rendering comes out of a game, whose scripts
+        # look for those functions to detect exploits.
+        executor = oneline
+        log('[%s] environment: %s (override with --executor / --no-executor)' % (
+            tag, 'executor' if executor else 'plain Roblox client'))
     if oneline:
         src, n = normalize.inline_protected_raw(src)
         if n:
@@ -215,7 +222,10 @@ def main(argv=None):
     ap.add_argument('--mfp-delta', type=int, default=None, help='make math_floor_precision(seed) equal the script\'s own expected value plus this constant')
     ap.add_argument('--http-reply', default=None, help='what game:HttpGet returns (scripts that mix a server reply into their key)')
     ap.add_argument('--http-map', default=None, help='file of <url substring><TAB><reply body> lines: canned replies for the offline request mock')
-    ap.add_argument('--executor', action='store_true', help='provide executor globals (identifyexecutor, iscclosure, islclosure)')
+    ap.add_argument('--executor', action='store_true', default=None,
+                    help='run the script as an executor would (getgenv, request, hookfunction, ... exist). '
+                         'Default: yes for scripts in Luraph\'s own one-line layout, no for decompiled ones')
+    ap.add_argument('--no-executor', dest='executor', action='store_false', help='run the script as a plain Roblox client')
     ap.add_argument('--root', type=int, default=None, help='proto number to lift from (1 = the first program)')
     ap.add_argument('--script-path', default=None,
                     help='where the script sits in the game, e.g. ReplicatedStorage.Packages.Net.init '
@@ -229,6 +239,37 @@ def main(argv=None):
     with open(out, 'w', encoding='utf-8') as f:
         f.write(text)
     print('written', out, '(%d lines)' % text.count('\n'))
+    for line in report(text):
+        print(line)
+
+
+def report(text):
+    """What is left unrecovered in a result, in plain words."""
+    import re
+    errs = text.count('LIFT ERROR')
+    blank = len(re.findall(r'(?m)^.*(?:\[nil\]|\(nil\)|= nil \.\.).*$', text))
+    refs = text.count('__LPH_PROTOS')
+    flat = text.count('not structured')
+    flags = len(re.findall(r'exit\d+ = true', text))
+    lines = max(1, text.count('\n'))
+    out = []
+    if not (errs or blank or refs or flat or flags):
+        out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
+        return out
+    out.append('result: PARTIAL')
+    if errs:
+        out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
+    if blank:
+        out.append('  %d lines with nil in place of a constant: code that never ran and stayed encrypted' % blank)
+    if refs:
+        out.append('  %d constants shown as __LPH_PROTOS[...]: a value the dump could not describe' % refs)
+    if flat or flags:
+        out.append('  control flow not fully structured: %d state machines, %d exit flags' % (flat, flags))
+    if blank * 5 > lines:
+        out.append('  most of the script did not run.  Usual causes: it waits for a server reply (see the [http] '
+                   'lines above; --http-map), a key system, or an environment check that failed '
+                   '(try --no-executor / --executor)')
+    return out
 
 
 if __name__ == '__main__':
