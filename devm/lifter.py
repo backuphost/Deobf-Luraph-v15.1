@@ -39,6 +39,7 @@ class ProtoIR:
 
 
 CAP = '__captured__'      # key in a known-register map: registers captured by reference
+ABS = '__truth__'         # ... and: frozenset of (register, 'T...' | 'F'), see known_after
 SYMPC = 'jump to a run-time computed instruction'
 
 
@@ -89,6 +90,7 @@ class Lifter:
         self.cap_vals = {}          # (function key, register) -> number last stored in a shared variable
         self.all_up_nums = {}
         self.lifting_key = None
+        self.folds = {}
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
@@ -164,10 +166,45 @@ class Lifter:
         out = []
         by_path = self.dump.by_path
 
-        def walk(tree, known, temps=None, calls=None):
+        def walk(tree, known, temps=None, calls=None, tabs=None):
             stmts, term = tree
             known = dict(known)
             temps = dict(temps or ())
+            # Truth values that are certain: 'T...' cannot be nil or false here, 'F' is.  Luraph's
+            # opaque predicates test a value it knows the truth of (a number just computed, an
+            # object just indexed), usually through two `not`s; the dead side leaves the code
+            # in a state no real path has, so it must not be followed.
+            ab = dict(known.get(ABS, ()))
+            tabs = dict(tabs or ())         # the same for the instruction's temporaries
+            torig = {}                      # temporary -> register it was read from
+
+            def absval(e):
+                if e[0] == 't':
+                    return tabs.get(e[1])
+                if e[0] == 'r':
+                    return ab.get(e[1])
+                if e[0] == 'k':
+                    return 'F' if e[1] is None or e[1] is False else 'T'
+                if e[0] in ('newtable', 'closure', 'constfn'):
+                    return 'T'
+                if e[0] == 'kfn':
+                    return 'T:' + str(e[1])
+                if e[0] == 'un' and e[1] == 'not':
+                    v = absval(e[2])
+                    return None if v is None else ('F' if v[0] == 'T' else 'T')
+                if e[0] == 'un' and e[1] in ('#', '-'):
+                    return 'T'
+                if e[0] == 'bin' and e[1] in ('+', '-', '*', '/', '%', '^', '..', '//'):
+                    return 'T'
+                return None
+
+            def used(e):
+                # indexing or calling it worked: it is not nil or false
+                if e[0] == 't' and e[1] in torig:
+                    ab[torig[e[1]]] = ab.get(torig[e[1]]) if (ab.get(torig[e[1]]) or '')[:1] == 'T' else 'T'
+                    tabs[e[1]] = tabs.get(e[1]) if (tabs.get(e[1]) or '')[:1] == 'T' else 'T'
+                elif e[0] == 'r':
+                    ab[e[1]] = ab.get(e[1]) if (ab.get(e[1]) or '')[:1] == 'T' else 'T'
 
             def num(e):
                 if e[0] == 'k':
@@ -195,7 +232,43 @@ class Lifter:
 
             calls = dict(calls or ())
             truth = {}
+            cabs = {}
             for st in stmts:
+                if st[0] == 'set' and isinstance(st[2], tuple):
+                    e = st[2]
+                    if e[0] in ('index', 'method') and isinstance(e[1], tuple):
+                        used(e[1])
+                    v = cabs.get(e[1]) if e[0] == 'mv' and e[2] == 1 else absval(e)
+                    if st[1][0] == 't':
+                        if v is not None:
+                            tabs[st[1][1]] = v
+                        if e[0] == 'r':
+                            torig[st[1][1]] = e[1]
+                    elif st[1][0] == 'r':
+                        if v is not None and st[1][1] not in known.get(CAP, ()):
+                            ab[st[1][1]] = v
+                        else:
+                            ab.pop(st[1][1], None)
+                elif st[0] == 'call':
+                    fn = absval(st[2]) if isinstance(st[2], tuple) else None
+                    if isinstance(st[2], tuple):
+                        used(st[2])
+                    name = fn[2:] if fn and fn.startswith('T:') else ''
+                    if name.startswith(('math.', 'bit32.')) or name in ('tostring', 'type', 'typeof', 'os.clock', 'os.time',
+                                                                       'tick', 'string.format', 'string.lower',
+                                                                       'string.upper', 'string.sub', 'string.rep',
+                                                                       'string.len', 'table.concat'):
+                        cabs[st[1]] = 'T'
+                    if not name:
+                        for r in known.get(CAP, ()):
+                            ab.pop(r, None)
+                elif st[0] in ('setindex',) and isinstance(st[1], tuple):
+                    used(st[1])
+                elif st[0] == 'setmulti':
+                    for n in [n for n in ab if not isinstance(n, int) or n >= st[1]]:
+                        del ab[n]
+                elif st[0] not in ('cold', 'params', 'close', 'forpop'):
+                    pass
                 if st[0] == 'call' and st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.') and st[4] is None:
                     # arithmetic on the opaque state numbers, done with the bit library
                     args = [num(a) for a in st[3]]
@@ -281,16 +354,32 @@ class Lifter:
                 n1 = len(out)
                 walk(term[3] if truth[term[1][1]] else term[2], known, temps, calls)
                 out[n1:] = [(t, taken.get(tuple(t[1]), kn) if t[0] == 'goto' else kn) for t, kn in out[n1:]]
+            elif term[0] == 'br' and self.end_state and (absval(term[1]) or '')[:1] in ('T', 'F') \
+                    and not (term[2][0] and term[2][0][0] == ('cold',) and absval(term[1])[0] == 'T') \
+                    and not (term[3][0] and term[3][0][0] == ('cold',) and absval(term[1])[0] == 'F'):
+                # an opaque predicate: only its live side exists (see lift_proto)
+                live = absval(term[1])[0] == 'T'
+                self.folds[id(term)] = live
+                known[ABS] = frozenset(ab.items())
+                walk(term[2] if live else term[3], known, temps, calls, tabs)
             elif term[0] == 'br':
-                walk(term[2], known, temps, calls)
-                walk(term[3], known, temps, calls)
+                known[ABS] = frozenset(ab.items())
+                walk(term[2], known, temps, calls, tabs)
+                walk(term[3], known, temps, calls, tabs)
             elif term[0] == 'forbr':
+                for n in ((term[2] + 3,) if term[1] == 'num' else tuple(term[2])):
+                    ab.pop(n, None)
+                known[ABS] = frozenset(ab.items())
                 regs = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
                 for n in regs:
                     known.pop(n, None)
                 walk(term[3], known)
                 walk(term[4], known)
             elif term[0] == 'goto':
+                if ab:
+                    known[ABS] = frozenset(ab.items())
+                else:
+                    known.pop(ABS, None)
                 out.append((term, known))
 
         walk(tree, known)
@@ -668,12 +757,16 @@ class Lifter:
                     old = node_in[key2]
                     meet = {r: v for r, v in old.items()
                             if r != CAP and r in known and same_const(known[r], v)}
+                    meet.pop(ABS, None)
+                    both = old.get(ABS, frozenset()) & known.get(ABS, frozenset())
+                    if both:
+                        meet[ABS] = both
                     cap = old.get(CAP, frozenset()) | known.get(CAP, frozenset())
                     for r in cap:
                         meet.pop(r, None)
                     if cap:
                         meet[CAP] = cap
-                    if len(meet) == len(old) and meet.get(CAP) == old.get(CAP):
+                    if len(meet) == len(old) and meet.get(CAP) == old.get(CAP) and meet.get(ABS) == old.get(ABS):
                         continue
                     known = meet
                     snap = node.snap_in
@@ -816,7 +909,12 @@ class Lifter:
                 # opaque predicate resolved by an earlier pass: the junk arm is not lifted at all,
                 # so that the instruction patches it contains cannot touch real code
                 node.tree = opaque.cut_arms(node.tree, cut)
+            self.folds = {}
             ends = self.known_after(node.tree, known)
+            if self.folds and pathmode:
+                node.tree = fold_tree(node.tree, self.folds)
+                self.folds = {}
+                ends = self.known_after(node.tree, known)
             if any(end[1] in indirect for end, kn in ends):
                 # specialise jumps into a trampoline by the value it will jump through
                 special = {}
@@ -968,6 +1066,19 @@ def undo(journal):
             obj.data[:] = old
         else:
             obj.set(key, old)
+
+
+def fold_tree(tree, folds):
+    """Copy of an instruction tree with decided branches (by identity of the `br`) replaced by their live side."""
+    stmts, term = tree
+    if term[0] == 'br':
+        if id(term) in folds:
+            s2, t2 = fold_tree(term[2] if folds[id(term)] else term[3], folds)
+            return (list(stmts) + [x for x in s2 if x != ('cold',)], t2)
+        return (stmts, ('br', term[1], fold_tree(term[2], folds), fold_tree(term[3], folds)))
+    if term[0] == 'forbr':
+        return (stmts, ('forbr', term[1], term[2], fold_tree(term[3], folds), fold_tree(term[4], folds)))
+    return tree
 
 
 def retarget_tree(tree, special):
