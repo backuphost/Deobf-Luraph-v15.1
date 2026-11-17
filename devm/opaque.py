@@ -99,6 +99,12 @@ def _drop_orphans(text):
         if name[0] == 'v' and all(own.fullmatch(lines[i]) for i in idx) and any(
                 re.fullmatch(r'\s*local %s = \d{6,}' % name, lines[i]) for i in idx):
             drop.update(idx)
+    # what is left of a removed test: `local v = not not f`, never read
+    for name, idx in occ.items():
+        if len(idx) == 1 and name[0] == 'v':
+            m = re.fullmatch(r'\s*local %s = ((?:not )+)([A-Za-z_]\w*)' % name, lines[idx[0]])
+            if m and len(re.findall(r'\b%s\b' % name, lines[idx[0]])) == 1:
+                drop.add(idx[0])
     if not drop:
         return text
     return '\n'.join(ln for i, ln in enumerate(lines) if i not in drop)

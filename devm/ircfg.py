@@ -420,8 +420,192 @@ class ProtoCFG:
             self._thread()
             self._merge_conds()
             self._fold_regs()
+        if self._unsplice():
+            self._table_aliases()
+            for _ in range(2):
+                self._fold_regs()
+                self._merge_tables()
         self._open_upcells()
         self._dead_stores()
+
+    def _table_aliases(self):
+        """`B = {}; A = B; A[1] = x; A[2] = y` fills B: the copy the interpreter works on is
+        replaced by the table itself."""
+        _, live_out = self.liveness()
+        done = 0
+        for b in self.blocks.values():
+            i = 0
+            while i < len(b.stmts):
+                st = b.stmts[i]
+                i += 1
+                if not (st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'r' and st[1] != st[2]):
+                    continue
+                A, B = st[1], st[2]
+                fresh = False
+                for j in range(i - 2, -1, -1):
+                    if B[1] in _writes_of(b.stmts[j]):
+                        fresh = b.stmts[j][0] == 'set' and b.stmts[j][2][0] in ('newtable', 'table')
+                        break
+                if not fresh:
+                    continue
+                j = i
+                ok = True
+                while j < len(b.stmts):
+                    sj = b.stmts[j]
+                    if sj[0] in ('setlist', 'setindex') and sj[1] == A:
+                        rest = [e for e in stmt_exprs(sj)[0][1:]]
+                        if any(A[1] in expr_reads(e)[0] for e in rest):
+                            ok = False
+                            break
+                        j += 1
+                        continue
+                    break
+                if not ok or j == i:
+                    continue
+                # the copy must not be looked at again
+                alive = A[1] in live_out.get(b.id, ())
+                for sk in b.stmts[j:] + [b.term]:
+                    rd, wr = stmt_exprs(sk)
+                    if any(A[1] in expr_reads(e)[0] for e in rd):
+                        alive = True
+                        break
+                    if A in wr:
+                        alive = False
+                        break
+                if alive:
+                    continue
+                for k in range(i, j):
+                    sk = b.stmts[k]
+                    b.stmts[k] = (sk[0], B) + tuple(sk[2:])
+                del b.stmts[i - 1]
+                i -= 1
+                done += 1
+        return done
+
+    def _unsplice(self):
+        """Calls that pass on all results of another call.  The interpreter does this with a
+        packed table:
+
+            R = table.pack(g(...))                       R = table.pack(g(...))
+            f(unpack(R, 1, R.n))                         T = R.n;  R.n = K + T - 1
+                                                         table.move(R, 1, T, K, R)
+                                                         R[1] = a1 ... R[K-1] = a(K-1)
+                                                         f(unpack(R, 1, R.n))
+
+        which is `f(g(...))` and `f(a1, ..., g(...))`; `table.move(R, 1, R.n, K, D)` is the tail of
+        a table constructor."""
+        PACK, MOVE, UNPACK = ('kfn', 'table.pack'), ('kfn', 'table.move'), ('kfn', 'unpack')
+        done = 0
+        _, live_out = self.liveness()
+
+        def pure(e):
+            return not any(x[0] in ('call', 'closure') for x in walk_expr(e, []))
+
+        for b in self.blocks.values():
+            i = 0
+            while i < len(b.stmts):
+                st = b.stmts[i]
+                i += 1
+                if not (st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'call' and st[2][1] == PACK
+                        and not st[2][2] and len(st[2]) > 3 and st[2][3] is not None):
+                    continue
+                R, M = st[1], st[2][3]
+                mreads = expr_reads(M)[0]
+                use = ('call', UNPACK, [R, ('k', 1), ('index', R, ('k', 'n'))], None)
+                T, K, moved, prefix, drop = None, 1, False, {}, [i - 1]
+                result = None
+                j = i
+                while j <= len(b.stmts):
+                    sj = b.stmts[j] if j < len(b.stmts) else b.term
+                    last = j == len(b.stmts)
+                    if sj[0] == 'set' and sj[2] == ('index', R, ('k', 'n')) and T is None and sj[1][0] == 'r':
+                        T = sj[1]
+                        drop.append(j)
+                    elif (sj[0] == 'setindex' and sj[1] == R and sj[2] == ('k', 'n') and T is not None and K == 1
+                          and sj[3][0] == 'bin' and sj[3][1] == '-' and sj[3][3] == ('k', 1) and sj[3][2][0] == 'bin'
+                          and sj[3][2][1] == '+' and _isnum(sj[3][2][2]) and sj[3][2][3] == T):
+                        K = int(sj[3][2][2][1])
+                        drop.append(j)
+                    elif (sj[0] == 'callstmt' and sj[1][0] == 'call' and sj[1][1] == MOVE and len(sj[1][2]) == 5
+                          and sj[1][2][0] == R and sj[1][2][1] == ('k', 1) and sj[1][2][4] == R
+                          and T is not None and sj[1][2][2] == T and sj[1][2][3] == ('k', K) and not moved):
+                        moved = True
+                        drop.append(j)
+                    elif (sj[0] == 'callstmt' and sj[1][0] == 'call' and sj[1][1] == MOVE and len(sj[1][2]) == 5
+                          and sj[1][2][0] == R and sj[1][2][1] == ('k', 1) and sj[1][2][2] == ('index', R, ('k', 'n'))
+                          and _isnum(sj[1][2][3]) and sj[1][2][4] != R and T is None and K == 1
+                          and R[1] not in expr_reads(sj[1][2][4])[0]):
+                        # the tail of a table constructor
+                        result = ('setlist', sj[1][2][4], int(sj[1][2][3][1]), [], M)
+                        break
+                    elif (sj[0] == 'setindex' and sj[1] == R and _isnum(sj[2]) and moved and 1 <= sj[2][1] < K
+                          and R[1] not in expr_reads(sj[3])[0]):
+                        prefix[int(sj[2][1])] = sj[3]
+                        drop.append(j)
+                    elif (sj[0] == 'setlist' and sj[1] == R and sj[4] is None and moved
+                          and all(1 <= sj[2] + n < K and R[1] not in expr_reads(v)[0] for n, v in enumerate(sj[3]))):
+                        for n, v in enumerate(sj[3]):
+                            prefix[sj[2] + n] = v
+                        drop.append(j)
+                    else:
+                        found = [0]
+
+                        def fix(x):
+                            if x[0] == 'call' and len(x) > 3 and x[3] == use:
+                                found[0] += 1
+                                return ('call', x[1], list(x[2]) + [prefix[n] for n in range(1, K)], M)
+                            return x
+                        complete = (K == 1 and T is None) or (moved and all(n in prefix for n in range(1, K)))
+                        if sj[0] == 'ret' and sj[2] == use and complete:
+                            result = ('ret', list(sj[1]) + [prefix[n] for n in range(1, K)], M)
+                            break
+                        new = map_stmt(sj, fix) if complete and sj[0] != 'ret' else sj
+                        if found[0] == 1:
+                            rest = [x for e in stmt_exprs(new)[0] for x in walk_expr(e, [])]
+                            if R in rest and not any(x == M for x in rest):
+                                break
+                            result = new
+                            break
+                        # anything else in between must not disturb the packed call or the table
+                        rd, wr = stmt_exprs(sj)
+                        regs = set()
+                        for e in rd:
+                            regs |= expr_reads(e)[0]
+                        if last or R[1] in regs or (T is not None and T[1] in regs) or not all(pure(e) for e in rd) \
+                                or sj[0] not in ('set', 'setindex', 'setlist') \
+                                or any(w[0] == 'r' and (w[1] in mreads or w == R or w == T) for w in wr):
+                            break
+                    j += 1
+                if result is None:
+                    continue
+                # the table (and the saved count) must be gone afterwards
+                after = b.stmts[j + 1:] + ([b.term] if j < len(b.stmts) else [])
+                alive = False
+                for x in (R, T):
+                    if x is None:
+                        continue
+                    dead = False
+                    for sk in after:
+                        rd, wr = stmt_exprs(sk)
+                        if any(x[1] in expr_reads(e)[0] for e in rd):
+                            alive = True
+                            break
+                        if x in wr:
+                            dead = True
+                            break
+                    if not dead and not alive and x[1] in live_out.get(b.id, ()):
+                        alive = True
+                if alive:
+                    continue
+                if j < len(b.stmts):
+                    b.stmts[j] = result
+                else:
+                    b.term = result
+                for d in sorted(drop, reverse=True):
+                    del b.stmts[d]
+                done += 1
+                i = max(0, i - 1)
+        return done
 
     def _reaching(self):
         """(block order, IN): IN[b][reg] = frozenset of definitions (bid, stmt index | 'T') or
