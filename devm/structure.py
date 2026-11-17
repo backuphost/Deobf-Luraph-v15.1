@@ -399,6 +399,12 @@ def _all_exprs(e):
     return out
 
 
+class EnclosingFollow(Exception):
+    def __init__(self, target):
+        Exception.__init__(self, 'jump to an enclosing join')
+        self.target = target
+
+
 # ------------------------------------------------------------------ structuring
 class Structurer:
     def __init__(self, cfg):
@@ -420,6 +426,8 @@ class Structurer:
             self._dominators()
             self._loops()
         self.emitted = {}
+        self.emit_log = []
+        self.follows = []
         self.depth = 0
         self.pending = {}
         self.njumps = 0
@@ -608,6 +616,8 @@ class Structurer:
                     return None
                 through.append(c)
                 c = c[2]
+        if x in self.follows:
+            raise EnclosingFollow(x)
         return x
 
     def after_loop(self, lctx, out):
@@ -624,6 +634,7 @@ class Structurer:
         while b is not None:
             n = self.emitted.get(b, 0) + 1
             self.emitted[b] = n
+            self.emit_log.append(b)
             if n > DUP_LIMIT:
                 raise Unstructured('block duplicated too often')
             if b in self.loop_nodes or self.blocks[b].term[0] == 'forbr':
@@ -687,9 +698,36 @@ class Structurer:
                 return self.emit_merges(c, t, f, merges, stop, ctx, out)
             follow = self.if_follow(b)
             if follow is not None:
-                T = self.arm(t, follow, ctx)
-                F = self.arm(f, follow, ctx)
-                out.append(make_if(c, T, F))
+                mark = (len(self.emit_log), self.njumps, {k: list(v) for k, v in self.pending.items()}, self.depth)
+                self.follows.append(follow)
+                try:
+                    T = self.arm(t, follow, ctx)
+                    F = self.arm(f, follow, ctx)
+                    out.append(make_if(c, T, F))
+                except EnclosingFollow as ex:
+                    if ex.target != follow:
+                        raise
+                    # Something nested inside the arms jumps straight to the join (the later
+                    # alternatives of `a or b or c`): the arms become a block that can be left
+                    # early, instead of each such jump dragging a copy of the join along.
+                    for x in self.emit_log[mark[0]:]:
+                        self.emitted[x] -= 1
+                    del self.emit_log[mark[0]:]
+                    self.njumps = mark[1]
+                    self.pending = mark[2]
+                    self.depth = mark[3]
+                    while self.follows and self.follows[-1] != follow:
+                        self.follows.pop()
+                    self.follows.pop()
+                    lctx = (None, follow, ctx)
+                    T = self.arm(t, follow, lctx)
+                    F = self.arm(f, follow, lctx)
+                    out.append(['repeat', [make_if(c, T, F)], ('k', True), None])
+                    self.after_loop(lctx, out)
+                    return self.jump(follow, stop, ctx, out)
+                finally:
+                    if self.follows and self.follows[-1] == follow:
+                        self.follows.pop()
                 return self.jump(follow, stop, ctx, out)
             T = self.arm(t, stop, ctx)
             F = self.arm(f, stop, ctx)
