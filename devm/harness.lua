@@ -208,6 +208,52 @@ local function servePools(protos)
 	-- A constant can be a function of the script (the closure maker of a nested function): asking
 	-- for it makes the loader build that function, which is then a new proto.  New protos and
 	-- the tables they bring are sent along with the answer.
+	-- Decoding can change the loader's own state (it decrypts bytecode and offset tables in
+	-- place).  Every request must start from the state the run ended in, so the buffers and
+	-- tables of numbers in the proto records are copied once and put back after each request.
+	local keepBufs, keepTabs, seenT = {}, {}, {}
+	local function keep(v, depth)
+		if type(v) == "buffer" then
+			if not seenT[v] then
+				seenT[v] = true
+				local c = buffer.create(buffer.len(v))
+				buffer.copy(c, 0, v)
+				keepBufs[#keepBufs + 1] = { v, c }
+			end
+		elseif type(v) == "table" and not seenT[v] and not libnames[v] and v ~= envTable then
+			seenT[v] = true
+			local copy, n = {}, 0
+			for k, x in next, v do
+				if type(x) == "number" and type(k) == "number" then
+					copy[k] = x
+					n += 1
+				end
+			end
+			if n > 0 and n <= 200000 then keepTabs[#keepTabs + 1] = { v, copy } end
+			if depth < 2 then
+				for _, x in next, v do keep(x, depth + 1) end
+			end
+		end
+	end
+	for _, p in ipairs(protos) do
+		if type(p.vars) == "table" then
+			for _, v in next, p.vars do keep(v, 0) end
+		end
+	end
+	local function restore()
+		for _, e in ipairs(keepBufs) do buffer.copy(e[1], 0, e[2]) end
+		for _, e in ipairs(keepTabs) do
+			local t, copy = e[1], e[2]
+			for k, x in next, t do
+				if type(x) == "number" and type(k) == "number" and copy[k] ~= x then
+					rawset(t, k, copy[k])
+				end
+			end
+			for k, x in copy do
+				if rawget(t, k) ~= x then rawset(t, k, x) end
+			end
+		end
+	end
 	writefile(serveDir .. "/ready", "1")
 	local K = 1073741823
 	local last = nil
@@ -254,8 +300,7 @@ local function servePools(protos)
 					quietHooks, __LPH_N.q = true, true
 					local ok, v = pcall(function() return t[K] end)
 					quietHooks, __LPH_N.q = false, false
-					for i = #tundo, 1, -1 do rawset(tundo[i][1], tundo[i][2], tundo[i][3]) end
-					for i = #undo, 1, -1 do buffer.writestring(undo[i][1], undo[i][2], undo[i][3]) end
+					restore()
 					rawset(t, K, nil)
 					rawset(idx, K, saved)
 					if ok and v ~= nil and (type(v) ~= "function" or protoOfFn[v] or fnames[v]) then
