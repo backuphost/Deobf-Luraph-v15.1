@@ -1513,21 +1513,23 @@ class ProtoCFG:
             known = None if v is None else arms[0 if ((v == consts[0]) == (e[1] == '==')) != flip else 1]
             if len(coldside) == 1:
                 lose = coldside[0]
-            elif not proven and v is None:
-                # Last resort, in code that never ran: the real side of a guard goes on to code
-                # of its own, the dead side jumps into code that something else leads to as well.
-                own = [sid for sid in arms if blocks[sid].preds == {b.id}]
-                if len(own) != 1 or any(blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold' for sid in arms) \
-                        or abs(consts[0]) < 2 ** 24:
-                    continue
-                lose = arms[1] if own[0] == arms[0] else arms[0]
             else:
-                scr = [sid for sid in arms if len(blocks[sid].preds) == 1 and scrambles(blocks[sid])]
+                lose = None
+                scr = [sid for sid in arms if len(blocks[sid].preds) == 1 and scrambles(blocks[sid])] \
+                    if (proven or v is not None) else []
                 if len(scr) == 1 and (known is None or known != scr[0]):
                     lose = scr[0]
                 elif not scr and known is not None:
                     lose = arms[1] if known == arms[0] else arms[0]
-                else:
+                elif known is None:
+                    # Last resort, in code that never ran: the real side of a guard goes on to
+                    # code of its own, the dead side jumps into code that something else leads
+                    # to as well.
+                    own = [sid for sid in arms if blocks[sid].preds == {b.id}]
+                    if len(own) == 1 and abs(consts[0]) >= 2 ** 24 and not any(
+                            blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold' for sid in arms):
+                        lose = arms[1] if own[0] == arms[0] else arms[0]
+                if lose is None:
                     continue
             b.term = ('goto', arms[1] if lose == arms[0] else arms[0])
             cut += 1
