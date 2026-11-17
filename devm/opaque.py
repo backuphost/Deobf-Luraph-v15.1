@@ -82,7 +82,26 @@ def strip(text):
         if new == text:
             break
         text = new
-    return text
+    return _drop_orphans(text)
+
+
+def _drop_orphans(text):
+    """Opaque numbers whose guards are gone: variables that are only ever set to a constant and
+    updated from themselves, and never read by anything else."""
+    lines = text.split('\n')
+    occ = {}
+    for i, ln in enumerate(lines):
+        for name in set(re.findall(r'\b[vp]\d+\b', ln)):
+            occ.setdefault(name, []).append(i)
+    drop = set()
+    for name, idx in occ.items():
+        own = re.compile(r'\s*(?:local %s = \d+|%s = \d+|%s = bit32\.\w+\(%s, \d+\)|%s = %s [-+*] \d+)' % ((name,) * 6))
+        if name[0] == 'v' and all(own.fullmatch(lines[i]) for i in idx) and any(
+                re.fullmatch(r'\s*local %s = \d{6,}' % name, lines[i]) for i in idx):
+            drop.update(idx)
+    if not drop:
+        return text
+    return '\n'.join(ln for i, ln in enumerate(lines) if i not in drop)
 
 
 def _strip_once(text):

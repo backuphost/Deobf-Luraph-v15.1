@@ -1,3 +1,4 @@
+import os
 """CFG -> structured Lua AST -> source text."""
 import math
 import re
@@ -1482,6 +1483,8 @@ class Decompiler:
         p.level = printer.level
         plist = list(params) + (['...'] if vararg else [])
         head = 'function%s(%s)' % (' ' + name if name else '', ', '.join(plist))
+        if os.environ.get('DEVM_PROTO_IDS'):
+            head += ' -- proto %s' % (key,)
         p.block(ast)
         if len(p.lines) > 4000 and sum(1 for ln in p.lines if re.match(r'\s*(local exit\d+|if exit\d+ then|exit\d+ = true)', ln)) * 20 > len(p.lines):
             # control flow that could not be untangled: thousands of lines of flag juggling help nobody

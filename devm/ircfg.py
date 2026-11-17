@@ -302,6 +302,55 @@ def rpo_order(cfg):
     return post
 
 
+# function key -> {index of an upvalue that holds an opaque state number: its value when the function
+# runs, if known} (filled in by the parent)
+OPAQUE_UPS = {}
+
+
+def _opaque_eval(e, ups):
+    """Value of an expression over opaque state numbers, None when it is not determined."""
+    if e[0] == 'k':
+        return e[1] if _isnum(e) else None
+    if e[0] == 'up':
+        return ups.get(e[1])
+    if e[0] == 'bin':
+        x, y = _opaque_eval(e[2], ups), _opaque_eval(e[3], ups)
+        if x is None or y is None:
+            return None
+        try:
+            return {'+': x + y, '-': x - y, '*': x * y}[e[1]] if e[1] != '%' else x % y
+        except (KeyError, ZeroDivisionError):
+            return None
+    if e[0] == 'call' and e[1][0] == 'kfn':
+        args = [_opaque_eval(x, ups) for x in e[2]]
+        if any(x is None or x != int(x) for x in args):
+            return None
+        args = [int(x) & 0xFFFFFFFF for x in args]
+        name = str(e[1][1])
+        if name == 'bit32.bxor':
+            r = 0
+            for x in args:
+                r ^= x
+            return r
+        if name == 'bit32.band':
+            r = 0xFFFFFFFF
+            for x in args:
+                r &= x
+            return r
+        if name == 'bit32.bor':
+            r = 0
+            for x in args:
+                r |= x
+            return r
+        if name == 'bit32.bnot' and len(args) == 1:
+            return ~args[0] & 0xFFFFFFFF
+        if name == 'bit32.lshift' and len(args) == 2:
+            return (args[0] << args[1]) & 0xFFFFFFFF if args[1] < 32 else 0
+        if name == 'bit32.rshift' and len(args) == 2:
+            return args[0] >> args[1] if args[1] < 32 else 0
+    return None
+
+
 class ProtoCFG:
     def __init__(self, pir):
         self.pir = pir
@@ -802,37 +851,213 @@ class ProtoCFG:
         self.entry = entry
         self._thread()
 
+    def _opaque_numbers(self):
+        """Registers and upvalues that only ever hold Luraph's opaque state numbers: set to large
+        integer constants and to arithmetic over themselves, nothing else.  Returns
+        (opaque(block, index, expr) -> bool, registers)."""
+        blocks = self.blocks
+        ups = OPAQUE_UPS.get(self.pir.key, {})
+        params = set(self.param_regs or ())
+
+        def local(b, i, e, depth=0):
+            """e with registers replaced by what the block assigned to them before statement i"""
+            if e[0] == 'r':
+                for j in range(i - 1, -1, -1):
+                    st = b.stmts[j]
+                    if e[1] in _writes_of(st):
+                        if st[0] == 'set' and st[1] == e and depth < 12:
+                            return local(b, j, st[2], depth + 1)
+                        return None
+                return e
+            if e[0] == 'k':
+                return e if _isnum(e) else None
+            if e[0] == 'up':
+                return e
+            if e[0] == 'bin' and e[1] in ('+', '-', '*', '%'):
+                x, y = local(b, i, e[2], depth), local(b, i, e[3], depth)
+                return None if x is None or y is None else ('bin', e[1], x, y)
+            if e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
+                args = [local(b, i, x, depth) for x in e[2]]
+                return None if any(x is None for x in args) else ('call', e[1], args, None)
+            return None
+
+        # a parameter counts when the function only does arithmetic with it
+        plain = set()
+
+        def reads(e, allowed):
+            if e[0] == 'r':
+                if not allowed:
+                    plain.add(e[1])
+            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '==', '~='):
+                reads(e[2], allowed)
+                reads(e[3], allowed)
+            elif e[0] == 'un' and e[1] == 'not':
+                reads(e[2], allowed)
+            elif e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
+                for x in e[2]:
+                    reads(x, allowed)
+            else:
+                sub = []
+                walk_expr(e, sub)
+                plain.update(x[1] for x in sub if x[0] == 'r')
+
+        def copy_ok(b, i, m):
+            """the copy made by statement i is itself only used for arithmetic and tests"""
+            for st in b.stmts[i + 1:] + [b.term]:
+                for e in stmt_exprs(st)[0]:
+                    if e == ('r', m):
+                        return False
+                    sub = []
+                    walk_expr(e, sub)
+                    if ('r', m) in sub:
+                        before = set(plain)
+                        reads(e, st[0] in ('set', 'br'))
+                        bad = m in plain and m not in before
+                        if m not in before:
+                            plain.discard(m)
+                        if bad:
+                            return False
+                if m in _writes_of(st):
+                    return True
+            return True
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts + [b.term]):
+                for e in stmt_exprs(st)[0]:
+                    if e[0] == 'r' and st[0] == 'set' and st[1][0] == 'r' and i < len(b.stmts):
+                        if not copy_ok(b, i, st[1][1]):
+                            plain.add(e[1])
+                    else:
+                        reads(e, st[0] in ('set', 'br'))
+        order, IN = self._reaching()
+        memo = {}
+
+        def def_ok(d):
+            if d[0] == 'ENTRY':
+                return d[1] in params and d[1] not in plain
+            if d[1] == 'T':
+                return False
+            if d in memo:
+                return memo[d]
+            memo[d] = True
+            st = blocks[d[0]].stmts[d[1]]
+            res = st[0] == 'set' and ok(local(blocks[d[0]], d[1], st[2]), d[0])
+            memo[d] = res
+            return res
+
+        def ok(e, bid):
+            if e is None:
+                return False
+            if e[0] == 'k':
+                return True
+            if e[0] == 'r':
+                ds = IN.get(bid, {}).get(e[1]) or [('ENTRY', e[1])]
+                return all(def_ok(d) for d in ds)
+            if e[0] == 'up':
+                return e[1] in ups
+            if e[0] == 'bin':
+                return ok(e[2], bid) and ok(e[3], bid)
+            if e[0] == 'call':
+                return all(ok(x, bid) for x in e[2])
+            return False
+
+        def opaque(b, i, e):
+            e = local(b, i, e)
+            return e is not None and e[0] != 'k' and ok(e, b.id)
+
+        def value(b, i, e):
+            """the number e holds before statement i, when the block alone determines it"""
+            e = local(b, i, e)
+            return None if e is None else _opaque_eval(e, ups)
+
+        def scrambles(b):
+            """the block updates an opaque number: what the losing side of a guard starts with"""
+            for i, st in enumerate(b.stmts):
+                if st[0] != 'set':
+                    continue
+                if st[1][0] == 'up' and st[1][1] in ups:
+                    return True
+                if st[1][0] == 'r':
+                    e = local(b, i, st[2])
+                    if e is not None and e[0] != 'k' and ok(e, b.id):
+                        sub = []
+                        walk_expr(e, sub)
+                        if st[1] in sub:
+                            return True
+            return False
+
+        # what the functions created here capture
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
+                    got = {}
+                    for n, c in enumerate(st[2][2]):
+                        if c[0] in ('val', 'ref'):
+                            m = c[1][1] if isinstance(c[1], tuple) else c[1]
+                            v = local(b, i, ('r', m))
+                            if v is None or not ok(v, b.id):
+                                continue
+                            # a shared variable is updated right after the function is made
+                            got[n] = value(b, i if c[0] == 'val' else len(b.stmts), ('r', m))
+                        elif c[0] != 'const' and c[1] in ups:
+                            got[n] = ups[c[1]]
+                    OPAQUE_UPS[st[2][1]] = got
+        return opaque, value, scrambles
+
     def _cut_cold_magic(self):
-        """Key checks (`x == 149143557`, compared against a large magic number) whose failing side
-        the traced run never took: that side is Luraph's tamper response.  It is cut before the
-        state machine is unflattened, because it usually corrupts the state register on purpose."""
+        """Key checks (`x == 149143557`: one of Luraph's opaque state numbers compared against a
+        large magic number): one side is the tamper response, and the check itself is not part of
+        the program.  The losing side is the one the traced run never took; in code that never ran
+        it is the side that scrambles the number, or the one the number's value rules out.  The
+        check is removed before the state machine is unflattened, because the losing side usually
+        corrupts the state register on purpose.  A test of anything else
+        (`game.PlaceId == 7465136166`) is the program's own."""
         blocks = self.blocks
         self.compute_preds()
+        opaque, value, scrambles = self._opaque_numbers()
         cut = 0
         for b in list(blocks.values()):
-            if b.term[0] != 'br':
+            if b.term[0] != 'br' or b.term[2] == b.term[3]:
                 continue
             e = b.term[1]
-            while e[0] == 'un' and e[1] == 'not':
-                e = e[2]
-            if e[0] == 'r':
+            flip = False
+            for _ in range(8):
+                while e[0] == 'un' and e[1] == 'not':
+                    e = e[2]
+                    flip = not flip
+                if e[0] != 'r':
+                    break
                 for st in reversed(b.stmts):
                     if e[1] in _writes_of(st):
                         e = st[2] if st[0] == 'set' and st[1] == e else ('k', None)
                         break
-            while e[0] == 'un' and e[1] == 'not':
-                e = e[2]
+                else:
+                    break
             if not (e[0] == 'bin' and e[1] in ('==', '~=')):
                 continue
             consts = [x[1] for x in (e[2], e[3]) if _isnum(x)]
             if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != round(consts[0]):
                 continue
-            for sid in set(b.succs()):
-                sb = blocks[sid]
-                if sb.stmts and sb.stmts[0][0] == 'cold' and len(sb.preds) == 1:
-                    sb.stmts = [('trap', None)]
-                    sb.term = ('ret', [], None)
-                    cut += 1
+            other = e[3] if _isnum(e[2]) else e[2]
+            n = len(b.stmts)
+            if not opaque(b, n, other):
+                continue
+            arms = (b.term[2], b.term[3])
+            coldside = [sid for sid in arms if blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold'
+                        and len(blocks[sid].preds) == 1]
+            v = value(b, n, other)
+            known = None if v is None else arms[0 if ((v == consts[0]) == (e[1] == '==')) != flip else 1]
+            if len(coldside) == 1:
+                lose = coldside[0]
+            else:
+                scr = [sid for sid in arms if len(blocks[sid].preds) == 1 and scrambles(blocks[sid])]
+                if len(scr) == 1 and (known is None or known != scr[0]):
+                    lose = scr[0]
+                elif not scr and known is not None:
+                    lose = arms[1] if known == arms[0] else arms[0]
+                else:
+                    continue
+            b.term = ('goto', arms[1] if lose == arms[0] else arms[0])
+            cut += 1
         if cut:
             self._prune()
             self.compute_preds()
@@ -1451,6 +1676,21 @@ class ProtoCFG:
                 if r != s:
                     b.retarget(s, r)
         self.entry = resolve(self.entry)
+        # the loop instruction of a for-loop can exist twice (one copy tests on entry, one closes the
+        # body): identical empty copies are one block
+        same = {}
+        for b in sorted(blocks.values(), key=lambda b: str(b.id)):
+            if b.term[0] == 'forbr' and not b.stmts:
+                first = same.setdefault(repr(b.term), b.id)
+                if first != b.id:
+                    fwd[b.id] = first
+        if any(blocks[k].term[0] == 'forbr' for k in fwd):
+            for b in blocks.values():
+                for s in list(b.succs()):
+                    if s in fwd and blocks[s].term[0] == 'forbr':
+                        b.retarget(s, fwd[s])
+            if self.entry in fwd and blocks[self.entry].term[0] == 'forbr':
+                self.entry = fwd[self.entry]
         self._prune()
         # merge linear chains
         changed = True
