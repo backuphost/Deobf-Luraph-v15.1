@@ -1275,6 +1275,31 @@ class ProtoCFG:
                     OPAQUE_UPS[st[2][1]] = got
         return opaque, value, scrambles, def_ok, local, IN, ups
 
+    def _used_as_object(self, b, src):
+        """The value `src` (an upvalue captured by value, or a register the block does not assign)
+        is indexed or called somewhere in block b, and the block negates it twice for its test."""
+        holds = set()
+        if src[0] == 'r':
+            if any(src[1] in _writes_of(st) for st in b.stmts):
+                return False
+            holds.add(src[1])
+        used = False
+        nots = 0
+        for st in b.stmts:
+            for e in stmt_exprs(st)[0]:
+                for x in walk_expr(e, []):
+                    if x[0] in ('index', 'method', 'call') and (x[1] == src or (x[1][0] == 'r' and x[1][1] in holds)):
+                        used = True
+            if st[0] == 'set' and st[1][0] == 'r':
+                if st[2] == src or (st[2][0] == 'r' and st[2][1] in holds):
+                    holds.add(st[1][1])
+                    continue
+                if st[2][0] == 'un' and st[2][1] == 'not':
+                    nots += 1
+            for r in _writes_of(st):
+                holds.discard(r)
+        return used and nots >= 2
+
     def _cut_cold_magic(self):
         """Key checks (`x == 149143557`: one of Luraph's opaque state numbers compared against a
         large magic number): one side is the tamper response, and the check itself is not part of
@@ -1307,6 +1332,14 @@ class ProtoCFG:
                         break
                 else:
                     break
+            if e[0] in ('upcell', 'r') and (flip or b.term[1][0] == 'r') and self._used_as_object(b, e):
+                # `if not not x then` right after x was indexed or called: an opaque predicate,
+                # x cannot be nil or false there
+                keep = b.term[3] if flip else b.term[2]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
             if e[0] == 'upcell' and e[1] in FUNCTION_UPS.get(self.pir.key, ()):
                 # `if f then` on a function captured by value: an opaque predicate, always true
                 keep = b.term[3] if flip else b.term[2]

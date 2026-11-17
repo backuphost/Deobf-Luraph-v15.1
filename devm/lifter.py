@@ -594,6 +594,22 @@ class Lifter:
                     key2 = key2 + (known[r],)
                     if pred is not None:
                         pred.tree = retarget_tree(pred.tree, {id(pend): key2})
+            if key2 in pir.nodes and pathmode and pir.nodes[key2].error and relifts.get(('err', key2), 0) < 6 \
+                    and (key, key2[0], key2[1]) not in self.oracle:
+                # The instruction did not lift on the path that got here first.  That path may have
+                # been the dead side of an opaque predicate, which leaves the code in a state no
+                # real path has: try again with the state of this one.
+                relifts[('err', key2)] = relifts.get(('err', key2), 0) + 1
+                del pir.nodes[key2]
+                pir.errors = [e for e in pir.errors if e[0] != key2]
+            if key2 in pir.nodes and pathmode and not pir.nodes[key2].tree[0]:
+                # an instruction that only passes control on (a jump through a register): the same
+                # goes for what it leads to
+                for end, kn in self.known_after(pir.nodes[key2].tree, known):
+                    nxt = pir.nodes.get(end[1]) if end[0] == 'goto' else None
+                    if nxt is not None and nxt.error and relifts.get(('err', end[1]), 0) < 6 \
+                            and (key, end[1][0], end[1][1]) not in self.oracle:
+                        work.append((end[1], end[2], kn, pir.nodes[key2], end, path))
             if key2 in pir.nodes:
                 node = pir.nodes[key2]
                 if self.constprop:
