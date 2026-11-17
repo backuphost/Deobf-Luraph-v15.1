@@ -305,6 +305,8 @@ def rpo_order(cfg):
 # function key -> {index of an upvalue that holds an opaque state number: its value when the function
 # runs, if known} (filled in by the parent)
 OPAQUE_UPS = {}
+# function key -> indexes of the upvalues that hold a function captured by value
+FUNCTION_UPS = {}
 
 
 def _opaque_eval(e, ups):
@@ -990,6 +992,26 @@ class ProtoCFG:
             for i, st in enumerate(b.stmts):
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
                     got = {}
+                    fns = set()
+                    for n, c in enumerate(st[2][2]):
+                        if c[0] == 'val':
+                            # a function captured by value stays a function
+                            m = c[1][1] if isinstance(c[1], tuple) else c[1]
+                            for j in range(i - 1, -1, -1):
+                                if m in _writes_of(b.stmts[j]):
+                                    sj = b.stmts[j]
+                                    if sj[0] == 'set' and isinstance(sj[2], tuple) and sj[2][0] == 'closure':
+                                        fns.add(n)
+                                    break
+                            else:
+                                ds = IN.get(b.id, {}).get(m) or ()
+                                if ds and all(d[0] != 'ENTRY' and d[1] != 'T' and blocks[d[0]].stmts[d[1]][0] == 'set'
+                                              and isinstance(blocks[d[0]].stmts[d[1]][2], tuple)
+                                              and blocks[d[0]].stmts[d[1]][2][0] == 'closure' for d in ds):
+                                    fns.add(n)
+                        elif c[0] not in ('ref', 'const') and c[1] in FUNCTION_UPS.get(self.pir.key, ()):
+                            fns.add(n)
+                    FUNCTION_UPS[st[2][1]] = fns
                     for n, c in enumerate(st[2][2]):
                         if c[0] in ('val', 'ref'):
                             m = c[1][1] if isinstance(c[1], tuple) else c[1]
@@ -1020,18 +1042,28 @@ class ProtoCFG:
                 continue
             e = b.term[1]
             flip = False
-            for _ in range(8):
+            pos = len(b.stmts)
+            while True:
                 while e[0] == 'un' and e[1] == 'not':
                     e = e[2]
                     flip = not flip
                 if e[0] != 'r':
                     break
-                for st in reversed(b.stmts):
+                for j in range(pos - 1, -1, -1):
+                    st = b.stmts[j]
                     if e[1] in _writes_of(st):
                         e = st[2] if st[0] == 'set' and st[1] == e else ('k', None)
+                        pos = j
                         break
                 else:
                     break
+            if e[0] == 'upcell' and e[1] in FUNCTION_UPS.get(self.pir.key, ()):
+                # `if f then` on a function captured by value: an opaque predicate, always true
+                keep = b.term[3] if flip else b.term[2]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
             if not (e[0] == 'bin' and e[1] in ('==', '~=')):
                 continue
             consts = [x[1] for x in (e[2], e[3]) if _isnum(x)]

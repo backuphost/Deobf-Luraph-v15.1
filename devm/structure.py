@@ -4,7 +4,7 @@ import math
 import re
 
 from . import beautify
-from .ircfg import ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
+from .ircfg import Block, ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
 
 
 DUP_LIMIT = 40
@@ -391,17 +391,32 @@ def make_reducible(cfg, limit=300):
     raise Unstructured('irreducible control flow')
 
 
+def _all_exprs(e):
+    out = []
+    walk_expr(e, out)
+    return out
+
+
 # ------------------------------------------------------------------ structuring
 class Structurer:
     def __init__(self, cfg):
         self.cfg = cfg
         self.blocks = cfg.blocks
+        self.ndup = 0
         make_reducible(cfg)
         cfg.compute_preds()
         self.order = rpo(cfg)
         self.rpo_idx = {b: i for i, b in enumerate(self.order)}
         self._dominators()
         self._loops()
+        for _ in range(6):
+            if not self._split_small_joins():
+                break
+            cfg.compute_preds()
+            self.order = rpo(cfg)
+            self.rpo_idx = {b: i for i, b in enumerate(self.order)}
+            self._dominators()
+            self._loops()
         self.emitted = {}
         self.depth = 0
         self.pending = {}
@@ -433,6 +448,40 @@ class Structurer:
                     idom[b] = new
                     changed = True
         self.idom = idom
+
+    def _split_small_joins(self):
+        """A branch whose arms meet at two join points needs a block that is left early (and a flag
+        when the exits nest).  When one of the join points is tiny (`x = {}` and on to the other
+        one: the shared else of `a and b or c`), every way into it gets its own copy instead."""
+        blocks = self.blocks
+        done = 0
+        for b in list(self.order):
+            ms = self.merge_children(b)
+            if len(ms) < 2:
+                continue
+            for m in ms:
+                blk = blocks[m]
+                if m in self.loop_nodes or blk.term[0] not in ('goto', 'ret') or len(blk.stmts) > 2:
+                    continue
+                if blk.term[0] == 'goto' and blk.term[1] == m:
+                    continue
+                if any(st[0] != 'set' or any(x[0] == 'closure' for x in _all_exprs(st[2])) for st in blk.stmts):
+                    continue
+                preds = sorted(blk.preds, key=lambda x: self.rpo_idx.get(x, 0))
+                if len(preds) < 2 or len(preds) > 4 or self.ndup + len(preds) > 400:
+                    continue
+                for n, pr in enumerate(preds[1:]):
+                    self.ndup += 1
+                    nb = Block((m, 'copy', self.ndup))
+                    nb.stmts = list(blk.stmts)
+                    nb.term = blk.term
+                    blocks[nb.id] = nb
+                    blocks[pr].retarget(m, nb.id)
+                done += 1
+                break
+            if done:
+                break
+        return done
 
     def dominates(self, a, b):
         while True:
