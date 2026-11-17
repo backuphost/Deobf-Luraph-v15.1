@@ -602,14 +602,24 @@ class Lifter:
                 relifts[('err', key2)] = relifts.get(('err', key2), 0) + 1
                 del pir.nodes[key2]
                 pir.errors = [e for e in pir.errors if e[0] != key2]
-            if key2 in pir.nodes and pathmode and not pir.nodes[key2].tree[0]:
-                # an instruction that only passes control on (a jump through a register): the same
-                # goes for what it leads to
-                for end, kn in self.known_after(pir.nodes[key2].tree, known):
-                    nxt = pir.nodes.get(end[1]) if end[0] == 'goto' else None
-                    if nxt is not None and nxt.error and relifts.get(('err', end[1]), 0) < 6 \
-                            and (key, end[1][0], end[1][1]) not in self.oracle:
-                        work.append((end[1], end[2], kn, pir.nodes[key2], end, path))
+            if key2 in pir.nodes and pathmode and not pir.nodes[key2].error:
+                # ... also when the failure is a few straight-line instructions further on: they are
+                # lifted again from here, on this path
+                chain, x = [key2], key2
+                while len(chain) <= 8:
+                    ends = [e for e in tree_ends(pir.nodes[x].tree)]
+                    if len(ends) != 1 or ends[0][0] != 'goto' or ends[0][1] not in pir.nodes or ends[0][1] in chain:
+                        break
+                    x = ends[0][1]
+                    chain.append(x)
+                    if pir.nodes[x].error:
+                        break
+                if pir.nodes[x].error and x != key2 and relifts.get(('err', x), 0) < 6 \
+                        and (key, x[0], x[1]) not in self.oracle:
+                    relifts[('err', x)] = relifts.get(('err', x), 0) + 1
+                    for c in chain:
+                        del pir.nodes[c]
+                    pir.errors = [e for e in pir.errors if e[0] not in chain]
             if key2 in pir.nodes:
                 node = pir.nodes[key2]
                 if self.constprop:

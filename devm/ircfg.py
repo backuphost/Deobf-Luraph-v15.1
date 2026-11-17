@@ -1275,6 +1275,19 @@ class ProtoCFG:
                     OPAQUE_UPS[st[2][1]] = got
         return opaque, value, scrambles, def_ok, local, IN, ups
 
+    def _double_not(self, b):
+        n = 0
+        for st in b.stmts[-4:]:
+            if st[0] == 'set' and st[2][0] == 'un' and st[2][1] == 'not':
+                n += 1
+                if st[2][2][0] == 'un' and st[2][2][1] == 'not':
+                    n += 1
+        e = b.term[1]
+        while e[0] == 'un' and e[1] == 'not':
+            n += 1
+            e = e[2]
+        return n >= 2
+
     def _used_as_object(self, b, src):
         """The value `src` (an upvalue captured by value, or a register the block does not assign)
         is indexed or called somewhere in block b, and the block negates it twice for its test."""
@@ -1340,6 +1353,17 @@ class ProtoCFG:
                     b.term = ('goto', keep)
                     cut += 1
                 continue
+            if e[0] in ('upcell', 'r', 'up') and self._double_not(b):
+                # `if not not x then` whose false side starts by scrambling an opaque number
+                lose = b.term[2] if flip else b.term[3]
+                keep = b.term[3] if flip else b.term[2]
+                lb = blocks[lose]
+                if len(lb.preds) == 1 and not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold') and (
+                        scrambles(lb) or any(st[0] == 'set' and st[1][0] in ('up', 'r') and _isnum(st[2])
+                                             and abs(st[2][1]) >= 2 ** 24 for st in lb.stmts[:2])):
+                    b.term = ('goto', keep)
+                    cut += 1
+                    continue
             if e[0] == 'upcell' and e[1] in FUNCTION_UPS.get(self.pir.key, ()):
                 # `if f then` on a function captured by value: an opaque predicate, always true
                 keep = b.term[3] if flip else b.term[2]
