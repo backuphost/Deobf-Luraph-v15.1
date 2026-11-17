@@ -755,14 +755,19 @@ class ProtoCFG:
                     for r in _writes_of(st):
                         cur[r] = frozenset([(bid, i)])
             removed = False
+            # (a register shared with a closure is only that while the variable is in scope; the
+            # same register serves as a temporary before and after)
+            CIN = self.captured_open() if captured else {}
             for bid in order:
                 b = self.blocks[bid]
                 keep = []
+                copen = set(CIN.get(bid, ()))
                 for i, st in enumerate(b.stmts):
                     if st[0] == 'set' and st[1][0] == 'r' and st[2][0] in PURE and (bid, i) not in used \
-                            and st[1][1] not in captured:
+                            and st[1][1] not in copen:
                         removed = True
                         continue
+                    copen = cap_step(copen, st)
                     keep.append(st)
                 b.stmts = keep
             if not removed:
