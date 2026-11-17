@@ -273,7 +273,14 @@ class Lifter:
                         del known[n]
             if term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
                 # (the not-a-number test inside a 32-bit multiply: only one side happens)
+                n0 = len(out)
                 walk(term[2] if truth[term[1][1]] else term[3], known, temps, calls)
+                taken = {tuple(t[1]): kn for t, kn in out[n0:] if t[0] == 'goto'}
+                # the other side is still part of the instruction's tree: where it leads must
+                # exist, with the registers as the real side leaves them
+                n1 = len(out)
+                walk(term[3] if truth[term[1][1]] else term[2], known, temps, calls)
+                out[n1:] = [(t, taken.get(tuple(t[1]), kn) if t[0] == 'goto' else kn) for t, kn in out[n1:]]
             elif term[0] == 'br':
                 walk(term[2], known, temps, calls)
                 walk(term[3], known, temps, calls)
