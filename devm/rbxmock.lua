@@ -1158,7 +1158,10 @@ return function(G, fnames, libnames)
 	if G.setvectormetatable and G.vector then
 		local vec = G.vector
 		local create = vec.create
-		local function v3(x, y, z) return create(x or 0, y or 0, z or 0) end
+		-- (a component that is not a number is a stand-in value from the analysis run: the vector
+		-- is built all the same, so that the code after it gets to run)
+		local function comp(x) return type(x) == "number" and x or 0 end
+		local function v3(x, y, z) return create(comp(x), comp(y), comp(z)) end
 		local function sign(x) return x > 0 and 1 or (x < 0 and -1 or 0) end
 		local methods = {
 			Abs = function(a) return vec.abs(a) end,
