@@ -386,6 +386,8 @@ class ProtoCFG:
             self._thread()
         self._detect_params()
         self._cut_cold_magic()
+        if self._drop_opaque_numbers():
+            self._dead_stores()
         if UNFLATTEN and not os.environ.get('DEVM_NO_UNFLATTEN'):
             self._unflatten()
         for _ in range(4):
@@ -1211,7 +1213,7 @@ class ProtoCFG:
                         elif c[0] != 'const' and c[1] in ups:
                             got[n] = ups[c[1]]
                     OPAQUE_UPS[st[2][1]] = got
-        return opaque, value, scrambles
+        return opaque, value, scrambles, def_ok, local, IN, ups
 
     def _cut_cold_magic(self):
         """Key checks (`x == 149143557`: one of Luraph's opaque state numbers compared against a
@@ -1223,7 +1225,7 @@ class ProtoCFG:
         (`game.PlaceId == 7465136166`) is the program's own."""
         blocks = self.blocks
         self.compute_preds()
-        opaque, value, scrambles = self._opaque_numbers()
+        opaque, value, scrambles = self._opaque_numbers()[:3]
         cut = 0
         for b in list(blocks.values()):
             if b.term[0] != 'br' or b.term[2] == b.term[3]:
@@ -1282,6 +1284,89 @@ class ProtoCFG:
             self._prune()
             self.compute_preds()
         return cut
+
+    def _drop_opaque_numbers(self):
+        """With the guards gone nothing reads the opaque state numbers any more, except their own
+        updates.  Those assignments are removed here, where the registers are still apart (in the
+        text they may share a variable with something real)."""
+        blocks = self.blocks
+        self.compute_preds()
+        _, _, _, def_ok, local, IN, ups = self._opaque_numbers()
+        cand = set()
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'set' and st[1][0] == 'r' and def_ok((b.id, i)):
+                    cand.add((b.id, i))
+
+        def defs_at(b, i, m):
+            for j in range(i - 1, -1, -1):
+                if m in _writes_of(b.stmts[j]):
+                    return [(b.id, j)]
+            return IN.get(b.id, {}).get(m) or ()
+
+        def plain_reads(e, out):
+            if e[0] == 'r':
+                out.add(e[1])
+            elif e[0] == 'closure':
+                opq = OPAQUE_UPS.get(e[1], {})
+                for n, c in enumerate(e[2]):
+                    if c[0] in ('val', 'ref') and n not in opq:
+                        out.add(c[1][1] if isinstance(c[1], tuple) else c[1])
+            elif e[0] == 'bin':
+                plain_reads(e[2], out); plain_reads(e[3], out)
+            elif e[0] == 'un':
+                plain_reads(e[2], out)
+            elif e[0] in ('index', 'and', 'or'):
+                plain_reads(e[1], out); plain_reads(e[2], out)
+            elif e[0] == 'call':
+                plain_reads(e[1], out)
+                for a in e[2]:
+                    plain_reads(a, out)
+                if len(e) > 3 and e[3]:
+                    plain_reads(e[3], out)
+            elif e[0] == 'method':
+                plain_reads(e[1], out)
+            elif e[0] == 'table':
+                for k, v in e[1]:
+                    if k is not None:
+                        plain_reads(k, out)
+                    plain_reads(v, out)
+                if e[2]:
+                    plain_reads(e[2], out)
+            else:
+                out.update(expr_reads(e)[0])
+
+        changed = True
+        while changed:
+            changed = False
+            for b in blocks.values():
+                for i, st in enumerate(b.stmts + [b.term]):
+                    if i < len(b.stmts) and ((b.id, i) in cand or (
+                            st[0] == 'set' and st[1][0] == 'up' and st[1][1] in ups)):
+                        continue
+                    regs = set()
+                    for e in stmt_exprs(st)[0]:
+                        plain_reads(e, regs)
+                    for m in regs:
+                        for d in defs_at(b, min(i, len(b.stmts)), m):
+                            if d in cand:
+                                cand.discard(d)
+                                changed = True
+        drop = {}
+        for bid, i in cand:
+            b = blocks[bid]
+            e = local(b, i, b.stmts[i][2])
+            if e is not None and e[0] == 'k' and abs(e[1]) < 65536:
+                continue
+            drop.setdefault(bid, set()).add(i)
+        n = 0
+        for b in blocks.values():
+            d = drop.get(b.id, ())
+            new = [st for i, st in enumerate(b.stmts) if i not in d
+                   and not (st[0] == 'set' and st[1][0] == 'up' and st[1][1] in ups)]
+            n += len(b.stmts) - len(new)
+            b.stmts = new
+        return n
 
     def _cut_cold_edges(self):
         """Opaque predicates.  Luraph guards its code with tests of the form `key == 1234` whose
