@@ -83,11 +83,210 @@ def strip(text):
             break
         text = new
     for _ in range(20):
-        new = _drop_opaque_params(_drop_orphans(text))
+        new = _drop_opaque_flow(_drop_opaque_params(_drop_orphans(text)))
         if new == text:
             break
         text = new
     return text
+
+
+_OPQ_FN = re.compile(r'bit32\.\w+')
+
+
+def _drop_opaque_flow(text):
+    """Opaque state numbers that travel: computed from one another, passed to functions as
+    arguments, received in parameters that nothing reads except to pass them on.  Found as the
+    largest set of variables every occurrence of which is one of those roles; their assignments,
+    the parameters and the arguments are removed together."""
+    names = {}
+    for m in re.finditer(r'\b[vp]\d+\b', text):
+        names.setdefault(m.group(0), []).append(m.start())
+    if not names:
+        return text
+    line_start = [0]
+    for m in re.finditer('\n', text):
+        line_start.append(m.end())
+    import bisect
+
+    def line_of(pos):
+        i = bisect.bisect_right(line_start, pos) - 1
+        a = line_start[i]
+        b = text.find('\n', a)
+        return a, (len(text) if b < 0 else b)
+
+    # function definitions with a plain name, and their call sites
+    defs = {}
+    for m in re.finditer(r'(?m)^[ \t]*(?:local (v\d+) = function|local function (v\d+)|(v\d+) = function)\(([^)\n]*)\)', text):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if name in defs:
+            defs[name] = None            # assigned twice: not one function
+            continue
+        params = [x.strip() for x in m.group(4).split(',') if x.strip()]
+        defs[name] = {'params': params, 'span': (m.start(4), m.end(4)), 'namepos': m.start(1 if m.group(1) else 2 if m.group(2) else 3),
+                      'calls': [], 'ok': True}
+    for name, d in defs.items():
+        if not d:
+            continue
+        for pos in names.get(name, ()):
+            if pos == d['namepos']:
+                continue
+            end = pos + len(name)
+            before = text[pos - 1:pos]
+            # (`local v5` forward declarations are fine)
+            a, b = line_of(pos)
+            if re.fullmatch(r'\s*local [\w, ]+', text[a:b]):
+                continue
+            if text[end:end + 1] != '(' or before in ('.', ':'):
+                d['ok'] = False
+                break
+            args, close = _call_args(text, end)
+            if args is None:
+                d['ok'] = False
+                break
+            d['calls'].append(args)
+    defs = {k: d for k, d in defs.items() if d and d['ok']}
+    # parameter -> (function, index); argument spans per (function, index)
+    param_of = {}
+    for name, d in defs.items():
+        for k, prm in enumerate(d['params']):
+            if re.fullmatch(r'p\d+', prm):
+                param_of[prm] = (name, k)
+
+    cand = set(names)
+    sinks = {(f, k) for prm, (f, k) in param_of.items()}
+
+    def opaque_expr(t):
+        t = _OPQ_FN.sub(' ', t)
+        for nm in re.findall(r'\b[A-Za-z_]\w*\b', t):
+            if nm not in cand:
+                return False
+        return re.fullmatch(r'[\w\s()+\-*/%,.]*', t) is not None and t.strip() != ''
+
+    def_line = re.compile(r'\s*(?:local )?([vp]\d+) = (.+)')
+
+    def role(name, pos):
+        """how this occurrence is accounted for, or None"""
+        a, b = line_of(pos)
+        ln = text[a:b]
+        if re.fullmatch(r'\s*local [\w, ]+', ln):
+            return ('decl', a, b)
+        if name in param_of:
+            f, k = param_of[name]
+            sa, sb = defs[f]['span']
+            if sa <= pos < sb:
+                return ('param', f, k) if (f, k) in sinks else None
+        m = def_line.fullmatch(ln)
+        if m and m.group(1) in cand and opaque_expr(m.group(2)):
+            return ('def', a, b)
+        # an argument of a sink call
+        for f, k in sinks:
+            for args in defs[f]['calls']:
+                if k < len(args) and args[k][0] <= pos < args[k][1]:
+                    return ('arg', f, k) if opaque_expr(text[args[k][0]:args[k][1]]) else None
+        return None
+
+    # (argument lookup by position, instead of scanning every sink for every occurrence)
+    arg_at = []
+    for f, d in defs.items():
+        for args in d['calls']:
+            for k, (x, y) in enumerate(args):
+                arg_at.append((x, y, f, k))
+    arg_at.sort()
+    arg_starts = [x[0] for x in arg_at]
+
+    def role(name, pos):          # noqa: F811
+        a, b = line_of(pos)
+        ln = text[a:b]
+        if re.fullmatch(r'\s*local [\w, ]+', ln):
+            return ('decl', a, b)
+        if name in param_of:
+            f, k = param_of[name]
+            sa, sb = defs[f]['span']
+            if sa <= pos < sb:
+                return ('param', f, k) if (f, k) in sinks else None
+        m = def_line.fullmatch(ln)
+        if m and m.group(1) in cand and opaque_expr(m.group(2)):
+            return ('def', a, b)
+        i = bisect.bisect_right(arg_starts, pos) - 1
+        while i >= 0 and i > bisect.bisect_right(arg_starts, pos) - 40:
+            x, y, f, k = arg_at[i]
+            if x <= pos < y and (f, k) in sinks:
+                return ('arg', f, k) if opaque_expr(text[x:y]) else None
+            i -= 1
+        return None
+
+    changed = True
+    rounds = 0
+    while changed and rounds < 60:
+        changed = False
+        rounds += 1
+        for name in list(cand):
+            if any(role(name, pos) is None for pos in names[name]):
+                cand.discard(name)
+                changed = True
+        for f, k in list(sinks):
+            d = defs[f]
+            prm = d['params'][k]
+            if prm not in cand or not d['calls'] or any(
+                    k >= len(args) or not opaque_expr(text[args[k][0]:args[k][1]]) for args in d['calls']):
+                sinks.discard((f, k))
+                changed = True
+    # something has to be an opaque number to begin with: a variable set to a large constant
+    seeds = {n for n in cand if any(re.fullmatch(r'\s*(?:local )?%s = \d{7,}' % n, text[slice(*line_of(p))]) for p in names[n])}
+    live = set(seeds)
+    grew = True
+    while grew:
+        grew = False
+        for n in cand - live:
+            for p in names[n]:
+                r = role(n, p)
+                a, b = line_of(p)
+                if r and r[0] == 'def' and any(x in live for x in re.findall(r'\b[vp]\d+\b', text[a:b]) if x != n):
+                    live.add(n)
+                    grew = True
+                    break
+                if r and r[0] == 'param':
+                    f, k = r[1], r[2]
+                    if any(set(re.findall(r'\b[vp]\d+\b', text[args[k][0]:args[k][1]])) & live
+                           or re.fullmatch(r'\s*\d{7,}\s*', text[args[k][0]:args[k][1]]) for args in defs[f]['calls']):
+                        live.add(n)
+                        grew = True
+                        break
+    if not live:
+        return text
+    cuts = []
+    drop_sinks = {param_of[n] for n in live if n in param_of and param_of[n] in sinks}
+    for n in live:
+        for p in names[n]:
+            r = role(n, p)
+            if r and r[0] == 'def':
+                a, b = r[1], r[2]
+                cuts.append((a, min(len(text), b + 1), ''))
+            elif r and r[0] == 'decl':
+                a, b = r[1], r[2]
+                ln = text[a:b]
+                rest = [x.strip() for x in ln.strip()[len('local '):].split(',') if x.strip() and x.strip() not in live]
+                ind = ln[:len(ln) - len(ln.lstrip())]
+                cuts.append((a, min(len(text), b + 1), (ind + 'local ' + ', '.join(rest) + '\n') if rest else ''))
+    for f, k in drop_sinks:
+        d = defs[f]
+        params = [x for i, x in enumerate(d['params']) if (f, i) not in drop_sinks]
+        cuts.append((d['span'][0], d['span'][1], ', '.join(params)))
+        for args in d['calls']:
+            keep = [text[x:y].strip() for i, (x, y) in enumerate(args) if (f, i) not in drop_sinks]
+            if args:
+                cuts.append((args[0][0], args[-1][1], ', '.join(keep)))
+    # apply, last first; overlapping edits (nested calls) are left for the next round
+    cuts = sorted(set(cuts))
+    out, pos = [], 0
+    for a, b, rep in cuts:
+        if a < pos:
+            continue
+        out.append(text[pos:a])
+        out.append(rep)
+        pos = b
+    out.append(text[pos:])
+    return ''.join(out)
 
 
 def _call_args(text, i):

@@ -180,7 +180,7 @@ def assign_variables(cfg, namer, coalesce=False):
         for d in list(parent):
             r = d[2] if len(d) == 3 else d[1]
             if d[0] == 'param':
-                r = d[1]
+                r = cfg.param_regs[d[1] - 1]        # (the register the parameter arrives in)
             if r in cap:
                 continue
             if r in first:
@@ -1150,7 +1150,29 @@ def section_scopes(stmts, limit=150):
             outer.add(x)
         k += 4
         comps = components()
-    if not comps or len(outer) + max(c[2] for c in comps) > limit + 30:
+    # A function-level local declared inside a section needs a forward declaration.  Where a
+    # few section locals are all that span such declarations, they move up instead.
+    budget = 186 - len(outer) - max([c[2] for c in comps] or [0])
+    bars = sorted({decl[x] for x in outer})
+    import bisect
+    for a, b, cnt in sorted(comps, key=lambda c: -(bisect.bisect_right(bars, c[1]) - bisect.bisect_left(bars, c[0]))):
+        inside = bisect.bisect_right(bars, b) - bisect.bisect_left(bars, a)
+        if not inside:
+            break
+        cross = []
+        for x in decl:
+            if x not in outer and a <= decl[x] <= b:
+                i = bisect.bisect_right(bars, decl[x])
+                if i < len(bars) and bars[i] <= last[x]:
+                    cross.append(x)
+        if cross and len(cross) <= budget and len(cross) < inside:
+            outer.update(cross)
+            budget -= len(cross)
+    comps = components()
+    if os.environ.get('DEVM_TRACE_LOCALS'):
+        print('sections: %d locals, %d at function level, %d sections, largest %d' % (
+            len(decl), len(outer), len(comps), max([c[2] for c in comps] or [0])))
+    if not comps or len(outer) + max(c[2] for c in comps) > limit + 40:
         return False
     out = []
     pos = 0
@@ -1175,7 +1197,15 @@ def section_scopes(stmts, limit=150):
             out.extend(block)
         pos = b + 1
     out.extend(stmts[pos:])
-    stmts[:] = out
+    # forward declarations of one section on as few lines as it takes
+    merged = []
+    for st in out:
+        if st[0] == 'local' and not st[2] and merged and merged[-1][0] == 'local' and not merged[-1][2] \
+                and len(merged[-1][1]) + len(st[1]) <= 10:
+            merged[-1][1].extend(st[1])
+        else:
+            merged.append(st)
+    stmts[:] = merged
     return True
 
 
