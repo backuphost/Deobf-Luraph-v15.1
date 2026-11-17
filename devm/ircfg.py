@@ -1275,6 +1275,24 @@ class ProtoCFG:
                     OPAQUE_UPS[st[2][1]] = got
         return opaque, value, scrambles, def_ok, local, IN, ups
 
+    def _holds_function(self, b, pos, m, IN):
+        """register m holds a function created here on every path to statement pos of block b"""
+        if m in self.captured_ref:
+            return False
+        for j in range(pos - 1, -1, -1):
+            if m in _writes_of(b.stmts[j]):
+                return False        # (resolved by the caller when it is a plain assignment)
+        ds = IN.get(b.id, {}).get(m)
+        if not ds:
+            return False
+        for d in ds:
+            if d[0] == 'ENTRY' or d[1] == 'T':
+                return False
+            st = self.blocks[d[0]].stmts[d[1]]
+            if not (st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure'):
+                return False
+        return True
+
     def _double_not(self, b):
         n = 0
         for st in b.stmts[-4:]:
@@ -1323,7 +1341,7 @@ class ProtoCFG:
         (`game.PlaceId == 7465136166`) is the program's own."""
         blocks = self.blocks
         self.compute_preds()
-        opaque, value, scrambles = self._opaque_numbers()[:3]
+        opaque, value, scrambles, _, local, IN, _ = self._opaque_numbers()
         cut = 0
         for b in list(blocks.values()):
             if b.term[0] != 'br' or b.term[2] == b.term[3]:
@@ -1364,6 +1382,13 @@ class ProtoCFG:
                     b.term = ('goto', keep)
                     cut += 1
                     continue
+            if e[0] == 'closure' or (e[0] == 'r' and self._holds_function(b, pos, e[1], IN)):
+                # `if not f then` on a local function
+                keep = b.term[3] if flip else b.term[2]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
             if e[0] == 'upcell' and e[1] in FUNCTION_UPS.get(self.pir.key, ()):
                 # `if f then` on a function captured by value: an opaque predicate, always true
                 keep = b.term[3] if flip else b.term[2]
@@ -1377,9 +1402,15 @@ class ProtoCFG:
             if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != round(consts[0]):
                 continue
             other = e[3] if _isnum(e[2]) else e[2]
-            n = len(b.stmts)
-            if not opaque(b, n, other):
-                continue
+            n = pos        # (where the comparison is made: its operands may be reassigned after)
+            proven = opaque(b, n, other)
+            if not proven and value(b, n, other) is None:
+                # (both sides plain numbers also count: `x = 9575712; if x ~= 9575712 then`)
+                # Not provably one of the opaque numbers (the register is shared with other
+                # values on some path): then only arithmetic on registers, and only with the
+                # traced run's verdict
+                if local(b, n, other) is None:
+                    continue
             arms = (b.term[2], b.term[3])
             coldside = [sid for sid in arms if blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold'
                         and len(blocks[sid].preds) == 1]
@@ -1387,6 +1418,8 @@ class ProtoCFG:
             known = None if v is None else arms[0 if ((v == consts[0]) == (e[1] == '==')) != flip else 1]
             if len(coldside) == 1:
                 lose = coldside[0]
+            elif not proven and v is None:
+                continue
             else:
                 scr = [sid for sid in arms if len(blocks[sid].preds) == 1 and scrambles(blocks[sid])]
                 if len(scr) == 1 and (known is None or known != scr[0]):
