@@ -91,6 +91,9 @@ class Lifter:
         self.all_up_nums = {}
         self.lifting_key = None
         self.folds = {}
+        self.opaque_in = {}
+        self.sticky = {}
+        self.cur_node = None
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
@@ -164,6 +167,9 @@ class Lifter:
     def known_after(self, tree, known):
         """[(goto target, registers known to hold program tables)] for every exit of an instruction."""
         out = []
+        brs = []
+        cmps = []
+        memo = {}
         by_path = self.dump.by_path
 
         def walk(tree, known, temps=None, calls=None, tabs=None):
@@ -197,6 +203,34 @@ class Lifter:
                 if e[0] == 'bin' and e[1] in ('+', '-', '*', '/', '%', '^', '..', '//'):
                     return 'T'
                 return None
+
+            def decided(term):
+                """True / False when the branch has one outcome, else None.  The outcome of an
+                opaque predicate does not depend on the path: once seen, it holds for the
+                instruction also where the value's history is not known (a join of paths)."""
+                v = (absval(term[1]) or '')[:1]
+                slot = (self.cur_node, len(brs))
+                brs.append(term)
+                live = None if v not in ('T', 'F') else v == 'T'
+                if live is not None:
+                    for arm, side in ((term[2], False), (term[3], True)):
+                        if arm[0] and arm[0][0] == ('cold',) and live == side:
+                            pass
+                    if (term[2][0] and term[2][0][0] == ('cold',) and live) or \
+                            (term[3][0] and term[3][0][0] == ('cold',) and not live):
+                        return None         # (the traced run says otherwise)
+                    if self.sticky.get(slot, live) != live:
+                        self.sticky[slot] = 'conflict'
+                        return None
+                    self.sticky[slot] = live
+                    return live
+                prev = self.sticky.get(slot)
+                return prev if isinstance(prev, bool) else None
+
+            def live_side(term):
+                if id(term) not in memo:
+                    memo[id(term)] = decided(term)
+                return memo[id(term)]
 
             def used(e):
                 # indexing or calling it worked: it is not nil or false
@@ -239,6 +273,21 @@ class Lifter:
                     if e[0] in ('index', 'method') and isinstance(e[1], tuple):
                         used(e[1])
                     v = cabs.get(e[1]) if e[0] == 'mv' and e[2] == 1 else absval(e)
+                    if v is None and e[0] == 'bin' and e[1] in ('==', '~='):
+                        # a guard on an opaque number whose value is known
+                        x, y = num(e[2]), num(e[3])
+                        magic = any(q[0] == 'k' and P.is_num(q[1]) and not isinstance(q[1], bool)
+                                    and abs(q[1]) >= 2 ** 24 for q in (e[2], e[3]))
+                        slot = (self.cur_node, 'cmp', len(cmps))
+                        cmps.append(e)
+                        if x is not None and y is not None:
+                            v = 'T' if (x == y) == (e[1] == '==') else 'F'
+                            if magic and self.cur_node is not None:
+                                # (the outcome of a guard is the same on every path: it is kept for
+                                # the paths on which the number's history is not known)
+                                self.sticky[slot] = v if self.sticky.get(slot, v) == v else 'conflict'
+                        elif magic and self.sticky.get(slot) in ('T', 'F'):
+                            v = self.sticky[slot]
                     if st[1][0] == 't':
                         if v is not None:
                             tabs[st[1][1]] = v
@@ -354,11 +403,9 @@ class Lifter:
                 n1 = len(out)
                 walk(term[3] if truth[term[1][1]] else term[2], known, temps, calls)
                 out[n1:] = [(t, taken.get(tuple(t[1]), kn) if t[0] == 'goto' else kn) for t, kn in out[n1:]]
-            elif term[0] == 'br' and self.end_state and (absval(term[1]) or '')[:1] in ('T', 'F') \
-                    and not (term[2][0] and term[2][0][0] == ('cold',) and absval(term[1])[0] == 'T') \
-                    and not (term[3][0] and term[3][0][0] == ('cold',) and absval(term[1])[0] == 'F'):
+            elif term[0] == 'br' and self.end_state and self.cur_node is not None and live_side(term) is not None:
                 # an opaque predicate: only its live side exists (see lift_proto)
-                live = absval(term[1])[0] == 'T'
+                live = live_side(term)
                 self.folds[id(term)] = live
                 known[ABS] = frozenset(ab.items())
                 walk(term[2] if live else term[3], known, temps, calls, tabs)
@@ -796,6 +843,15 @@ class Lifter:
                     if isinstance(cur, Sym) and isinstance(cur.e, tuple) and cur.e[0] == 't' and P.is_num(v):
                         self.temp_vals.setdefault(cur.e[1], P.norm(v))
             node_in[key2] = known
+            keep = self.opaque_in.get((key, key2)) if pathmode else None
+            if keep and any(r not in known and r not in known.get(CAP, ()) for r in keep):
+                # An instruction that consumed opaque state numbers (a guard, a decryption step)
+                # sees the same numbers on every real path.  Where a later path arrives without
+                # knowing them (a join with something that lost track), it gets them back.
+                known = dict(known)
+                for r, v in keep.items():
+                    if r not in known and r not in known.get(CAP, ()):
+                        known[r] = v
             node = Node(key2)
             node.snap_in = snap
             pir.nodes[key2] = node
@@ -803,6 +859,13 @@ class Lifter:
             self.pe.write_log = wlog = [] if ppath and not self.end_state else None
             err = self.lift_node(interp, node, key2, snap, known, indirect, key)
             self.pe.write_log = None
+            if pathmode and err is None and node.kreads and node.tree is not None and all(
+                    st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'k' and isinstance(st[2][1], bool)
+                    for st in node.tree[0]) and node.tree[1][0] == 'goto':
+                big = {r: known[r] for r in node.kreads if isinstance(r, int) and P.is_num(known.get(r))
+                       and not isinstance(known.get(r), bool) and abs(known[r]) >= 2 ** 24}
+                if big:
+                    self.opaque_in.setdefault((key, key2), {}).update(big)
             if wlog and err is None:
                 # the instruction rewrote instructions of its own function that were lifted
                 # already (a jump that is patched after its first use): lift those again
@@ -910,11 +973,14 @@ class Lifter:
                 # so that the instruction patches it contains cannot touch real code
                 node.tree = opaque.cut_arms(node.tree, cut)
             self.folds = {}
+            self.cur_node = (key, key2)
             ends = self.known_after(node.tree, known)
             if self.folds and pathmode:
                 node.tree = fold_tree(node.tree, self.folds)
                 self.folds = {}
+                self.cur_node = None
                 ends = self.known_after(node.tree, known)
+            self.cur_node = None
             if any(end[1] in indirect for end, kn in ends):
                 # specialise jumps into a trampoline by the value it will jump through
                 special = {}
