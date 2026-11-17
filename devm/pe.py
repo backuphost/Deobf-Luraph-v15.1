@@ -194,6 +194,13 @@ class KNum(float):
     __slots__ = ()
 
 
+class UpNum(float):
+    """The number an upvalue held at the end of the traced run.  Luraph mixes opaque numbers kept in
+    upvalues into decryption keys; whether a given upvalue is one of those is not known, so the
+    value is only used when an instruction cannot be lifted without it (PE.use_upnum)."""
+    __slots__ = ()
+
+
 def keyed(r, *ops):
     if is_num(r) and not isinstance(r, KNum) and any(isinstance(o, KNum) for o in ops):
         return KNum(r)
@@ -736,6 +743,7 @@ class PE:
         # journalled, so that lifting an instruction again starts from the same state.
         self.frozen = False
         self.live_table_patches = None  # callable -> (('T', path, key, number), ...): shared-table entries this path changed
+        self.use_upnum = False
         self.replay_tables = set()  # ids of code arrays whose changes are replayed even for instructions that ran
         self.journal = None
         self.protect = None         # (path prefix of the proto's code arrays, executed pcs): known-final code
@@ -927,6 +935,8 @@ class PE:
         t = self.regknown.get(n)
         if n in self.regdirty or self.regdirty_all:
             t = None
+        if isinstance(t, UpNum):
+            t = KNum(t) if self.use_upnum else None
         if t is not None and n != '__captured__' and (self.use_numknown or isinstance(t, KNum) or
                                                       not (is_num(t) or isinstance(t, bool))):
             # the register is known to hold one of the program's own code/constant arrays
@@ -1572,6 +1582,11 @@ class PE:
                 return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))
+        if name in BUF and ('write' in name or name in ('buffer.copy', 'buffer.fill')) and args \
+                and isinstance(args[0], Buffer) and args[0].path:
+            # the VM patching its own bytecode with a value only known at run time: not part of
+            # the script (and already done in the dump when the instruction ran)
+            return [None]
         if self.lazy_depth and not sym and all(is_num(a) or isinstance(a, (str, bool)) or a is None for a in args):
             # the loader materialising a constant of a Roblox datatype, e.g. Vector3.new(x, y, z)
             return [GlobalPath('%s(%s)' % (name, ', '.join(const_text(a) for a in args)))]

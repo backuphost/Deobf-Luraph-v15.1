@@ -83,6 +83,8 @@ class Lifter:
         self.queue = []
         self.proto_objs = {}
         self.pe.on_closure = self.on_closure
+        self.temp_vals = {}
+        self.up_nums = {}
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
@@ -167,12 +169,18 @@ class Lifter:
                     return v if P.is_num(v) and not isinstance(v, bool) else None
                 if e[0] == 't':
                     return temps.get(e[1])
+                if e[0] == 'up':
+                    return self.up_nums.get(e[1])
                 if e[0] == 'bin' and e[1] in ('+', '-', '*'):
                     x, y = num(e[2]), num(e[3])
                     if x is None or y is None:
                         return None
                     r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y
-                    return P.norm(r) if abs(r) < 2 ** 53 else None
+                    if abs(r) >= 2 ** 53:
+                        return None
+                    if isinstance(x, P.UpNum) or isinstance(y, P.UpNum):
+                        return P.UpNum(r)
+                    return P.norm(r)
                 return None
 
             for st in stmts:
@@ -180,6 +188,8 @@ class Lifter:
                     v = num(st[2])
                     if v is not None:
                         temps[st[1][1]] = v
+                        self.temp_vals[st[1][1]] = v     # (a temporary can outlive the instruction
+                                                         # as the value of an interpreter local)
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
                     refs = {c[1] for c in st[2][2] if c[0] == 'ref' and not isinstance(c[1], tuple)}
                     if refs:
@@ -199,7 +209,7 @@ class Lifter:
                         known[st[1][1]] = e[1]
                     elif e[0] == 'constfn':
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
-                    elif e[0] in ('t', 'bin') and num(e) is not None:
+                    elif e[0] in ('t', 'bin', 'up') and num(e) is not None:
                         known[st[1][1]] = num(e)
                     else:
                         known.pop(st[1][1], None)
@@ -369,6 +379,10 @@ class Lifter:
                 # the patch value was computed by earlier instructions from plain constants
                 # (a counter kept in an operand slot): retry with those register constants
                 return self.lift_node(interp, node, key2, snap, known, indirect, pkey, numknown=True)
+            if not self.pe.use_upnum and self.up_nums and (
+                    'self-modifying' in str(e) or 'out of range' in str(e) or 'evaluator failure' in str(e)):
+                # a key mixed from an opaque number kept in an upvalue: use the value it had
+                return self._upnum_retry(interp, node, key2, snap, known, indirect, pkey)
             return str(e)
         finally:
             self.pe.use_numknown = self.constprop
@@ -376,8 +390,24 @@ class Lifter:
             self.pe.journal = None
             self.pe.protect = None
         if any(not isinstance(end[1][1], int) for end, kn in self.known_after(node.tree, known)):
+            if not self.pe.use_upnum and self.up_nums:
+                r = self._upnum_retry(interp, node, key2, snap, known, indirect, pkey)
+                if r is None:
+                    return None
             return SYMPC
         return None
+
+    def _upnum_retry(self, interp, node, key2, snap, known, indirect, pkey):
+        """Lift again with the numbers upvalues held at the end of the run (see pe.UpNum)."""
+        self.pe.use_upnum = True
+        snap2 = dict(snap)
+        for name, v in snap.items():
+            if isinstance(v, Sym) and isinstance(v.e, tuple) and v.e[0] == 't' and v.e[1] in self.temp_vals:
+                snap2[name] = P.KNum(self.temp_vals[v.e[1]])
+        try:
+            return self.lift_node(interp, node, key2, snap2, known, indirect, pkey, numknown=True)
+        finally:
+            self.pe.use_upnum = False
 
     # ---- whole proto
     def lift_proto(self, key):
@@ -978,6 +1008,15 @@ class FactoryLifter(Lifter):
         sc2 = Scope(midfn.scope)
         up = self.upvalue_param(mid)
         pe.upvals_list = self.dump.proto_upvals(key) if self.end_state else None
+        # numbers held by closed upvalues at the end of the run (see pe.UpNum)
+        self.up_nums = {}
+        c0, c1 = self.model.cells
+        for i, cell in (pe.upvals_list or {}).items():
+            if isinstance(i, int) and isinstance(cell, LuaTable):
+                box = cell.h.get(c0)
+                v = box.h.get(cell.h.get(c1)) if isinstance(box, LuaTable) else None
+                if P.is_num(v) and float(v).is_integer() and abs(v) >= 65536:
+                    self.up_nums[i - self.model.up_base] = P.UpNum(v)
         for i, p in enumerate(mid.params):
             sc2.vars[p] = None
         if up is not None:
