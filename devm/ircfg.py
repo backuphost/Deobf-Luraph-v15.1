@@ -420,6 +420,10 @@ class ProtoCFG:
             self._thread()
             self._merge_conds()
             self._fold_regs()
+        if self._unthread_tests():
+            self._thread()
+            self._merge_conds()
+            self._fold_regs()
         if self._unsplice():
             self._table_aliases()
             for _ in range(2):
@@ -1928,6 +1932,43 @@ class ProtoCFG:
                         blocks[x].preds.add(b.id)
                     changed = True
         self.compute_preds()
+
+    def _unthread_tests(self):
+        """`if c then goto T end; work; if c then goto T else goto F end` is compiled (or obfuscated)
+        with the second test folded into the first: `if c then goto T else work; goto F end`, next
+        to another copy of the test for the paths that skip the first one.  The arm goes back
+        through that copy, so T and F each have one way in."""
+        blocks = self.blocks
+        self.compute_preds()
+        changed = False
+        for y in list(blocks.values()):
+            if y.stmts or y.term[0] != 'br' or len(y.term) != 4 or y.term[2] == y.term[3]:
+                continue
+            c = y.term[1]
+            cr, mem, impure = expr_reads(c)
+            if impure or mem:
+                continue
+            for x in list(blocks.values()):
+                if x is y or x.term[0] != 'br' or len(x.term) != 4 or x.term[1] != c or x.term[2] == x.term[3]:
+                    continue
+                for same, other in ((2, 3), (3, 2)):
+                    if x.term[same] != y.term[same] or x.term[other] == y.term[other]:
+                        continue
+                    arm = blocks.get(x.term[other])
+                    if arm is None or arm is y or arm is x or arm.preds != {x.id} or arm.term != ('goto', y.term[other]):
+                        continue
+                    if any(set(_writes_of(st)) & cr for st in arm.stmts) or (cr & self.captured_ref and any(
+                            expr_reads(e)[2] for st in arm.stmts for e in stmt_exprs(st)[0])):
+                        continue
+                    t = list(x.term)
+                    t[same] = y.id
+                    x.term = tuple(t)
+                    arm.term = ('goto', y.id)
+                    changed = True
+                    break
+        if changed:
+            self.compute_preds()
+        return changed
 
     def _thread_same_test(self):
         """`if r then A else goto B end` where B is nothing but `if r then C else D end`: on that
