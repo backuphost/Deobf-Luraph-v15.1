@@ -60,6 +60,7 @@ def _run_traced(self):
     for n in notes:
         self.log('[%s]   %s' % (self.tag, n))
     self.dump = pe.Dump(raw, m)
+    self.dump.server = vmmodel.SERVER
     self.lifter = lifter.FactoryLifter(m, self.dump)
     self.lifter.oracle = oracle
     self.lifter.end_state = True

@@ -1270,7 +1270,11 @@ class Printer:
 
     def emit(self, text):
         if text.startswith('('):
-            text = ';' + text       # a statement that starts with `(` would continue the previous one
+            # a statement that starts with `(` would continue the previous one; Luau has no empty
+            # statement, so at the start of a block (nothing to continue) there is no `;`
+            prev = self.lines[-1].strip() if self.lines else ''
+            if prev and not re.search(r'(\b(do|then|else|repeat)|\))$', prev) or prev.endswith(')') and not re.search(r'function\b[^()]*\([^()]*\)$', prev):
+                text = ';' + text
         self.lines.append('\t' * self.level + text)
 
     def block(self, stmts):
@@ -1301,7 +1305,7 @@ class Printer:
             self.emit('local ' + text)
         elif t == 'call':
             text = self.expr(st[1])
-            self.emit((';' if text.startswith('(') else '') + text)
+            self.emit(text)
         elif t == 'call_discard':
             self.emit('local _ = ' + self.expr(st[1]))
         elif t == 'return':
@@ -1356,7 +1360,9 @@ class Printer:
             if st[4]:
                 self.emit('for __i, __v in { %s } do %s[%d + __i] = __v end' % (self.expr(st[4]), tbl, st[2] + len(st[3]) - 1))
         elif t == 'prep':
-            self.emit('-- for-loop setup: ' + ', '.join(self.expr(e) for e in st[2]))
+            # (an operand can print over several lines: a table or a function literal)
+            text = ', '.join(self.expr(e) for e in st[2])
+            self.emit('-- for-loop setup: ' + re.sub(r'\s*\n\s*', ' ', text))
         else:
             self.emit('-- ?? ' + repr(st)[:100])
 
@@ -1477,7 +1483,7 @@ class Decompiler:
         plist = list(params) + (['...'] if vararg else [])
         head = 'function%s(%s)' % (' ' + name if name else '', ', '.join(plist))
         p.block(ast)
-        if len(p.lines) > 4000:
+        if len(p.lines) > 4000 and sum(1 for ln in p.lines if re.match(r'\s*(local exit\d+|if exit\d+ then|exit\d+ = true)', ln)) * 20 > len(p.lines):
             # control flow that could not be untangled: thousands of lines of flag juggling help nobody
             self.stats['unstructured'] += 1
             return 'function(...) --[[ UNSTRUCTURED: %d lines of unrecovered control flow omitted ]] end' % len(p.lines)

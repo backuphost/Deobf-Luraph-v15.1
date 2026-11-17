@@ -504,7 +504,7 @@ class Lifter:
             if err is not None:
                 if os.environ.get('DEVM_TRACE_ERR'):
                     print('PEERR', key, key2, err, {k: (v.path if hasattr(v, 'path') else v) for k, v in known.items()})
-                    print('   partial IR', self.pe.ir[-8:])
+                    print('   partial IR', self.pe.ir[:6], '...', self.pe.ir[-8:])
                 stmts = list(node.tree[0]) if err == SYMPC and node.tree else []
                 node.error = err
                 node.tree = (stmts + [('error', err)], ('ret', [], None))
@@ -798,6 +798,7 @@ class FactoryLifter(Lifter):
             if k in done:
                 continue
             fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
+            fresh.dump.server = self.dump.server
             fresh.pe.keyfn_override = self.pe.keyfn_override
             fresh.oracle = self.oracle
             fresh.end_state = self.end_state

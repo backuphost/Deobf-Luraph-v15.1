@@ -60,6 +60,7 @@ end
 
 local envTable
 local enumName
+local describeValue     -- Roblox datatype value -> constructor expression (set once the mock is loaded)
 local fidOf = setmetatable({}, { __mode = "k" })
 function __LPH_F(id, fn)
 	fidOf[fn] = id
@@ -76,6 +77,8 @@ function ser(v)
 	elseif t == "table" then
 		if v == envTable then return '{"env":true}' end
 		if libnames[v] then return '{"lib":"' .. libnames[v] .. '"}' end
+		local dv = describeValue and describeValue(v)
+		if dv then return '{"g":"' .. dv .. '"}' end
 		local id = tblIds[v]
 		if not id then
 			id = #tblList + 1
@@ -110,6 +113,9 @@ function ser(v)
 	else
 		local en = enumName and enumName(v)
 		if en then return '{"g":"' .. en .. '"}' end
+		if t == "vector" and v.X == v.X and v.Y == v.Y and v.Z == v.Z then
+			return '{"g":"Vector3.new(' .. string.format("%.14g, %.14g, %.14g", v.X, v.Y, v.Z) .. ')"}'
+		end
 		return '{"o":"' .. t .. '"}'
 	end
 end
@@ -148,6 +154,8 @@ end
 -- ---------------------------------------------------------------- hooks
 local protos = {}
 local done = false
+local quietSteps = 0
+local quietHooks = false     -- VM code run by the harness itself (reading constant pools) is not traced
 
 -- Constant tables can carry an __index hook that decrypts entries on first use; touch every
 -- pending entry so the dump only ever sees plain values.
@@ -167,6 +175,48 @@ local function forceLazy(root)
 			if type(v) == "table" and not seen[v] and not libnames[v] and v ~= envTable then
 				seen[v] = true
 				queue[#queue + 1] = v
+			end
+		end
+	end
+end
+
+-- Constant pools.  In some builds a proto's constant table is {[-1] = pool, [-2] = index array} with
+-- an __index metamethod (itself VM code) that decodes pool[index[pc]] from the bytecode the first
+-- time an instruction asks for it.  The index is a position in the bytecode, so only the exact
+-- values the instructions carry can be decoded, and instructions that never ran still carry
+-- encrypted ones.  With serve=<dir> the harness therefore stays alive after the dump and answers
+-- the lifter, which knows the decrypted index:
+--     <dir>/req :  "<seq> <table id in the dump> <index>"      <dir>/resp :  "<seq>\n<value>\nEND"
+local serveDir = nil
+local function servePools()
+	writefile(serveDir .. "/ready", "1")
+	local K = 1073741823
+	local last = nil
+	while true do
+		local okr, req = pcall(readfile, serveDir .. "/req")
+		if okr and type(req) == "string" and req ~= last and string.sub(req, -1) == "\n" then
+			last = req
+			local seq, id, index = string.match(req, "^(%d+) (%d+) (%-?%d+)\n$")
+			if seq == nil then
+				if string.match(req, "^quit") then return end
+			else
+				local t = tblList[tonumber(id)]
+				local out = "null"
+				if type(t) == "table" and type(rawget(t, -2)) == "table" then
+					local idx = rawget(t, -2)
+					local saved = rawget(idx, K)
+					rawset(idx, K, tonumber(index))
+					quietSteps = 0
+					quietHooks, __LPH_N.q = true, true
+					local ok, v = pcall(function() return t[K] end)
+					quietHooks, __LPH_N.q = false, false
+					rawset(t, K, nil)
+					rawset(idx, K, saved)
+					if ok and v ~= nil and (type(v) ~= "table" or (describeValue and describeValue(v))) and type(v) ~= "function" then
+						out = ser(v)
+					end
+				end
+				writefile(serveDir .. "/resp", seq .. "\n" .. out .. "\nEND")
 			end
 		end
 	end
@@ -264,6 +314,7 @@ local tbPid = nil          -- tb=<pid>: print the Lua call stack when that proto
 local mfpDelta = nil       -- option mfpdelta=<n>: math_floor_precision(seed) - expected(seed) comes out as n
 local showGlobals = false   -- globals=1: when the script ends, list the globals it defined
 local baseGlobals = {}
+local httpMap, httpMapPath = nil, nil    -- httpmap=<file> of `<url substring><TAB><reply body>` lines
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
 local orcLast = setmetatable({}, { __mode = "k" })
@@ -317,7 +368,13 @@ end
 --   __LPH_S    protos replaced by a no-op                         branch decision is to be inverted
 --   __LPH_X    instruction numbers whose decision is inverted
 --   __LPH_R    ring of the last instructions (pid, loop, pc)
-__LPH_N = { c = 0, s = 0, f = false, t = 1 }
+__LPH_N = { c = 0, s = 0, f = false, t = 1, q = false }
+-- __LPH_N.q: the harness itself is calling into the loader (servePools); __LPH_W is called from every
+-- loop of the loader then and stops one that does not end (garbage in, endless decoding)
+function __LPH_W()
+	quietSteps += 1
+	if quietSteps > 20000 then error("__LPH_POOL_BUDGET", 0) end
+end
 __LPH_S = stubs
 __LPH_T = setmetatable({}, { __mode = "k" })   -- protos already seen (dumpnew=1)
 __LPH_X = {}
@@ -327,7 +384,15 @@ local scriptPath = nil
 for i = #layers, 1, -1 do
 	local sp = string.match(layers[i], "^scriptpath=(.+)$")
 	local pk = string.match(layers[i], "^poke=(.+)$")
-	if sp then
+	local hm = string.match(layers[i], "^httpmap=(.+)$")
+	local sv = string.match(layers[i], "^serve=(.+)$")
+	if sv then
+		serveDir = sv
+		table.remove(layers, i)
+	elseif hm then
+		httpMapPath = hm
+		table.remove(layers, i)
+	elseif sp then
 		scriptPath = sp
 		table.remove(layers, i)
 	elseif pk then
@@ -452,6 +517,12 @@ end
 
 local lastRegs, seenErr = nil, {}
 function __LPH_STEP(pid, loop, pc, regs, names, ...)
+	if quietHooks then
+		-- a pool read with an index that is not in the pool can decode garbage for a long time
+		quietSteps += 1
+		if quietSteps > 20000 then error("__LPH_POOL_BUDGET", 0) end
+		return
+	end
 	if aborted then error(ABORT, 0) end
 	stepCount += 1
 	if stepCount > budgetAt then error("__LPH_BUDGET", 0) end
@@ -605,6 +676,7 @@ if cwrap and (oracleOn or traceMode or showErrors or tbPid) then
 end
 
 function __LPH_RUN(names, n, ...)
+	if quietHooks then return nil end
 	if aborted then error(ABORT, 0) end
 	local vals = { ... }
 	local env = {}
@@ -768,7 +840,72 @@ end
 mock.onMfpExpected = function(i, v, e)
 	ewrite("[env] math_floor_precision call " .. i .. ": seed " .. tostring(v) .. ", expected " .. tostring(e) .. ", answering expected+" .. tostring(mfpDelta) .. "\n")
 end
+do
+	-- A script's constants can be datatype values (Luraph caches `Color3.fromRGB(1, 2, 3)` in the
+	-- instruction that built it).  In the dump they are written as the expression that makes them.
+	local function n(x)
+		if x ~= x or x == math.huge or x == -math.huge then return nil end
+		if x == math.floor(x) and math.abs(x) < 2 ^ 53 then return string.format("%d", x) end
+		return string.format("%.14g", x)
+	end
+	local function all(...)
+		local out = {}
+		for i = 1, select("#", ...) do
+			local v = select(i, ...)
+			if type(v) ~= "number" then return nil end
+			local t = n(v)
+			if not t then return nil end
+			out[i] = t
+		end
+		return table.concat(out, ", ")
+	end
+	describeValue = function(v)
+		local tn = mock.typeNames and mock.typeNames[v]
+		if tn == "Color3" then
+			local r, g, b = rawget(v, "R"), rawget(v, "G"), rawget(v, "B")
+			if type(r) ~= "number" or type(g) ~= "number" or type(b) ~= "number" then return nil end
+			local R, G, B = r * 255, g * 255, b * 255
+			if math.abs(R - math.floor(R + 0.5)) < 1e-6 and math.abs(G - math.floor(G + 0.5)) < 1e-6 and math.abs(B - math.floor(B + 0.5)) < 1e-6 then
+				return "Color3.fromRGB(" .. all(math.floor(R + 0.5), math.floor(G + 0.5), math.floor(B + 0.5)) .. ")"
+			end
+			local a = all(r, g, b)
+			return a and "Color3.new(" .. a .. ")"
+		elseif tn == "Vector3" then
+			local a = all(rawget(v, "X"), rawget(v, "Y"), rawget(v, "Z"))
+			return a and "Vector3.new(" .. a .. ")"
+		elseif tn == "Vector2" then
+			local a = all(rawget(v, "X"), rawget(v, "Y"))
+			return a and "Vector2.new(" .. a .. ")"
+		elseif tn == "UDim" then
+			local a = all(rawget(v, "Scale"), rawget(v, "Offset"))
+			return a and "UDim.new(" .. a .. ")"
+		elseif tn == "UDim2" then
+			local x, y = rawget(v, "X"), rawget(v, "Y")
+			if type(x) ~= "table" or type(y) ~= "table" then return nil end
+			local a = all(rawget(x, "Scale"), rawget(x, "Offset"), rawget(y, "Scale"), rawget(y, "Offset"))
+			return a and "UDim2.new(" .. a .. ")"
+		end
+		return nil
+	end
+end
 mock.onHttp = function(method, url)
+	if httpMapPath and not httpMap then
+		httpMap = {}
+		local okm, text = pcall(readfile, httpMapPath)
+		if not okm then ewrite("[http] cannot read reply map: " .. tostring(text) .. "\n") text = "" end
+		for line in string.gmatch(text, "[^\n]+") do
+			local key, body = string.match(line, "^([^\t]+)\t(.*)$")
+			if key then table.insert(httpMap, { key, body }) end
+		end
+	end
+	if httpMap and type(url) == "string" then
+		for _, e in ipairs(httpMap) do
+			if string.find(url, e[1], 1, true) then
+				ewrite("[http] " .. method .. " " .. url .. " -> canned reply for '" .. e[1] .. "' [step " .. tostring(stepCount) .. "]\n")
+				return e[2]
+			end
+		end
+	end
 	ewrite("[http] " .. method .. " " .. tostring(url) .. (httpReply and (" -> canned reply " .. httpReply) or " -> empty reply (no network)") .. " [step " .. tostring(stepCount) .. "]\n")
 	return httpReply or ""
 end
@@ -844,6 +981,64 @@ function populateSandbox()
 	-- anti-cheat code treats an environment that only inherits _G / shared as an executor's.
 	local globals = sandbox
 	rawset(globals, "_G", {})       -- the scripts' shared table, not the CLI's own globals
+	if executorEnv and rawget(globals, "request") == nil then
+		-- executor HTTP: nothing is sent.  Every call is logged and answered with a canned reply
+		-- (httpreply=<text>, default empty body), so the script's handling of it can be traced.
+		local function request(opts)
+			local url = type(opts) == "table" and (opts.Url or opts.url) or opts
+			local method = type(opts) == "table" and (opts.Method or opts.method) or "GET"
+			local body = mock.onHttp(tostring(method), url)
+			return { StatusCode = 200, StatusMessage = "OK", Success = true, Body = body, Headers = {} }
+		end
+		for _, n in ipairs({ "request", "http_request" }) do rawset(globals, n, request) end
+		-- other executor functions scripts expect to exist; inert stand-ins
+		if rawget(globals, "gethwid") == nil then rawset(globals, "gethwid", function() return "devm-offline-hwid" end) end
+		for _, n in ipairs({ "setclipboard", "toclipboard" }) do
+			if rawget(globals, n) == nil then rawset(globals, n, function() end) end
+		end
+		-- require(ModuleScript): the game's modules do not exist here; hand out a permissive stub
+		do
+			local realRequire = rawget(globals, "require")
+			local function impl(m)
+				if type(m) == "string" and realRequire then return realRequire(m) end
+				return mock.stub("require(" .. tostring(m) .. ")")
+			end
+			local f = cwrap and cwrap("require", impl) or impl
+			fnames[f] = "require"
+			rawset(globals, "require", f)
+		end
+		-- the rest of the usual executor API, inert: hooks install nothing, fire* do nothing
+		local genv = setmetatable({}, { __index = globals })
+		local noop = function() end
+		local ex = {
+			getgenv = function() return genv end, getrenv = function() return globals end,
+			newcclosure = function(f) return f end, clonefunction = function(f) return f end,
+			hookfunction = function(f) return f end, replaceclosure = function(f) return f end,
+			hookmetamethod = function() return function() end end,
+			checkcaller = function() return true end, getnamecallmethod = function() return "" end,
+			cloneref = function(x) return x end, compareinstances = function(a, b) return a == b end,
+			gethui = function() return fallback.game:GetService("CoreGui") end,
+			getconnections = function() return {} end, getgc = function() return {} end,
+			getinstances = function() return {} end, getnilinstances = function() return {} end,
+			getloadedmodules = function() return {} end, getrunningscripts = function() return {} end,
+			isexecutorclosure = function() return false end, getcustomasset = function() return "" end,
+			getthreadidentity = function() return 8 end, setthreadidentity = noop,
+			fireproximityprompt = noop, firetouchinterest = noop, fireclickdetector = noop, firesignal = noop,
+			setfpscap = noop, queue_on_teleport = noop, setclipboard = noop, toclipboard = noop,
+			sethiddenproperty = noop, gethiddenproperty = noop, setsimulationradius = noop,
+		}
+		for n, f in pairs(ex) do
+			if rawget(globals, n) == nil then rawset(globals, n, f) end
+		end
+		-- executor file system: empty and read-only
+		local fs = { isfile = function() return false end, isfolder = function() return false end,
+			listfiles = function() return {} end, writefile = function() end, appendfile = function() end,
+			makefolder = function() end, delfile = function() end, delfolder = function() end,
+			readfile = function(path) error("file does not exist: " .. tostring(path), 2) end }
+		for n, f in pairs(fs) do
+			if rawget(globals, n) == nil then rawset(globals, n, f) end
+		end
+	end
 	if not executorEnv then
 		-- a plain Roblox client has none of these; scripts with their own anti-cheat look for them
 		for _, n in ipairs({ "identifyexecutor", "iscclosure", "islclosure" }) do
@@ -1445,6 +1640,11 @@ function __LPH_AFTER(ok, message)
 		if not okx then ewrite("[poke] stopped: " .. tostring(errx) .. "\n") end
 	end
 	if oracleOn then
+		if not ok and showErrors and mock.recentStubs then
+			local names = {}
+			for j = 0, 7 do names[#names + 1] = mock.recentStubs[(mock.recentN + j) % 8 + 1] end
+			ewrite("[stubs] last permissive stubs: " .. table.concat(names, ", ") .. "\n")
+		end
 		ewrite("[oracle] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. stepCount .. " instructions\n")
 		writeOracle()
@@ -1454,6 +1654,7 @@ function __LPH_AFTER(ok, message)
 		ewrite("[end] " .. (ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))) ..
 			" after " .. __LPH_N.c .. " closure entries\n")
 		finish({ kind = "end", vars = { __pid = 1 } })
+		if serveDir then servePools() end
 		return
 	end
 	if not ok and not aborted then

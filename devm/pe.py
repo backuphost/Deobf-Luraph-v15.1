@@ -554,6 +554,7 @@ class Dump:
         self.tables = {}
         self.by_path = {}
         self.raw = data['tables']
+        self.server = None      # vmmodel.PoolServer: the finished run, kept alive for pool constants
 
     def conv(self, v, path=None):
         if v is None or isinstance(v, (bool, int)):
@@ -697,6 +698,7 @@ class PE:
         self.known_reads = set()
         self.use_numknown = False
         self.write_log = None
+        self.state_scopes = None
         self.model_writes = 0
         self.keyfn_used = set()
         self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
@@ -925,7 +927,7 @@ class PE:
                 # Roblox datatypes and executor functions (gethui, fireproximityprompt, ...)
                 return GlobalPath(name)
             raise PEError('unbound name %s' % name)
-        if s.owner == self.cur_interp.func.id:
+        if s.owner == self.cur_interp.func.id and (self.state_scopes is None or id(s) in self.state_scopes):
             # interpreter-level state variables (names are only meaningful inside the interpreter)
             if name in self.openups:
                 return OPENUPS
@@ -940,13 +942,15 @@ class PE:
 
     def is_state(self, scope, name):
         s = scope.lookup(name)
-        return s is not None and s.owner == self.cur_interp.func.id
+        return s is not None and s.owner == self.cur_interp.func.id and \
+            (self.state_scopes is None or id(s) in self.state_scopes)
 
     def setvar(self, scope, name, v):
         s = scope.lookup(name)
         if s is None:
             raise PEError('assignment to unbound name %s' % name)
-        if s.owner == self.cur_interp.func.id and (name in self.fvars or name in self.fstack):
+        if s.owner == self.cur_interp.func.id and (name in self.fvars or name in self.fstack) \
+                and (self.state_scopes is None or id(s) in self.state_scopes):
             if self.perm is None and not self.seeking:
                 raise ForOp()
         if self.track and (id(s), name) in self.injected:
@@ -1084,6 +1088,20 @@ class PE:
                 key = norm(key)
             v = obj.h.get(key)
             if v is None and isinstance(obj.mt, LuaTable) and not self.seeking:
+                kt, et = obj.h.get(-1), obj.h.get(-2)
+                if isinstance(kt, LuaTable) and isinstance(et, LuaTable) and is_num(et.h.get(key)):
+                    # {[-1] = pool, [-2] = index array}: the metamethod (VM code) returns
+                    # pool[index[pc]]; the harness has decoded the pool (fillPools)
+                    idx = et.h.get(key)
+                    if is_num(idx) and not isinstance(idx, bool) and float(idx).is_integer():
+                        idx = int(idx)
+                        v = kt.h.get(idx)
+                        if v is None and self.dump.server is not None and not isinstance(idx, KNum):
+                            # not decoded during the run: ask the run itself (it is still alive)
+                            raw = self.dump.server.decode(obj.id, idx)
+                            if raw is not None and not (isinstance(raw, dict) and ('t' in raw or 'o' in raw)):
+                                v = self.dump.conv(raw)
+                        return v
                 h = obj.mt.h.get('__index')
                 if isinstance(h, LFn) and h.scope is not None:
                     # lazily materialised entry (e.g. a constant decoded from the bytecode buffer)
@@ -1645,7 +1663,7 @@ class PE:
         if isinstance(v, tuple):
             raise PEError('unsupported condition %r' % (v,))
         if isinstance(v, LinSym):
-            raise PEError('condition on symbolic count')
+            return True         # a count is a number, and every number is truthy
         return truthy(v)
 
     def exec_block(self, block, scope):
@@ -1834,6 +1852,13 @@ class PE:
                     raise PEError('runaway for')
             return None
         if t == 'forin':
+            if len(st[2]) == 3 and st[2][2] == ('nil',) and st[2][0][0] == 'name' and st[2][1][0] == 'name':
+                # `for k[, v] in next, open_upvalues, nil do v[4] = ...; v[6] = ...; open_upvalues[k] = nil end`
+                # (handlers that leave the function close its upvalues inline): no counterpart in
+                # the lifted code
+                txt = repr(st[3])
+                if "('num', 4)" in txt and "('num', 6)" in txt and "[('nil',)]" in txt:
+                    return None
             it = self.evalargs(st[2], scope)
             if it and it[0] is OPENUPS:
                 self.emit(('close', self.close_base(st, scope)))
@@ -1920,6 +1945,12 @@ class PE:
         """One iteration of a dispatch loop."""
         lid = self.loop_ids[id(st)]
         self.injected = set()
+        # interpreter-level scopes: a handler's own locals may reuse the names of state variables
+        self.state_scopes = set()
+        sc = scope
+        while sc is not None:
+            self.state_scopes.add(id(sc))
+            sc = sc.parent
         if not self.seeking:
             # arrived at a dispatch loop after leaving another one
             raise LoopHead(lid, self.snapshot(scope))
