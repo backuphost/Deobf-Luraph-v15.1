@@ -1225,7 +1225,7 @@ class PE:
             if self.perm is not None:
                 return FSTATE
             raise PEError('attempt to index %r' % (obj,))
-        if isinstance(obj, Builtin) or isinstance(obj, LFn) or isinstance(obj, Opaque) or isinstance(obj, Buffer):
+        if isinstance(obj, (Builtin, LFn, Opaque, Buffer, GlobalPath)):
             return self.emit_expr(('index', self.atom(obj), self.atom(key)))
         raise PEError('index: unsupported object %r' % (obj,))
 

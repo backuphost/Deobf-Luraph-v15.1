@@ -171,6 +171,8 @@ class Lifter:
                     return temps.get(e[1])
                 if e[0] == 'up':
                     return self.up_nums.get(e[1])
+                if e[0] == 'mv' and e[2] == 1:
+                    return calls.get(e[1])
                 if e[0] == 'bin' and e[1] in ('+', '-', '*'):
                     x, y = num(e[2]), num(e[3])
                     if x is None or y is None:
@@ -183,7 +185,16 @@ class Lifter:
                     return P.norm(r)
                 return None
 
+            calls = {}
             for st in stmts:
+                if st[0] == 'call' and st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.') and st[4] is None:
+                    # arithmetic on the opaque state numbers, done with the bit library
+                    args = [num(a) for a in st[3]]
+                    if args and all(a is not None for a in args):
+                        from . import ircfg
+                        v = ircfg._opaque_eval(('call', st[2], [('k', a) for a in args], None), {})
+                        if v is not None:
+                            calls[st[1]] = P.UpNum(v) if any(isinstance(a, P.UpNum) for a in args) else P.norm(v)
                 if st[0] == 'set' and st[1][0] == 't' and isinstance(st[2], tuple):
                     v = num(st[2])
                     if v is not None:
@@ -199,7 +210,18 @@ class Lifter:
                 if st[0] == 'call' and any(a == ('regs',) for a in st[3]):
                     # the register array itself escaped into a call: anything may have changed
                     known = {CAP: known[CAP]} if CAP in known else {}
+                if st[0] == 'call' and not (st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.')):
+                    # a variable shared with a closure can change whenever something is called
+                    for r in known.get(CAP, ()):
+                        known.pop(r, None)
                 if st[0] == 'set' and st[1][0] == 'r' and st[1][1] in known.get(CAP, ()):
+                    # ... and holds what was just put there until then (numbers only: the opaque
+                    # state numbers are such variables)
+                    v = num(st[2]) if isinstance(st[2], tuple) else None
+                    if v is not None:
+                        known[st[1][1]] = v
+                    else:
+                        known.pop(st[1][1], None)
                     continue
                 if st[0] == 'set' and st[1][0] == 'r':
                     e = st[2]
@@ -209,7 +231,7 @@ class Lifter:
                         known[st[1][1]] = e[1]
                     elif e[0] == 'constfn':
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
-                    elif e[0] in ('t', 'bin', 'up') and num(e) is not None:
+                    elif e[0] in ('t', 'bin', 'up', 'mv') and num(e) is not None:
                         known[st[1][1]] = num(e)
                     else:
                         known.pop(st[1][1], None)
