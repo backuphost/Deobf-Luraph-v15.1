@@ -1187,7 +1187,13 @@ class PE:
                 # plain-value upvalue lists (the payload interpreter of some builds): numbers and
                 # library functions bound once by the bootstrap
                 v = ups.get(key)
-                if is_num(v) or isinstance(v, (str, bool, Builtin, Lib, GlobalPath)):
+                if isinstance(v, (Builtin, Lib, GlobalPath)):
+                    return v
+                # A number, string or boolean here is what one instance of the function captured
+                # by value: another instance has another (`makeToggle("A", ...)`, `makeToggle("B",
+                # ...)`), so in the script's own layout it stays the variable it is.  (Opaque
+                # numbers among them are still available as keys: see UpNum.)
+                if (is_num(v) or isinstance(v, (str, bool))) and not self.model.oneline:
                     return v
             return UpRef(key - self.model.up_base)
         if isinstance(obj, UpRef):

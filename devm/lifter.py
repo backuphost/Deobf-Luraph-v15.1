@@ -248,7 +248,7 @@ class Lifter:
                     return v if P.is_num(v) and not isinstance(v, bool) else None
                 if e[0] == 't':
                     return temps.get(e[1])
-                if e[0] == 'up':
+                if e[0] in ('up', 'upcell'):
                     return self.up_nums.get(e[1])
                 if e[0] == 'mv' and e[2] == 1:
                     return calls.get(e[1])
@@ -386,7 +386,7 @@ class Lifter:
                         known[st[1][1]] = e[1]
                     elif e[0] == 'constfn':
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
-                    elif e[0] in ('t', 'bin', 'up', 'mv') and num(e) is not None:
+                    elif e[0] in ('t', 'bin', 'up', 'upcell', 'mv') and num(e) is not None:
                         known[st[1][1]] = num(e)
                     else:
                         known.pop(st[1][1], None)
@@ -1341,6 +1341,9 @@ class FactoryLifter(Lifter):
                 v = box.h.get(cell.h.get(c1)) if isinstance(box, LuaTable) else None
                 if P.is_num(v) and float(v).is_integer() and abs(v) >= 65536:
                     self.up_nums[i - self.model.up_base] = P.UpNum(v)
+            elif isinstance(i, int) and P.is_num(cell) and not isinstance(cell, bool) \
+                    and float(cell).is_integer() and abs(cell) >= 65536:
+                self.up_nums[i - self.model.up_base] = P.UpNum(cell)       # (captured by value)
         # ... and, for a function that was never created in the run, the numbers its creator would
         # have handed it
         for i, src in self.cap_src.get(key, {}).items():

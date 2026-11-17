@@ -160,7 +160,7 @@ def _drop_opaque_flow(text):
         for nm in re.findall(r'\b[A-Za-z_]\w*\b', t):
             if nm not in cand:
                 return False
-        return re.fullmatch(r'[\w\s()+\-*/%,.]*', t) is not None and t.strip() != ''
+        return re.fullmatch(r'[\w\s()+\-*/%,.]*(?:[=~]= ?[\w\s()+\-*/%,.]*)?', t) is not None and t.strip() != ''
 
     def_line = re.compile(r'\s*(?:local )?([vp]\d+) = (.+)')
 
@@ -221,9 +221,14 @@ def _drop_opaque_flow(text):
         changed = False
         rounds += 1
         for name in list(cand):
-            if any(role(name, pos) is None for pos in names[name]):
+            bad = next((pos for pos in names[name] if role(name, pos) is None), None)
+            if bad is not None:
                 cand.discard(name)
                 changed = True
+                if os.environ.get('DEVM_TRACE_OPQFLOW') and any(
+                        re.search(r'= (\d{7,}$|bit32\.)', text[slice(*line_of(p2))]) and def_line.fullmatch(text[slice(*line_of(p2))])
+                        and def_line.fullmatch(text[slice(*line_of(p2))]).group(1) == name for p2 in names[name]):
+                    print('opqflow r%d: %s kept because of: %s' % (rounds, name, text[slice(*line_of(bad))].strip()[:150]))
         for f, k in list(sinks):
             d = defs[f]
             prm = d['params'][k]

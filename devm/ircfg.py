@@ -1314,6 +1314,18 @@ class ProtoCFG:
                 return False
         return True
 
+    def _is_number(self, b, pos, reg):
+        """the register was just computed as `x % 2^32` or by a bit operation: a number, not NaN"""
+        for j in range(pos - 1, -1, -1):
+            st = b.stmts[j]
+            if reg[1] in _writes_of(st):
+                if st[0] != 'set':
+                    return False
+                e = st[2]
+                return (e[0] == 'bin' and e[1] == '%' and _isnum(e[3]) and e[3][1] > 0) or (
+                    e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.'))
+        return False
+
     def _double_not(self, b):
         n = 0
         for st in b.stmts[-4:]:
@@ -1447,7 +1459,7 @@ class ProtoCFG:
                 else:
                     break
             if e[0] == 'bin' and e[1] in ('==', '~=') and e[2] == e[3] and e[2][0] == 'r' \
-                    and local(b, pos, e[2]) is not None:
+                    and (local(b, pos, e[2]) is not None or self._is_number(b, pos, e[2])):
                 # `x ~= x` on a number: never
                 keep = b.term[2] if ((e[1] == '==') != flip) else b.term[3]
                 if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
