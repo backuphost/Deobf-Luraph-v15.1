@@ -84,6 +84,11 @@ def strip(text):
         text = new
     for _ in range(20):
         new = _drop_opaque_flow(_drop_opaque_params(_drop_orphans(text)))
+        for _ in range(200):
+            nxt = _fold_param_guards(new)
+            if nxt == new:
+                break
+            new = nxt
         if new == text:
             break
         text = new
@@ -91,6 +96,7 @@ def strip(text):
 
 
 _OPQ_FN = re.compile(r'bit32\.\w+')
+_WORD = re.compile(r'[A-Za-z_]\w*')
 
 
 def _drop_opaque_flow(text):
@@ -236,6 +242,12 @@ def _drop_opaque_flow(text):
                     k >= len(args) or not opaque_expr(text[args[k][0]:args[k][1]]) for args in d['calls']):
                 sinks.discard((f, k))
                 changed = True
+                if os.environ.get('DEVM_TRACE_OPQFLOW') and any(
+                        k < len(args) and re.search(r'bit32\.|\d{7,}', text[args[k][0]:args[k][1]]) for args in d['calls']):
+                    why = 'parameter %s is used' % prm if prm not in cand else 'an argument is not opaque: ' + next(
+                        (text[args[k][0]:args[k][1]].strip()[:60] if k < len(args) else '(missing)') for args in d['calls']
+                        if k >= len(args) or not opaque_expr(text[args[k][0]:args[k][1]]))
+                    print('opqflow r%d: sink %s #%d dropped: %s' % (rounds, f, k, why))
     # something has to be an opaque number to begin with: a variable set to a large constant
     seeds = {n for n in cand if any(re.fullmatch(r'\s*(?:local )?%s = \d{7,}' % n, text[slice(*line_of(p))]) for p in names[n])}
     live = set(seeds)
@@ -317,6 +329,15 @@ def _call_args(text, i):
         elif c == '-' and text[j + 1:j + 2] == '-':
             end = text.find('\n', j)
             j = (end if end >= 0 else n) - 1
+        elif c.isalpha() or c == '_':
+            # a word: block keywords nest like brackets (a function literal among the arguments)
+            m = _WORD.match(text, j)
+            w = m.group(0)
+            if w in ('function', 'if', 'do', 'repeat'):
+                depth += 1
+            elif w in ('end', 'until'):
+                depth -= 1
+            j = m.end() - 1
         elif c in '({[':
             depth += 1
         elif c in ')}]':
@@ -330,6 +351,74 @@ def _call_args(text, i):
             start = j + 1
         j += 1
     return None, None
+
+
+def _fold_param_guards(text):
+    """A guard on a parameter for which every caller passes the same magic number:
+    `if p == 139446416 then BODY end` is BODY, `if p ~= 139446416 then JUNK else BODY end` is BODY."""
+    lines = text.split('\n')
+    joined = text
+    done = False
+    for m in re.finditer(r'(?m)^[ \t]*(?:local (v\d+) = function|local function (v\d+)|(v\d+) = function)\(([^)\n]*)\)', joined):
+        name = m.group(1) or m.group(2) or m.group(3)
+        params = [x.strip() for x in m.group(4).split(',') if x.strip()]
+        calls = []
+        ok = True
+        for u in re.finditer(r'\b%s\b' % name, joined):
+            if m.start() <= u.start() < m.end():
+                continue
+            a = joined.rfind('\n', 0, u.start()) + 1
+            b = joined.find('\n', u.start())
+            if re.fullmatch(r'\s*local [\w, ]+', joined[a:b if b >= 0 else len(joined)]):
+                continue
+            if joined[u.end():u.end() + 1] != '(' or joined[u.start() - 1:u.start()] in ('.', ':'):
+                ok = False
+                break
+            args, close = _call_args(joined, u.end())
+            if args is None:
+                ok = False
+                break
+            calls.append([joined[x:y].strip() for x, y in args])
+        if not ok or not calls:
+            continue
+        for k, prm in enumerate(params):
+            if not re.fullmatch(r'p\d+', prm):
+                continue
+            vals = {c[k] if k < len(c) else None for c in calls}
+            if len(vals) != 1:
+                continue
+            v = next(iter(vals))
+            if v is None or not re.fullmatch(r'\d{7,}', v):
+                continue
+            v = int(v)
+            pat = re.compile(r'(\t*)if (?:%s|%s \+ (\d+)) ([=~]=) (\d+) then' % (prm, prm))
+            for i, ln in enumerate(lines):
+                g = pat.fullmatch(ln)
+                if not g:
+                    continue
+                ind = g.group(1)
+                truth = ((v + int(g.group(2) or 0)) % 4294967296 == int(g.group(4))) == (g.group(3) == '==')
+                # the statement's extent: `else` / `end` at the same indentation
+                els, end = None, None
+                for j in range(i + 1, len(lines)):
+                    if lines[j] == ind + 'else' and els is None:
+                        els = j
+                    elif lines[j].startswith(ind + 'elseif ') and els is None:
+                        break
+                    elif lines[j] == ind + 'end':
+                        end = j
+                        break
+                if end is None:
+                    continue
+                body = lines[i + 1:(els if els is not None else end)] if truth else (lines[els + 1:end] if els is not None else [])
+                lines[i:end + 1] = [x[1:] if x.startswith('\t') else x for x in body]
+                done = True
+                break
+            if done:
+                break
+        if done:
+            break
+    return '\n'.join(lines) if done else text
 
 
 def _drop_opaque_params(text):
