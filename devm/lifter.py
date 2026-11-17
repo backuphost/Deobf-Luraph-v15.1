@@ -145,7 +145,11 @@ class Lifter:
             end = ('ret', [pe.atom(v) for v in vals], tail)
         except LoopHead as lh:
             pcv = pe.pcvars[id(self.model.loops[lh.loop])]
-            end = ('goto', (lh.loop, lh.snapshot[pcv]), lh.snapshot)
+            pc = lh.snapshot[pcv]
+            if isinstance(pc, float) and not isinstance(pc, P.UpNum) and pc.is_integer():
+                # a jump operand that a key-derived patch put there: an instruction number all the same
+                pc = lh.snapshot[pcv] = int(pc)
+            end = ('goto', (lh.loop, pc), lh.snapshot)
         finally:
             pe.track = False
         pe.finish_closures()
@@ -674,6 +678,43 @@ class Lifter:
                     self.pe.known_reads = node.kreads
                     if os.environ.get('DEVM_TRACE_ERR'):
                         print('ORACLE failed', key, key2, err2)
+            if err is not None and hint is not None and hint.get('final') and self.end_state:
+                # Still not liftable, but the instruction ran: its operands as they were when it
+                # last executed are on record.  (They were put there by a patch whose key the
+                # lifter could not follow.)
+                saved = []
+                arrays = self.records[key - 1][1]
+                for part in hint['final'].split():
+                    name, _, val = part.partition('=')
+                    t = arrays.get(name)
+                    try:
+                        val = P.norm(float(val))
+                    except ValueError:
+                        continue
+                    if isinstance(t, LuaTable) and t.h.get(key2[1]) != val:
+                        saved.append((t, t.h.get(key2[1])))
+                        t.h[key2[1]] = val
+                if os.environ.get('DEVM_TRACE_ERR'):
+                    print('FINAL', key, key2, hint['final'], [(n, type(arrays[n].h.get(key2[1])).__name__, arrays[n].h.get(key2[1])) for n in ('B', 'Q', 'Z', 'e', 'v') if isinstance(arrays.get(n), LuaTable)])
+                if saved:
+                    node2 = Node(key2)
+                    node2.snap_in = snap
+                    self.pe.known_reads = node2.kreads = set()
+                    err2 = self.lift_node(interp, node2, key2, snap, known, indirect, key)
+                    if err2 is None:
+                        node = node2
+                        pir.nodes[key2] = node
+                        err = None
+                        pir.oracle_used.add(key2)
+                    else:
+                        self.pe.known_reads = node.kreads
+                        for t, old in saved:
+                            if old is None:
+                                t.h.pop(key2[1], None)
+                            else:
+                                t.h[key2[1]] = old
+                    if os.environ.get('DEVM_TRACE_ERR'):
+                        print('FINAL operands', key, key2, 'resolved' if err2 is None else err2)
             if err is None and hint is None and isinstance(key, int):
                 hint = self.oracle.get((key, key2[0], key2[1]))
             if err is None and hint is not None and not hint.get('p') and hint.get('succ') and node.tree[1][0] == 'br':

@@ -1232,6 +1232,11 @@ class PE:
     def setindex(self, obj, key, val, keyast=None):
         if isinstance(key, KNum) and key.is_integer():
             key = int(key)
+        if isinstance(val, UpNum) and isinstance(obj, LuaTable) and not obj.fresh:
+            # a patch computed with an upvalue's number: in the code it is an ordinary operand
+            val = norm(float(val))
+        if isinstance(key, UpNum):
+            key = norm(float(key))
         if isinstance(obj, LuaTable):
             if isinstance(key, (Sym, LinSym)):
                 if obj.path and not obj.fresh:
