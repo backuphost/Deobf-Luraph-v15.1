@@ -188,11 +188,29 @@ class Lifter:
             tabs = dict(tabs or ())         # the same for the instruction's temporaries
             torig = {}                      # temporary -> register it was read from
 
+            tup = {}                        # temporary -> upvalue it was read from
+
+            def upfact(n):
+                # (the upvalue was indexed, called or iterated earlier in this function: enough
+                # to tell the sides of a `not not x` guard apart, like what a branch implies)
+                return 'Tb' if n is not None and ab.get(('U', n)) else None
+
+            def origin(e):
+                if e[0] in ('up', 'upcell'):
+                    return e[1]
+                if e[0] == 't':
+                    return tup.get(e[1])
+                if e[0] == 'r' and ('O', e[1]) in ab:
+                    return int(ab[('O', e[1])][2:])
+                return None
+
             def absval(e):
                 if e[0] == 't':
-                    return tabs.get(e[1])
+                    return tabs.get(e[1]) or upfact(tup.get(e[1]))
                 if e[0] == 'r':
-                    return ab.get(e[1])
+                    return ab.get(e[1]) or upfact(origin(e))
+                if e[0] in ('up', 'upcell') and upfact(e[1]):
+                    return 'Tb'
                 if e[0] == 'k':
                     return 'F' if e[1] is None or e[1] is False else 'T'
                 if e[0] in ('newtable', 'closure', 'constfn'):
@@ -248,6 +266,18 @@ class Lifter:
 
             def used(e):
                 # indexing or calling it worked: it is not nil or false
+                n = origin(e) if e[0] != 't' or e[1] not in torig else origin(('r', torig[e[1]]))
+                if n is None and e[0] == 't':
+                    n = tup.get(e[1])
+                if n is not None:
+                    ab[('U', n)] = 'Tb'
+                # (and the registers that hold a copy of the same value)
+                r0 = torig.get(e[1]) if e[0] == 't' else e[1] if e[0] == 'r' else None
+                if r0 is not None:
+                    src = int(ab[('E', r0)][2:]) if ('E', r0) in ab else r0
+                    for x in [src] + [k[1] for k, v in ab.items() if isinstance(k, tuple) and k[0] == 'E' and int(v[2:]) == src]:
+                        if x != r0 and x not in known.get(CAP, ()) and (ab.get(x) or '')[:1] != 'T':
+                            ab[x] = 'Tb'
                 if e[0] == 't' and e[1] in torig:
                     ab[torig[e[1]]] = ab.get(torig[e[1]]) if (ab.get(torig[e[1]]) or '')[:1] == 'T' else 'T'
                     tabs[e[1]] = tabs.get(e[1]) if (tabs.get(e[1]) or '')[:1] == 'T' else 'T'
@@ -309,11 +339,27 @@ class Lifter:
                             tabs[st[1][1]] = v
                         if e[0] == 'r':
                             torig[st[1][1]] = e[1]
+                        if origin(e) is not None:
+                            tup[st[1][1]] = origin(e)
                     elif st[1][0] == 'r':
+                        n = origin(e)
                         if v is not None and st[1][1] not in known.get(CAP, ()):
                             ab[st[1][1]] = v
                         else:
                             ab.pop(st[1][1], None)
+                        if n is not None and st[1][1] not in known.get(CAP, ()):
+                            ab[('O', st[1][1])] = 'ob%d' % n
+                        else:
+                            ab.pop(('O', st[1][1]), None)
+                        # copies: `b = a` makes what is learnt about one hold for the other
+                        for k2 in [k2 for k2, v2 in ab.items() if isinstance(k2, tuple) and k2[0] == 'E'
+                                   and (k2[1] == st[1][1] or int(v2[2:]) == st[1][1])]:
+                            del ab[k2]
+                        src = e[1] if e[0] == 'r' else torig.get(e[1]) if e[0] == 't' else None
+                        if src is not None and src != st[1][1] and st[1][1] not in known.get(CAP, ()) and src not in known.get(CAP, ()):
+                            ab[('E', st[1][1])] = 'eb%d' % (int(ab[('E', src)][2:]) if ('E', src) in ab else src)
+                    elif st[1][0] in ('up', 'upcell'):
+                        ab.pop(('U', st[1][1]), None)
                 elif st[0] == 'call':
                     fn = absval(st[2]) if isinstance(st[2], tuple) else None
                     if isinstance(st[2], tuple):
@@ -330,8 +376,11 @@ class Lifter:
                 elif st[0] in ('setindex',) and isinstance(st[1], tuple):
                     used(st[1])
                 elif st[0] == 'setmulti':
-                    for n in [n for n in ab if not isinstance(n, int) or n >= st[1]]:
+                    for n in [n for n in ab if (isinstance(n, int) and n >= st[1]) or (isinstance(n, tuple) and n[0] in ('O', 'E') and n[1] >= st[1])
+                              or not isinstance(n, (int, tuple))]:
                         del ab[n]
+                elif st[0] == 'genforprep' and isinstance(st[1], int):
+                    used(('r', st[1]))
                 elif st[0] == 'params' and self.param_vals:
                     # opaque numbers the callers pass (see opaque.relift_params)
                     for i, v in self.param_vals.items():

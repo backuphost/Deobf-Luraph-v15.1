@@ -1131,7 +1131,11 @@ do
 		end
 		-- a datatype the mock does not model: the constructor call that made it
 		local c = mock.ctorCalls and mock.ctorCalls[v]
-		if c then
+		-- (only values that cannot change afterwards: a RaycastParams gets its fields set later)
+		local immutable = { Rect = true, NumberRange = true, NumberSequence = true, ColorSequence = true, TweenInfo = true,
+			Font = true, Region3 = true, Ray = true, NumberSequenceKeypoint = true, ColorSequenceKeypoint = true,
+			BrickColor = true, PhysicalProperties = true, Vector3int16 = true, Vector2int16 = true, CFrame = true }
+		if c and immutable[string.match(c[1], "^[^.]+")] then
 			local out = {}
 			for i = 1, c[2].n do
 				local a = c[2][i]
