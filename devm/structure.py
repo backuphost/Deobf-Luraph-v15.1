@@ -927,6 +927,87 @@ def attach_preps(stmts):
     return stmts
 
 
+def unflag(root):
+    """An exit flag that only carries a jump across one block that nothing else leaves:
+
+        repeat                                  if a then
+            if a then                               x = 1
+                x = 1                               break
+                exit1 = true            ->      end
+                break                           y = 2
+            end
+            y = 2
+        until true
+        if exit1 then break end
+
+    The inner block existed for that jump alone; without it the `break` reaches the same place."""
+    def level_jumps(stmts, flagname, acc):
+        """acc: [flagged pairs at this loop level, other breaks/continues at this level, flag uses deeper]"""
+        i = 0
+        while i < len(stmts):
+            st = stmts[i]
+            t = st[0]
+            if t == 'assign' and st[1] == [('r', flagname)] and i + 1 < len(stmts) and stmts[i + 1][0] == 'break':
+                acc[0].append((stmts, i))
+                i += 2
+                continue
+            if t in ('break', 'continue'):
+                acc[1] += 1
+            elif t == 'if':
+                level_jumps(st[2], flagname, acc)
+                if st[3]:
+                    level_jumps(st[3], flagname, acc)
+            elif t == 'do':
+                level_jumps(st[1], flagname, acc)
+            elif t in ('while', 'repeat', 'fornum', 'forin'):
+                acc[2] += _mentions(st, flagname)
+            i += 1
+
+    def _mentions(node, flagname):
+        if node == ('r', flagname):
+            return 1
+        if isinstance(node, (list, tuple)):
+            return sum(_mentions(x, flagname) for x in node)
+        return 0
+
+    def walk(lst):
+        changed = False
+        for st in lst:
+            t = st[0]
+            if t == 'if':
+                changed |= walk(st[2])
+                if st[3]:
+                    changed |= walk(st[3])
+            elif t in ('while',):
+                changed |= walk(st[2])
+            elif t in ('repeat', 'do'):
+                changed |= walk(st[1])
+            elif t in ('fornum', 'forin'):
+                changed |= walk(st[3])
+        i = 0
+        while i + 1 < len(lst):
+            st, nx = lst[i], lst[i + 1]
+            if st[0] == 'repeat' and st[2] == ('k', True) and nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' \
+                    and str(nx[1][1]).startswith('exit') and len(nx[2]) == 1 and nx[2][0][0] in ('break', 'continue'):
+                flag = nx[1][1]
+                acc = [[], 0, 0]
+                level_jumps(st[1], flag, acc)
+                if acc[0] and acc[1] == 0 and acc[2] == 0 and nx[2][0][0] == 'break':
+                    others = _mentions(root, flag) - len(acc[0]) - 1
+                    if others == 0:
+                        for blk, k in sorted(acc[0], key=lambda x: -x[1]):
+                            del blk[k]
+                    lst[i:i + 2] = st[1]
+                    changed = True
+                    continue
+            i += 1
+        return changed
+    for _ in range(50):
+        if not walk(root):
+            break
+    return root
+
+
 def cleanup(stmts, in_loop_tail=False):
     """Cosmetic rewrites on the structured AST."""
     out = []
@@ -1729,7 +1810,7 @@ class Decompiler:
                 self.stats['flat'] = self.stats.get('flat', 0) + 1
                 ast = flat_ast(Structurer(cfg), str(ex), params)
                 break
-            ast = cleanup(attach_preps(ast))
+            ast = cleanup(unflag(attach_preps(ast)))
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
             n0 = max_locals(ast) + len(params)
