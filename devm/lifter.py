@@ -667,6 +667,10 @@ class Lifter:
     def lift_node(self, interp, node, key2, snap, known, indirect, pkey, numknown=False):
         """Lift one instruction into node.tree; returns None or the error text."""
         self.pe.regknown = known
+        # (a never-run instruction that decrypts bytecode with a key it took from a register:
+        # with the number that register held the decryption can be done -- see _upnum_retry)
+        self.pe.sym_buf_error = bool(self.end_state and not self.pe.use_upnum and (self.up_nums or self.temp_vals)
+                                     and (pkey, key2[0], key2[1]) not in self.oracle)
         if self.end_state:
             jkey = key2[:2]
             undo(self.journals.pop(jkey, ()))

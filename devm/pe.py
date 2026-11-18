@@ -1158,7 +1158,7 @@ class PE:
                                 patches += tuple(self.live_table_patches())
                             raw = self.dump.server.decode(obj.id, idx, patches, key if isinstance(key, int) and not isinstance(key, bool) else None)
                             if os.environ.get('DEVM_POOLDBG') and isinstance(raw, dict) and 's' in raw and any(c > 160 for c in bytes.fromhex(raw['s'])):
-                                print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, raw['s'][:40], 'patches', [(p_[0][-20:], p_[1], len(p_[2])) for p_ in patches if p_[0] != 'T'][:6])
+                                print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, raw['s'][:40], 'patches', [(p_[0][-20:], p_[1], p_[2][:12]) for p_ in patches if p_[0] != 'T'][:6], 'T', len([p_ for p_ in patches if p_[0] == 'T']), [p_[1:] for p_ in patches if p_[0] == 'T'][:12])
                             # (a function built for the answer added entries to shared tables)
                             for tid, ents in self.dump.server.tdiffs:
                                 live = self.dump.tables.get(tid)
@@ -1619,6 +1619,8 @@ class PE:
                 and isinstance(args[0], Buffer) and args[0].path:
             # the VM patching its own bytecode with a value only known at run time: not part of
             # the script (and already done in the dump when the instruction ran)
+            if getattr(self, 'sym_buf_error', False) and not self.use_upnum:
+                raise PEError('self-modifying store of a run-time value into the bytecode buffer')
             return [None]
         if self.lazy_depth and not sym and all(is_num(a) or isinstance(a, (str, bool)) or a is None for a in args):
             # the loader materialising a constant of a Roblox datatype, e.g. Vector3.new(x, y, z)
