@@ -82,6 +82,12 @@ def _run_traced(self):
         self.lifter.root_key = root
         self.log('[%s] payload: proto %d is the script (protos 1..%d are the bootstrap)' % (self.tag, root, root - 1))
     protos = self.lifter.lift_all(root)
+    if vmmodel.SERVER is not None:
+        # functions that never ran decrypt themselves with numbers their callers pass: lift those
+        # again with the numbers the lifted callers show (see opaque.relift_params)
+        from . import opaque
+        protos = opaque.relift_params(self.lifter, protos, root, self.native_text,
+                                      log=lambda msg: self.log('[%s] %s' % (self.tag, msg)))
     self.protos = protos
     self.oracle = oracle
     nodes = sum(len(p.nodes) for p in protos.values())
