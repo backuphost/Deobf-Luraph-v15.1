@@ -847,7 +847,11 @@ class Lifter:
                         meet.pop(r, None)
                     if cap:
                         meet[CAP] = cap
-                    if len(meet) == len(old) and meet.get(CAP) == old.get(CAP) and meet.get(ABS) == old.get(ABS):
+                    def firm(d):
+                        # (what a branch implies is not a reason to lift an instruction again)
+                        return frozenset(x for x in d.get(ABS, ()) if x[1][1:2] != 'b')
+                    if len({r for r in meet if r != ABS}) == len({r for r in old if r != ABS}) \
+                            and meet.get(CAP) == old.get(CAP) and firm(meet) == firm(old):
                         continue
                     known = meet
                     snap = node.snap_in
