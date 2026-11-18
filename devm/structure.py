@@ -481,8 +481,8 @@ class Structurer:
                     continue
                 if blk.term[0] == 'goto' and blk.term[1] == m:
                     continue
-                if any(x[0] == 'closure' for st in blk.stmts for e in stmt_exprs(st)[0] for x in _all_exprs(e)):
-                    continue
+                if any(x[0] == 'closure' or x == ('kfn', 'table.pack') for st in blk.stmts for e in stmt_exprs(st)[0] for x in _all_exprs(e)):
+                    continue        # (a multi-value table must keep its one definition: see beautify.fold_packs)
                 if self.small_join <= 2 and any(st[0] != 'set' for st in blk.stmts):
                     continue
                 preds = sorted(blk.preds, key=lambda x: self.rpo_idx.get(x, 0))

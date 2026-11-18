@@ -43,9 +43,15 @@ ABS = '__truth__'         # ... and: frozenset of (register, 'T...' | 'F'), see 
 SYMPC = 'jump to a run-time computed instruction'
 
 
+class Samp(tuple):
+    """samples of a number that is not known (see known_after.num2)"""
+
+
 def same_const(a, b):
     if a is b:
         return True
+    if isinstance(a, Samp) or isinstance(b, Samp):
+        return isinstance(a, Samp) and isinstance(b, Samp) and tuple(a) == tuple(b)
     if type(a) != type(b) and not (P.is_num(a) and P.is_num(b)):
         return False
     if isinstance(a, bool) or isinstance(b, bool):
@@ -193,7 +199,8 @@ class Lifter:
             def upfact(n):
                 # (the upvalue was indexed, called or iterated earlier in this function: enough
                 # to tell the sides of a `not not x` guard apart, like what a branch implies)
-                return 'Tb' if n is not None and ab.get(('U', n)) else None
+                # (certain, like a register that was indexed: a test of it that follows is a guard)
+                return 'T' if n is not None and ab.get(('U', n)) else None
 
             def origin(e):
                 if e[0] in ('up', 'upcell'):
@@ -206,11 +213,13 @@ class Lifter:
 
             def absval(e):
                 if e[0] == 't':
-                    return tabs.get(e[1]) or upfact(tup.get(e[1]))
+                    v = tabs.get(e[1])
+                    return upfact(tup.get(e[1])) or v if v is None or v[1:2] == 'b' else v
                 if e[0] == 'r':
-                    return ab.get(e[1]) or upfact(origin(e))
+                    v = ab.get(e[1])
+                    return upfact(origin(e)) or v if v is None or v[1:2] == 'b' else v
                 if e[0] in ('up', 'upcell') and upfact(e[1]):
-                    return 'Tb'
+                    return 'T'
                 if e[0] == 'k':
                     return 'F' if e[1] is None or e[1] is False else 'T'
                 if e[0] in ('newtable', 'closure', 'constfn'):
@@ -278,18 +287,28 @@ class Lifter:
                     for x in [src] + [k[1] for k, v in ab.items() if isinstance(k, tuple) and k[0] == 'E' and int(v[2:]) == src]:
                         if x != r0 and x not in known.get(CAP, ()) and (ab.get(x) or '')[:1] != 'T':
                             ab[x] = 'Tb'
+                def firm(v):
+                    # (what was only implied so far is now certain)
+                    return v if (v or '')[:1] == 'T' and (v or '')[1:2] != 'b' else 'T'
                 if e[0] == 't' and e[1] in torig:
-                    ab[torig[e[1]]] = ab.get(torig[e[1]]) if (ab.get(torig[e[1]]) or '')[:1] == 'T' else 'T'
-                    tabs[e[1]] = tabs.get(e[1]) if (tabs.get(e[1]) or '')[:1] == 'T' else 'T'
+                    ab[torig[e[1]]] = firm(ab.get(torig[e[1]]))
+                    tabs[e[1]] = firm(tabs.get(e[1]))
                 elif e[0] == 'r':
-                    ab[e[1]] = ab.get(e[1]) if (ab.get(e[1]) or '')[:1] == 'T' else 'T'
+                    ab[e[1]] = firm(ab.get(e[1]))
 
             def num(e):
+                v = num2(e)
+                return None if isinstance(v, Samp) else v
+
+            def num2(e):
+                # like num, but a value that is not known can enter through `x % 4294967296`: it
+                # is then carried as a few samples (Samp), and whatever comes out the same for
+                # all of them is a number again -- `mul(x, C) + mul(bnot(x), C)` is, for every x
                 if e[0] == 'k':
                     return e[1] if P.is_num(e[1]) and not isinstance(e[1], bool) else None
                 if e[0] == 'r':
                     v = known.get(e[1])
-                    return v if P.is_num(v) and not isinstance(v, bool) else None
+                    return v if isinstance(v, Samp) or (P.is_num(v) and not isinstance(v, bool)) else None
                 if e[0] == 't':
                     # (a temporary of an earlier instruction: the value of an interpreter local)
                     return temps[e[1]] if e[1] in temps else self.temp_vals.get(e[1])
@@ -298,7 +317,25 @@ class Lifter:
                 if e[0] == 'mv' and e[2] == 1:
                     return calls.get(e[1])
                 if e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//'):
-                    x, y = num(e[2]), num(e[3])
+                    x, y = num2(e[2]), num2(e[3])
+                    if x is None and e[1] == '%' and y == 4294967296 and e[2][0] in ('r', 't', 'up', 'upcell') and self.end_state:
+                        import random
+                        g = random.Random(repr((self.cur_node, e[2])))
+                        return Samp((float(g.randrange(0, 2 ** 32)), g.uniform(0, 2 ** 32), float(g.randrange(0, 2 ** 31))))
+                    if isinstance(x, Samp) or isinstance(y, Samp):
+                        if x is None or y is None:
+                            return None
+                        xs = x if isinstance(x, Samp) else (x,) * 3
+                        ys = y if isinstance(y, Samp) else (y,) * 3
+                        out = []
+                        for a_, b_ in zip(xs, ys):
+                            if e[1] in ('%', '//') and b_ == 0:
+                                return None
+                            out.append(a_ + b_ if e[1] == '+' else a_ - b_ if e[1] == '-' else a_ * b_ if e[1] == '*' else
+                                       a_ % b_ if e[1] == '%' else a_ // b_)
+                        if out[0] == out[1] == out[2]:
+                            return P.norm(out[0]) if abs(out[0]) < 2 ** 53 else None
+                        return Samp(out)
                     if x is None or y is None or (e[1] in ('%', '//') and y == 0):
                         return None
                     r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y if e[1] == '*' else \
@@ -388,8 +425,14 @@ class Lifter:
                             known[st[1] + i] = P.norm(v)
                 if st[0] == 'call' and st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.') and st[4] is None:
                     # arithmetic on the opaque state numbers, done with the bit library
-                    args = [num(a) for a in st[3]]
-                    if args and all(a is not None for a in args):
+                    args = [num2(a) for a in st[3]]
+                    if args and all(a is not None for a in args) and any(isinstance(a, Samp) for a in args):
+                        from . import ircfg
+                        vs = [ircfg._opaque_eval(('call', st[2], [('k', a[i] if isinstance(a, Samp) else a) for a in args], None), {})
+                              for i in range(3)]
+                        if all(v is not None for v in vs):
+                            calls[st[1]] = P.norm(vs[0]) if vs[0] == vs[1] == vs[2] else Samp(float(v) for v in vs)
+                    elif args and all(a is not None for a in args):
                         from . import ircfg
                         v = ircfg._opaque_eval(('call', st[2], [('k', a) for a in args], None), {})
                         if v is not None:
@@ -400,7 +443,7 @@ class Lifter:
                     if x is not None and y is not None:
                         truth[st[1][1]] = (x == y) == (st[2][1] == '==')
                 if st[0] == 'set' and st[1][0] == 't' and isinstance(st[2], tuple):
-                    v = num(st[2])
+                    v = num2(st[2])
                     if v is not None:
                         temps[st[1][1]] = v
                         self.temp_vals[st[1][1]] = v     # (a temporary can outlive the instruction
@@ -467,8 +510,8 @@ class Lifter:
                         known[st[1][1]] = e[1]
                     elif e[0] == 'constfn':
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
-                    elif e[0] in ('t', 'bin', 'up', 'upcell', 'mv') and num(e) is not None:
-                        known[st[1][1]] = num(e)
+                    elif e[0] in ('t', 'bin', 'up', 'upcell', 'mv') and num2(e) is not None:
+                        known[st[1][1]] = num2(e)
                     else:
                         known.pop(st[1][1], None)
                 elif st[0] == 'setmulti':

@@ -1145,6 +1145,10 @@ class PE:
                     if is_num(idx) and not isinstance(idx, bool) and float(idx).is_integer():
                         idx = int(idx)
                         v = kt.h.get(idx)
+                        if os.environ.get('DEVM_POOLDBG') and isinstance(v, str) and any(ord(c) > 160 for c in v) and self.dump.server is not None:
+                            patches = tuple((b.path, off, data) for b in self.dump.buffers for off, data in b.patches())
+                            print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, repr(v)[:40], 'server says', repr(self.dump.server.decode(obj.id, idx, patches))[:120],
+                                  'neighbours', [repr(kt.h.get(idx + d))[:30] for d in (-2, -1, 1, 2)])
                         if v is None and self.dump.server is not None and not isinstance(idx, KNum):
                             # not decoded during the run: ask the run itself (it is still alive)
                             # (with the bytecode as this path has left it: decoding a nested
@@ -1153,6 +1157,8 @@ class PE:
                             if self.live_table_patches is not None:
                                 patches += tuple(self.live_table_patches())
                             raw = self.dump.server.decode(obj.id, idx, patches)
+                            if os.environ.get('DEVM_POOLDBG') and isinstance(raw, dict) and 's' in raw and any(c > 160 for c in bytes.fromhex(raw['s'])):
+                                print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, raw['s'][:40], 'patches', [(p_[0][-20:], p_[1], len(p_[2])) for p_ in patches if p_[0] != 'T'][:6])
                             # (a function built for the answer added entries to shared tables)
                             for tid, ents in self.dump.server.tdiffs:
                                 live = self.dump.tables.get(tid)
