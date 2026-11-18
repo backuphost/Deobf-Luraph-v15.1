@@ -89,6 +89,8 @@ class Lifter:
         self.cap_src = {}           # function key -> {upvalue index: where its creator takes it from}
         self.cap_vals = {}          # (function key, register) -> number last stored in a shared variable
         self.all_up_nums = {}
+        self.cap_hist = {}          # (function key, register) -> every number stored there
+        self.cap_pick = {}          # ... and the one to use instead of the last (lift_all)
         self.lifting_key = None
         self.folds = {}
         self.opaque_in = {}
@@ -198,6 +200,9 @@ class Lifter:
                     return 'T:' + str(e[1])
                 if e[0] == 'un' and e[1] == 'not':
                     v = absval(e[2])
+                    if v is not None and v[1:2] == 'b':
+                        # (known from a branch only: see below)
+                        return ('F' if v[0] == 'T' else 'T') + 'b' + v[2:] + 'n'
                     return None if v is None else ('F' if v[0] == 'T' else 'T')
                 if e[0] == 'un' and e[1] in ('#', '-'):
                     return 'T'
@@ -209,7 +214,10 @@ class Lifter:
                 """True / False when the branch has one outcome, else None.  The outcome of an
                 opaque predicate does not depend on the path: once seen, it holds for the
                 instruction also where the value's history is not known (a join of paths)."""
-                v = (absval(term[1]) or '')[:1]
+                v = absval(term[1]) or ''
+                if v[1:2] == 'b' and not v.endswith('nn'):
+                    v = ''          # an ordinary second test of a value: both sides are real
+                v = v[:1]
                 slot = (self.cur_node, len(brs))
                 brs.append(term)
                 live = None if v not in ('T', 'F') else v == 'T'
@@ -359,6 +367,9 @@ class Lifter:
                                 if v is not None:
                                     # (a number stored after the capture counts: see below)
                                     self.cap_vals.setdefault((self.lifting_key, c[1]), v)
+                                    h = self.cap_hist.setdefault((self.lifting_key, c[1]), [])
+                                    if v not in h:
+                                        h.append(v)
                         elif c[0] == 'up':
                             src[i] = ('up', self.lifting_key, c[1])
                     refs = {c[1] for c in st[2][2] if c[0] == 'ref' and not isinstance(c[1], tuple)}
@@ -386,6 +397,9 @@ class Lifter:
                     if v is not None:
                         known[st[1][1]] = v
                         self.cap_vals[(self.lifting_key, st[1][1])] = v
+                        h = self.cap_hist.setdefault((self.lifting_key, st[1][1]), [])
+                        if v not in h:
+                            h.append(v)
                     else:
                         known.pop(st[1][1], None)
                     continue
@@ -423,9 +437,16 @@ class Lifter:
                 known[ABS] = frozenset(ab.items())
                 walk(term[2] if live else term[3], known, temps, calls, tabs)
             elif term[0] == 'br':
-                known[ABS] = frozenset(ab.items())
-                walk(term[2], known, temps, calls, tabs)
-                walk(term[3], known, temps, calls, tabs)
+                # Inside `if x then`, x is not nil or false.  That alone decides nothing, but
+                # Luraph follows such a test with `not not x` and a branch on it, whose dead side
+                # applies a decryption layer that the real path never applies.
+                reg = torig.get(term[1][1]) if term[1][0] == 't' else None
+                for arm, tv in ((term[2], 'Tb'), (term[3], 'Fb')):
+                    ab2 = dict(ab)
+                    if reg is not None and reg not in known.get(CAP, ()) and ab2.get(reg) is None:
+                        ab2[reg] = tv
+                    known[ABS] = frozenset(ab2.items())
+                    walk(arm, known, temps, calls, tabs)
             elif term[0] == 'forbr':
                 for n in ((term[2] + 3,) if term[1] == 'num' else tuple(term[2])):
                     ab.pop(n, None)
@@ -1312,15 +1333,36 @@ class FactoryLifter(Lifter):
             k = queue.pop(0)
             if k in done and k != root_key:
                 continue
-            fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
-            fresh.param_vals = dict(param_vals.get(k) or ())
-            fresh.dump.server = self.dump.server
-            fresh.pe.keyfn_override = self.pe.keyfn_override
-            fresh.oracle = self.oracle
-            fresh.end_state = self.end_state
-            fresh.entry_override = self.entry_override
-            fresh.cap_src, fresh.cap_vals, fresh.all_up_nums = self.cap_src, self.cap_vals, self.all_up_nums
-            pir = fresh.lift_proto(k)
+            def attempt(pick=None):
+                fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
+                fresh.param_vals = dict(param_vals.get(k) or ())
+                fresh.dump.server = self.dump.server
+                fresh.pe.keyfn_override = self.pe.keyfn_override
+                fresh.oracle = self.oracle
+                fresh.end_state = self.end_state
+                fresh.entry_override = self.entry_override
+                fresh.cap_src, fresh.cap_vals, fresh.all_up_nums = self.cap_src, self.cap_vals, self.all_up_nums
+                fresh.cap_hist = self.cap_hist
+                fresh.cap_pick = pick or {}
+                return fresh.lift_proto(k)
+
+            pir = attempt()
+            if pir.errors and not any((k, e[0][0], e[0][1]) in (self.oracle or ()) for e in pir.errors):
+                # A function that never ran, lifted with the opaque numbers its creator shares
+                # with it.  The creator rewrites such a variable several times and which value
+                # the function sees depends on when it is called: try the others.
+                tries = 0
+                for src in list(self.cap_src.get(k, {}).values()):
+                    if src[0] != 'reg' or not pir.errors:
+                        continue
+                    reg = (src[1], src[2])
+                    for v in list(self.cap_hist.get(reg, ())):
+                        if v == self.cap_vals.get(reg) or tries >= 8 or not pir.errors:
+                            continue
+                        tries += 1
+                        alt = attempt({reg: v})
+                        if len(alt.errors) < len(pir.errors):
+                            pir = alt
             pir.keyfns = set(pir.keyfns)
             done[k] = pir
             queue.extend(c for c in pir.children if c not in done)
@@ -1369,7 +1411,7 @@ class FactoryLifter(Lifter):
             if src[0] == 'num':
                 v = src[1]
             elif src[0] == 'reg':
-                v = self.cap_vals.get((src[1], src[2]))
+                v = self.cap_pick.get((src[1], src[2]), self.cap_vals.get((src[1], src[2])))
             else:
                 v = self.all_up_nums.get(src[1], {}).get(src[2])
             if v is not None and P.is_num(v) and float(v).is_integer() and abs(v) >= 65536:

@@ -26,6 +26,7 @@ Terminators:
   ('goto', pc) ('ret', vals, tail) ('br', cond, T, F) where T/F = (stmts, term)
 """
 import math
+import os
 import struct
 import sys
 
@@ -1275,7 +1276,7 @@ class PE:
                 # an instruction that never ran must not rewrite one that did (and is in its final form)
                 return
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
-                raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key))
+                raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key) + (' <%r was %r>' % (val, obj.h.get(key)) if os.environ.get('DEVM_PEDBG') else ''))
             if obj.path and not obj.fresh and not self.seeking and self.inject is not None \
                     and obj.path in self.volatile:
                 # a VM instruction writing into loader state that outlives the instruction:
