@@ -923,13 +923,26 @@ def relift_params(lift, protos, root, native_text=None, rounds=5, log=None):
                 del os.environ['DEVM_PROTO_IDS']
             else:
                 os.environ['DEVM_PROTO_IDS'] = saved
+        def below(k, seen=None):
+            seen = set() if seen is None else seen
+            for c in getattr(protos.get(k), 'children', ()) or ():
+                if c not in seen and c in protos:
+                    seen.add(c)
+                    below(c, seen)
+            return seen
+
+        # (the number may also be handed on to a nested function that needs it)
         vals = {k: v for k, v in param_literals(text).items()
-                if k in protos and protos[k].errors and done.get(k) != v}
+                if k in protos and done.get(k) != v
+                and (protos[k].errors or any(protos[c].errors for c in below(k)))}
         if not vals:
             break
         for k, v in vals.items():
+            if k not in protos:
+                continue
             done[k] = v
             if log:
                 log('lifting proto %s again with parameters %s' % (k, v))
-            protos = lift.lift_all(k, redo_into=protos, param_vals={k: v})
+            keep = {x: q for x, q in protos.items() if x not in below(k)}
+            protos = lift.lift_all(k, redo_into=keep, param_vals={k: v})
     return protos

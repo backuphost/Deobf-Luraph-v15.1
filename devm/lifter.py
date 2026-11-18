@@ -248,7 +248,8 @@ class Lifter:
                     v = known.get(e[1])
                     return v if P.is_num(v) and not isinstance(v, bool) else None
                 if e[0] == 't':
-                    return temps.get(e[1])
+                    # (a temporary of an earlier instruction: the value of an interpreter local)
+                    return temps[e[1]] if e[1] in temps else self.temp_vals.get(e[1])
                 if e[0] in ('up', 'upcell'):
                     return self.up_nums.get(e[1])
                 if e[0] == 'mv' and e[2] == 1:
@@ -356,7 +357,8 @@ class Lifter:
                             else:
                                 src[i] = ('reg', self.lifting_key, c[1])
                                 if v is not None:
-                                    self.cap_vals[(self.lifting_key, c[1])] = v
+                                    # (a number stored after the capture counts: see below)
+                                    self.cap_vals.setdefault((self.lifting_key, c[1]), v)
                         elif c[0] == 'up':
                             src[i] = ('up', self.lifting_key, c[1])
                     refs = {c[1] for c in st[2][2] if c[0] == 'ref' and not isinstance(c[1], tuple)}
@@ -371,8 +373,12 @@ class Lifter:
                     known = {CAP: known[CAP]} if CAP in known else {}
                 if st[0] == 'call' and not (st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.')):
                     # a variable shared with a closure can change whenever something is called
+                    # (not an opaque state number: closures only scramble those on dead paths)
                     for r in known.get(CAP, ()):
-                        known.pop(r, None)
+                        v = known.get(r)
+                        if not (P.is_num(v) and not isinstance(v, bool) and float(v).is_integer()
+                                and abs(v) >= 2 ** 24):
+                            known.pop(r, None)
                 if st[0] == 'set' and st[1][0] == 'r' and st[1][1] in known.get(CAP, ()):
                     # ... and holds what was just put there until then (numbers only: the opaque
                     # state numbers are such variables)
