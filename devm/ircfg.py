@@ -1217,20 +1217,26 @@ class ProtoCFG:
             memo[d] = res
             return res
 
-        def ok(e, bid):
+        def ok(e, bid, top=True):
             if e is None:
                 return False
             if e[0] == 'k':
-                return True
+                # (a variable that is set to 0 or 1 is the script's own: a state number is large)
+                return not top or (isinstance(e[1], (int, float)) and not isinstance(e[1], bool)
+                                   and float(e[1]).is_integer() and abs(e[1]) >= 65536)
             if e[0] == 'r':
                 ds = IN.get(bid, {}).get(e[1]) or [('ENTRY', e[1])]
                 return all(def_ok(d) for d in ds)
             if e[0] == 'up':
                 return e[1] in ups
             if e[0] == 'bin':
-                return ok(e[2], bid) and ok(e[3], bid)
+                if e[1] == '%' and e[3] == ('k', 4294967296) and e[2][0] in ('r', 'up'):
+                    # any value at all, reduced to 32 bits: the way into `mul(x, C) + mul(bnot(x), C)`,
+                    # which is the same number for every x
+                    return True
+                return ok(e[2], bid, False) and ok(e[3], bid, False)
             if e[0] == 'call':
-                return all(ok(x, bid) for x in e[2])
+                return all(ok(x, bid, False) for x in e[2])
             return False
 
         def opaque(b, i, e):
@@ -1359,21 +1365,59 @@ class ProtoCFG:
                 return (x == y) == (e[1] == '==')
             return _opaque_eval(e, ups, env)
 
-        def run(b, env):
-            env = dict(env)
-            for st in b.stmts:
+        import random
+        K = 3
+
+        class Env(dict):
+            # a register nothing is known about holds some number: a different one in each of
+            # the K evaluations, so that only what does not depend on it comes out equal
+            def get(self, r, default=None):
+                if r in self:
+                    return self[r]
+                return self.rnd.setdefault(r, self.gen.choice([float(self.gen.randrange(0, 2 ** 32)), self.gen.uniform(-1e6, 1e6),
+                                                                self.gen.uniform(0, 2 ** 33)]))
+
+            def __bool__(self):
+                return True
+
+        def run(b, env, want_cond=False, upto=None, expr=None):
+            envs = []
+            for k in range(K):
+                e = Env(env)
+                e.rnd = {}
+                e.gen = random.Random(hash((b.id, k)) & 0xFFFFFFF)
+                envs.append(e)
+            for st in (b.stmts if upto is None else b.stmts[:upto]):
                 if st[0] == 'set' and st[1][0] == 'r':
-                    v = ev(st[2], env)
-                    if v is None or st[1][1] in cap:
-                        env.pop(st[1][1], None)
-                    else:
-                        env[st[1][1]] = v
+                    vs = [ev(st[2], e) for e in envs]
+                    for e, v in zip(envs, vs):
+                        e.rnd.pop(st[1][1], None)
+                        if v is None or any(x is None for x in vs) or st[1][1] in cap:
+                            e.pop(st[1][1], None)
+                        else:
+                            e[st[1][1]] = v
                 else:
                     for r in _writes_of(st):
-                        env.pop(r, None)
+                        for e in envs:
+                            e.pop(r, None)
+                            e.rnd.pop(r, None)
+            if expr is not None:
+                # the value of an expression before statement `upto`, when it is the same whatever
+                # the unknown registers hold
+                vs = [ev(expr, e) for e in envs]
+                same = vs[0] is not None and all(type(v) is type(vs[0]) and v == vs[0] for v in vs)
+                return vs[0] if same else None
+            cond = None
+            if want_cond and b.term[0] == 'br':
+                cs = [ev(b.term[1], e) for e in envs]
+                if isinstance(cs[0], bool) and all(c is cs[0] for c in cs):
+                    cond = cs[0]
             for r in _writes_of(b.term):
-                env.pop(r, None)
-            return env
+                for e in envs:
+                    e.pop(r, None)
+            out = {r: v for r, v in envs[0].items()
+                   if all(r in e and type(e[r]) is type(v) and e[r] == v for e in envs[1:])}
+            return (out, cond) if want_cond else out
 
         IN = {self.entry: {}}
         work = [self.entry]
@@ -1382,10 +1426,9 @@ class ProtoCFG:
             rounds += 1
             bid = work.pop()
             b = blocks[bid]
-            out = run(b, IN[bid])
+            out, c = run(b, IN[bid], True)
             succs = b.succs()
             if b.term[0] == 'br':
-                c = ev(b.term[1], out)
                 if isinstance(c, bool):
                     succs = [b.term[2] if c else b.term[3]]
             for sid in succs:
@@ -1398,7 +1441,7 @@ class ProtoCFG:
                     if len(new) != len(cur):
                         IN[sid] = new
                         work.append(sid)
-        return IN, ev
+        return IN, lambda b, n, e: run(b, IN[b.id], False, n, e)
 
     def _used_as_object(self, b, src):
         """The value `src` (an upvalue captured by value, or a register the block does not assign)
@@ -1520,18 +1563,7 @@ class ProtoCFG:
             v = value(b, n, other)
             if v is None and b.id in flow:
                 # ... or the paths that can execute determine it
-                env = dict(flow[b.id])
-                for st in b.stmts[:n]:
-                    if st[0] == 'set' and st[1][0] == 'r':
-                        x = flow_ev(st[2], env)
-                        if x is None or st[1][1] in self.captured_ref:
-                            env.pop(st[1][1], None)
-                        else:
-                            env[st[1][1]] = x
-                    else:
-                        for r in _writes_of(st):
-                            env.pop(r, None)
-                x = flow_ev(other, env)
+                x = flow_ev(b, n, other)
                 if isinstance(x, (int, float)) and not isinstance(x, bool):
                     v = x
             known = None if v is None else arms[0 if ((v == consts[0]) == (e[1] == '==')) != flip else 1]
