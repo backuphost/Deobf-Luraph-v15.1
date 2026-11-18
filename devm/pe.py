@@ -1788,7 +1788,7 @@ class PE:
     def exec_core(self, st, scope):
         t = st[0]
         if self.trace is not None:
-            self.trace.append(repr(st)[:300])
+            self.trace.append(repr(st)[:300] if st[0] != 'assign' else repr(st)[:3000])
         if t == 'if':
             if len(st[1]) == 1 and not st[2] and len(st[1][0][1]) == 4 and st[1][0][0][0] == 'name':
                 # `local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5; open[r] = nil end`:
@@ -1846,6 +1846,9 @@ class PE:
                     self.assign_target(tg, v, scope)
                 return None
             vals = self.adjust(self.evalargs(st[2], scope), len(targets))
+            if self.trace is not None:
+                self.trace.append('   -> %r' % (vals,))
+                self.trace.append('   fn %r' % ([self.eval1(e[1], scope) for e in st[2] if e[0] == 'call'],))
             for tg, v in zip(targets, vals):
                 self.assign_target(tg, v, scope)
             return None

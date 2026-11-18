@@ -870,3 +870,66 @@ def prune_ir(protos, cuts=None):
             del nodes[k]
         pir.errors = [e for e in pir.errors if e[0] in seen]
     return total
+
+
+def param_literals(text):
+    """{proto id: {parameter index: number}} for the functions (tagged `-- proto N`) every call
+    of which passes the same big literal number in that position: opaque state numbers.  A
+    function that never ran takes decryption keys of its own code from them."""
+    out = {}
+    for m in re.finditer(r'(?m)^[ \t]*(?:local (v\d+) = function|local function (v\d+)|(v\d+) = function)'
+                         r'\(([^)\n]*)\) -- proto (\d+)$', text):
+        name = m.group(1) or m.group(2) or m.group(3)
+        nparams = len([x for x in m.group(4).split(',') if x.strip()])
+        calls = []
+        for c in re.finditer(r'(?<![\w.:])%s\(' % name, text):
+            args, close = _call_args(text, c.end() - 1)
+            if args is None:
+                calls = None
+                break
+            calls.append(args)
+        if not calls:
+            continue
+        vals = {}
+        for k in range(nparams):
+            seen = set()
+            for args in calls:
+                a = args[k] if k < len(args) else None
+                a = text[a[0]:a[1]].strip() if isinstance(a, tuple) else (a.strip() if isinstance(a, str) else None)
+                seen.add(a)
+            if len(seen) == 1:
+                a = next(iter(seen))
+                if a and re.fullmatch(r'\d+', a) and int(a) >= 2 ** 24:
+                    vals[k] = int(a)
+        if vals:
+            out[int(m.group(5))] = vals
+    return out
+
+
+def relift_params(lift, protos, root, native_text=None, rounds=5, log=None):
+    """Functions that never ran and whose code is decrypted with numbers their callers pass:
+    find those numbers in the decompiled callers and lift the functions again."""
+    from . import structure
+    done = {}
+    for _ in range(rounds):
+        if not any(p.errors for p in protos.values()):
+            break
+        saved = os.environ.get('DEVM_PROTO_IDS')
+        os.environ['DEVM_PROTO_IDS'] = '1'
+        try:
+            text = structure.Decompiler(protos, root, native_text).run()
+        finally:
+            if saved is None:
+                del os.environ['DEVM_PROTO_IDS']
+            else:
+                os.environ['DEVM_PROTO_IDS'] = saved
+        vals = {k: v for k, v in param_literals(text).items()
+                if k in protos and protos[k].errors and done.get(k) != v}
+        if not vals:
+            break
+        for k, v in vals.items():
+            done[k] = v
+            if log:
+                log('lifting proto %s again with parameters %s' % (k, v))
+            protos = lift.lift_all(k, redo_into=protos, param_vals={k: v})
+    return protos

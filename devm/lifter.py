@@ -94,6 +94,7 @@ class Lifter:
         self.opaque_in = {}
         self.sticky = {}
         self.cur_node = None
+        self.param_vals = {}        # parameter index -> opaque number every caller passes
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
@@ -252,11 +253,12 @@ class Lifter:
                     return self.up_nums.get(e[1])
                 if e[0] == 'mv' and e[2] == 1:
                     return calls.get(e[1])
-                if e[0] == 'bin' and e[1] in ('+', '-', '*', '%'):
+                if e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//'):
                     x, y = num(e[2]), num(e[3])
-                    if x is None or y is None or (e[1] == '%' and y == 0):
+                    if x is None or y is None or (e[1] in ('%', '//') and y == 0):
                         return None
-                    r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y if e[1] == '*' else x % y
+                    r = x + y if e[1] == '+' else x - y if e[1] == '-' else x * y if e[1] == '*' else \
+                        x % y if e[1] == '%' else x // y
                     if abs(r) >= 2 ** 53:
                         return None
                     if isinstance(x, P.UpNum) or isinstance(y, P.UpNum):
@@ -316,8 +318,11 @@ class Lifter:
                 elif st[0] == 'setmulti':
                     for n in [n for n in ab if not isinstance(n, int) or n >= st[1]]:
                         del ab[n]
-                elif st[0] not in ('cold', 'params', 'close', 'forpop'):
-                    pass
+                elif st[0] == 'params' and self.param_vals:
+                    # opaque numbers the callers pass (see opaque.relift_params)
+                    for i, v in self.param_vals.items():
+                        if i < st[2]:
+                            known[st[1] + i] = P.norm(v)
                 if st[0] == 'call' and st[2][0] == 'kfn' and str(st[2][1]).startswith('bit32.') and st[4] is None:
                     # arithmetic on the opaque state numbers, done with the bit library
                     args = [num(a) for a in st[3]]
@@ -380,7 +385,9 @@ class Lifter:
                     continue
                 if st[0] == 'set' and st[1][0] == 'r':
                     e = st[2]
-                    if e[0] == 'outer' and e[1] in by_path:
+                    if e[0] == 'arg' and self.param_vals and (e[1] - 1) in self.param_vals:
+                        known[st[1][1]] = P.norm(self.param_vals[e[1] - 1])
+                    elif e[0] == 'outer' and e[1] in by_path:
                         known[st[1][1]] = by_path[e[1]]
                     elif e[0] == 'k' and (P.is_num(e[1]) or isinstance(e[1], bool)):
                         known[st[1][1]] = e[1]
@@ -1283,20 +1290,24 @@ class FactoryLifter(Lifter):
     def register(self, key):
         pass
 
-    def lift_all(self, root_key):
+    def lift_all(self, root_key, redo_into=None, param_vals=None):
         """Every proto is lifted against a pristine copy of the dumped VM state.
+        (redo_into: protos already lifted, of which root_key is lifted again with the opaque
+        numbers its callers pass, param_vals = {proto: {parameter index: number}}.)
 
         Lifting evaluates instructions that modify state shared by all protos (one-shot decryption
         of pooled constants inside the bytecode buffer).  A proto that is still partly encrypted
         (hash-keyed code that has not run yet) lifts garbage on those paths, and garbage writes
         must not leak into the constants of the other protos."""
         queue = [root_key]
-        done = {}
+        done = dict(redo_into or ())
+        param_vals = param_vals or {}
         while queue:
             k = queue.pop(0)
-            if k in done:
+            if k in done and k != root_key:
                 continue
             fresh = FactoryLifter(self.model, P.Dump(self.dump.data, self.model), self.log)
+            fresh.param_vals = dict(param_vals.get(k) or ())
             fresh.dump.server = self.dump.server
             fresh.pe.keyfn_override = self.pe.keyfn_override
             fresh.oracle = self.oracle
