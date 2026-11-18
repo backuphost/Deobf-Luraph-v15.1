@@ -297,7 +297,205 @@ def inline_single_use(ast):
         run(ast)
 
 
+def _count(node, target):
+    """occurrences of the tuple `target` anywhere inside an AST fragment"""
+    if node == target:
+        return 1
+    if isinstance(node, (list, tuple)):
+        return sum(_count(x, target) for x in node)
+    return 0
+
+
+def _has_call(node):
+    if isinstance(node, tuple) and node and node[0] in ('call', 'closure'):
+        return node[0] == 'call' or _has_call(list(node[1:]))
+    if isinstance(node, (list, tuple)):
+        return any(_has_call(x) for x in node)
+    return False
+
+
+def _targets(node, out):
+    """registers assigned anywhere inside a statement"""
+    if isinstance(node, list) and node and isinstance(node[0], str):
+        if node[0] == 'assign':
+            out.update(d for d in node[1] if d[0] == 'r')
+        elif node[0] == 'fornum':
+            out.add(('r', node[1]))
+        elif node[0] == 'forin':
+            out.update(('r', v) for v in node[1])
+    if isinstance(node, list):
+        for x in node:
+            _targets(x, out)
+    return out
+
+
+def fold_packs(root):
+    """This VM keeps the open results of a call in a table until the instruction that uses them:
+
+        t = table.pack(g(x))                         f(a, b, g(x))
+        n = t.n; t.n = 3 + n - 1
+        table.move(t, 1, n, 3, t)             ->
+        t[1] = a; t[2] = b
+        f(unpack(t, 1, t.n))
+
+    and `table.move(t, 1, t.n, k, list)` where the results end a table constructor."""
+    import copy
+
+    def unpack_of(T):
+        return ('call', ('kfn', 'unpack'), [T, ('k', 1), ('index', T, ('k', 'n'))], None)
+
+    def try_fold(lst, i):
+        st = lst[i]
+        T = st[1][0]
+        call = st[2][0]
+        items, tail = list(call[2]), call[3]
+        total = _count(root, T)
+        if total == 1 and not _has_call(items) and (tail is None or tail == ('va',)):
+            del lst[i]          # (a function that never looks at its `...`)
+            return True
+        movable = not _has_call(items) and (tail is None or tail == ('va',)) and \
+            all(e[0] in ('k', 'r') for e in items)
+        reads = set()
+        for e in items + ([tail] if tail else []):
+            walk_expr(e, out := [])
+            reads.update(x for x in out if x[0] == 'r')
+        consumed = 1
+        prefix = {}
+        K = None
+        nvar = None
+        drop = [i]
+        U = unpack_of(T)
+        j = i + 1
+        work = lst
+        while j < len(work):
+            x = work[j]
+            t = x[0]
+            if t == 'assign' and len(x[1]) == 1 and x[1][0][0] == 'r' and x[2] == [('index', T, ('k', 'n'))] and nvar is None:
+                nvar = x[1][0]
+                if _count(root, nvar) != 3:
+                    return False
+                consumed += 1
+                drop.append(j)
+            elif t == 'assign' and nvar is not None and x[1] == [('index', T, ('k', 'n'))] and len(x[2]) == 1 \
+                    and x[2][0][0] == 'bin' and x[2][0][1] == '-' and x[2][0][3] == ('k', 1) and x[2][0][2][0] == 'bin' \
+                    and x[2][0][2][1] == '+' and x[2][0][2][2][0] == 'k' and x[2][0][2][3] == nvar:
+                K = x[2][0][2][2][1]
+                consumed += 1
+                drop.append(j)
+            elif t == 'call' and K is not None and x[1] == ('call', ('kfn', 'table.move'), [T, ('k', 1), nvar, ('k', K), T], None):
+                consumed += 2
+                drop.append(j)
+            elif t == 'setlist' and K is not None and x[1] == T and x[4] is None:
+                for n, v in enumerate(x[3]):
+                    prefix[x[2] + n] = v
+                consumed += 1
+                drop.append(j)
+            elif t == 'assign' and K is not None and len(x[1]) == 1 and x[1][0][0] == 'index' and x[1][0][1] == T \
+                    and x[1][0][2][0] == 'k' and isinstance(x[1][0][2][1], int) and len(x[2]) == 1 and _count(x[2], T) == 0:
+                prefix[x[1][0][2][1]] = x[2][0]
+                consumed += 1
+                drop.append(j)
+            elif _count(x, T):
+                if K is not None and sorted(prefix) != list(range(1, K)):
+                    return False
+                final = [prefix[n] for n in sorted(prefix)] + items
+                if t == 'if' and x[1] == T and consumed + 1 < total:
+                    # (a table is never nil or false)
+                    work = work[:j] + list(x[2]) + work[j + 1:]
+                    consumed += 1
+                    continue
+                y = copy.copy(x)
+                if t == 'call' and y[1][0] == 'call' and y[1][1] == ('kfn', 'table.move') and len(y[1][2]) == 5 \
+                        and y[1][2][:3] == [T, ('k', 1), ('index', T, ('k', 'n'))] and y[1][2][3][0] == 'k' and _count(y[1][2][4], T) == 0:
+                    y = ['setlist', y[1][2][4], y[1][2][3][1], final, tail]
+                    consumed += 2
+                    # ... of a table that was created empty just before: its constructor
+                    prev = next((n for n in range(j - 1, -1, -1) if n not in drop), None)
+                    if prev is not None and y[2] == 1 and work[prev][0] == 'setlist' and work[prev][1] == y[1] \
+                            and not work[prev][3] and work[prev][4] is None:
+                        drop.append(prev)
+                        prev = next((n for n in range(prev - 1, -1, -1) if n not in drop), None)
+                    if prev is not None and y[2] == 1 and work[prev][0] == 'assign' and work[prev][1] == [y[1]] \
+                            and len(work[prev][2]) == 1 and work[prev][2][0][0] == 'newtable' and y[1][0] == 'r':
+                        work[prev] = ['assign', [y[1]], [('table', [(None, v) for v in final], tail)]]
+                        if consumed != total:
+                            return False
+                        drop.append(j)
+                        lst[:] = [w for n, w in enumerate(work) if n not in drop]
+                        return True
+                else:
+                    hits = [0]
+
+                    def fn(e):
+                        if e[0] == 'call' and e[3] == U:
+                            hits[0] += 1
+                            return ('call', e[1], list(e[2]) + final, tail)
+                        if e[0] == 'table' and e[2] == U:
+                            hits[0] += 1
+                            return ('table', list(e[1]) + [(None, v) for v in final], tail)
+                        return e
+                    if t == 'return' and y[1] and y[1][-1] == U:
+                        y[1] = list(y[1][:-1]) + final + ([tail] if tail else [])
+                        hits[0] += 1
+                    set_head_exprs(y, fn)
+                    if hits[0] != 1:
+                        return False
+                    consumed += 2
+                if consumed != total:
+                    return False
+                work[j] = y
+                lst[:] = [w for n, w in enumerate(work) if n not in drop]
+                return True
+            else:
+                if not movable and _has_call(x):
+                    return False
+                if reads & _targets(x, set()):
+                    return False
+            j += 1
+        return False
+
+    def defs(T):
+        n = [0]
+
+        def go(node):
+            if isinstance(node, list):
+                if node and node[0] == 'assign' and T in node[1]:
+                    n[0] += 1
+                for x in node:
+                    go(x)
+        go(root)
+        return n[0]
+
+    def walk(lst):
+        i = 0
+        while i < len(lst):
+            st = lst[i]
+            if st[0] == 'assign' and len(st[1]) == 1 and st[1][0][0] == 'r' and len(st[2]) == 1 and st[2][0][0] == 'call' \
+                    and st[2][0][1] == ('kfn', 'table.pack') and defs(st[1][0]) == 1:
+                # `x = t` copies of the table first
+                T = st[1][0]
+                for j in range(i + 1, len(lst)):
+                    x = lst[j]
+                    if x[0] == 'assign' and x[2] == [T] and len(x[1]) == 1 and x[1][0][0] == 'r' and defs(x[1][0]) == 1 \
+                            and _count(root, T) == 2:
+                        X = x[1][0]
+                        del lst[j]
+                        for k in range(j, len(lst)):
+                            def ren(e, X=X, T=T):
+                                return T if e == X else e
+                            set_head_exprs(lst[k], ren)
+                        break
+                if _count(root, ('r', '\0')) == 0 and try_fold(lst, i):
+                    continue
+            for b in sub_blocks(st):
+                walk(b)
+            i += 1
+    walk(root)
+    return root
+
+
 def beautify(ast):
+    fold_packs(ast)
     strip_tail_returns(ast)
     nil_vars(ast)
     and_or(ast)

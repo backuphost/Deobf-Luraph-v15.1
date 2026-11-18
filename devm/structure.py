@@ -1630,7 +1630,10 @@ class Printer:
             self.block(st[3])
             self.emit('end')
         elif t == 'forin':
-            self.emit('for %s in %s do' % (', '.join(st[1]), ', '.join(self.expr(e) for e in st[2])))
+            its = [self.expr(e) for e in st[2]]
+            while len(its) > 1 and its[-1] == 'nil':
+                its.pop()           # (state and control variable of a plain `for k, v in t`)
+            self.emit('for %s in %s do' % (', '.join(st[1]), ', '.join(its)))
             self.block(st[3])
             self.emit('end')
         elif t == 'setlist':

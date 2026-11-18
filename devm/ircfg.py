@@ -2733,15 +2733,21 @@ class ProtoCFG:
                 for e in stmt_reads_raw(st):
                     count_uses(e, lambda x: x[0] in ('t', 'mv'), tcount)
         tails = {}
+        va_alias = set()
         for b in self.blocks.values():
             new = []
             for st in b.stmts:
                 t = st[0]
                 if t == 'call':
                     _, cid, f, args, tail, nres = st
+                    if tail == 'args' and f == ('kfn', 'select') and len(args) == 1 and args[0][0] == 'k':
+                        # the function's own prologue: select(#params + 1, <all arguments>) is `...`
+                        va_alias.add(cid)
+                        self.vararg = True
+                        continue
                     tl = None
                     if tail is not None:
-                        tl = ('va',) if tail == 'va' else ('mvall', tail)
+                        tl = ('va',) if tail == 'va' or tail in va_alias else ('mvall', tail)
                     new.append(('calldef', cid, ('call', f, list(args), tl)))
                 elif t == 'setmulti':
                     if st[2] == 'va':
@@ -2750,7 +2756,7 @@ class ProtoCFG:
                 elif t == 'setlist':
                     tl = None
                     if st[4] is not None:
-                        tl = ('va',) if st[4] == 'va' else ('mvall', st[4])
+                        tl = ('va',) if st[4] == 'va' or st[4] in va_alias else ('mvall', st[4])
                     new.append(('setlist', st[1], st[2], list(st[3]), tl))
                 elif t == 'numforprep' or t == 'genforprep':
                     a = st[1]
@@ -2764,7 +2770,7 @@ class ProtoCFG:
                 tail = b.term[2]
                 tl = None
                 if tail is not None:
-                    tl = ('va',) if tail == 'va' else ('mvall', tail)
+                    tl = ('va',) if tail == 'va' or tail in va_alias else ('mvall', tail)
                 b.term = ('ret', list(b.term[1]), tl)
         # SELF pattern: t = X; R[A+1] = t; t2 = t[k]; R[A] = t2
         for b in self.blocks.values():
