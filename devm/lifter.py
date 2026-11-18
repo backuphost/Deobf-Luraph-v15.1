@@ -86,6 +86,7 @@ class Lifter:
         self.pe.on_closure = self.on_closure
         self.temp_vals = {}
         self.up_nums = {}
+        self.up_objs = set()
         self.cap_src = {}           # function key -> {upvalue index: where its creator takes it from}
         self.cap_vals = {}          # (function key, register) -> number last stored in a shared variable
         self.all_up_nums = {}
@@ -196,6 +197,10 @@ class Lifter:
                     return 'F' if e[1] is None or e[1] is False else 'T'
                 if e[0] in ('newtable', 'closure', 'constfn'):
                     return 'T'
+                if e[0] in ('up', 'upcell') and e[1] in self.up_objs:
+                    # holds a function or a table when the run ends: enough to tell which side
+                    # of a `not not x` guard is real, not enough to drop a test the script wrote
+                    return 'Tb'
                 if e[0] == 'kfn':
                     return 'T:' + str(e[1])
                 if e[0] == 'un' and e[1] == 'not':
@@ -420,6 +425,10 @@ class Lifter:
                 elif st[0] == 'setmulti':
                     for n in [n for n in known if n != CAP and (not isinstance(n, int) or n >= st[1])]:
                         del known[n]
+                elif st[0] == 'close' and CAP in known:
+                    # the closures that captured these registers keep a copy from here on
+                    hi = st[2] if len(st) > 2 else None
+                    known[CAP] = frozenset(r for r in known[CAP] if r < st[1] or (hi is not None and r > hi))
             if term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
                 # (the not-a-number test inside a 32-bit multiply: only one side happens)
                 n0 = len(out)
@@ -443,7 +452,9 @@ class Lifter:
                 reg = torig.get(term[1][1]) if term[1][0] == 't' else None
                 for arm, tv in ((term[2], 'Tb'), (term[3], 'Fb')):
                     ab2 = dict(ab)
-                    if reg is not None and reg not in known.get(CAP, ()) and ab2.get(reg) is None:
+                    # (what an earlier test implied gives way: `a = f(); if a then a = g() end;
+                    # if a then` is tested twice, and the arm taken here is what holds in it)
+                    if reg is not None and reg not in known.get(CAP, ()) and (ab2.get(reg) is None or ab2[reg][1:2] == 'b'):
                         ab2[reg] = tv
                     known[ABS] = frozenset(ab2.items())
                     walk(arm, known, temps, calls, tabs)
@@ -534,9 +545,8 @@ class Lifter:
         irF, _, endF, evF, _, _ = self.run_once(interp, (key[0], snap), [], False, prefix)
         kinds = {e[0] for e in evT}
         reads = [s[2][1] for s in irT if s[0] == 'set' and s[2][0] == 'r']
-        if not reads:
-            # bounds that are known constants are read without leaving a trace in the IR
-            reads = all_reads
+        # (bounds that are known constants are read without leaving a trace in the IR)
+        reads = reads + [r for r in all_reads if isinstance(r, int)] if 'push' in kinds else reads or all_reads
         writes = [s[1][1] for s in irT if s[0] == 'set' and s[1][0] == 'r']
         if endT[0] != 'goto':
             raise PEError('for-op ended with %r' % (endT[0],))
@@ -1397,16 +1407,22 @@ class FactoryLifter(Lifter):
         pe.upvals_list = self.dump.proto_upvals(key) if self.end_state else None
         # numbers held by closed upvalues at the end of the run (see pe.UpNum)
         self.up_nums = {}
+        # ... and the upvalues that hold an object (a function, a table) there
+        self.up_objs = set()
         c0, c1 = self.model.cells
         for i, cell in (pe.upvals_list or {}).items():
             if isinstance(i, int) and isinstance(cell, LuaTable):
                 box = cell.h.get(c0)
                 v = box.h.get(cell.h.get(c1)) if isinstance(box, LuaTable) else None
+                if not isinstance(box, LuaTable) or (v is not None and not isinstance(v, (bool, int, float, str, bytes))):
+                    self.up_objs.add(i - self.model.up_base)
                 if P.is_num(v) and float(v).is_integer() and abs(v) >= 65536:
                     self.up_nums[i - self.model.up_base] = P.UpNum(v)
             elif isinstance(i, int) and P.is_num(cell) and not isinstance(cell, bool) \
                     and float(cell).is_integer() and abs(cell) >= 65536:
                 self.up_nums[i - self.model.up_base] = P.UpNum(cell)       # (captured by value)
+            elif isinstance(i, int) and cell is not None and not isinstance(cell, (bool, int, float, str, bytes)):
+                self.up_objs.add(i - self.model.up_base)
         # ... and, for a function that was never created in the run, the numbers its creator would
         # have handed it
         for i, src in self.cap_src.get(key, {}).items():

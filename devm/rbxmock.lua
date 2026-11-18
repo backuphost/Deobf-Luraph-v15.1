@@ -530,12 +530,18 @@ return function(G, fnames, libnames)
 		SharedTable = { "new", "clear", "clone", "cloneAndFreeze", "increment", "isFrozen", "size", "update" },
 		Content = { "fromUri", "fromObject", "fromAssetId" }, Secret = {}, ValueCurveKey = { "new" },
 	}
+	local ctorCalls = setmetatable({}, { __mode = "k" })
+	M.ctorCalls = ctorCalls
 	local function lib(name, tname)
 		local l = {}
 		libnames[l] = name
 		for _, k in ipairs(known[name] or { "new" }) do
 			local full = name .. "." .. k
-			l[k] = named(full, function() return stub(full .. "()", tname or name) end)
+			l[k] = named(full, function(...)
+				local s = stub(full .. "()", tname or name)
+				ctorCalls[s] = { full, table.pack(...) }       -- (a constant of this type is dumped as this call)
+				return s
+			end)
 		end
 		return l
 	end

@@ -1129,6 +1129,22 @@ do
 			local a = all(rawget(x, "Scale"), rawget(x, "Offset"), rawget(y, "Scale"), rawget(y, "Offset"))
 			return a and "UDim2.new(" .. a .. ")"
 		end
+		-- a datatype the mock does not model: the constructor call that made it
+		local c = mock.ctorCalls and mock.ctorCalls[v]
+		if c then
+			local out = {}
+			for i = 1, c[2].n do
+				local a = c[2][i]
+				local t
+				if type(a) == "number" then t = n(a)
+				elseif type(a) == "string" then t = string.format("%q", a)
+				elseif type(a) == "boolean" or a == nil then t = tostring(a)
+				else t = describeValue(a) end
+				if not t then return nil end
+				out[i] = t
+			end
+			return c[1] .. "(" .. table.concat(out, ", ") .. ")"
+		end
 		return nil
 	end
 end

@@ -843,6 +843,90 @@ def terminates(stmts):
 
 
 # ------------------------------------------------------------------ AST clean-up
+def attach_preps(stmts):
+    """A for loop whose setup instruction did not end up right in front of it: a few register
+    copies in between, or one setup per path that reaches the loop."""
+    def preps_in(st, found):
+        """the setups inside a statement, with the list each sits in"""
+        t = st[0]
+        subs = []
+        if t == 'if':
+            subs = [st[2], st[3] or []]
+        elif t in ('while',):
+            subs = [st[2]]
+        elif t in ('repeat', 'do'):
+            subs = [st[1]]
+        for sub in subs:
+            for x in sub:
+                if x[0] == 'prep':
+                    found.append((sub, x))
+                else:
+                    preps_in(x, found)
+
+    def walk(lst):
+        i = 0
+        while i < len(lst):
+            st = lst[i]
+            t = st[0]
+            if t == 'if':
+                walk(st[2])
+                if st[3]:
+                    walk(st[3])
+            elif t == 'while':
+                walk(st[2])
+            elif t in ('repeat', 'do'):
+                walk(st[1])
+            elif t in ('fornum', 'forin'):
+                walk(st[3])
+            if t == 'comment' and st[1] == 'for-loop without visible setup' and i + 1 < len(lst) \
+                    and lst[i + 1][0] in ('fornum', 'forin') and lst[i + 1][2] == [('opaque', '?')]:
+                loop = lst[i + 1]
+                j = i - 1
+                found = []
+                while j >= 0:
+                    x = lst[j]
+                    if x[0] == 'prep':
+                        found = [(lst, x)]
+                        break
+                    if x[0] in ('if', 'while', 'repeat', 'do'):
+                        preps_in(x, found)
+                        break
+                    if x[0] in ('fornum', 'forin', 'return', 'break', 'continue') or "'call'" in repr(x):
+                        break
+                    j -= 1
+                kind = 'numforprep' if loop[0] == 'fornum' else 'genforprep'
+                if found and all(f[1][1] == kind and f[1][2] == found[0][1][2] for f in found):
+                    exprs = list(found[0][1][2])
+                    # R[A], R[A+1], R[A+2] = call   right before every setup
+                    befores = []
+                    for sub, x in found:
+                        k = next(n for n, y in enumerate(sub) if y is x)
+                        b = sub[k - 1] if k else None
+                        if b is not None and b[0] == 'assign' and len(b[1]) == 3 and list(b[1]) == exprs \
+                                and (len(found) == 1 or k == len(sub) - 1):
+                            befores.append((sub, b))
+                    if kind == 'genforprep' and len(befores) == len(found) and all(b[1][2] == befores[0][1][2] for b in befores):
+                        exprs = befores[0][1][2]
+                        for sub, b in befores:
+                            sub[:] = [y for y in sub if y is not b]
+                    for sub, x in found:
+                        sub[:] = [y for y in sub if y is not x]
+                    if kind == 'numforprep':
+                        if len(exprs) == 3 and exprs[2] == ('k', 1):
+                            exprs = exprs[:2]
+                    else:
+                        exprs = list(exprs) if isinstance(exprs, (list, tuple)) else [exprs]
+                        while len(exprs) > 1 and exprs[-1] == ('k', None):
+                            exprs.pop()
+                    loop[2] = list(exprs)
+                    i = next(n for n, y in enumerate(lst) if y is st)
+                    del lst[i]
+                    continue
+            i += 1
+    walk(stmts)
+    return stmts
+
+
 def cleanup(stmts, in_loop_tail=False):
     """Cosmetic rewrites on the structured AST."""
     out = []
@@ -1642,7 +1726,7 @@ class Decompiler:
                 self.stats['flat'] = self.stats.get('flat', 0) + 1
                 ast = flat_ast(Structurer(cfg), str(ex), params)
                 break
-            ast = cleanup(ast)
+            ast = cleanup(attach_preps(ast))
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
             n0 = max_locals(ast) + len(params)
