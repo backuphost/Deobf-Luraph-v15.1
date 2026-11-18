@@ -906,14 +906,12 @@ def param_literals(text):
     return out
 
 
-def relift_params(lift, protos, root, native_text=None, rounds=5, log=None):
+def relift_params(lift, protos, root, native_text=None, rounds=6, log=None):
     """Functions that never ran and whose code is decrypted with numbers their callers pass:
     find those numbers in the decompiled callers and lift the functions again."""
     from . import structure
     done = {}
     for _ in range(rounds):
-        if not any(p.errors for p in protos.values()):
-            break
         saved = os.environ.get('DEVM_PROTO_IDS')
         os.environ['DEVM_PROTO_IDS'] = '1'
         try:
@@ -932,9 +930,9 @@ def relift_params(lift, protos, root, native_text=None, rounds=5, log=None):
             return seen
 
         # (the number may also be handed on to a nested function that needs it)
+        # (also where nothing failed: the function's own guards on the number fold away)
         vals = {k: v for k, v in param_literals(text).items()
-                if k in protos and done.get(k) != v
-                and (protos[k].errors or any(protos[c].errors for c in below(k)))}
+                if k in protos and done.get(k) != v}
         if not vals:
             break
         for k, v in vals.items():
@@ -943,6 +941,13 @@ def relift_params(lift, protos, root, native_text=None, rounds=5, log=None):
             done[k] = v
             if log:
                 log('lifting proto %s again with parameters %s' % (k, v))
-            keep = {x: q for x, q in protos.items() if x not in below(k)}
-            protos = lift.lift_all(k, redo_into=keep, param_vals={k: v})
+            sub = below(k)
+            keep = {x: q for x, q in protos.items() if x not in sub}
+            before = len(protos[k].errors) + sum(len(protos[c].errors) for c in sub)
+            new = lift.lift_all(k, redo_into=keep, param_vals={k: v})
+            after = len(new[k].errors) + sum(len(new[c].errors) for c in new if c not in keep)
+            if after <= before:
+                protos = new
+            elif log:
+                log('  (kept as it was: %d errors instead of %d)' % (after, before))
     return protos
