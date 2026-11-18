@@ -1049,6 +1049,33 @@ def unflag(root):
                     lst[i:i + 1] = st[1]
                     changed = True
                     continue
+            # `if c then x() else exit1 = true end  if exit1 then break end`: the jump goes where
+            # the flag is set, when nothing runs in between
+            nx = lst[i + 1]
+            if st[0] == 'if' and nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' and str(nx[1][1]).startswith('exit') \
+                    and len(nx[2]) == 1 and nx[2][0][0] in ('break', 'continue', 'return'):
+                f = nx[1]
+                tails = []
+
+                def tail_sets(blk):
+                    if not blk:
+                        return
+                    last = blk[-1]
+                    if last[0] == 'assign' and last[1] == [f] and last[2] == [('k', True)]:
+                        tails.append(blk)
+                    elif last[0] == 'if':
+                        tail_sets(last[2])
+                        if last[3]:
+                            tail_sets(last[3])
+                tail_sets(st[2])
+                if st[3]:
+                    tail_sets(st[3])
+                if tails and _mentions(root, f[1]) == len(tails) + 1:
+                    for blk in tails:
+                        blk[-1] = list(nx[2][0])
+                    del lst[i + 1]
+                    changed = True
+                    continue
             # the flags that are checked right after the block
             flags = []
             kinds = {}
@@ -1888,7 +1915,7 @@ class Decompiler:
                 self.stats['flat'] = self.stats.get('flat', 0) + 1
                 ast = flat_ast(Structurer(cfg), str(ex), params)
                 break
-            ast = cleanup(unflag(or_chains(attach_preps(ast))))
+            ast = cleanup(or_chains(unflag(or_chains(attach_preps(ast)))))
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
             n0 = max_locals(ast) + len(params)
