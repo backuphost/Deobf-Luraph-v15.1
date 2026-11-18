@@ -931,6 +931,20 @@ def _has_call_expr(e):
     return any(x[0] in ('call', 'index') for x in _all_exprs(e))
 
 
+def _assigns(node, target):
+    """assignments to the variable `target` inside an AST fragment"""
+    n = 0
+    if isinstance(node, list):
+        if node and node[0] == 'assign' and target in node[1]:
+            n += 1
+        elif node and node[0] in ('fornum', 'forin') and (node[1] == target[1] or (isinstance(node[1], list) and target[1] in node[1])):
+            n += 1
+        for x in node:
+            if isinstance(x, list):
+                n += _assigns(x, target)
+    return n
+
+
 def or_chains(lst):
     """`v = a; if v then break end; v = b; if v then break end`  ->  `v = a or b; if v then break end`"""
     for st in lst:
@@ -1021,6 +1035,22 @@ def unflag(root):
             st = lst[i]
             if st[0] == 'repeat' and st[2] == ('k', True):
                 body = st[1]
+                # `if a then v = f(); if v then break end end  REST` where v is new here: v is
+                # still nil when a is not true, so REST runs exactly when v is not set
+                for k, x in enumerate(body):
+                    if x[0] == 'if' and not x[3] and len(x[2]) >= 2 and x[2][-1][0] == 'if' and not x[2][-1][3] \
+                            and x[2][-1][2] == [['break']] and x[2][-1][1][0] == 'r' and str(x[2][-1][1][1]).startswith('v') \
+                            and x[2][-2][0] == 'assign' and x[2][-2][1] == [x[2][-1][1]] \
+                            and not has_break(x[2][:-1]) and not has_continue(x[2][:-1]):
+                        v = x[2][-1][1]
+                        if _assigns(root, v) != _assigns(st, v) or any(_assigns(y, v) for y in body[:k]) \
+                                or _assigns(x[2][:-2], v) or _mentions(x[1], v[1]):
+                            continue
+                        x[2].pop()
+                        rest = body[k + 1:]
+                        body[k + 1:] = [['if', ('un', 'not', v), rest, None]] if rest else []
+                        changed = True
+                        break
                 # `if c then break end` / `if c then ...; break end` among the block's own
                 # statements: the rest of the block is the other side of that test
                 k = 0
@@ -1915,7 +1945,7 @@ class Decompiler:
                 self.stats['flat'] = self.stats.get('flat', 0) + 1
                 ast = flat_ast(Structurer(cfg), str(ex), params)
                 break
-            ast = cleanup(or_chains(unflag(or_chains(attach_preps(ast)))))
+            ast = cleanup(unflag(or_chains(unflag(or_chains(attach_preps(ast))))))
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
             n0 = max_locals(ast) + len(params)
