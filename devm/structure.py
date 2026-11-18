@@ -927,6 +927,37 @@ def attach_preps(stmts):
     return stmts
 
 
+def _has_call_expr(e):
+    return any(x[0] in ('call', 'index') for x in _all_exprs(e))
+
+
+def or_chains(lst):
+    """`v = a; if v then break end; v = b; if v then break end`  ->  `v = a or b; if v then break end`"""
+    for st in lst:
+        t = st[0]
+        if t == 'if':
+            or_chains(st[2])
+            if st[3]:
+                or_chains(st[3])
+        elif t == 'while':
+            or_chains(st[2])
+        elif t in ('repeat', 'do'):
+            or_chains(st[1])
+        elif t in ('fornum', 'forin'):
+            or_chains(st[3])
+    i = 0
+    while i + 3 < len(lst):
+        a, b, c, d = lst[i:i + 4]
+        if a[0] == 'assign' and c[0] == 'assign' and len(a[1]) == 1 and a[1] == c[1] and a[1][0][0] == 'r' \
+                and len(a[2]) == 1 and len(c[2]) == 1 and b[0] == 'if' and d[0] == 'if' and not b[3] and not d[3] \
+                and b[1] == a[1][0] and d[1] == a[1][0] and b[2] == d[2] and len(b[2]) == 1 \
+                and b[2][0][0] in ('break', 'continue') and a[1][0] not in _all_exprs(c[2][0]):
+            lst[i:i + 4] = [['assign', a[1], [('or', a[2][0], c[2][0])]], d]
+            continue
+        i += 1
+    return lst
+
+
 def unflag(root):
     """An exit flag that only carries a jump across one block that nothing else leaves:
 
@@ -988,27 +1019,62 @@ def unflag(root):
         i = 0
         while i + 1 < len(lst):
             st = lst[i]
+            if st[0] == 'repeat' and st[2] == ('k', True):
+                body = st[1]
+                # `if c then break end` / `if c then ...; break end` among the block's own
+                # statements: the rest of the block is the other side of that test
+                k = 0
+                while k < len(body):
+                    x = body[k]
+                    if x[0] == 'if' and not x[3] and x[2] and x[2][-1][0] == 'break' and not has_break(x[2][:-1]) \
+                            and not has_continue(x[2][:-1]):
+                        rest = body[k + 1:]
+                        then = x[2][:-1]
+                        if then and rest:
+                            body[k:] = [['if', x[1], then, rest]]
+                        elif rest:
+                            body[k:] = [['if', negate(x[1]), rest, None]]
+                        elif then:
+                            body[k:] = [['if', x[1], then, None]]
+                        else:
+                            body[k:] = [['if', x[1], [], None]] if _has_call_expr(x[1]) else []
+                        changed = True
+                        if rest:
+                            body = body[k][3] if then else body[k][2]
+                            k = 0
+                            continue
+                        break
+                    k += 1
+                if not has_break(st[1]) and not has_continue(st[1]):
+                    lst[i:i + 1] = st[1]
+                    changed = True
+                    continue
             # the flags that are checked right after the block
             flags = []
+            kinds = {}
             j = i + 1
             while st[0] == 'repeat' and st[2] == ('k', True) and j < len(lst):
                 nx = lst[j]
                 if nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' and str(nx[1][1]).startswith('exit') \
-                        and len(nx[2]) == 1 and nx[2][0][0] == 'break':
+                        and len(nx[2]) == 1 and nx[2][0][0] in ('break', 'continue'):
                     flags.append(nx[1][1])
+                    kinds[nx[1][1]] = nx[2][0][0]
                     j += 1
                 else:
                     break
             if flags:
                 acc = [[], 0, 0]
                 level_jumps(st[1], set(flags), acc)
-                if acc[0] and acc[1] == 0 and acc[2] == 0:
+                alone = {f: _mentions(root, f) - len([x for x in acc[0] if x[2] == f]) - 1 == 0 for f in flags}
+                if acc[0] and acc[1] == 0 and acc[2] == 0 and all(alone[f] for f in flags if kinds[f] == 'continue'):
                     for f in flags:
                         mine = [x for x in acc[0] if x[2] == f]
-                        if _mentions(root, f) - len(mine) - 1 == 0:
+                        if alone[f]:
                             for blk, k, _ in sorted(mine, key=lambda x: -x[1]):
                                 n = next(n for n, y in enumerate(blk) if y[0] == 'assign' and y[1] == [('r', f)])
                                 del blk[n]
+                                if kinds[f] == 'continue':
+                                    blk[n] = ['continue']
                     lst[i:j] = st[1]
                     changed = True
                     continue
@@ -1822,7 +1888,7 @@ class Decompiler:
                 self.stats['flat'] = self.stats.get('flat', 0) + 1
                 ast = flat_ast(Structurer(cfg), str(ex), params)
                 break
-            ast = cleanup(unflag(attach_preps(ast)))
+            ast = cleanup(unflag(or_chains(attach_preps(ast))))
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
             n0 = max_locals(ast) + len(params)
