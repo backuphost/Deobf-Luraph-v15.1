@@ -941,26 +941,27 @@ def unflag(root):
         if exit1 then break end
 
     The inner block existed for that jump alone; without it the `break` reaches the same place."""
-    def level_jumps(stmts, flagname, acc):
+    def level_jumps(stmts, flags, acc):
         """acc: [flagged pairs at this loop level, other breaks/continues at this level, flag uses deeper]"""
         i = 0
         while i < len(stmts):
             st = stmts[i]
             t = st[0]
-            if t == 'assign' and st[1] == [('r', flagname)] and i + 1 < len(stmts) and stmts[i + 1][0] == 'break':
-                acc[0].append((stmts, i))
+            if t == 'assign' and len(st[1]) == 1 and st[1][0][0] == 'r' and st[1][0][1] in flags \
+                    and i + 1 < len(stmts) and stmts[i + 1][0] == 'break':
+                acc[0].append((stmts, i, st[1][0][1]))
                 i += 2
                 continue
             if t in ('break', 'continue'):
                 acc[1] += 1
             elif t == 'if':
-                level_jumps(st[2], flagname, acc)
+                level_jumps(st[2], flags, acc)
                 if st[3]:
-                    level_jumps(st[3], flagname, acc)
+                    level_jumps(st[3], flags, acc)
             elif t == 'do':
-                level_jumps(st[1], flagname, acc)
+                level_jumps(st[1], flags, acc)
             elif t in ('while', 'repeat', 'fornum', 'forin'):
-                acc[2] += _mentions(st, flagname)
+                acc[2] += sum(_mentions(st, f) for f in flags)
             i += 1
 
     def _mentions(node, flagname):
@@ -986,18 +987,29 @@ def unflag(root):
                 changed |= walk(st[3])
         i = 0
         while i + 1 < len(lst):
-            st, nx = lst[i], lst[i + 1]
-            if st[0] == 'repeat' and st[2] == ('k', True) and nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' \
-                    and str(nx[1][1]).startswith('exit') and len(nx[2]) == 1 and nx[2][0][0] in ('break', 'continue'):
-                flag = nx[1][1]
+            st = lst[i]
+            # the flags that are checked right after the block
+            flags = []
+            j = i + 1
+            while st[0] == 'repeat' and st[2] == ('k', True) and j < len(lst):
+                nx = lst[j]
+                if nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' and str(nx[1][1]).startswith('exit') \
+                        and len(nx[2]) == 1 and nx[2][0][0] == 'break':
+                    flags.append(nx[1][1])
+                    j += 1
+                else:
+                    break
+            if flags:
                 acc = [[], 0, 0]
-                level_jumps(st[1], flag, acc)
-                if acc[0] and acc[1] == 0 and acc[2] == 0 and nx[2][0][0] == 'break':
-                    others = _mentions(root, flag) - len(acc[0]) - 1
-                    if others == 0:
-                        for blk, k in sorted(acc[0], key=lambda x: -x[1]):
-                            del blk[k]
-                    lst[i:i + 2] = st[1]
+                level_jumps(st[1], set(flags), acc)
+                if acc[0] and acc[1] == 0 and acc[2] == 0:
+                    for f in flags:
+                        mine = [x for x in acc[0] if x[2] == f]
+                        if _mentions(root, f) - len(mine) - 1 == 0:
+                            for blk, k, _ in sorted(mine, key=lambda x: -x[1]):
+                                n = next(n for n, y in enumerate(blk) if y[0] == 'assign' and y[1] == [('r', f)])
+                                del blk[n]
+                    lst[i:j] = st[1]
                     changed = True
                     continue
             i += 1
