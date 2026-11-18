@@ -261,7 +261,7 @@ local function servePools(protos)
 		local okr, req = pcall(readfile, serveDir .. "/req")
 		if okr and type(req) == "string" and req ~= last and string.sub(req, -1) == "\n" then
 			last = req
-			local seq, id, index, haveP, haveT = string.match(req, "^(%d+) (%d+) (%-?%d+) (%d+) (%d+)\n")
+			local seq, id, index, haveP, haveT, atPc = string.match(req, "^(%d+) (%d+) (%-?%d+) (%d+) (%d+) ?(%-?%d*)\n")
 			if seq == nil then
 				if string.match(req, "^quit") then return end
 			else
@@ -272,7 +272,12 @@ local function servePools(protos)
 				local tdiff = {}
 				if type(t) == "table" and type(rawget(t, -2)) == "table" then
 					local idx = rawget(t, -2)
+					-- (the decoder can mix the instruction's own position into what it reads: ask
+					-- at the position the lifter is at, when it says so)
+					local K = tonumber(atPc) or K
 					local saved = rawget(idx, K)
+					local savedV = rawget(t, K)
+					rawset(t, K, nil)
 					rawset(idx, K, tonumber(index))
 					-- "P <path> <offset> <hex>": the lifter's view of a bytecode buffer on this path
 					local undo = {}
@@ -323,7 +328,7 @@ local function servePools(protos)
 						end
 					end
 					restore()
-					rawset(t, K, nil)
+					rawset(t, K, savedV)
 					rawset(idx, K, saved)
 					if ok and v ~= nil and (type(v) ~= "function" or protoOfFn[v] or fnames[v]) then
 						out = ser(v)

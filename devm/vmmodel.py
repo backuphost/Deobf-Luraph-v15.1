@@ -617,10 +617,10 @@ class PoolServer:
         self.data = None        # the dump this run produced (new protos and tables are added to it)
         self.tdiffs = []        # (table id, [(key, number)]) additions not yet applied to live models
 
-    def decode(self, table_id, index, patches=()):
+    def decode(self, table_id, index, patches=(), pc=None):
         """the raw dump value (see pe.Dump.conv) of pool entry `index` of constant table `table_id`;
         patches = ((buffer path, offset, bytes), ...) are applied to the run's buffers for the call"""
-        key = (table_id, index, patches)
+        key = (table_id, index, patches, pc)
         if key in self.cache:
             return self.cache[key]
         v = None
@@ -628,8 +628,9 @@ class PoolServer:
             self.seq += 1
             tmp = os.path.join(self.dir, 'req.tmp')
             with open(tmp, 'w') as f:
-                f.write('%d %d %d %d %d\n' % (self.seq, table_id, index, len(self.data['protos']) if self.data else 10 ** 9,
-                                              len(self.data['tables']) if self.data else 10 ** 9))
+                f.write('%d %d %d %d %d%s\n' % (self.seq, table_id, index, len(self.data['protos']) if self.data else 10 ** 9,
+                                                len(self.data['tables']) if self.data else 10 ** 9,
+                                                '' if pc is None else ' %d' % pc))
                 for pt in patches:
                     if pt[0] == 'T':
                         f.write('T %s %d %r\n' % (pt[1], pt[2], pt[3]))

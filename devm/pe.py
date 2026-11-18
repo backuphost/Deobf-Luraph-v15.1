@@ -1156,7 +1156,7 @@ class PE:
                             patches = tuple((b.path, off, data) for b in self.dump.buffers for off, data in b.patches())
                             if self.live_table_patches is not None:
                                 patches += tuple(self.live_table_patches())
-                            raw = self.dump.server.decode(obj.id, idx, patches)
+                            raw = self.dump.server.decode(obj.id, idx, patches, key if isinstance(key, int) and not isinstance(key, bool) else None)
                             if os.environ.get('DEVM_POOLDBG') and isinstance(raw, dict) and 's' in raw and any(c > 160 for c in bytes.fromhex(raw['s'])):
                                 print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, raw['s'][:40], 'patches', [(p_[0][-20:], p_[1], len(p_[2])) for p_ in patches if p_[0] != 'T'][:6])
                             # (a function built for the answer added entries to shared tables)
