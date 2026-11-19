@@ -6,6 +6,7 @@ PURE_LEAF = ('k', 'kfn', 'env', 'opaque', 'regs', 'arg', 'varargn', 'nargs', 'va
 
 
 import os
+import pickle
 CELLS = (1, 3)        # upvalue cell layout of the VM being lifted (set by the lifter)
 DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
 
@@ -302,6 +303,112 @@ def rpo_order(cfg):
     return post
 
 
+# function key -> {index of an upvalue that holds an opaque state number: its value when the function
+# runs, if known} (filled in by the parent)
+OPAQUE_UPS = {}
+# function key -> indexes of the upvalues that hold a function captured by value
+FUNCTION_UPS = {}
+# function key -> upvalues whose assignments may be removed (opaque, and read by nobody)
+DROP_UPS = {}
+# usage scan (see prepass): (function key, upvalue index) that some function really reads
+PREPASS = False
+USED_UPS = None
+# remove the opaque numbers themselves (traced factory builds; the two-stage builds have their
+# own pass over the lifted program)
+DROP_OPAQUE = False
+_UP_PLAIN = {}
+_UP_PASS = {}
+
+
+def prepass(protos):
+    """Find out which upvalues are read for real anywhere (as opposed to compared with magic
+    numbers and updated from themselves), before any function decides what to remove."""
+    global PREPASS, USED_UPS
+    _UP_PLAIN.clear()
+    _UP_PASS.clear()
+    OPAQUE_UPS.clear()
+    FUNCTION_UPS.clear()
+    DROP_UPS.clear()
+    PREPASS = True
+    try:
+        for key, pir in protos.items():
+            try:
+                # (on a copy: building a graph edits the lifted statements in place)
+                ProtoCFG(pickle.loads(pickle.dumps(pir, -1)))
+            except Exception:
+                _UP_PLAIN[key] = None
+    finally:
+        PREPASS = False
+    used = set()
+    unknown = {k for k, v in _UP_PLAIN.items() if v is None}
+    for k, v in _UP_PLAIN.items():
+        for j in v or ():
+            used.add((k, j))
+    changed = True
+    while changed:
+        changed = False
+        for k, ps in _UP_PASS.items():
+            for j, child, n in ps:
+                if (k, j) not in used and ((child, n) in used or child in unknown or child not in _UP_PLAIN):
+                    used.add((k, j))
+                    changed = True
+    USED_UPS = (used, unknown, set(_UP_PLAIN))
+
+
+def _up_used(child, n):
+    if USED_UPS is None:
+        return True
+    used, unknown, seen = USED_UPS
+    return (child, n) in used or child in unknown or child not in seen
+
+
+def _opaque_eval(e, ups, regs=None):
+    """Value of an expression over opaque state numbers, None when it is not determined."""
+    if e[0] == 'k':
+        return e[1] if _isnum(e) else None
+    if e[0] == 'up':
+        return ups.get(e[1])
+    if e[0] == 'r':
+        v = regs.get(e[1]) if regs else None
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    if e[0] == 'bin':
+        x, y = _opaque_eval(e[2], ups, regs), _opaque_eval(e[3], ups, regs)
+        if x is None or y is None:
+            return None
+        try:
+            return {'+': x + y, '-': x - y, '*': x * y}[e[1]] if e[1] not in ('%', '//') else (x % y if e[1] == '%' else x // y)
+        except (KeyError, ZeroDivisionError):
+            return None
+    if e[0] == 'call' and e[1][0] == 'kfn':
+        args = [_opaque_eval(x, ups, regs) for x in e[2]]
+        if any(x is None or x != int(x) for x in args):
+            return None
+        args = [int(x) & 0xFFFFFFFF for x in args]
+        name = str(e[1][1])
+        if name == 'bit32.bxor':
+            r = 0
+            for x in args:
+                r ^= x
+            return r
+        if name == 'bit32.band':
+            r = 0xFFFFFFFF
+            for x in args:
+                r &= x
+            return r
+        if name == 'bit32.bor':
+            r = 0
+            for x in args:
+                r |= x
+            return r
+        if name == 'bit32.bnot' and len(args) == 1:
+            return ~args[0] & 0xFFFFFFFF
+        if name == 'bit32.lshift' and len(args) == 2:
+            return (args[0] << args[1]) & 0xFFFFFFFF if args[1] < 32 else 0
+        if name == 'bit32.rshift' and len(args) == 2:
+            return args[0] >> args[1] if args[1] < 32 else 0
+    return None
+
+
 class ProtoCFG:
     def __init__(self, pir):
         self.pir = pir
@@ -334,7 +441,18 @@ class ProtoCFG:
         if self._thread_same_test():
             self._thread()
         self._detect_params()
+        if PREPASS:
+            self._scan_up_usage()
+            return
         self._cut_cold_magic()
+        if DROP_OPAQUE and self._cut_loop_entries():
+            self._thread()
+        if DROP_OPAQUE:
+            n = self._drop_opaque_numbers()
+            if os.environ.get('DEVM_TRACE_DROP') and n:
+                print('drop', self.pir.key, n)
+            if n and not os.environ.get('DEVM_NO_DS'):
+                self._dead_stores()
         if UNFLATTEN and not os.environ.get('DEVM_NO_UNFLATTEN'):
             self._unflatten()
         for _ in range(4):
@@ -369,8 +487,201 @@ class ProtoCFG:
             self._thread()
             self._merge_conds()
             self._fold_regs()
+        if self._unthread_tests():
+            self._thread()
+            self._merge_conds()
+            self._fold_regs()
+        if DROP_OPAQUE and self._fold_value_chains():
+            self._thread()
+            self._fold_regs()
+            self._merge_conds()
+            self._fold_regs()
+        if self._unsplice():
+            self._table_aliases()
+            for _ in range(2):
+                self._fold_regs()
+                self._merge_tables()
         self._open_upcells()
         self._dead_stores()
+
+    def _table_aliases(self):
+        """`B = {}; A = B; A[1] = x; A[2] = y` fills B: the copy the interpreter works on is
+        replaced by the table itself."""
+        _, live_out = self.liveness()
+        done = 0
+        for b in self.blocks.values():
+            i = 0
+            while i < len(b.stmts):
+                st = b.stmts[i]
+                i += 1
+                if not (st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'r' and st[1] != st[2]):
+                    continue
+                A, B = st[1], st[2]
+                fresh = False
+                for j in range(i - 2, -1, -1):
+                    if B[1] in _writes_of(b.stmts[j]):
+                        fresh = b.stmts[j][0] == 'set' and b.stmts[j][2][0] in ('newtable', 'table')
+                        break
+                if not fresh:
+                    continue
+                j = i
+                ok = True
+                while j < len(b.stmts):
+                    sj = b.stmts[j]
+                    if sj[0] in ('setlist', 'setindex') and sj[1] == A:
+                        rest = [e for e in stmt_exprs(sj)[0][1:]]
+                        if any(A[1] in expr_reads(e)[0] for e in rest):
+                            ok = False
+                            break
+                        j += 1
+                        continue
+                    break
+                if not ok or j == i:
+                    continue
+                # the copy must not be looked at again
+                alive = A[1] in live_out.get(b.id, ())
+                for sk in b.stmts[j:] + [b.term]:
+                    rd, wr = stmt_exprs(sk)
+                    if any(A[1] in expr_reads(e)[0] for e in rd):
+                        alive = True
+                        break
+                    if A in wr:
+                        alive = False
+                        break
+                if alive:
+                    continue
+                for k in range(i, j):
+                    sk = b.stmts[k]
+                    b.stmts[k] = (sk[0], B) + tuple(sk[2:])
+                del b.stmts[i - 1]
+                i -= 1
+                done += 1
+        return done
+
+    def _unsplice(self):
+        """Calls that pass on all results of another call.  The interpreter does this with a
+        packed table:
+
+            R = table.pack(g(...))                       R = table.pack(g(...))
+            f(unpack(R, 1, R.n))                         T = R.n;  R.n = K + T - 1
+                                                         table.move(R, 1, T, K, R)
+                                                         R[1] = a1 ... R[K-1] = a(K-1)
+                                                         f(unpack(R, 1, R.n))
+
+        which is `f(g(...))` and `f(a1, ..., g(...))`; `table.move(R, 1, R.n, K, D)` is the tail of
+        a table constructor."""
+        PACK, MOVE, UNPACK = ('kfn', 'table.pack'), ('kfn', 'table.move'), ('kfn', 'unpack')
+        done = 0
+        _, live_out = self.liveness()
+
+        def pure(e):
+            return not any(x[0] in ('call', 'closure') for x in walk_expr(e, []))
+
+        for b in self.blocks.values():
+            i = 0
+            while i < len(b.stmts):
+                st = b.stmts[i]
+                i += 1
+                if not (st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'call' and st[2][1] == PACK
+                        and not st[2][2] and len(st[2]) > 3 and st[2][3] is not None):
+                    continue
+                R, M = st[1], st[2][3]
+                mreads = expr_reads(M)[0]
+                use = ('call', UNPACK, [R, ('k', 1), ('index', R, ('k', 'n'))], None)
+                T, K, moved, prefix, drop = None, 1, False, {}, [i - 1]
+                result = None
+                j = i
+                while j <= len(b.stmts):
+                    sj = b.stmts[j] if j < len(b.stmts) else b.term
+                    last = j == len(b.stmts)
+                    if sj[0] == 'set' and sj[2] == ('index', R, ('k', 'n')) and T is None and sj[1][0] == 'r':
+                        T = sj[1]
+                        drop.append(j)
+                    elif (sj[0] == 'setindex' and sj[1] == R and sj[2] == ('k', 'n') and T is not None and K == 1
+                          and sj[3][0] == 'bin' and sj[3][1] == '-' and sj[3][3] == ('k', 1) and sj[3][2][0] == 'bin'
+                          and sj[3][2][1] == '+' and _isnum(sj[3][2][2]) and sj[3][2][3] == T):
+                        K = int(sj[3][2][2][1])
+                        drop.append(j)
+                    elif (sj[0] == 'callstmt' and sj[1][0] == 'call' and sj[1][1] == MOVE and len(sj[1][2]) == 5
+                          and sj[1][2][0] == R and sj[1][2][1] == ('k', 1) and sj[1][2][4] == R
+                          and T is not None and sj[1][2][2] == T and sj[1][2][3] == ('k', K) and not moved):
+                        moved = True
+                        drop.append(j)
+                    elif (sj[0] == 'callstmt' and sj[1][0] == 'call' and sj[1][1] == MOVE and len(sj[1][2]) == 5
+                          and sj[1][2][0] == R and sj[1][2][1] == ('k', 1) and sj[1][2][2] == ('index', R, ('k', 'n'))
+                          and _isnum(sj[1][2][3]) and sj[1][2][4] != R and T is None and K == 1
+                          and R[1] not in expr_reads(sj[1][2][4])[0]):
+                        # the tail of a table constructor
+                        result = ('setlist', sj[1][2][4], int(sj[1][2][3][1]), [], M)
+                        break
+                    elif (sj[0] == 'setindex' and sj[1] == R and _isnum(sj[2]) and moved and 1 <= sj[2][1] < K
+                          and R[1] not in expr_reads(sj[3])[0]):
+                        prefix[int(sj[2][1])] = sj[3]
+                        drop.append(j)
+                    elif (sj[0] == 'setlist' and sj[1] == R and sj[4] is None and moved
+                          and all(1 <= sj[2] + n < K and R[1] not in expr_reads(v)[0] for n, v in enumerate(sj[3]))):
+                        for n, v in enumerate(sj[3]):
+                            prefix[sj[2] + n] = v
+                        drop.append(j)
+                    else:
+                        found = [0]
+
+                        def fix(x):
+                            if x[0] == 'call' and len(x) > 3 and x[3] == use:
+                                found[0] += 1
+                                return ('call', x[1], list(x[2]) + [prefix[n] for n in range(1, K)], M)
+                            return x
+                        complete = (K == 1 and T is None) or (moved and all(n in prefix for n in range(1, K)))
+                        if sj[0] == 'ret' and sj[2] == use and complete:
+                            result = ('ret', list(sj[1]) + [prefix[n] for n in range(1, K)], M)
+                            break
+                        new = map_stmt(sj, fix) if complete and sj[0] != 'ret' else sj
+                        if found[0] == 1:
+                            rest = [x for e in stmt_exprs(new)[0] for x in walk_expr(e, [])]
+                            if R in rest and not any(x == M for x in rest):
+                                break
+                            result = new
+                            break
+                        # anything else in between must not disturb the packed call or the table
+                        rd, wr = stmt_exprs(sj)
+                        regs = set()
+                        for e in rd:
+                            regs |= expr_reads(e)[0]
+                        if last or R[1] in regs or (T is not None and T[1] in regs) or not all(pure(e) for e in rd) \
+                                or sj[0] not in ('set', 'setindex', 'setlist') \
+                                or any(w[0] == 'r' and (w[1] in mreads or w == R or w == T) for w in wr):
+                            break
+                    j += 1
+                if result is None:
+                    continue
+                # the table (and the saved count) must be gone afterwards
+                after = b.stmts[j + 1:] + ([b.term] if j < len(b.stmts) else [])
+                alive = False
+                for x in (R, T):
+                    if x is None:
+                        continue
+                    dead = False
+                    for sk in after:
+                        rd, wr = stmt_exprs(sk)
+                        if any(x[1] in expr_reads(e)[0] for e in rd):
+                            alive = True
+                            break
+                        if x in wr:
+                            dead = True
+                            break
+                    if not dead and not alive and x[1] in live_out.get(b.id, ()):
+                        alive = True
+                if alive:
+                    continue
+                if j < len(b.stmts):
+                    b.stmts[j] = result
+                else:
+                    b.term = result
+                for d in sorted(drop, reverse=True):
+                    del b.stmts[d]
+                done += 1
+                i = max(0, i - 1)
+        return done
 
     def _reaching(self):
         """(block order, IN): IN[b][reg] = frozenset of definitions (bid, stmt index | 'T') or
@@ -444,14 +755,19 @@ class ProtoCFG:
                     for r in _writes_of(st):
                         cur[r] = frozenset([(bid, i)])
             removed = False
+            # (a register shared with a closure is only that while the variable is in scope; the
+            # same register serves as a temporary before and after)
+            CIN = self.captured_open() if captured else {}
             for bid in order:
                 b = self.blocks[bid]
                 keep = []
+                copen = set(CIN.get(bid, ()))
                 for i, st in enumerate(b.stmts):
                     if st[0] == 'set' and st[1][0] == 'r' and st[2][0] in PURE and (bid, i) not in used \
-                            and st[1][1] not in captured:
+                            and st[1][1] not in copen:
                         removed = True
                         continue
+                    copen = cap_step(copen, st)
                     keep.append(st)
                 b.stmts = keep
             if not removed:
@@ -802,41 +1118,785 @@ class ProtoCFG:
         self.entry = entry
         self._thread()
 
+    def _opaque_numbers(self):
+        """Registers and upvalues that only ever hold Luraph's opaque state numbers: set to large
+        integer constants and to arithmetic over themselves, nothing else.  Returns
+        (opaque(block, index, expr) -> bool, registers)."""
+        blocks = self.blocks
+        ups = OPAQUE_UPS.get(self.pir.key, {})
+        params = set(self.param_regs or ())
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                # (one result of a bit operation, written as a multiple assignment)
+                if st[0] == 'multiset' and len(st[1]) == 1 and st[1][0][0] == 'r' and st[2][0] == 'call' \
+                        and st[2][1][0] == 'kfn' and str(st[2][1][1]).startswith('bit32.') and st[2][3] is None:
+                    b.stmts[i] = ('set', st[1][0], st[2])
+
+        def local(b, i, e, depth=0):
+            """e with registers replaced by what the block assigned to them before statement i"""
+            if e[0] == 'r':
+                for j in range(i - 1, -1, -1):
+                    st = b.stmts[j]
+                    if e[1] in _writes_of(st):
+                        if st[0] == 'set' and st[1] == e and depth < 12:
+                            return local(b, j, st[2], depth + 1)
+                        return None
+                return e
+            if e[0] == 'k':
+                return e if _isnum(e) else None
+            if e[0] == 'up':
+                return e
+            if e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//'):
+                x, y = local(b, i, e[2], depth), local(b, i, e[3], depth)
+                return None if x is None or y is None else ('bin', e[1], x, y)
+            if e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
+                args = [local(b, i, x, depth) for x in e[2]]
+                return None if any(x is None for x in args) else ('call', e[1], args, None)
+            return None
+
+        # a parameter counts when the function only does arithmetic with it
+        plain = set()
+
+        def reads(e, allowed):
+            if e[0] == 'r':
+                if not allowed:
+                    plain.add(e[1])
+            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//', '==', '~='):
+                reads(e[2], allowed)
+                reads(e[3], allowed)
+            elif e[0] == 'un' and e[1] == 'not':
+                reads(e[2], allowed)
+            elif e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
+                for x in e[2]:
+                    reads(x, allowed)
+            else:
+                sub = []
+                walk_expr(e, sub)
+                plain.update(x[1] for x in sub if x[0] == 'r')
+
+        def copy_ok(b, i, m):
+            """the copy made by statement i is itself only used for arithmetic and tests"""
+            for st in b.stmts[i + 1:] + [b.term]:
+                for e in stmt_exprs(st)[0]:
+                    if e == ('r', m):
+                        return False
+                    sub = []
+                    walk_expr(e, sub)
+                    if ('r', m) in sub:
+                        before = set(plain)
+                        reads(e, st[0] in ('set', 'br'))
+                        bad = m in plain and m not in before
+                        if m not in before:
+                            plain.discard(m)
+                        if bad:
+                            return False
+                if m in _writes_of(st):
+                    return True
+            return True
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts + [b.term]):
+                for e in stmt_exprs(st)[0]:
+                    if e[0] == 'r' and st[0] == 'set' and st[1][0] == 'r' and i < len(b.stmts):
+                        if not copy_ok(b, i, st[1][1]):
+                            plain.add(e[1])
+                    else:
+                        reads(e, st[0] in ('set', 'br'))
+        order, IN = self._reaching()
+        memo = {}
+
+        def def_ok(d):
+            if d[0] == 'ENTRY':
+                return d[1] in params and d[1] not in plain
+            if d[1] == 'T':
+                return False
+            if d in memo:
+                return memo[d]
+            memo[d] = True
+            st = blocks[d[0]].stmts[d[1]]
+            res = st[0] == 'set' and ok(local(blocks[d[0]], d[1], st[2]), d[0])
+            memo[d] = res
+            return res
+
+        def ok(e, bid, top=True):
+            if e is None:
+                return False
+            if e[0] == 'k':
+                # (a variable that is set to 0 or 1 is the script's own: a state number is large)
+                return not top or (isinstance(e[1], (int, float)) and not isinstance(e[1], bool)
+                                   and float(e[1]).is_integer() and abs(e[1]) >= 65536)
+            if e[0] == 'r':
+                ds = IN.get(bid, {}).get(e[1]) or [('ENTRY', e[1])]
+                return all(def_ok(d) for d in ds)
+            if e[0] == 'up':
+                return e[1] in ups
+            if e[0] == 'bin':
+                if e[1] == '%' and e[3] == ('k', 4294967296) and e[2][0] in ('r', 'up'):
+                    # any value at all, reduced to 32 bits: the way into `mul(x, C) + mul(bnot(x), C)`,
+                    # which is the same number for every x
+                    return True
+                return ok(e[2], bid, False) and ok(e[3], bid, False)
+            if e[0] == 'call':
+                return all(ok(x, bid, False) for x in e[2])
+            return False
+
+        def opaque(b, i, e):
+            e = local(b, i, e)
+            return e is not None and e[0] != 'k' and ok(e, b.id)
+
+        def value(b, i, e):
+            """the number e holds before statement i, when the block alone determines it"""
+            e = local(b, i, e)
+            return None if e is None else _opaque_eval(e, ups)
+
+        def scrambles(b):
+            """the block updates an opaque number: what the losing side of a guard starts with"""
+            for i, st in enumerate(b.stmts):
+                if st[0] != 'set':
+                    continue
+                if st[1][0] == 'up' and st[1][1] in ups:
+                    return True
+                if st[1][0] == 'r':
+                    e = local(b, i, st[2])
+                    if e is not None and e[0] != 'k' and ok(e, b.id):
+                        sub = []
+                        walk_expr(e, sub)
+                        if st[1] in sub:
+                            return True
+            return False
+
+        # what the functions created here capture
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
+                    got = {}
+                    fns = set()
+                    for n, c in enumerate(st[2][2]):
+                        if c[0] == 'val':
+                            # a function captured by value stays a function
+                            m = c[1][1] if isinstance(c[1], tuple) else c[1]
+                            for j in range(i - 1, -1, -1):
+                                if m in _writes_of(b.stmts[j]):
+                                    sj = b.stmts[j]
+                                    if sj[0] == 'set' and isinstance(sj[2], tuple) and sj[2][0] == 'closure':
+                                        fns.add(n)
+                                    break
+                            else:
+                                ds = IN.get(b.id, {}).get(m) or ()
+                                if ds and all(d[0] != 'ENTRY' and d[1] != 'T' and blocks[d[0]].stmts[d[1]][0] == 'set'
+                                              and isinstance(blocks[d[0]].stmts[d[1]][2], tuple)
+                                              and blocks[d[0]].stmts[d[1]][2][0] == 'closure' for d in ds):
+                                    fns.add(n)
+                        elif c[0] not in ('ref', 'const') and c[1] in FUNCTION_UPS.get(self.pir.key, ()):
+                            fns.add(n)
+                    FUNCTION_UPS[st[2][1]] = fns
+                    for n, c in enumerate(st[2][2]):
+                        if c[0] in ('val', 'ref'):
+                            m = c[1][1] if isinstance(c[1], tuple) else c[1]
+                            v = local(b, i, ('r', m))
+                            if v is None or not ok(v, b.id):
+                                continue
+                            # a shared variable is updated right after the function is made
+                            got[n] = value(b, i if c[0] == 'val' else len(b.stmts), ('r', m))
+                        elif c[0] != 'const' and c[1] in ups:
+                            got[n] = ups[c[1]]
+                    OPAQUE_UPS[st[2][1]] = got
+        return opaque, value, scrambles, def_ok, local, IN, ups, ok
+
+    def _holds_function(self, b, pos, m, IN):
+        """register m holds a function created here on every path to statement pos of block b"""
+        if m in self.captured_ref:
+            return False
+        for j in range(pos - 1, -1, -1):
+            if m in _writes_of(b.stmts[j]):
+                return False        # (resolved by the caller when it is a plain assignment)
+        ds = IN.get(b.id, {}).get(m)
+        if not ds:
+            return False
+        for d in ds:
+            if d[0] == 'ENTRY' or d[1] == 'T':
+                return False
+            st = self.blocks[d[0]].stmts[d[1]]
+            if not (st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure'):
+                return False
+        return True
+
+    def _is_number(self, b, pos, reg):
+        """the register was just computed as `x % 2^32` or by a bit operation: a number, not NaN"""
+        for j in range(pos - 1, -1, -1):
+            st = b.stmts[j]
+            if reg[1] in _writes_of(st):
+                if st[0] != 'set':
+                    return False
+                e = st[2]
+                return (e[0] == 'bin' and e[1] == '%' and _isnum(e[3]) and e[3][1] > 0) or (
+                    e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.'))
+        return False
+
+    def _double_not(self, b):
+        n = 0
+        for st in b.stmts[-4:]:
+            if st[0] == 'set' and st[2][0] == 'un' and st[2][1] == 'not':
+                n += 1
+                if st[2][2][0] == 'un' and st[2][2][1] == 'not':
+                    n += 1
+        e = b.term[1]
+        while e[0] == 'un' and e[1] == 'not':
+            n += 1
+            e = e[2]
+        return n >= 2
+
+    def _opaque_flow(self, ups):
+        """Constant propagation of the opaque state numbers along the paths that can execute: a
+        guard whose outcome is known is followed on that side only, so the scrambling on its dead
+        side never mixes in.  Returns {block: {register: number or boolean}} at block entry."""
+        blocks = self.blocks
+        cap = set(self.captured_ref)
+
+        def ev(e, env):
+            if e[0] == 'r':
+                return env.get(e[1])
+            if e[0] == 'un' and e[1] == 'not':
+                v = ev(e[2], env)
+                return (not v) if isinstance(v, bool) else None
+            if e[0] == 'bin' and e[1] in ('==', '~='):
+                x, y = ev(e[2], env), ev(e[3], env)
+                if x is None or y is None or isinstance(x, bool) or isinstance(y, bool):
+                    return None
+                return (x == y) == (e[1] == '==')
+            return _opaque_eval(e, ups, env)
+
+        import random
+        K = 3
+
+        class Env(dict):
+            # a register nothing is known about holds some number: a different one in each of
+            # the K evaluations, so that only what does not depend on it comes out equal
+            def get(self, r, default=None):
+                if r in self:
+                    return self[r]
+                return self.rnd.setdefault(r, self.gen.choice([float(self.gen.randrange(0, 2 ** 32)), self.gen.uniform(-1e6, 1e6),
+                                                                self.gen.uniform(0, 2 ** 33)]))
+
+            def __bool__(self):
+                return True
+
+        def run(b, env, want_cond=False, upto=None, expr=None):
+            envs = []
+            for k in range(K):
+                e = Env(env)
+                e.rnd = {}
+                e.gen = random.Random(hash((b.id, k)) & 0xFFFFFFF)
+                envs.append(e)
+            for st in (b.stmts if upto is None else b.stmts[:upto]):
+                if st[0] == 'set' and st[1][0] == 'r':
+                    vs = [ev(st[2], e) for e in envs]
+                    for e, v in zip(envs, vs):
+                        e.rnd.pop(st[1][1], None)
+                        if v is None or any(x is None for x in vs) or st[1][1] in cap:
+                            e.pop(st[1][1], None)
+                        else:
+                            e[st[1][1]] = v
+                else:
+                    for r in _writes_of(st):
+                        for e in envs:
+                            e.pop(r, None)
+                            e.rnd.pop(r, None)
+            if expr is not None:
+                # the value of an expression before statement `upto`, when it is the same whatever
+                # the unknown registers hold
+                vs = [ev(expr, e) for e in envs]
+                same = vs[0] is not None and all(type(v) is type(vs[0]) and v == vs[0] for v in vs)
+                return vs[0] if same else None
+            cond = None
+            if want_cond and b.term[0] == 'br':
+                cs = [ev(b.term[1], e) for e in envs]
+                if isinstance(cs[0], bool) and all(c is cs[0] for c in cs):
+                    cond = cs[0]
+            for r in _writes_of(b.term):
+                for e in envs:
+                    e.pop(r, None)
+            out = {r: v for r, v in envs[0].items()
+                   if all(r in e and type(e[r]) is type(v) and e[r] == v for e in envs[1:])}
+            return (out, cond) if want_cond else out
+
+        IN = {self.entry: {}}
+        work = [self.entry]
+        rounds = 0
+        while work and rounds < 20 * len(blocks) + 100:
+            rounds += 1
+            bid = work.pop()
+            b = blocks[bid]
+            out, c = run(b, IN[bid], True)
+            succs = b.succs()
+            if b.term[0] == 'br':
+                if isinstance(c, bool):
+                    succs = [b.term[2] if c else b.term[3]]
+            for sid in succs:
+                if sid not in IN:
+                    IN[sid] = dict(out)
+                    work.append(sid)
+                else:
+                    cur = IN[sid]
+                    new = {r: v for r, v in cur.items() if r in out and out[r] == v and type(out[r]) == type(v)}
+                    if len(new) != len(cur):
+                        IN[sid] = new
+                        work.append(sid)
+        return IN, lambda b, n, e: run(b, IN[b.id], False, n, e)
+
+    def _used_as_object(self, b, src):
+        """The value `src` (an upvalue captured by value, or a register the block does not assign)
+        is indexed or called somewhere in block b, and the block negates it twice for its test."""
+        holds = set()
+        if src[0] == 'r':
+            if any(src[1] in _writes_of(st) for st in b.stmts):
+                return False
+            holds.add(src[1])
+        used = False
+        nots = 0
+        for st in b.stmts:
+            for e in stmt_exprs(st)[0]:
+                for x in walk_expr(e, []):
+                    if x[0] in ('index', 'method', 'call') and (x[1] == src or (x[1][0] == 'r' and x[1][1] in holds)):
+                        used = True
+            if st[0] == 'set' and st[1][0] == 'r':
+                if st[2] == src or (st[2][0] == 'r' and st[2][1] in holds):
+                    holds.add(st[1][1])
+                    continue
+                if st[2][0] == 'un' and st[2][1] == 'not':
+                    nots += 1
+            for r in _writes_of(st):
+                holds.discard(r)
+        return used and nots >= 2
+
     def _cut_cold_magic(self):
-        """Key checks (`x == 149143557`, compared against a large magic number) whose failing side
-        the traced run never took: that side is Luraph's tamper response.  It is cut before the
-        state machine is unflattened, because it usually corrupts the state register on purpose."""
+        """Key checks (`x == 149143557`: one of Luraph's opaque state numbers compared against a
+        large magic number): one side is the tamper response, and the check itself is not part of
+        the program.  The losing side is the one the traced run never took; in code that never ran
+        it is the side that scrambles the number, or the one the number's value rules out.  The
+        check is removed before the state machine is unflattened, because the losing side usually
+        corrupts the state register on purpose.  A test of anything else
+        (`game.PlaceId == 7465136166`) is the program's own."""
         blocks = self.blocks
         self.compute_preds()
+        opaque, value, scrambles, _, local, IN, ups, _ = self._opaque_numbers()
+        flow, flow_ev = self._opaque_flow(ups)
         cut = 0
         for b in list(blocks.values()):
-            if b.term[0] != 'br':
+            if b.term[0] != 'br' or b.term[2] == b.term[3]:
                 continue
             e = b.term[1]
-            while e[0] == 'un' and e[1] == 'not':
-                e = e[2]
-            if e[0] == 'r':
-                for st in reversed(b.stmts):
+            flip = False
+            pos = len(b.stmts)
+            while True:
+                while e[0] == 'un' and e[1] == 'not':
+                    e = e[2]
+                    flip = not flip
+                if e[0] != 'r':
+                    break
+                for j in range(pos - 1, -1, -1):
+                    st = b.stmts[j]
                     if e[1] in _writes_of(st):
                         e = st[2] if st[0] == 'set' and st[1] == e else ('k', None)
+                        pos = j
                         break
-            while e[0] == 'un' and e[1] == 'not':
-                e = e[2]
+                else:
+                    break
+            if e[0] == 'bin' and e[1] in ('==', '~=') and e[2] == e[3] and e[2][0] == 'r' \
+                    and (local(b, pos, e[2]) is not None or self._is_number(b, pos, e[2])):
+                # `x ~= x` on a number: never
+                keep = b.term[2] if ((e[1] == '==') != flip) else b.term[3]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
+            if e[0] in ('upcell', 'r') and (flip or b.term[1][0] == 'r') and self._used_as_object(b, e):
+                # `if not not x then` right after x was indexed or called: an opaque predicate,
+                # x cannot be nil or false there
+                keep = b.term[3] if flip else b.term[2]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
+            if e[0] in ('upcell', 'r', 'up') and self._double_not(b):
+                # `if not not x then` whose false side starts by scrambling an opaque number
+                lose = b.term[2] if flip else b.term[3]
+                keep = b.term[3] if flip else b.term[2]
+                lb = blocks[lose]
+                if len(lb.preds) == 1 and not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold') and (
+                        scrambles(lb) or any(st[0] == 'set' and st[1][0] in ('up', 'r') and _isnum(st[2])
+                                             and abs(st[2][1]) >= 2 ** 24 for st in lb.stmts[:2])):
+                    b.term = ('goto', keep)
+                    cut += 1
+                    continue
+            if e[0] == 'closure' or (e[0] == 'r' and self._holds_function(b, pos, e[1], IN)):
+                # `if not f then` on a local function
+                keep = b.term[3] if flip else b.term[2]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
+            if e[0] == 'upcell' and e[1] in FUNCTION_UPS.get(self.pir.key, ()):
+                # `if f then` on a function captured by value: an opaque predicate, always true
+                keep = b.term[3] if flip else b.term[2]
+                if not (blocks[keep].stmts and blocks[keep].stmts[0][0] == 'cold'):
+                    b.term = ('goto', keep)
+                    cut += 1
+                continue
             if not (e[0] == 'bin' and e[1] in ('==', '~=')):
                 continue
             consts = [x[1] for x in (e[2], e[3]) if _isnum(x)]
             if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != round(consts[0]):
                 continue
-            for sid in set(b.succs()):
-                sb = blocks[sid]
-                if sb.stmts and sb.stmts[0][0] == 'cold' and len(sb.preds) == 1:
-                    sb.stmts = [('trap', None)]
-                    sb.term = ('ret', [], None)
-                    cut += 1
+            other = e[3] if _isnum(e[2]) else e[2]
+            n = pos        # (where the comparison is made: its operands may be reassigned after)
+            proven = opaque(b, n, other)
+            if not proven and value(b, n, other) is None:
+                # (both sides plain numbers also count: `x = 9575712; if x ~= 9575712 then`)
+                # Not provably one of the opaque numbers (the register is shared with other
+                # values on some path): then only arithmetic on registers, and only with the
+                # traced run's verdict
+                if local(b, n, other) is None:
+                    continue
+            arms = (b.term[2], b.term[3])
+            coldside = [sid for sid in arms if blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold'
+                        and len(blocks[sid].preds) == 1]
+            v = value(b, n, other)
+            if v is None and b.id in flow:
+                # ... or the paths that can execute determine it
+                x = flow_ev(b, n, other)
+                if isinstance(x, (int, float)) and not isinstance(x, bool):
+                    v = x
+            known = None if v is None else arms[0 if ((v == consts[0]) == (e[1] == '==')) != flip else 1]
+            if len(coldside) == 1:
+                lose = coldside[0]
+            else:
+                lose = None
+                scr = [sid for sid in arms if len(blocks[sid].preds) == 1 and scrambles(blocks[sid])] \
+                    if (proven or v is not None) else []
+                if len(scr) == 1 and (known is None or known != scr[0]):
+                    lose = scr[0]
+                elif not scr and known is not None:
+                    lose = arms[1] if known == arms[0] else arms[0]
+                elif known is None:
+                    # Last resort, in code that never ran: the real side of a guard goes on to
+                    # code of its own, the dead side jumps into code that something else leads
+                    # to as well.
+                    own = [sid for sid in arms if blocks[sid].preds == {b.id}]
+                    if len(own) == 1 and abs(consts[0]) >= 2 ** 24 and not any(
+                            blocks[sid].stmts and blocks[sid].stmts[0][0] == 'cold' for sid in arms):
+                        lose = arms[1] if own[0] == arms[0] else arms[0]
+                if lose is None:
+                    continue
+            b.term = ('goto', arms[1] if lose == arms[0] else arms[0])
+            cut += 1
         if cut:
             self._prune()
             self.compute_preds()
         return cut
+
+    def _scan_up_usage(self):
+        """Which upvalues this function reads for something other than arithmetic and tests, and
+        which ones it hands on to the functions it creates."""
+        plain, passes = set(), []
+
+        def reads(e, allowed):
+            if e[0] in ('up', 'upcell'):
+                if not allowed:
+                    plain.add(e[1])
+            elif e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//', '==', '~='):
+                reads(e[2], allowed)
+                reads(e[3], allowed)
+            elif e[0] == 'un' and e[1] == 'not':
+                reads(e[2], allowed)
+            elif e[0] == 'call' and e[1][0] == 'kfn' and str(e[1][1]).startswith('bit32.') and len(e) > 3 and e[3] is None:
+                for x in e[2]:
+                    reads(x, allowed)
+            else:
+                for x in walk_expr(e, []) or ():
+                    if x[0] in ('up', 'upcell'):
+                        plain.add(x[1])
+                    elif x[0] == 'closure':
+                        for n, c in enumerate(x[2]):
+                            if c[0] not in ('val', 'ref', 'const'):
+                                passes.append((c[1], x[1], n))
+
+        def copy_ok(b, i, m):
+            for st in b.stmts[i + 1:] + [b.term]:
+                for e in stmt_exprs(st)[0]:
+                    sub = walk_expr(e, []) or ()
+                    if ('r', m) in sub:
+                        if e == ('r', m) and st[0] != 'br':
+                            if not (st[0] == 'set' and st[1][0] == 'up'):
+                                return False
+                            continue
+                        if st[0] not in ('set', 'br'):
+                            return False
+                        # only inside arithmetic and comparisons
+                        def fine(x):
+                            if x == ('r', m):
+                                return True
+                            if x[0] == 'bin' and x[1] in ('+', '-', '*', '%', '//', '==', '~='):
+                                return fine(x[2]) and fine(x[3])
+                            if x[0] == 'un' and x[1] == 'not':
+                                return fine(x[2])
+                            if x[0] == 'call' and x[1][0] == 'kfn' and str(x[1][1]).startswith('bit32.') and len(x) > 3 and x[3] is None:
+                                return all(fine(a) for a in x[2])
+                            return ('r', m) not in (walk_expr(x, []) or ())
+                        if not fine(e):
+                            return False
+                if m in _writes_of(st):
+                    return True
+            return m not in self._scan_live_out.get(b.id, ())
+        self._scan_live_out = self.liveness()[1]
+        for b in self.blocks.values():
+            for i, st in enumerate(b.stmts + [b.term]):
+                for e in stmt_exprs(st)[0]:
+                    if e[0] in ('up', 'upcell') and st[0] == 'set' and st[1][0] == 'r' and i < len(b.stmts):
+                        if not copy_ok(b, i, st[1][1]):
+                            plain.add(e[1])
+                    else:
+                        reads(e, st[0] in ('set', 'br'))
+        _UP_PLAIN[self.pir.key] = plain
+        _UP_PASS[self.pir.key] = passes
+
+    def _cut_loop_entries(self):
+        """A branch into the middle of a loop from outside it.  No source construct compiles to
+        that; it is the dead side of an opaque predicate, aimed at some unrelated block.  The
+        branch is cut when the traced run never took that side, or when the loop is a for-loop
+        (whose only way in is its own instruction)."""
+        blocks = self.blocks
+        cut = 0
+        for _ in range(8):
+            self.compute_preds()
+            # retreating edges of a depth-first walk
+            state, retreat = {}, []
+            stack = [(self.entry, iter(blocks[self.entry].succs()))]
+            state[self.entry] = 1
+            while stack:
+                n, it = stack[-1]
+                for x in it:
+                    if x not in state:
+                        state[x] = 1
+                        stack.append((x, iter(blocks[x].succs())))
+                        break
+                    if state[x] == 1:
+                        retreat.append((n, x))
+                else:
+                    state[n] = 2
+                    stack.pop()
+            done = False
+            for u, h in retreat:
+                body, todo = {h}, [u]
+                while todo:
+                    x = todo.pop()
+                    if x not in body:
+                        body.add(x)
+                        todo.extend(blocks[x].preds)
+                forloop = blocks[h].term[0] == 'forbr'
+                for y in body:
+                    if y == h:
+                        continue
+                    for x in list(blocks[y].preds):
+                        if x in body:
+                            continue
+                        src, arm = blocks[x], y
+                        cold = False
+                        if len(src.stmts) == 1 and src.stmts[0][0] == 'cold' and src.term[0] == 'goto' and len(src.preds) == 1:
+                            cold = True
+                            arm = x
+                            src = blocks[next(iter(src.preds))]
+                            if src.id in body:
+                                continue
+                        if src.term[0] != 'br' or src.term[2] == src.term[3] or arm not in (src.term[2], src.term[3]):
+                            continue
+                        if not (cold or forloop):
+                            continue
+                        src.term = ('goto', src.term[3] if arm == src.term[2] else src.term[2])
+                        cut += 1
+                        done = True
+                        break
+                    if done:
+                        break
+                if done:
+                    break
+            if not done:
+                # Likewise from the code after a for-loop back into its body: once the loop is
+                # exhausted the only way to run its body again is the loop's set-up.
+                def reach(start, stop, back=False):
+                    seen, todo = set(), list(start)
+                    while todo:
+                        x = todo.pop()
+                        if x in seen or x in stop:
+                            continue
+                        seen.add(x)
+                        todo.extend(blocks[x].preds if back else blocks[x].succs())
+                    return seen
+                for h, hb in list(blocks.items()):
+                    if hb.term[0] != 'forbr' or hb.term[3] == hb.term[4]:
+                        continue
+                    s3, s4 = hb.term[3], hb.term[4]
+                    preps = {x for x in hb.preds if any(st[0] in ('genforprep', 'numforprep') for st in blocks[x].stmts)}
+                    after = reach([s4], {h})
+                    inbody = reach([s3], {h, s4})
+                    again = reach([x for x in hb.preds if x not in preps], preps | {h}, back=True)
+                    for x in after - inbody:
+                        src = blocks[x]
+                        if src.term[0] != 'br' or src.term[2] == src.term[3]:
+                            continue
+                        def through(y):
+                            # (past the marker block of a side the traced run never took)
+                            n = 0
+                            while n < 8 and all(st[0] == 'cold' for st in blocks[y].stmts) \
+                                    and blocks[y].term[0] == 'goto' and len(blocks[y].preds) == 1:
+                                y = blocks[y].term[1]
+                                n += 1
+                            return y
+                        bad = [y for y in (src.term[2], src.term[3])
+                               if through(y) in inbody and through(y) in again and through(y) != h]
+                        if len(bad) == 1:
+                            src.term = ('goto', src.term[3] if bad[0] == src.term[2] else src.term[2])
+                            cut += 1
+                            done = True
+                            break
+                    if done:
+                        break
+            if not done:
+                break
+            self._prune()
+        if cut:
+            self.compute_preds()
+        return cut
+
+    def _drop_opaque_numbers(self):
+        """With the guards gone nothing reads the opaque state numbers any more, except their own
+        updates.  Those assignments are removed here, where the registers are still apart (in the
+        text they may share a variable with something real)."""
+        blocks = self.blocks
+        self.compute_preds()
+        _, _, _, def_ok, local, IN, ups, ok = self._opaque_numbers()
+        dropups = DROP_UPS.get(self.pir.key, frozenset())
+        cand = set()
+        deadcalls = set()
+
+        def test_of_opaque(b, i, e):
+            # the stored result of a guard's comparison
+            while e[0] == 'un' and e[1] == 'not':
+                e = e[2]
+            if e[0] == 'bin' and e[1] in ('==', '~='):
+                x, y = local(b, i, e[2]), local(b, i, e[3])
+                return x is not None and y is not None and ok(x, b.id) and ok(y, b.id)
+            return False
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'set' and st[1][0] == 'r' and (def_ok((b.id, i)) or test_of_opaque(b, i, st[2])):
+                    cand.add((b.id, i))
+                elif st[0] == 'callstmt' and st[1][0] == 'call' and st[1][1][0] == 'kfn' \
+                        and str(st[1][1][1]).startswith('bit32.') and st[1][3] is None:
+                    deadcalls.add((b.id, i))        # a bit operation whose result nobody takes
+        allok = set(cand)
+        if os.environ.get('DEVM_TRACE_DROP') == str(self.pir.key):
+            for b in blocks.values():
+                for i, st in enumerate(b.stmts):
+                    if st[0] == 'set' and st[1] == ('r', 1) and (b.id, i) not in cand:
+                        print('  r1 def not opaque', b.id, i, str(st)[:200], '| resolved', str(local(b, i, st[2]))[:300])
+
+        def defs_at(b, i, m):
+            for j in range(i - 1, -1, -1):
+                if m in _writes_of(b.stmts[j]):
+                    return [(b.id, j)]
+            return IN.get(b.id, {}).get(m) or ()
+
+        def plain_reads(e, out):
+            if e[0] == 'r':
+                out.add(e[1])
+            elif e[0] == 'closure':
+                opq = OPAQUE_UPS.get(e[1], {})
+                for n, c in enumerate(e[2]):
+                    if c[0] in ('val', 'ref') and (n not in opq or _up_used(e[1], n)):
+                        out.add(c[1][1] if isinstance(c[1], tuple) else c[1])
+            elif e[0] == 'bin':
+                plain_reads(e[2], out); plain_reads(e[3], out)
+            elif e[0] == 'un':
+                plain_reads(e[2], out)
+            elif e[0] in ('index', 'and', 'or'):
+                plain_reads(e[1], out); plain_reads(e[2], out)
+            elif e[0] == 'call':
+                plain_reads(e[1], out)
+                for a in e[2]:
+                    plain_reads(a, out)
+                if len(e) > 3 and e[3]:
+                    plain_reads(e[3], out)
+            elif e[0] == 'method':
+                plain_reads(e[1], out)
+            elif e[0] == 'table':
+                for k, v in e[1]:
+                    if k is not None:
+                        plain_reads(k, out)
+                    plain_reads(v, out)
+                if e[2]:
+                    plain_reads(e[2], out)
+            else:
+                out.update(expr_reads(e)[0])
+
+        changed = True
+        while changed:
+            changed = False
+            for b in blocks.values():
+                for i, st in enumerate(b.stmts + [b.term]):
+                    if i < len(b.stmts) and ((b.id, i) in cand or (b.id, i) in deadcalls or (
+                            st[0] == 'set' and st[1][0] == 'up' and st[1][1] in dropups)):
+                        continue
+                    regs = set()
+                    for e in stmt_exprs(st)[0]:
+                        plain_reads(e, regs)
+                    for m in regs:
+                        for d in defs_at(b, min(i, len(b.stmts)), m):
+                            if d in cand:
+                                cand.discard(d)
+                                changed = True
+                                if os.environ.get('DEVM_TRACE_DROP') == str(self.pir.key):
+                                    print('  keeps r%s def %s: %s %s' % (m, d, 'ROOT' if (b.id, i) not in allok else 'cascade', str(st)[:260]))
+        # which of the captured ones the functions created here may forget about as well
+        kept = {blocks[bid].stmts[i][1][1] for bid, i in allok - cand}
+        for b in blocks.values():
+            for i, st in enumerate(b.stmts):
+                for x in (walk_expr(st[2], []) or ()) if st[0] == 'set' else ():
+                    if x[0] != 'closure':
+                        continue
+                    got = set()
+                    opq = OPAQUE_UPS.get(x[1], {})
+                    for n, c in enumerate(x[2]):
+                        if n not in opq or _up_used(x[1], n):
+                            continue
+                        if c[0] in ('val', 'ref'):
+                            m = c[1][1] if isinstance(c[1], tuple) else c[1]
+                            ds = defs_at(b, i, m)
+                            if m not in kept and ds and all(d in cand for d in ds):
+                                got.add(n)
+                        elif c[0] != 'const' and c[1] in dropups:
+                            got.add(n)
+                    DROP_UPS[x[1]] = frozenset(got)
+        drop = {}
+        for bid, i in cand:
+            b = blocks[bid]
+            e = local(b, i, b.stmts[i][2])
+            if e is not None and e[0] == 'k' and abs(e[1]) < 65536:
+                continue
+            drop.setdefault(bid, set()).add(i)
+        for bid, i in deadcalls:
+            drop.setdefault(bid, set()).add(i)
+        n = 0
+        for b in blocks.values():
+            d = drop.get(b.id, ())
+            new = [st for i, st in enumerate(b.stmts) if i not in d
+                   and not (st[0] == 'set' and st[1][0] == 'up' and st[1][1] in dropups)]
+            n += len(b.stmts) - len(new)
+            if os.environ.get('DEVM_TRACE_DROP'):
+                for st in b.stmts:
+                    if st not in new:
+                        print('   dropped', self.pir.key, b.id, str(st)[:200])
+            b.stmts = new
+        return n
 
     def _cut_cold_edges(self):
         """Opaque predicates.  Luraph guards its code with tests of the form `key == 1234` whose
@@ -1451,6 +2511,21 @@ class ProtoCFG:
                 if r != s:
                     b.retarget(s, r)
         self.entry = resolve(self.entry)
+        # the loop instruction of a for-loop can exist twice (one copy tests on entry, one closes the
+        # body): identical empty copies are one block
+        same = {}
+        for b in sorted(blocks.values(), key=lambda b: str(b.id)):
+            if b.term[0] == 'forbr' and not b.stmts:
+                first = same.setdefault(repr(b.term), b.id)
+                if first != b.id:
+                    fwd[b.id] = first
+        if any(blocks[k].term[0] == 'forbr' for k in fwd):
+            for b in blocks.values():
+                for s in list(b.succs()):
+                    if s in fwd and blocks[s].term[0] == 'forbr':
+                        b.retarget(s, fwd[s])
+            if self.entry in fwd and blocks[self.entry].term[0] == 'forbr':
+                self.entry = fwd[self.entry]
         self._prune()
         # merge linear chains
         changed = True
@@ -1472,6 +2547,97 @@ class ProtoCFG:
                         blocks[x].preds.add(b.id)
                     changed = True
         self.compute_preds()
+
+    def _fold_value_chains(self):
+        """`x = a or b or c` and `x = a and b` as values: a test of the register followed, on one
+        side, by a block that does nothing but assign the same register again.
+
+            A: ...; if r then goto J        A: ...; r = r or e
+            B: r = e; goto J           =>      goto J
+
+        (and the mirror image for `and`; B may end in the same test again, which chains)."""
+        blocks = self.blocks
+        changed = False
+        again = True
+        while again:
+            again = False
+            self.compute_preds()
+            for a in list(blocks.values()):
+                if a.id not in blocks or a.term[0] != 'br' or len(a.term) != 4 or a.term[2] == a.term[3]:
+                    continue
+                c = a.term[1]
+                neg = False
+                while c[0] == 'un' and c[1] == 'not':
+                    c = c[2]
+                    neg = not neg
+                if c[0] != 'r' or c[1] in self.captured_ref:
+                    continue
+                t, f = (a.term[3], a.term[2]) if neg else (a.term[2], a.term[3])
+                for op, bid, join in (('or', f, t), ('and', t, f)):
+                    b = blocks.get(bid)
+                    if b is None or b is a or b.preds != {a.id} or len(b.stmts) != 1:
+                        continue
+                    st = b.stmts[0]
+                    if st[0] != 'set' or st[1] != c or any(x[0] == 'closure' for x in walk_expr(st[2], [])):
+                        continue
+                    if b.term == ('goto', join):
+                        a.stmts.append(('set', c, (op, c, st[2])))
+                        a.term = ('goto', join)
+                    elif b.term[0] == 'br' and len(b.term) == 4:
+                        c2, neg2 = b.term[1], False
+                        while c2[0] == 'un' and c2[1] == 'not':
+                            c2 = c2[2]
+                            neg2 = not neg2
+                        t2, f2 = (b.term[3], b.term[2]) if neg2 else (b.term[2], b.term[3])
+                        if c2 != c or (t2 if op == 'or' else f2) != join:
+                            continue
+                        a.stmts.append(('set', c, (op, c, st[2])))
+                        a.term = ('br', c, t2, f2)
+                    else:
+                        continue
+                    del blocks[b.id]
+                    again = changed = True
+                    break
+        if changed:
+            self.compute_preds()
+        return changed
+
+    def _unthread_tests(self):
+        """`if c then goto T end; work; if c then goto T else goto F end` is compiled (or obfuscated)
+        with the second test folded into the first: `if c then goto T else work; goto F end`, next
+        to another copy of the test for the paths that skip the first one.  The arm goes back
+        through that copy, so T and F each have one way in."""
+        blocks = self.blocks
+        self.compute_preds()
+        changed = False
+        for y in list(blocks.values()):
+            if y.stmts or y.term[0] != 'br' or len(y.term) != 4 or y.term[2] == y.term[3]:
+                continue
+            c = y.term[1]
+            cr, mem, impure = expr_reads(c)
+            if impure or mem:
+                continue
+            for x in list(blocks.values()):
+                if x is y or x.term[0] != 'br' or len(x.term) != 4 or x.term[1] != c or x.term[2] == x.term[3]:
+                    continue
+                for same, other in ((2, 3), (3, 2)):
+                    if x.term[same] != y.term[same] or x.term[other] == y.term[other]:
+                        continue
+                    arm = blocks.get(x.term[other])
+                    if arm is None or arm is y or arm is x or arm.preds != {x.id} or arm.term != ('goto', y.term[other]):
+                        continue
+                    if any(set(_writes_of(st)) & cr for st in arm.stmts) or (cr & self.captured_ref and any(
+                            expr_reads(e)[2] for st in arm.stmts for e in stmt_exprs(st)[0])):
+                        continue
+                    t = list(x.term)
+                    t[same] = y.id
+                    x.term = tuple(t)
+                    arm.term = ('goto', y.id)
+                    changed = True
+                    break
+        if changed:
+            self.compute_preds()
+        return changed
 
     def _thread_same_test(self):
         """`if r then A else goto B end` where B is nothing but `if r then C else D end`: on that
@@ -1599,15 +2765,21 @@ class ProtoCFG:
                 for e in stmt_reads_raw(st):
                     count_uses(e, lambda x: x[0] in ('t', 'mv'), tcount)
         tails = {}
+        va_alias = set()
         for b in self.blocks.values():
             new = []
             for st in b.stmts:
                 t = st[0]
                 if t == 'call':
                     _, cid, f, args, tail, nres = st
+                    if tail == 'args' and f == ('kfn', 'select') and len(args) == 1 and args[0][0] == 'k':
+                        # the function's own prologue: select(#params + 1, <all arguments>) is `...`
+                        va_alias.add(cid)
+                        self.vararg = True
+                        continue
                     tl = None
                     if tail is not None:
-                        tl = ('va',) if tail == 'va' else ('mvall', tail)
+                        tl = ('va',) if tail == 'va' or tail in va_alias else ('mvall', tail)
                     new.append(('calldef', cid, ('call', f, list(args), tl)))
                 elif t == 'setmulti':
                     if st[2] == 'va':
@@ -1616,7 +2788,7 @@ class ProtoCFG:
                 elif t == 'setlist':
                     tl = None
                     if st[4] is not None:
-                        tl = ('va',) if st[4] == 'va' else ('mvall', st[4])
+                        tl = ('va',) if st[4] == 'va' or st[4] in va_alias else ('mvall', st[4])
                     new.append(('setlist', st[1], st[2], list(st[3]), tl))
                 elif t == 'numforprep' or t == 'genforprep':
                     a = st[1]
@@ -1630,7 +2802,7 @@ class ProtoCFG:
                 tail = b.term[2]
                 tl = None
                 if tail is not None:
-                    tl = ('va',) if tail == 'va' else ('mvall', tail)
+                    tl = ('va',) if tail == 'va' or tail in va_alias else ('mvall', tail)
                 b.term = ('ret', list(b.term[1]), tl)
         # SELF pattern: t = X; R[A+1] = t; t2 = t[k]; R[A] = t2
         for b in self.blocks.values():
@@ -2039,9 +3211,14 @@ class ProtoCFG:
         self.compute_preds()
 
 
+def closes(st, r):
+    """('close', base) ends the scope of every register from base up; ('close', r, r) of one."""
+    return isinstance(r, int) and r >= st[1] and (len(st) < 3 or r <= st[2])
+
+
 def cap_step(cur, st):
     if st[0] == 'close':
-        cur = {r for r in cur if not (isinstance(r, int) and r >= st[1])}
+        cur = {r for r in cur if not closes(st, r)}
     for e in stmt_exprs(st)[0]:
         for x in walk_expr(e, []):
             if x[0] == 'closure':

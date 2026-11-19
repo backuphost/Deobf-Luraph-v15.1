@@ -1,9 +1,12 @@
+import os
 """CFG -> structured Lua AST -> source text."""
 import math
 import re
 
 from . import beautify
-from .ircfg import ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
+from . import ircfg as ircfg_mod
+from .ircfg import prepass as ircfg_prepass
+from .ircfg import closes, Block, ProtoCFG, walk_expr, map_expr, map_stmt, stmt_exprs, negate, expr_reads
 
 
 DUP_LIMIT = 40
@@ -113,7 +116,7 @@ def assign_variables(cfg, namer, coalesce=False):
                 CIN[bid] = set(cur)
                 for st in b.stmts + [b.term]:
                     if st[0] == 'close':
-                        cur = {r for r in cur if not (isinstance(r, int) and r >= st[1])}
+                        cur = {r for r in cur if not closes(st, r)}
                     for e in stmt_exprs(st)[0]:
                         for x in walk_expr(e, []):
                             if x[0] == 'closure':
@@ -150,7 +153,7 @@ def assign_variables(cfg, namer, coalesce=False):
                     if c[0] == 'ref' and c[1] == st[1][1]:
                         selfcap.add(c[1])
             if st[0] == 'close':
-                copen = {r for r in copen if not (isinstance(r, int) and r >= st[1])}
+                copen = {r for r in copen if not closes(st, r)}
             for e in reads:
                 for x in walk_expr(e, []):
                     if x[0] == 'r':
@@ -177,7 +180,7 @@ def assign_variables(cfg, namer, coalesce=False):
         for d in list(parent):
             r = d[2] if len(d) == 3 else d[1]
             if d[0] == 'param':
-                r = d[1]
+                r = cfg.param_regs[d[1] - 1]        # (the register the parameter arrives in)
             if r in cap:
                 continue
             if r in first:
@@ -390,18 +393,47 @@ def make_reducible(cfg, limit=300):
     raise Unstructured('irreducible control flow')
 
 
+def _all_exprs(e):
+    out = []
+    walk_expr(e, out)
+    return out
+
+
+# statements a join block may have to get a copy per way in (see Structurer._split_small_joins)
+SMALL_JOIN = int(os.environ.get('DEVM_SMALL_JOIN', '2'))
+SPLIT_ROUNDS = int(os.environ.get('DEVM_SPLIT_ROUNDS', '6'))
+
+
+class EnclosingFollow(Exception):
+    def __init__(self, target):
+        Exception.__init__(self, 'jump to an enclosing join')
+        self.target = target
+
+
 # ------------------------------------------------------------------ structuring
 class Structurer:
     def __init__(self, cfg):
         self.cfg = cfg
         self.blocks = cfg.blocks
+        self.ndup = 0
         make_reducible(cfg)
         cfg.compute_preds()
         self.order = rpo(cfg)
         self.rpo_idx = {b: i for i, b in enumerate(self.order)}
         self._dominators()
         self._loops()
+        self.small_join = 3 if ircfg_mod.DROP_OPAQUE else SMALL_JOIN
+        for _ in range(60 if ircfg_mod.DROP_OPAQUE else SPLIT_ROUNDS):
+            if not self._split_small_joins():
+                break
+            cfg.compute_preds()
+            self.order = rpo(cfg)
+            self.rpo_idx = {b: i for i, b in enumerate(self.order)}
+            self._dominators()
+            self._loops()
         self.emitted = {}
+        self.emit_log = []
+        self.follows = []
         self.depth = 0
         self.pending = {}
         self.njumps = 0
@@ -432,6 +464,42 @@ class Structurer:
                     idom[b] = new
                     changed = True
         self.idom = idom
+
+    def _split_small_joins(self):
+        """A branch whose arms meet at two join points needs a block that is left early (and a flag
+        when the exits nest).  When one of the join points is tiny (`x = {}` and on to the other
+        one: the shared else of `a and b or c`), every way into it gets its own copy instead."""
+        blocks = self.blocks
+        done = 0
+        for b in list(self.order):
+            ms = self.merge_children(b)
+            if len(ms) < 2:
+                continue
+            for m in ms:
+                blk = blocks[m]
+                if m in self.loop_nodes or blk.term[0] not in ('goto', 'ret') or len(blk.stmts) > self.small_join:
+                    continue
+                if blk.term[0] == 'goto' and blk.term[1] == m:
+                    continue
+                if any(x[0] == 'closure' or x == ('kfn', 'table.pack') for st in blk.stmts for e in stmt_exprs(st)[0] for x in _all_exprs(e)):
+                    continue        # (a multi-value table must keep its one definition: see beautify.fold_packs)
+                if self.small_join <= 2 and any(st[0] != 'set' for st in blk.stmts):
+                    continue
+                preds = sorted(blk.preds, key=lambda x: self.rpo_idx.get(x, 0))
+                if len(preds) < 2 or len(preds) > 4 or self.ndup + len(preds) > 400:
+                    continue
+                for n, pr in enumerate(preds[1:]):
+                    self.ndup += 1
+                    nb = Block((m, 'copy', self.ndup))
+                    nb.stmts = list(blk.stmts)
+                    nb.term = blk.term
+                    blocks[nb.id] = nb
+                    blocks[pr].retarget(m, nb.id)
+                done += 1
+                break
+            if done:
+                break
+        return done
 
     def dominates(self, a, b):
         while True:
@@ -556,6 +624,8 @@ class Structurer:
                     return None
                 through.append(c)
                 c = c[2]
+        if x in self.follows:
+            raise EnclosingFollow(x)
         return x
 
     def after_loop(self, lctx, out):
@@ -572,6 +642,7 @@ class Structurer:
         while b is not None:
             n = self.emitted.get(b, 0) + 1
             self.emitted[b] = n
+            self.emit_log.append(b)
             if n > DUP_LIMIT:
                 raise Unstructured('block duplicated too often')
             if b in self.loop_nodes or self.blocks[b].term[0] == 'forbr':
@@ -635,9 +706,36 @@ class Structurer:
                 return self.emit_merges(c, t, f, merges, stop, ctx, out)
             follow = self.if_follow(b)
             if follow is not None:
-                T = self.arm(t, follow, ctx)
-                F = self.arm(f, follow, ctx)
-                out.append(make_if(c, T, F))
+                mark = (len(self.emit_log), self.njumps, {k: list(v) for k, v in self.pending.items()}, self.depth)
+                self.follows.append(follow)
+                try:
+                    T = self.arm(t, follow, ctx)
+                    F = self.arm(f, follow, ctx)
+                    out.append(make_if(c, T, F))
+                except EnclosingFollow as ex:
+                    if ex.target != follow:
+                        raise
+                    # Something nested inside the arms jumps straight to the join (the later
+                    # alternatives of `a or b or c`): the arms become a block that can be left
+                    # early, instead of each such jump dragging a copy of the join along.
+                    for x in self.emit_log[mark[0]:]:
+                        self.emitted[x] -= 1
+                    del self.emit_log[mark[0]:]
+                    self.njumps = mark[1]
+                    self.pending = mark[2]
+                    self.depth = mark[3]
+                    while self.follows and self.follows[-1] != follow:
+                        self.follows.pop()
+                    self.follows.pop()
+                    lctx = (None, follow, ctx)
+                    T = self.arm(t, follow, lctx)
+                    F = self.arm(f, follow, lctx)
+                    out.append(['repeat', [make_if(c, T, F)], ('k', True), None])
+                    self.after_loop(lctx, out)
+                    return self.jump(follow, stop, ctx, out)
+                finally:
+                    if self.follows and self.follows[-1] == follow:
+                        self.follows.pop()
                 return self.jump(follow, stop, ctx, out)
             T = self.arm(t, stop, ctx)
             F = self.arm(f, stop, ctx)
@@ -745,6 +843,306 @@ def terminates(stmts):
 
 
 # ------------------------------------------------------------------ AST clean-up
+def attach_preps(stmts):
+    """A for loop whose setup instruction did not end up right in front of it: a few register
+    copies in between, or one setup per path that reaches the loop."""
+    def preps_in(st, found):
+        """the setups inside a statement, with the list each sits in"""
+        t = st[0]
+        subs = []
+        if t == 'if':
+            subs = [st[2], st[3] or []]
+        elif t in ('while',):
+            subs = [st[2]]
+        elif t in ('repeat', 'do'):
+            subs = [st[1]]
+        for sub in subs:
+            for x in sub:
+                if x[0] == 'prep':
+                    found.append((sub, x))
+                else:
+                    preps_in(x, found)
+
+    def walk(lst):
+        i = 0
+        while i < len(lst):
+            st = lst[i]
+            t = st[0]
+            if t == 'if':
+                walk(st[2])
+                if st[3]:
+                    walk(st[3])
+            elif t == 'while':
+                walk(st[2])
+            elif t in ('repeat', 'do'):
+                walk(st[1])
+            elif t in ('fornum', 'forin'):
+                walk(st[3])
+            if t == 'comment' and st[1] == 'for-loop without visible setup' and i + 1 < len(lst) \
+                    and lst[i + 1][0] in ('fornum', 'forin') and lst[i + 1][2] == [('opaque', '?')]:
+                loop = lst[i + 1]
+                j = i - 1
+                found = []
+                while j >= 0:
+                    x = lst[j]
+                    if x[0] == 'prep':
+                        found = [(lst, x)]
+                        break
+                    if x[0] in ('if', 'while', 'repeat', 'do'):
+                        preps_in(x, found)
+                        break
+                    if x[0] in ('fornum', 'forin', 'return', 'break', 'continue') or "'call'" in repr(x):
+                        break
+                    j -= 1
+                kind = 'numforprep' if loop[0] == 'fornum' else 'genforprep'
+                if found and all(f[1][1] == kind and f[1][2] == found[0][1][2] for f in found):
+                    exprs = list(found[0][1][2])
+                    # R[A], R[A+1], R[A+2] = call   right before every setup
+                    befores = []
+                    for sub, x in found:
+                        k = next(n for n, y in enumerate(sub) if y is x)
+                        b = sub[k - 1] if k else None
+                        if b is not None and b[0] == 'assign' and len(b[1]) == 3 and list(b[1]) == exprs \
+                                and (len(found) == 1 or k == len(sub) - 1):
+                            befores.append((sub, b))
+                    if kind == 'genforprep' and len(befores) == len(found) and all(b[1][2] == befores[0][1][2] for b in befores):
+                        exprs = befores[0][1][2]
+                        for sub, b in befores:
+                            sub[:] = [y for y in sub if y is not b]
+                    for sub, x in found:
+                        sub[:] = [y for y in sub if y is not x]
+                    if kind == 'numforprep':
+                        if len(exprs) == 3 and exprs[2] == ('k', 1):
+                            exprs = exprs[:2]
+                    else:
+                        exprs = list(exprs) if isinstance(exprs, (list, tuple)) else [exprs]
+                        while len(exprs) > 1 and exprs[-1] == ('k', None):
+                            exprs.pop()
+                    loop[2] = list(exprs)
+                    i = next(n for n, y in enumerate(lst) if y is st)
+                    del lst[i]
+                    continue
+            i += 1
+    walk(stmts)
+    return stmts
+
+
+def _has_call_expr(e):
+    return any(x[0] in ('call', 'index') for x in _all_exprs(e))
+
+
+def _assigns(node, target):
+    """assignments to the variable `target` inside an AST fragment"""
+    n = 0
+    if isinstance(node, list):
+        if node and node[0] == 'assign' and target in node[1]:
+            n += 1
+        elif node and node[0] in ('fornum', 'forin') and (node[1] == target[1] or (isinstance(node[1], list) and target[1] in node[1])):
+            n += 1
+        for x in node:
+            if isinstance(x, list):
+                n += _assigns(x, target)
+    return n
+
+
+def or_chains(lst):
+    """`v = a; if v then break end; v = b; if v then break end`  ->  `v = a or b; if v then break end`"""
+    for st in lst:
+        t = st[0]
+        if t == 'if':
+            or_chains(st[2])
+            if st[3]:
+                or_chains(st[3])
+        elif t == 'while':
+            or_chains(st[2])
+        elif t in ('repeat', 'do'):
+            or_chains(st[1])
+        elif t in ('fornum', 'forin'):
+            or_chains(st[3])
+    i = 0
+    while i + 3 < len(lst):
+        a, b, c, d = lst[i:i + 4]
+        if a[0] == 'assign' and c[0] == 'assign' and len(a[1]) == 1 and a[1] == c[1] and a[1][0][0] == 'r' \
+                and len(a[2]) == 1 and len(c[2]) == 1 and b[0] == 'if' and d[0] == 'if' and not b[3] and not d[3] \
+                and b[1] == a[1][0] and d[1] == a[1][0] and b[2] == d[2] and len(b[2]) == 1 \
+                and b[2][0][0] in ('break', 'continue') and a[1][0] not in _all_exprs(c[2][0]):
+            lst[i:i + 4] = [['assign', a[1], [('or', a[2][0], c[2][0])]], d]
+            continue
+        i += 1
+    return lst
+
+
+def unflag(root):
+    """An exit flag that only carries a jump across one block that nothing else leaves:
+
+        repeat                                  if a then
+            if a then                               x = 1
+                x = 1                               break
+                exit1 = true            ->      end
+                break                           y = 2
+            end
+            y = 2
+        until true
+        if exit1 then break end
+
+    The inner block existed for that jump alone; without it the `break` reaches the same place."""
+    def level_jumps(stmts, flags, acc):
+        """acc: [flagged pairs at this loop level, other breaks/continues at this level, flag uses deeper]"""
+        i = 0
+        while i < len(stmts):
+            st = stmts[i]
+            t = st[0]
+            if t == 'assign' and len(st[1]) == 1 and st[1][0][0] == 'r' and st[1][0][1] in flags \
+                    and i + 1 < len(stmts) and stmts[i + 1][0] == 'break':
+                acc[0].append((stmts, i, st[1][0][1]))
+                i += 2
+                continue
+            if t in ('break', 'continue'):
+                acc[1] += 1
+            elif t == 'if':
+                level_jumps(st[2], flags, acc)
+                if st[3]:
+                    level_jumps(st[3], flags, acc)
+            elif t == 'do':
+                level_jumps(st[1], flags, acc)
+            elif t in ('while', 'repeat', 'fornum', 'forin'):
+                acc[2] += sum(_mentions(st, f) for f in flags)
+            i += 1
+
+    def _mentions(node, flagname):
+        if node == ('r', flagname):
+            return 1
+        if isinstance(node, (list, tuple)):
+            return sum(_mentions(x, flagname) for x in node)
+        return 0
+
+    def walk(lst):
+        changed = False
+        for st in lst:
+            t = st[0]
+            if t == 'if':
+                changed |= walk(st[2])
+                if st[3]:
+                    changed |= walk(st[3])
+            elif t in ('while',):
+                changed |= walk(st[2])
+            elif t in ('repeat', 'do'):
+                changed |= walk(st[1])
+            elif t in ('fornum', 'forin'):
+                changed |= walk(st[3])
+        i = 0
+        while i + 1 < len(lst):
+            st = lst[i]
+            if st[0] == 'repeat' and st[2] == ('k', True):
+                body = st[1]
+                # `if a then v = f(); if v then break end end  REST` where v is new here: v is
+                # still nil when a is not true, so REST runs exactly when v is not set
+                for k, x in enumerate(body):
+                    if x[0] == 'if' and not x[3] and len(x[2]) >= 2 and x[2][-1][0] == 'if' and not x[2][-1][3] \
+                            and x[2][-1][2] == [['break']] and x[2][-1][1][0] == 'r' and str(x[2][-1][1][1]).startswith('v') \
+                            and x[2][-2][0] == 'assign' and x[2][-2][1] == [x[2][-1][1]] \
+                            and not has_break(x[2][:-1]) and not has_continue(x[2][:-1]):
+                        v = x[2][-1][1]
+                        if _assigns(root, v) != _assigns(st, v) or any(_assigns(y, v) for y in body[:k]) \
+                                or _assigns(x[2][:-2], v) or _mentions(x[1], v[1]):
+                            continue
+                        x[2].pop()
+                        rest = body[k + 1:]
+                        body[k + 1:] = [['if', ('un', 'not', v), rest, None]] if rest else []
+                        changed = True
+                        break
+                # `if c then break end` / `if c then ...; break end` among the block's own
+                # statements: the rest of the block is the other side of that test
+                k = 0
+                while k < len(body):
+                    x = body[k]
+                    if x[0] == 'if' and not x[3] and x[2] and x[2][-1][0] == 'break' and not has_break(x[2][:-1]) \
+                            and not has_continue(x[2][:-1]):
+                        rest = body[k + 1:]
+                        then = x[2][:-1]
+                        if then and rest:
+                            body[k:] = [['if', x[1], then, rest]]
+                        elif rest:
+                            body[k:] = [['if', negate(x[1]), rest, None]]
+                        elif then:
+                            body[k:] = [['if', x[1], then, None]]
+                        else:
+                            body[k:] = [['if', x[1], [], None]] if _has_call_expr(x[1]) else []
+                        changed = True
+                        if rest:
+                            body = body[k][3] if then else body[k][2]
+                            k = 0
+                            continue
+                        break
+                    k += 1
+                if not has_break(st[1]) and not has_continue(st[1]):
+                    lst[i:i + 1] = st[1]
+                    changed = True
+                    continue
+            # `if c then x() else exit1 = true end  if exit1 then break end`: the jump goes where
+            # the flag is set, when nothing runs in between
+            nx = lst[i + 1]
+            if st[0] == 'if' and nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' and str(nx[1][1]).startswith('exit') \
+                    and len(nx[2]) == 1 and nx[2][0][0] in ('break', 'continue', 'return'):
+                f = nx[1]
+                tails = []
+
+                def tail_sets(blk):
+                    if not blk:
+                        return
+                    last = blk[-1]
+                    if last[0] == 'assign' and last[1] == [f] and last[2] == [('k', True)]:
+                        tails.append(blk)
+                    elif last[0] == 'if':
+                        tail_sets(last[2])
+                        if last[3]:
+                            tail_sets(last[3])
+                tail_sets(st[2])
+                if st[3]:
+                    tail_sets(st[3])
+                if tails and _mentions(root, f[1]) == len(tails) + 1:
+                    for blk in tails:
+                        blk[-1] = list(nx[2][0])
+                    del lst[i + 1]
+                    changed = True
+                    continue
+            # the flags that are checked right after the block
+            flags = []
+            kinds = {}
+            j = i + 1
+            while st[0] == 'repeat' and st[2] == ('k', True) and j < len(lst):
+                nx = lst[j]
+                if nx[0] == 'if' and not nx[3] and nx[1][0] == 'r' and str(nx[1][1]).startswith('exit') \
+                        and len(nx[2]) == 1 and nx[2][0][0] in ('break', 'continue'):
+                    flags.append(nx[1][1])
+                    kinds[nx[1][1]] = nx[2][0][0]
+                    j += 1
+                else:
+                    break
+            if flags:
+                acc = [[], 0, 0]
+                level_jumps(st[1], set(flags), acc)
+                alone = {f: _mentions(root, f) - len([x for x in acc[0] if x[2] == f]) - 1 == 0 for f in flags}
+                if acc[0] and acc[1] == 0 and acc[2] == 0 and all(alone[f] for f in flags if kinds[f] == 'continue'):
+                    for f in flags:
+                        mine = [x for x in acc[0] if x[2] == f]
+                        if alone[f]:
+                            for blk, k, _ in sorted(mine, key=lambda x: -x[1]):
+                                n = next(n for n, y in enumerate(blk) if y[0] == 'assign' and y[1] == [('r', f)])
+                                del blk[n]
+                                if kinds[f] == 'continue':
+                                    blk[n] = ['continue']
+                    lst[i:j] = st[1]
+                    changed = True
+                    continue
+            i += 1
+        return changed
+    for _ in range(50):
+        if not walk(root):
+            break
+    return root
+
+
 def cleanup(stmts, in_loop_tail=False):
     """Cosmetic rewrites on the structured AST."""
     out = []
@@ -1011,6 +1409,104 @@ def tighten_scopes(stmts):
             stmts[i:last + 1] = [['do', stmts[i:last + 1]]]
             changed = True
             break
+
+
+def section_scopes(stmts, limit=150):
+    """Keep a long function under Luau's 200-local limit the way its author did: consecutive
+    sections in `do ... end`, each with the locals nothing after it uses, and the long-lived
+    locals (services, shared state, functions used throughout) at the function's own level."""
+    n = len(stmts)
+    decl, last = {}, {}
+    for i, st in enumerate(stmts):
+        for name in (st[1] if st[0] == 'local' else [st[1]] if st[0] == 'localfunction' else ()):
+            decl.setdefault(name, i)
+    if len(decl) <= limit:
+        return False
+    for j, st in enumerate(stmts):
+        for name in stmt_vars(st):
+            if name in decl and j >= decl[name]:
+                last[name] = j
+    for name in decl:
+        last.setdefault(name, decl[name])
+    by_span = sorted(decl, key=lambda x: (decl[x] - last[x], decl[x]))
+    outer = set()
+
+    def components():
+        ivs = sorted((decl[x], last[x]) for x in decl if x not in outer)
+        comps = []
+        for a, b in ivs:
+            if comps and a <= comps[-1][1]:
+                comps[-1][1] = max(comps[-1][1], b)
+                comps[-1][2] += 1
+            else:
+                comps.append([a, b, 1])
+        return comps
+
+    comps = components()
+    k = 0
+    while comps and len(outer) + max(c[2] for c in comps) > limit and k < len(by_span) and len(outer) < limit - 20:
+        # (several at a time: one long-lived local rarely splits a section on its own)
+        for x in by_span[k:k + 4]:
+            outer.add(x)
+        k += 4
+        comps = components()
+    # A function-level local declared inside a section needs a forward declaration.  Where a
+    # few section locals are all that span such declarations, they move up instead.
+    budget = 186 - len(outer) - max([c[2] for c in comps] or [0])
+    bars = sorted({decl[x] for x in outer})
+    import bisect
+    for a, b, cnt in sorted(comps, key=lambda c: -(bisect.bisect_right(bars, c[1]) - bisect.bisect_left(bars, c[0]))):
+        inside = bisect.bisect_right(bars, b) - bisect.bisect_left(bars, a)
+        if not inside:
+            break
+        cross = []
+        for x in decl:
+            if x not in outer and a <= decl[x] <= b:
+                i = bisect.bisect_right(bars, decl[x])
+                if i < len(bars) and bars[i] <= last[x]:
+                    cross.append(x)
+        if cross and len(cross) <= budget and len(cross) < inside:
+            outer.update(cross)
+            budget -= len(cross)
+    comps = components()
+    if os.environ.get('DEVM_TRACE_LOCALS'):
+        print('sections: %d locals, %d at function level, %d sections, largest %d' % (
+            len(decl), len(outer), len(comps), max([c[2] for c in comps] or [0])))
+    if not comps or len(outer) + max(c[2] for c in comps) > limit + 40:
+        return False
+    out = []
+    pos = 0
+    for a, b, cnt in comps:
+        out.extend(stmts[pos:a])
+        block = []
+        for st in stmts[a:b + 1]:
+            names = st[1] if st[0] == 'local' else [st[1]] if st[0] == 'localfunction' else ()
+            if names and any(x in outer for x in names):
+                # declared inside the section but needed after it
+                out.append(['local', list(names), []])
+                if st[0] == 'local':
+                    if st[2]:
+                        block.append(['assign', [('r', x) for x in names], list(st[2])])
+                else:
+                    block.append(['assign', [('r', st[1])], [st[2]]])
+            else:
+                block.append(st)
+        if b > a and cnt >= 1:
+            out.append(['do', block])
+        else:
+            out.extend(block)
+        pos = b + 1
+    out.extend(stmts[pos:])
+    # forward declarations of one section on as few lines as it takes
+    merged = []
+    for st in out:
+        if st[0] == 'local' and not st[2] and merged and merged[-1][0] == 'local' and not merged[-1][2] \
+                and len(merged[-1][1]) + len(st[1]) <= 10:
+            merged[-1][1].extend(st[1])
+        else:
+            merged.append(st)
+    stmts[:] = merged
+    return True
 
 
 def max_locals(stmts, base=0):
@@ -1350,7 +1846,10 @@ class Printer:
             self.block(st[3])
             self.emit('end')
         elif t == 'forin':
-            self.emit('for %s in %s do' % (', '.join(st[1]), ', '.join(self.expr(e) for e in st[2])))
+            its = [self.expr(e) for e in st[2]]
+            while len(its) > 1 and its[-1] == 'nil':
+                its.pop()           # (state and control variable of a plain `for k, v in t`)
+            self.emit('for %s in %s do' % (', '.join(st[1]), ', '.join(its)))
             self.block(st[3])
             self.emit('end')
         elif t == 'setlist':
@@ -1446,13 +1945,20 @@ class Decompiler:
                 self.stats['flat'] = self.stats.get('flat', 0) + 1
                 ast = flat_ast(Structurer(cfg), str(ex), params)
                 break
-            ast = cleanup(ast)
+            ast = cleanup(unflag(or_chains(unflag(or_chains(attach_preps(ast))))))
             ast = beautify.beautify(ast)
             declare(ast, params, st.live_in)
-            if max_locals(ast) + len(params) <= 180:
+            n0 = max_locals(ast) + len(params)
+            if n0 <= 180:
                 break
-        if max_locals(ast) + len(params) > 180:
-            tighten_scopes(ast)
+            # too many locals for one Luau function: first try do-blocks around the short-lived
+            # ones (every variable keeps its own name); sharing variables is the last resort
+            if not (ircfg_mod.DROP_OPAQUE and section_scopes(ast) and max_locals(ast) + len(params) <= 195):
+                tighten_scopes(ast)
+            if os.environ.get('DEVM_TRACE_LOCALS'):
+                print('locals', key, 'coalesce' if coalesce else 'plain', n0, '->', max_locals(ast) + len(params))
+            if max_locals(ast) + len(params) <= int(os.environ.get('DEVM_LOCALS_MAX', '195')):
+                break
         self.stats['protos'] += 1
         self.stats['warnings'].extend(cfg.warnings)
         return params, cfg.vararg, ast
@@ -1464,6 +1970,10 @@ class Decompiler:
         for c in caps:
             if c[0] in ('ref', 'val'):
                 upnames.append(c[1][1] if isinstance(c[1], tuple) else 'REG_%s' % (c[1],))
+            elif c[0] == 'const' and hasattr(c[1], 'text'):
+                upnames.append(c[1].text)
+            elif c[0] == 'const' and hasattr(c[1], 'name') and not isinstance(c[1], (str, int, float, bool)):
+                upnames.append(c[1].name)
             elif c[0] == 'const':
                 upnames.append(lua_number(c[1]) if isinstance(c[1], (int, float)) and not isinstance(c[1], bool) else ('true' if c[1] is True else 'false' if c[1] is False else lua_string(c[1])))
             else:
@@ -1482,6 +1992,8 @@ class Decompiler:
         p.level = printer.level
         plist = list(params) + (['...'] if vararg else [])
         head = 'function%s(%s)' % (' ' + name if name else '', ', '.join(plist))
+        if os.environ.get('DEVM_PROTO_IDS'):
+            head += ' -- proto %s' % (key,)
         p.block(ast)
         if len(p.lines) > 4000 and sum(1 for ln in p.lines if re.match(r'\s*(local exit\d+|if exit\d+ then|exit\d+ = true)', ln)) * 20 > len(p.lines):
             # control flow that could not be untangled: thousands of lines of flag juggling help nobody
@@ -1490,6 +2002,8 @@ class Decompiler:
         return head + '\n' + '\n'.join(p.lines) + '\n' + '\t' * printer.level + 'end'
 
     def run(self):
+        if ircfg_mod.DROP_OPAQUE:
+            ircfg_prepass(self.protos)
         params, vararg, ast = self.proto_ast(self.root_key)
         p = Printer(self, [])
         p.level = -1

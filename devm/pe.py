@@ -26,6 +26,7 @@ Terminators:
   ('goto', pc) ('ret', vals, tail) ('br', cond, T, F) where T/F = (stmts, term)
 """
 import math
+import os
 import struct
 import sys
 
@@ -107,7 +108,32 @@ class Lib:
 class Buffer:
     def __init__(self, data):
         self.data = bytearray(data)
+        self.orig = bytes(data)         # as dumped
         self.path = None
+
+    def patches(self):
+        """[(offset, bytes)]: where the buffer differs from the dump"""
+        if self.data == self.orig:
+            return []
+        out = []
+        d, o = self.data, self.orig
+        n = min(len(d), len(o))
+        i = 0
+        while i < n:
+            j = min(n, i + 4096)
+            if d[i:j] != o[i:j]:
+                k = i
+                while k < j:
+                    if d[k] != o[k]:
+                        e = k + 1
+                        while e < j and (d[e] != o[e] or (e + 1 < j and d[e + 1] != o[e + 1])):
+                            e += 1
+                        out.append((k, bytes(d[k:e])))
+                        k = e
+                    else:
+                        k += 1
+            i = j
+        return out
 
 
 def _qs(s):
@@ -166,6 +192,13 @@ def _unparen(e):
 class KNum(float):
     """A number derived from the loader's key functions. Unlike ordinary values it is tracked
     across instructions, because self-modifying code uses it as patch address / patch value."""
+    __slots__ = ()
+
+
+class UpNum(float):
+    """The number an upvalue held at the end of the traced run.  Luraph mixes opaque numbers kept in
+    upvalues into decryption keys; whether a given upvalue is one of those is not known, so the
+    value is only used when an instruction cannot be lifted without it (PE.use_upnum)."""
     __slots__ = ()
 
 
@@ -555,6 +588,7 @@ class Dump:
         self.by_path = {}
         self.raw = data['tables']
         self.server = None      # vmmodel.PoolServer: the finished run, kept alive for pool constants
+        self.buffers = []       # Buffer objects with a path (their changes go along with pool requests)
 
     def conv(self, v, path=None):
         if v is None or isinstance(v, (bool, int)):
@@ -594,6 +628,8 @@ class Dump:
         if 'buf' in v:
             b = Buffer(bytes.fromhex(v['buf']))
             b.path = path
+            if path:
+                self.buffers.append(b)
             return b
         if 'cfn' in v:
             return ConstFn(self.conv(v['cfn']), v.get('k'))
@@ -707,6 +743,9 @@ class PE:
         # that state are dropped (frozen).  Writes of the other instructions are applied and
         # journalled, so that lifting an instruction again starts from the same state.
         self.frozen = False
+        self.live_table_patches = None  # callable -> (('T', path, key, number), ...): shared-table entries this path changed
+        self.use_upnum = False
+        self.replay_tables = set()  # ids of code arrays whose changes are replayed even for instructions that ran
         self.journal = None
         self.protect = None         # (path prefix of the proto's code arrays, executed pcs): known-final code
         from . import luprint
@@ -810,6 +849,14 @@ class PE:
                 txt = repr(body)
                 if "('num', 3)" in txt and "('num', 2)" in txt:
                     openups.add(st[2][0][1])
+            if t == 'if':
+                # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
+                # open[r] = nil end end`: handlers that end the scope of single registers
+                for c, body in st[1]:
+                    if c[0] == 'name' and body and body[0][0] == 'local':
+                        txt = repr(body[:3])
+                        if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
+                            openups.add(c[1])
             for sub in substmts(st):
                 visit(sub)
 
@@ -897,6 +944,8 @@ class PE:
         t = self.regknown.get(n)
         if n in self.regdirty or self.regdirty_all:
             t = None
+        if isinstance(t, UpNum):
+            t = KNum(t) if self.use_upnum else None
         if t is not None and n != '__captured__' and (self.use_numknown or isinstance(t, KNum) or
                                                       not (is_num(t) or isinstance(t, bool))):
             # the register is known to hold one of the program's own code/constant arrays
@@ -1096,10 +1145,28 @@ class PE:
                     if is_num(idx) and not isinstance(idx, bool) and float(idx).is_integer():
                         idx = int(idx)
                         v = kt.h.get(idx)
+                        if os.environ.get('DEVM_POOLDBG') and isinstance(v, str) and any(ord(c) > 160 for c in v) and self.dump.server is not None:
+                            patches = tuple((b.path, off, data) for b in self.dump.buffers for off, data in b.patches())
+                            print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, repr(v)[:40], 'server says', repr(self.dump.server.decode(obj.id, idx, patches))[:120],
+                                  'neighbours', [repr(kt.h.get(idx + d))[:30] for d in (-2, -1, 1, 2)])
                         if v is None and self.dump.server is not None and not isinstance(idx, KNum):
                             # not decoded during the run: ask the run itself (it is still alive)
-                            raw = self.dump.server.decode(obj.id, idx)
-                            if raw is not None and not (isinstance(raw, dict) and ('t' in raw or 'o' in raw)):
+                            # (with the bytecode as this path has left it: decoding a nested
+                            # function reads bytes that earlier instructions decrypt in place)
+                            patches = tuple((b.path, off, data) for b in self.dump.buffers for off, data in b.patches())
+                            if self.live_table_patches is not None:
+                                patches += tuple(self.live_table_patches())
+                            raw = self.dump.server.decode(obj.id, idx, patches, key if isinstance(key, int) and not isinstance(key, bool) else None)
+                            if os.environ.get('DEVM_POOLDBG') and isinstance(raw, dict) and 's' in raw and any(c > 160 for c in bytes.fromhex(raw['s'])):
+                                print('POOLDBG table', obj.id, 'pc', key, 'idx', idx, raw['s'][:40], 'patches', [(p_[0][-20:], p_[1], p_[2][:12]) for p_ in patches if p_[0] != 'T'][:6], 'T', len([p_ for p_ in patches if p_[0] == 'T']), [p_[1:] for p_ in patches if p_[0] == 'T'][:12])
+                            # (a function built for the answer added entries to shared tables)
+                            for tid, ents in self.dump.server.tdiffs:
+                                live = self.dump.tables.get(tid)
+                                if live is not None:
+                                    for k, x in ents:
+                                        live.h.setdefault(k, norm(x))
+                            del self.dump.server.tdiffs[:]
+                            if raw is not None and not (isinstance(raw, dict) and 'o' in raw):
                                 v = self.dump.conv(raw)
                         return v
                 h = obj.mt.h.get('__index')
@@ -1134,7 +1201,13 @@ class PE:
                 # plain-value upvalue lists (the payload interpreter of some builds): numbers and
                 # library functions bound once by the bootstrap
                 v = ups.get(key)
-                if is_num(v) or isinstance(v, (str, bool, Builtin, Lib, GlobalPath)):
+                if isinstance(v, (Builtin, Lib, GlobalPath)):
+                    return v
+                # A number, string or boolean here is what one instance of the function captured
+                # by value: another instance has another (`makeToggle("A", ...)`, `makeToggle("B",
+                # ...)`), so in the script's own layout it stays the variable it is.  (Opaque
+                # numbers among them are still available as keys: see UpNum.)
+                if (is_num(v) or isinstance(v, (str, bool))) and not self.model.oneline:
                     return v
             return UpRef(key - self.model.up_base)
         if isinstance(obj, UpRef):
@@ -1180,13 +1253,18 @@ class PE:
             if self.perm is not None:
                 return FSTATE
             raise PEError('attempt to index %r' % (obj,))
-        if isinstance(obj, Builtin) or isinstance(obj, LFn) or isinstance(obj, Opaque) or isinstance(obj, Buffer):
+        if isinstance(obj, (Builtin, LFn, Opaque, Buffer, GlobalPath)):
             return self.emit_expr(('index', self.atom(obj), self.atom(key)))
         raise PEError('index: unsupported object %r' % (obj,))
 
     def setindex(self, obj, key, val, keyast=None):
         if isinstance(key, KNum) and key.is_integer():
             key = int(key)
+        if isinstance(val, UpNum) and isinstance(obj, LuaTable) and not obj.fresh:
+            # a patch computed with an upvalue's number: in the code it is an ordinary operand
+            val = norm(float(val))
+        if isinstance(key, UpNum):
+            key = norm(float(key))
         if isinstance(obj, LuaTable):
             if isinstance(key, (Sym, LinSym)):
                 if obj.path and not obj.fresh:
@@ -1197,14 +1275,14 @@ class PE:
                 raise PEError('store into escaped table')
             if isinstance(key, float):
                 key = norm(key)
-            if not obj.fresh and self.frozen and obj.path not in self.volatile:
+            if not obj.fresh and self.frozen and obj.path not in self.volatile and id(obj) not in self.replay_tables:
                 return
             if not obj.fresh and self.protect is not None and key in self.protect[1] and obj.path \
                     and obj.path.startswith(self.protect[0]):
                 # an instruction that never ran must not rewrite one that did (and is in its final form)
                 return
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
-                raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key))
+                raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key) + (' <%r was %r>' % (val, obj.h.get(key)) if os.environ.get('DEVM_PEDBG') else ''))
             if obj.path and not obj.fresh and not self.seeking and self.inject is not None \
                     and obj.path in self.volatile:
                 # a VM instruction writing into loader state that outlives the instruction:
@@ -1537,6 +1615,13 @@ class PE:
                 return [BUF[name](*args)]
             if name == 'error':
                 raise PEError('VM raised error: %r' % (args[:1],))
+        if name in BUF and ('write' in name or name in ('buffer.copy', 'buffer.fill')) and args \
+                and isinstance(args[0], Buffer) and args[0].path:
+            # the VM patching its own bytecode with a value only known at run time: not part of
+            # the script (and already done in the dump when the instruction ran)
+            if getattr(self, 'sym_buf_error', False) and not self.use_upnum:
+                raise PEError('self-modifying store of a run-time value into the bytecode buffer')
+            return [None]
         if self.lazy_depth and not sym and all(is_num(a) or isinstance(a, (str, bool)) or a is None for a in args):
             # the loader materialising a constant of a Roblox datatype, e.g. Vector3.new(x, y, z)
             return [GlobalPath('%s(%s)' % (name, ', '.join(const_text(a) for a in args)))]
@@ -1634,6 +1719,9 @@ class PE:
                     elif (is_num(v) or isinstance(v, (str, bool))) and not isinstance(v, Sym):
                         # captured by value from a register whose content is a known constant
                         caps.append(('const', v))
+                    elif isinstance(v, (GlobalPath, Builtin)):
+                        # ... or a library function / datatype (`local insert = table.insert`)
+                        caps.append(('const', v))
                     else:
                         raise PEError('unknown upvalue capture %r' % (v,))
                     n += 1
@@ -1709,8 +1797,25 @@ class PE:
     def exec_core(self, st, scope):
         t = st[0]
         if self.trace is not None:
-            self.trace.append(repr(st)[:300])
+            self.trace.append(repr(st)[:300] if st[0] != 'assign' else repr(st)[:3000])
         if t == 'if':
+            if len(st[1]) == 1 and not st[2] and len(st[1][0][1]) == 4 and st[1][0][0][0] == 'name':
+                # `local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5; open[r] = nil end`:
+                # the variable in register r goes out of scope (its upvalue cell is closed)
+                last = st[1][0][1][3]
+                if last[0] == 'assign' and len(last[1]) == 1 and last[1][0][0] == 'index' and last[2] == [('nil',)] \
+                        and "('num', 6)" in repr(st[1][0][1][2]):
+                    try:
+                        holder = self.eval1(last[1][0][1], scope)
+                    except PEError:
+                        holder = None
+                    if holder is OPENUPS:
+                        r = self.eval1(last[1][0][2], scope)
+                        if isinstance(r, float) and r.is_integer():
+                            r = int(r)
+                        if isinstance(r, int):
+                            self.emit(('close', r, r))
+                        return None
             for c, body in st[1]:
                 if self.cond(self.eval1(c, scope)):
                     return self.exec_block(body, scope)
@@ -1750,6 +1855,9 @@ class PE:
                     self.assign_target(tg, v, scope)
                 return None
             vals = self.adjust(self.evalargs(st[2], scope), len(targets))
+            if self.trace is not None:
+                self.trace.append('   -> %r' % (vals,))
+                self.trace.append('   fn %r' % ([self.eval1(e[1], scope) for e in st[2] if e[0] == 'call'],))
             for tg, v in zip(targets, vals):
                 self.assign_target(tg, v, scope)
             return None

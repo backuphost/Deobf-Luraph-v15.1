@@ -530,12 +530,18 @@ return function(G, fnames, libnames)
 		SharedTable = { "new", "clear", "clone", "cloneAndFreeze", "increment", "isFrozen", "size", "update" },
 		Content = { "fromUri", "fromObject", "fromAssetId" }, Secret = {}, ValueCurveKey = { "new" },
 	}
+	local ctorCalls = setmetatable({}, { __mode = "k" })
+	M.ctorCalls = ctorCalls
 	local function lib(name, tname)
 		local l = {}
 		libnames[l] = name
 		for _, k in ipairs(known[name] or { "new" }) do
 			local full = name .. "." .. k
-			l[k] = named(full, function() return stub(full .. "()", tname or name) end)
+			l[k] = named(full, function(...)
+				local s = stub(full .. "()", tname or name)
+				ctorCalls[s] = { full, table.pack(...) }       -- (a constant of this type is dumped as this call)
+				return s
+			end)
 		end
 		return l
 	end
@@ -1158,7 +1164,10 @@ return function(G, fnames, libnames)
 	if G.setvectormetatable and G.vector then
 		local vec = G.vector
 		local create = vec.create
-		local function v3(x, y, z) return create(x or 0, y or 0, z or 0) end
+		-- (a component that is not a number is a stand-in value from the analysis run: the vector
+		-- is built all the same, so that the code after it gets to run)
+		local function comp(x) return type(x) == "number" and x or 0 end
+		local function v3(x, y, z) return create(comp(x), comp(y), comp(z)) end
 		local function sign(x) return x > 0 and 1 or (x < 0 and -1 or 0) end
 		local methods = {
 			Abs = function(a) return vec.abs(a) end,
