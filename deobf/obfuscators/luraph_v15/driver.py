@@ -457,15 +457,26 @@ def run(job):
         # trace has statements shows less than the trace does
         code = [ln for ln in lifted.split("\n") if ln.strip() and not ln.startswith("--")]
         stopped = bool(code) and code[-1].startswith('error("devirt: ') and len(code) < trace.stmt_count(body)
-        if not stopped and (nil_calls < 50 or nil_calls * 100 < lifted.count("\n")):
+        if not code:
+            # (a run that failed before the VM made its first closure: the
+            # "lift" of no function is the file header and nothing else)
+            print("[!] nothing was lifted: the traced run made no VM function (%s)" % status, file=sys.stderr)
+            job.lacks("nothing was lifted: the traced run made no VM function (%s)" % status)
+        elif not stopped and (nil_calls < 50 or nil_calls * 100 < lifted.count("\n")):
             for what in lifted_lacks:
                 job.lacks(what)
             if not trace.run_ended(status):
                 # (a run the tracer had to stop: a tamper response scrambles
                 # code, and what was dumped is then not the script's)
                 job.lacks("the traced run did not end (%s)" % status)
+            elif "nested" in shapes and status != "finished":
+                # (v15.2: one function holds Luraph's start-up code and the
+                # script, and its lift follows what the run executed: a run
+                # that stopped with an error did not show the rest)
+                job.lacks("the traced run stopped (%s): Luraph v15.2 code is recovered only as far as "
+                          "the run got" % status)
             return dpath
-        if stopped:
+        elif stopped:
             print("[!] the devirtualized output stops after %d lines (%s); the behaviour trace shows more: "
                   "writing it instead" % (len(code) - 1, code[-1][7:-2]), file=sys.stderr)
             job.lacks("the lift stops on the main function's entry path (%s)" % code[-1][7:-2])
