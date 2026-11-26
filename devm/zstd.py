@@ -99,7 +99,9 @@ def _lib_decompress(lib, data, limit):
         outb = _Buf(ctypes.cast(dst, ctypes.c_void_p), osize, 0)
         parts = []
         total = 0
-        while inb.pos < inb.size:
+
+        def step():
+            nonlocal total
             outb.pos = 0
             ret = lib.ZSTD_decompressStream(ds, ctypes.byref(outb), ctypes.byref(inb))
             if lib.ZSTD_isError(ret):
@@ -109,19 +111,15 @@ def _lib_decompress(lib, data, limit):
                 if total > limit:
                     raise ZstdError('zstd: the data expands to more than %d bytes' % limit)
                 parts.append(ctypes.string_at(dst, outb.pos))
+            return ret                          # 0: a frame is complete and all of it was handed out
+
+        while inb.pos < inb.size:
+            ret = step()
             while ret != 0 and inb.pos >= inb.size:
-                # all input is read and the frame is not finished: either output is still waiting, or the input is cut off
+                # all input is read and the frame is not finished: output is still waiting, or the input is cut off
                 if outb.pos < outb.size:
                     raise ZstdError('zstd: the input ends inside a frame')
-                outb.pos = 0
-                ret = lib.ZSTD_decompressStream(ds, ctypes.byref(outb), ctypes.byref(inb))
-                if lib.ZSTD_isError(ret):
-                    raise ZstdError('zstd: ' + lib.ZSTD_getErrorName(ret).decode('ascii', 'replace'))
-                if outb.pos:
-                    total += outb.pos
-                    if total > limit:
-                        raise ZstdError('zstd: the data expands to more than %d bytes' % limit)
-                    parts.append(ctypes.string_at(dst, outb.pos))
+                ret = step()
         return b''.join(parts)
     finally:
         lib.ZSTD_freeDStream(ds)
