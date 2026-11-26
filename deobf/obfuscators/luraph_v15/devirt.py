@@ -877,6 +877,7 @@ class ProtoLifter:
     walk_only = False   # set for request-collecting walks (no text is produced)
 
     def __init__(self, vm, dump, vmobj, proto, upvals, globals_tab):
+        self.init_args = (vm, dump, vmobj, proto, upvals, globals_tab)   # (Stepper._noise makes a second one)
         self.vm = vm
         self.vmobj = vmobj
         self.dump = dump
@@ -2222,6 +2223,32 @@ def _plain_num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
 
 
+def tree_leaves_all(node):
+    """(node, path) for every node of an instruction's IR tree."""
+    stack = [(node, "")]
+    while stack:
+        n, p = stack.pop()
+        if n is None:
+            continue
+        yield n, p
+        stack += [(n.then, p + "t"), (n.els, p + "e")]
+
+
+def _noise_stmt(st):
+    """Arithmetic with a string constant that is not a number: no compiler
+    emits it (see Stepper._noise)."""
+    stack = [v for v in st.__dict__.values() if isinstance(v, Expr)]
+    while stack:
+        e = stack.pop()
+        if isinstance(e, Bin) and e.op in ("Add", "Sub", "Mul", "Div", "Mod", "Pow", "FloorDiv"):
+            for o in (e.a, e.b):
+                if isinstance(o, Const) and isinstance(o.v, bytes) and S.lua_num(o.v) is None:
+                    return True
+        if isinstance(e, Expr):
+            stack += [v for v in e.__dict__.values() if isinstance(v, Expr)]
+    return False
+
+
 U32_HELPER = "lph_u32"
 
 
@@ -3170,6 +3197,7 @@ class _AccessLog(dict):
 
 class Stepper:
     key_locals = frozenset()    # (v15.2 key registers, see __init__)
+    dec_log = dec_losers = None     # (v15.2 decryptor pairs, see _alternative; not for LPH_JIT functions)
 
     def __init__(self, vm, lifter):
         self.vm = vm
@@ -3252,6 +3280,8 @@ class Stepper:
             self.loop_at = {i: (i, st, w) for i, st, w in self.loops}
             self.loop_of = {id(w): i for i, st, w in self.loops}
         self.gov = Overlay()
+        self.dec_log = {}       # v15.2 decryptor pairs, see _alternative
+        self.dec_losers = {}
         # Loop-function locals that carry a value from one instruction to the
         # next (a stack VM's stack pointer: `local M=G` in the prologue,
         # handlers `M+=1;R[M]=...`). Found while walking: a prologue local a
@@ -3546,8 +3576,115 @@ class Stepper:
             return r.values
         return Multi([])
 
+    def _alternative(self, state, writes):
+        """Luraph v15.2 puts pairs of decryptors behind the two sides of a
+        check of a run-time value: same instructions, keys that differ by
+        one. One of them yields code, the other noise; which side is real is
+        not always the side the check's constant suggests. The walk has one
+        code state per function, so the second of a pair must not be applied
+        on top of the first (that leaves noise for both sides). When this
+        instruction is such a second decryptor, both results are stepped for
+        show (_noise): if this one's reads like code and the first one's
+        does not, the instructions get this version, the first decryptor is
+        remembered as the decoy (its path then ends there) and the walk
+        starts over; otherwise this one is refused. A decryptor the traced
+        run executed always wins."""
+        lf = self.lf
+        pa = lf.proto_arrays
+        slots = {k: v for k, v in writes.d.items() if k[0] in pa and k[1] != state.pc}
+        if len(slots) < 4 or not all(type(v) is int for v in slots.values()):
+            return
+        arrs = {id(v): v for v in lf.proto.h.values() if isinstance(v, LTable)}
+        ms = getattr(lf, "maker_scope", None)
+        if ms is not None:
+            arrs.update({id(v): v for v in ms.vars.values() if isinstance(v, LTable) and id(v) in pa})
+        if any(k[0] not in arrs for k in slots):
+            return
+        sig = frozenset(slots)
+        ops = tuple(self.gov.get((aid, state.pc), arrs[aid].get(state.pc)) for aid in sorted(arrs))
+        before = {k: self.gov.get(k, arrs[k[0]].get(k[1])) for k in slots}
+        prev = self.dec_log.get(sig)
+        if prev is None or prev[0] == state.pc:
+            self.dec_log[sig] = (state.pc, before, dict(slots), ops, lf.cold)
+            return
+        p1, before1, after1, ops1, cold1 = prev
+        diff = [(a, b) for a, b in zip(ops1, ops) if type(a) is not type(b) or a != b]
+        if not (len(diff) == 1 and type(diff[0][0]) is int and type(diff[0][1]) is int
+                and abs(diff[0][0] - diff[0][1]) == 1):
+            return      # (layers of one path, not alternatives)
+        if any(before[k] != after1[k] or type(before1[k]) is not int for k in slots):
+            return
+        lo = min(k[1] for k in slots)
+        hi = max(k[1] for k in slots)
+        where = "%s:%d..%d" % (state.mode, lo, hi)
+        if not cold1:
+            raise Unsupported("decoy: a second decryptor for instructions %s; the traced run executed the other "
+                              "one (at %s:%d)" % (where, state.mode, p1))
+        v2 = {k: slots[k] ^ after1[k] ^ before1[k] for k in slots}
+        j1, j2 = self._noise(state, after1), self._noise(state, v2)
+        if os.environ.get("DEVIRT_ORDER"):
+            print("ALTERNATIVE decryptors %s:%d / %s:%d for %s: noise %d / %d" % (
+                state.mode, p1, state.mode, state.pc, where, j1, j2), file=sys.stderr)
+        if j2 < j1:
+            for k in slots:
+                writes.d[k] = v2[k]
+            self.dec_log[sig] = (state.pc, before1, v2, ops, True)
+            self.dec_losers[p1] = ("decoy: this decryptor's key gives no code for instructions %s; the one on the "
+                                   "other side of the check does (at %s:%d)" % (where, state.mode, state.pc))
+            self.new_carry = True       # (walk again: what followed the decoy was stepped on noise)
+            return
+        raise Unsupported("a second decryptor for instructions %s, behind the other side of the check that leads "
+                          "to the first (at %s:%d): one of the two is a decoy, and this one's result reads no "
+                          "better (not applied)" % (where, state.mode, p1))
+
+    def _noise(self, state, version):
+        """How many of the instructions in `version` ({(array id, pc): value},
+        one decryptor's result) do not step like compiled code: arithmetic
+        on a string constant that is no number, a register far outside the
+        frame, a handler that breaks. Stepped by a second lifter of the same
+        function on a copy of the code state; nothing is kept."""
+        lf = self.lf
+        dump = lf.dump
+        saved = (dump.fetcher, dump.vm_used, dump.u32_used, dict(dump.shared), dict(dump.buf_patch),
+                 dict(dump.tab_patch), set(dump.keyed_jumps), dict(dump.misses))
+        dump.fetcher = None
+        n = 0
+        try:
+            plf = ProtoLifter(*lf.init_args)
+            ps = Stepper(self.vm, plf)
+            ps.initial()
+            ps.carry, ps.key_locals, ps.key_reg = set(self.carry), self.key_locals, getattr(self, "key_reg", {})
+            ps.gov.d.update(self.gov.d)
+            ps.gov.d.update(version)
+            plf.cold = True
+            plf.walk_only = True
+            for pc in sorted({k[1] for k in version}):
+                s = State(state.mode, pc, state.kstack, (), None, (), state.locs, ())
+                try:
+                    node = ps.step(s, "probe_")
+                except Unsupported as e:
+                    n += "instruction uses register" in str(e)
+                    continue
+                except Exception:  # noqa: BLE001 - a handler that breaks on its operands
+                    n += 1
+                    continue
+                n += any(_noise_stmt(x) for nd, _ in tree_leaves_all(node) for x in nd.stmts)
+        except Exception:  # noqa: BLE001 - no verdict
+            n = 1 << 20
+        finally:
+            (dump.fetcher, dump.vm_used, dump.u32_used) = saved[:3]
+            for cur, old in ((dump.shared, saved[3]), (dump.buf_patch, saved[4]), (dump.tab_patch, saved[5]),
+                             (dump.misses, saved[7])):
+                cur.clear()
+                cur.update(old)
+            dump.keyed_jumps.clear()
+            dump.keyed_jumps.update(saved[6])
+        return n
+
     def step(self, state, tprefix):
         """All paths of one instruction -> Node tree. Decoders re-dispatch."""
+        if self.dec_losers and state.pc in self.dec_losers and self.lf.cold:    # (see _alternative)
+            raise Unsupported(self.dec_losers[state.pc])
         for _ in range(8):
             paths = []
             writes = None
@@ -3573,6 +3710,8 @@ class Stepper:
                 if any(k_[0] in pa and k_[1] in guard and k_[1] != state.pc for k_ in writes.d):
                     raise Unsupported("rewrites instructions the traced run executed, on a path the run did not take "
                                       "(a tamper response or junk code: not applied)")
+            if writes is not None and writes.d and self.lf.state_on and self.dec_log is not None:
+                self._alternative(state, writes)
             if writes is not None:
                 # commit this instruction's in-place writes (decryption) once
                 if os.environ.get("DEVIRT_WATCH"):
@@ -4544,17 +4683,18 @@ class FunctionLifter:
         prefix = REG_PREFIX[depth % len(REG_PREFIX)]
         import structure as ST
         import loops as LP
+        import variables as VR
         # back end switches of the v15.2 shape (children are lifted inside
         # lower(): each lift sets them for itself and puts them back)
-        saved = ST.GUARD_TAILS, ST.JOIN_DOM, LP.TABLE_FOR
+        saved = ST.GUARD_TAILS, ST.JOIN_DOM, LP.TABLE_FOR, VR.MERGE_DO_TAILS
         if lf.state_on:
-            ST.GUARD_TAILS = ST.JOIN_DOM = LP.TABLE_FOR = True
+            ST.GUARD_TAILS = ST.JOIN_DOM = LP.TABLE_FOR = VR.MERGE_DO_TAILS = True
         try:
             lines, self.params, nerr, fallbacks = backend.lower(
                 s0.key(vm.kstack_link), order, me, vm.kstack_link, prefix, upnames,
                 lambda x, names: self.closure(vm, vmobj, x, names, depth))
         finally:
-            ST.GUARD_TAILS, ST.JOIN_DOM, LP.TABLE_FOR = saved
+            ST.GUARD_TAILS, ST.JOIN_DOM, LP.TABLE_FOR, VR.MERGE_DO_TAILS = saved
         self.stats["fallbacks"] += fallbacks
         if os.environ.get("DEVIRT_DEBUG"):
             pid = self.prog.dump.pid_of_table.get(proto.tid)

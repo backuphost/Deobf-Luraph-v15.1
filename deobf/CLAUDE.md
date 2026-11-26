@@ -379,11 +379,12 @@ hold for every change to the shared runtime:
   as `local tN = table.pack(call)` count as locals there (`declared_here`,
   `names_anywhere`): a segment must not close before a temp's last read, and
   `TailCount` (the number of a call's values) is a read of its temp too.
-- `structure.GUARD_TAILS` (off; a front end switches it on, Luraph v15.2 does):
-  a branch whose one side is a join that runs straight into a return/error
-  becomes a guard clause with a copy of that tail, and without a join the
-  clearly smaller side is tried first as the guard. Fuzz it with
-  `DEVIRT_GUARD_TAILS=1 python research/structure_fuzz.py 0 3000` too.
+- Back end switches a front end turns on (off by default; Luraph v15.2 uses all,
+  V15_2.md): `structure.GUARD_TAILS` (guard clauses with a copy of a short
+  terminal join), `structure.JOIN_DOM` (join chosen by dominance, not "first
+  block both sides reach"), `loops.TABLE_FOR` (numeric for kept in a register
+  table), `variables.MERGE_DO_TAILS`. Fuzz structure.py with the env switches too
+  (`DEVIRT_GUARD_TAILS=1`, `DEVIRT_JOIN_DOM=1`, both).
 - Structuring heuristics (before any goto rewrite): `break` paths to another
   exit via tail duplication / return-only regions / "same statements as the
   exit"; endless loops join at the first block both branches reach (RPO);

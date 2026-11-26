@@ -23,8 +23,14 @@ KEEP_COLD = False
 #    goes through a scratch register, a bound may be a call, the loop may be left by a jump inside
 #    an enclosing loop;
 #  * key checks are cut until none is left: cutting one often leaves the next test of the same
-#    flag alone in its block's only predecessor (ProtoCFG.__init__).
+#    flag alone in its block's only predecessor (ProtoCFG.__init__);
+#  * nothing follows a call of the tamper response (ProtoCFG._cut_after_traps).
 V152 = False
+# Functions that are Luraph's tamper response (set by structure.Decompiler, see
+# structure.loads_own_code), and per function the registers / upvalues that hold one (prepass).
+TRAP_PROTOS = set()
+TRAP_REFS = {}
+_TRAP_SCAN = {}
 
 
 class Block:
@@ -340,6 +346,8 @@ def prepass(protos):
     OPAQUE_UPS.clear()
     FUNCTION_UPS.clear()
     DROP_UPS.clear()
+    _TRAP_SCAN.clear()
+    TRAP_REFS.clear()
     PREPASS = True
     try:
         for key, pir in protos.items():
@@ -364,6 +372,33 @@ def prepass(protos):
                     used.add((k, j))
                     changed = True
     USED_UPS = (used, unknown, set(_UP_PLAIN))
+    if V152 and TRAP_PROTOS:
+        TRAP_REFS.update(_trap_refs())
+
+
+def _trap_refs():
+    """{function key: {('r', n) | ('up', i)}}: where each function keeps the tamper response.
+    A register counts when a closure of a tamper-response function is all it is ever assigned;
+    from there the value is followed into the upvalues of the functions that capture it.  If any
+    function assigns to such an upvalue the variable is not a constant, and nothing is claimed."""
+    refs = {k: {('r', n) for n in regs} for k, (regs, _, _) in _TRAP_SCAN.items()}
+    changed = True
+    while changed:
+        changed = False
+        for k, (_, closures, _) in _TRAP_SCAN.items():
+            have = refs.get(k)
+            if not have:
+                continue
+            for child, caps in closures:
+                for i, c in enumerate(caps):
+                    src = ('r', c[1]) if c[0] in ('ref', 'val') else ('up', c[1]) if c[0] == 'up' else None
+                    if src in have and ('up', i) not in refs.setdefault(child, set()):
+                        refs[child].add(('up', i))
+                        changed = True
+    for k, (_, _, upwrites) in _TRAP_SCAN.items():
+        if any(('up', i) in refs.get(k, ()) for i in upwrites):
+            return {}
+    return {k: v for k, v in refs.items() if v}
 
 
 def _up_used(child, n):
@@ -454,7 +489,11 @@ class ProtoCFG:
         self._detect_params()
         if PREPASS:
             self._scan_up_usage()
+            if V152 and TRAP_PROTOS:
+                self._scan_traps()
             return
+        if V152 and self._cut_after_traps():
+            self._thread()
         if self._cut_cold_magic() and V152:
             # `flag = key ~= 437829938; if flag then <tamper> end; x = ...; if flag then <tamper> end`:
             # with the first test gone the second sits in the same block as the comparison
@@ -1612,6 +1651,84 @@ class ProtoCFG:
             self.compute_preds()
         return cut
 
+    def _scan_traps(self):
+        """Facts for _trap_refs: the registers that only ever receive a closure of a tamper-response
+        function, the closures this function creates (with what they capture), and the upvalues
+        it assigns to."""
+        defs, closures, upwrites = {}, [], set()
+        self.compute_preds()
+        params = set(self.param_regs or ())
+        for b in self.blocks.values():
+            # (a function starts by copying registers nobody has written yet -- nil -- into the
+            # ones it is going to use: `R145 = R13`)
+            fresh = b.id == self.entry and not b.preds
+            written = set()
+            for st in b.stmts + [b.term]:
+                reads, writes = stmt_exprs(st)
+                for w in writes:
+                    if w[0] == 'r':
+                        d = st[2] if st[0] == 'set' else None
+                        if d is not None and d[0] == 'r' and fresh and d[1] not in written and d[1] not in params:
+                            d = ('k', None)
+                        defs.setdefault(w[1], []).append(d)
+                        written.add(w[1])
+                    elif w[0] in ('up', 'upcell'):
+                        upwrites.add(w[1])
+                for e in reads:
+                    for x in walk_expr(e, []) or ():
+                        if x[0] == 'closure':
+                            closures.append((x[1], x[2]))
+
+        def trap(d):
+            return d is not None and d[0] == 'closure' and d[1] in TRAP_PROTOS
+
+        def inert(d):       # (a value that cannot be called)
+            return d is not None and d[0] == 'k' and (d[1] is None or isinstance(d[1], (bool, int, float, str)))
+        regs = {n for n, ds in defs.items() if any(trap(d) for d in ds) and all(trap(d) or inert(d) for d in ds)}
+        _TRAP_SCAN[self.pir.key] = (regs, closures, upwrites)
+
+    def _cut_after_traps(self):
+        """Nothing follows a call of Luraph's tamper response: it overwrites the code of the VM
+        and does not come back, and what the instruction stream holds behind the call is a jump
+        to some unrelated place (into the body of a loop, back to the start of a block).  Read as
+        control flow those jumps tie the function into knots.  The plain shape
+        `if not ok then tamper() end` is left as it is; anywhere else the block ends at the call."""
+        refs = TRAP_REFS.get(self.pir.key)
+        if not refs:
+            return 0
+        blocks = self.blocks
+        self.compute_preds()
+        cut = 0
+        for b in list(blocks.values()):
+            hit = None
+            copies = {}         # register -> the upvalue it was loaded from, in this block
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'callstmt' and st[1][0] == 'call' and not st[1][2] and st[1][3] is None:
+                    f = st[1][1]
+                    if f[0] == 'r' and f[1] in copies:
+                        f = copies[f[1]]
+                    if f in refs:
+                        hit = i
+                        break
+                for r in _writes_of(st):
+                    copies.pop(r, None)
+                if st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'up':
+                    copies[st[1][1]] = st[2]
+            if hit is None:
+                continue
+            if b.term[0] == 'goto' and len(b.preds) == 1 and hit == len(b.stmts) - 1:
+                pred = blocks[next(iter(b.preds))]
+                if pred.term[0] == 'br' and b.term[1] in pred.succs():
+                    continue
+            succs = b.succs()
+            b.stmts = b.stmts[:hit + 1] + [('trap', succs[0] if succs else None, 'call')]
+            b.term = ('ret', [], None)
+            cut += 1
+        if cut:
+            self._prune()
+            self.compute_preds()
+        return cut
+
     def _scan_up_usage(self):
         """Which upvalues this function reads for something other than arithmetic and tests, and
         which ones it hands on to the functions it creates."""
@@ -2327,9 +2444,10 @@ class ProtoCFG:
                 return limit
 
             def push_at(p):
-                """The state table built at the end of block p: (index of the statement that
-                defines S, items, [start - step, limit, step], statements to delete, statements
-                to put in the table's place), or None."""
+                """The state table built at the end of block p, or None: (index of the statement
+                that defines S, items, the three bounds, indexes of the statements to delete,
+                statements to put in the table's place, whether the first bound already is the
+                loop's first value rather than `first - step`)."""
                 pb = blocks[p]
                 idx = None
                 for i in range(len(pb.stmts) - 1, -1, -1):
@@ -2352,7 +2470,8 @@ class ProtoCFG:
                         why(hid, 'entry %r: scratch register %r is used by the loop' % (p, tmp))
                         return None
                     rest = pb.stmts[j + 1:idx] + pb.stmts[idx + 1:] + [pb.term]
-                    if any(tmp in [r for r, _ in _reads_of(x)] or tmp in _writes_of(x) for x in rest):
+                    if any(tmp in [r for r, _ in _reads_of(x)] or tmp in _writes_of(x) for x in rest) \
+                            or any(s in _writes_of(x) for x in pb.stmts[j + 1:idx]):
                         why(hid, 'entry %r: scratch register %r is used between table and loop' % (p, tmp))
                         return None
                     idx = j
@@ -2385,7 +2504,7 @@ class ProtoCFG:
                     return defidx, items, need, drop, [], False
                 # v15.2: a bound can be a call (`for i = 1, f(x) do`), as long as moving it behind
                 # the other two cannot change what they read; and a bound whose registers the
-                # set-up statements after the table reuse is kept in the scratch register
+                # set-up statements after the table reuse is kept in a register of its own
                 heap = [any(x[0] in ('index', 'up', 'global', 'method', 'call') for x in walk_expr(e, [])) for e in need]
                 calls = [n for n, e in enumerate(need) if expr_reads(e)[2]]
                 if len(calls) > 1 or (calls and any(h for n, h in enumerate(heap) if n != calls[0])):

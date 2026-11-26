@@ -235,7 +235,7 @@ def main():
         verdict('mkfast --stub', log)
 
         # ---- deob.py: step [2b] runs a file with a Luraph header in that sandbox
-        rc, log = run('deob', [py, '-B', os.path.join(ROOT, 'deob.py'), src, '-o', os.path.join(tmp, 'o.lua')])
+        rc, log = run('deob', [py, '-B', os.path.join(ROOT, 'deob.py'), '--engine', 'static', src, '-o', os.path.join(tmp, 'o.lua')])
         verdict('deob.py', log, want_probe=False)
         chunk = os.path.join(tmp, 'evil.chunk.lua')
         check('deob.py: forged chunk not taken',
@@ -244,7 +244,7 @@ def main():
         plain = os.path.join(tmp, 'plain.lua')
         with open(plain, 'w', encoding='utf-8') as fh:
             fh.write(hostile('plain', header=False).replace('PROBED', 'PLAINRAN'))
-        rc, log = run('deob plain', [py, '-B', os.path.join(ROOT, 'deob.py'), plain, '-o', os.path.join(tmp, 'p.lua')])
+        rc, log = run('deob plain', [py, '-B', os.path.join(ROOT, 'deob.py'), '--engine', 'static', plain, '-o', os.path.join(tmp, 'p.lua')])
         verdict('deob.py plain script', log, want_probe=False)
         check('deob.py: a plain script is not executed', '没有执行它' in log and rc == 2, 'rc=%d ' % rc + log[-300:])
         import deob

@@ -205,9 +205,15 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             log('[%s] round %d: %d more branch arms of the script did not run; probing %d in all' % (tag, rnd, len(new), len(allpokes)))
             stage.harness_options = base + ['poke=' + pf]
             text = stage.run_traced()
+        text = name_vm_object(cleanup.tidy(text))
         if stage.errors:
-            log('[%s] %d instructions could not be lifted (marked LIFT ERROR in the output)' % (tag, len(stage.errors)))
-        return name_vm_object(cleanup.tidy(text))
+            # (not every such instruction is in the result: code behind a cut opaque test or
+            # behind a tamper response is not printed, and neither are its markers)
+            shown = text.count('LIFT ERROR')
+            log('[%s] %d instructions could not be lifted: %d marked LIFT ERROR in the output%s' % (
+                tag, len(stage.errors), shown,
+                ', the others in code the output does not contain (cut as unreachable)' if shown < len(stage.errors) else ''))
+        return text
     text1 = stage.run()
     boot_text, info = bootstrap.patch(text1)
     if not info['fixkey']:

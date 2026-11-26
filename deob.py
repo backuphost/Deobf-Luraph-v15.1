@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-luraph_v151_deob —— Luraph v15.x 静态反混淆（明文业务函数提取）
+deob.py —— Luraph 反混淆一体化入口（v15.1 / v15.2）+ 静态提取引擎
+
+    python3 deob.py 输入.lua -o 输出.lua
+
+先做静态分析（剥容器、判断形态）。脚本的业务代码还是明文（形态 A）时，本文件自己把它切出来；
+脚本主体跑在 Luraph 的 VM 里时，自动交给去虚拟化器 devm（python3 -m devm.run）；devm 没出
+结果再试第二个引擎 deobf（python3 deobf/deob.py）；不是 Luraph 而是 IronBrew1 时交给 deobf。
+引擎之间的交接在 allinone.py。用 --engine static 可以只做下面说的静态部分。
+
+以下是静态提取引擎的说明。
 
 思路
 ----
@@ -27,7 +36,8 @@ Luraph v15.1 的常见形态是：
   5. 验证：语法、token 无损、重命名前后绑定一致
 
 脚本被整体虚拟化时（Luraph v15.2 的常见形态：容器里解出来的只有 VM 本体，没有明文业务
-函数），静态提取到剥壳为止，本工具会直接说明并指向去虚拟化器 `python3 -m devm.run`。
+函数），静态提取到剥壳为止：默认（--engine auto）接着自动交给去虚拟化器 devm；
+--engine static 时只说明情况并给出 `python3 -m devm.run` 的命令，退出码 4。
 
 关于「执行」：静态提取不运行脚本。唯一会运行输入的一步是 [2b] 剥 Luraph 容器。它只在
 下面三种情况之一成立时才做（unwrap_reason）：
@@ -42,8 +52,13 @@ Luraph v15.1 的常见形态是：
 
 用法
 ----
-    python deob.py 输入.lua [-o 输出.lua] [--min-size 20000] [--no-rename] [--no-run]
+    python deob.py 输入.lua [-o 输出.lua] [--engine auto|static|devm|deobf|trace]
+                            [--min-size 20000] [--no-rename] [--no-run]
                             [--force] [--keep-dispatchers]
+
+退出码：0 完整结果；6 有结果但不完整（引擎的报告说明缺什么，或只有行为轨迹）；
+4 VM 形态而没有引擎给出结果（或 --engine static）；3 静态结果没通过语法校验；
+2 没认出来；1 出错；7 形态 C 自跑脚本。
 
     python deob.py 输入.lua --list       # 只列出发现的大函数，不输出
 
@@ -1429,13 +1444,14 @@ def print_vm_block(scan, inp, kept_work):
                 print(f"      数据 buffer  {c['buffer_path']}")
         else:
             print("  剥出的 VM chunk / 数据 buffer 没有保存（临时目录已清理）；"
-                  "要保存：加 --work 目录，或用 -o 指定输出路径（存到它旁边）")
+                  "要保存：加 --work 目录（--engine static 时也可以用 -o，存到输出文件旁边）")
     print("═" * 64)
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Luraph v15.x 静态反混淆：剥壳 + 提取明文业务函数（整体虚拟化的脚本请用 python3 -m devm.run）")
+        description="Luraph 反混淆一体化入口：自动判断形态并选引擎（静态提取 / devm 去虚拟化 / deobf 动态引擎）。"
+                    "All-in-one front end: static extraction, devm devirtualizer, deobf dynamic engine.")
     ap.add_argument("input", help="输入的 .lua / .txt 文件")
     ap.add_argument("-o", "--output", help="输出文件")
     ap.add_argument("--min-size", type=int, default=20000,
@@ -1460,7 +1476,17 @@ def main():
     ap.add_argument("--vm-report", action="store_true",
                     help="形态 C（内联 VM）时导出 vm_anatomy.md 解剖报告")
     ap.add_argument("--work", help="保存剥壳得到的 VM chunk / 数据 buffer 的目录"
-                                   "（默认：-o 所在目录；两者都没给就不保存）")
+                                   "（--engine static 时默认存到 -o 所在目录；其它情况不给就不保存）；"
+                                   "交给引擎时，引擎的中间文件放在它下面的 engine/ 里")
+    import allinone
+    ap.add_argument("--engine", choices=allinone.ENGINES, default="auto",
+                    help="用哪个引擎 / which engine: auto（默认：先静态分析；脚本主体在 VM 里就自动交给 devm 去虚拟化，"
+                         "devm 没出结果再试 deobf）、static（只做静态分析，不运行 VM）、devm（去虚拟化器）、"
+                         "deobf（动态引擎：Luraph v15 提升器 / IronBrew1）、trace（只要行为轨迹）")
+    ap.add_argument("--timeout", type=int, default=None,
+                    help="交给 devm / deobf 引擎时的超时秒数（默认不限；大脚本要跑几分钟）")
+    ap.add_argument("--engine-args", default="",
+                    help="原样传给 devm / deobf 引擎的额外参数，写成一个字符串，例如 \"--http-map replies.txt\"")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -1468,17 +1494,35 @@ def main():
         print(f"[✗] 文件不存在：{inp}")
         return 1
 
+    import shlex
     out_path = Path(args.output) if args.output else inp.with_name(inp.stem + "_反混淆.lua")
-    work_dir = args.work or (str(out_path.parent) if args.output else None)
+    engine_work = str(Path(args.work) / "engine") if args.work else None
+    engine_extra = shlex.split(args.engine_args)
+    if args.engine in ("devm", "deobf", "trace"):
+        # the engine was named: no static scan, the engine unwraps the container itself
+        return allinone.hand_over(str(inp), str(out_path), args.engine, work=engine_work,
+                                  timeout=args.timeout, extra=engine_extra)
+
+    # the unwrapped chunk and buffer are kept where the user asked for them: --work, or, when
+    # only the static engine runs, next to -o.  In automatic mode the engines unwrap on their own.
+    work_dir = args.work or (str(out_path.parent) if args.output and args.engine == "static" else None)
     scan = Scan(inp, min_size=args.min_size, work_dir=work_dir, allow_run=not args.no_run,
                 keep_dispatchers=args.keep_dispatchers)
+    plan = None
     try:
         rc, _keep = run(scan, args, inp, out_path, kept_work=work_dir is not None)
-        return rc
+        if args.engine == "auto":
+            # what the static scan cannot recover goes to the engine that can
+            plan = allinone.after_static(scan, rc, args)
     finally:
         # a work directory the tool made itself is temporary and always removed: what was
         # unwrapped is only kept where the user asked for it (--work, or next to -o)
         scan.cleanup(keep_work=False)
+    if plan is None:
+        return rc
+    engine, extra = plan
+    return allinone.hand_over(str(inp), str(out_path), engine, work=engine_work,
+                              timeout=args.timeout, extra=extra + engine_extra)
 
 
 def run(scan, args, inp, out_path, kept_work):

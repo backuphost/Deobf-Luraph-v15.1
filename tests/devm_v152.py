@@ -19,7 +19,9 @@
   the v15.2 chunk, against how the interpreter bodies use them;
 * `ircfg.ProtoCFG._recover_for_loops` on the v15.2 forms of table-state `for` loops (state table
   through a scratch register, bounds reused by the set-up, a bound that is a call, a loop left by
-  a jump inside an enclosing loop), and that none of it happens without `ircfg.V152`.
+  a jump inside an enclosing loop), and that none of it happens without `ircfg.V152`;
+* the tamper response: which registers and upvalues hold its closure, and that a block ends at
+  its call (`ircfg.ProtoCFG._scan_traps`, `_trap_refs`, `_cut_after_traps`).
 
     DEVM_V152_FULL=1 python3 tests/devm_v152.py V152Full Layer3Full     (about 2 minutes each)
 
@@ -541,6 +543,87 @@ class ForState(unittest.TestCase):
         self.assertEqual(cfg._recover_for_loops(), 0)
 
 
+def hand_cfg(blocks, entry, key=1):
+    """A ProtoCFG from {name: (statements, terminator)}, without the passes of its constructor."""
+    from devm import ircfg
+    cfg = ircfg.ProtoCFG.__new__(ircfg.ProtoCFG)
+    cfg.pir = type('P', (), {'key': key})()
+    cfg.param_regs = None
+    cfg.blocks = {}
+    for name, (stmts, term) in blocks.items():
+        b = ircfg.Block(name)
+        b.stmts, b.term = list(stmts), term
+        cfg.blocks[name] = b
+    cfg.entry = entry
+    cfg.compute_preds()
+    return cfg
+
+
+class TrapCalls(unittest.TestCase):
+    """Luraph's tamper response (a function that loads its own VM instruction arrays): where the
+    closure is kept, and that a block ends at its call (ircfg.V152)."""
+
+    def setUp(self):
+        from devm import ircfg
+        self.ircfg = ircfg
+        ircfg.V152 = True
+        ircfg.TRAP_PROTOS = {6}
+        ircfg._TRAP_SCAN.clear()
+        ircfg.TRAP_REFS.clear()
+
+    def tearDown(self):
+        self.ircfg.V152 = False
+        self.ircfg.TRAP_PROTOS = set()
+        self.ircfg._TRAP_SCAN.clear()
+        self.ircfg.TRAP_REFS.clear()
+
+    TRAP = ('closure', 6, ())
+
+    def test_where_the_closure_is_kept(self):
+        ircfg = self.ircfg
+        cfg = hand_cfg({
+            # R145 = R13 copies a register nobody wrote yet (nil); R7 also receives a call result
+            'E': ([('set', ('r', 145), ('r', 13)), ('set', ('r', 13), ('k', 0)), ('set', ('r', 7), self.TRAP),
+                   ('set', ('r', 8), ('closure', 9, (('ref', 145), ('ref', 7))))], ('goto', 'B')),
+            'B': ([('set', ('r', 145), self.TRAP), ('set', ('r', 7), ('call', ('r', 8), [], None))], ('ret', [], None)),
+        }, 'E')
+        cfg._scan_traps()
+        self.assertEqual(ircfg._TRAP_SCAN[1][0], {145})
+        # ... and from there into the upvalues of the functions that capture it
+        ircfg._TRAP_SCAN[9] = (set(), [(10, (('up', 0),)), (11, (('up', 1),))], set())
+        ircfg._TRAP_SCAN[10] = (set(), [], set())
+        ircfg._TRAP_SCAN[11] = (set(), [], {0})
+        self.assertEqual(ircfg._trap_refs(), {1: {('r', 145)}, 9: {('up', 0)}, 10: {('up', 0)}})
+        # a function that assigns to the variable: it is not a constant, nothing is claimed
+        ircfg._TRAP_SCAN[10] = (set(), [], {0})
+        self.assertEqual(ircfg._trap_refs(), {})
+
+    def test_block_ends_at_the_call(self):
+        ircfg = self.ircfg
+        ircfg.TRAP_REFS[1] = {('r', 145), ('up', 3)}
+        call = ('callstmt', ('call', ('r', 145), [], None))
+        cfg = hand_cfg({
+            'A': ([], ('br', ('r', 1), 'T', 'J')),
+            'T': ([call], ('goto', 'J')),                       # if not ok then tamper() end
+            'J': ([], ('br', ('r', 2), 'T2', 'K')),
+            # the callee comes out of an upvalue; behind the call a jump into unrelated code
+            'T2': ([('set', ('r', 4), ('up', 3)), ('callstmt', ('call', ('r', 4), [], None)), ('set', ('r', 2), ('k', 5))],
+                   ('goto', 'A')),
+            'K': ([('callstmt', ('call', ('r', 9), [], None))], ('ret', [], None)),      # some other function
+        }, 'A')
+        self.assertEqual(cfg._cut_after_traps(), 1)
+        self.assertEqual(cfg.blocks['T'].term, ('goto', 'J'))
+        self.assertEqual(cfg.blocks['T2'].stmts[-1], ('trap', 'A', 'call'))
+        self.assertEqual(len(cfg.blocks['T2'].stmts), 3)
+        self.assertEqual(cfg.blocks['T2'].term, ('ret', [], None))
+        self.assertEqual(cfg.blocks['K'].term, ('ret', [], None))
+        self.assertEqual(len(cfg.blocks['K'].stmts), 1)
+        # a function that does not hold the closure is left alone
+        ircfg.TRAP_REFS.clear()
+        cfg = hand_cfg({'A': ([call, ('set', ('r', 2), ('k', 5))], ('goto', 'A'))}, 'A')
+        self.assertEqual(cfg._cut_after_traps(), 0)
+
+
 @unittest.skipUnless(os.environ.get('DEVM_V152_FULL') and have_luau() and os.path.exists(SAMPLE), 'set DEVM_V152_FULL=1 (about 2 minutes)')
 class V152Full(unittest.TestCase):
     def test_pipeline(self):
@@ -576,14 +659,17 @@ class V152Full(unittest.TestCase):
         self.assertRegex(text, r'for \w+, \w+ in LuraphVM do')
         self.assertIn('getgenv().SCRIPT_KEY or SCRIPT_KEY', text)
         self.assertEqual(misplaced_terminators(text), [])
-        # numeric for loops that v15.2 keeps in a state table are loops again (at most the few
-        # in code that never ran are left as `x = t[i] + t[s]` arithmetic), and no state
-        # comparison is left over a boolean (`true <= 4`: the junk side of a key check)
+        # numeric for loops that v15.2 keeps in a state table are loops again (13 loop tests are
+        # left as `x = t[i] + t[s]` arithmetic: 11 in functions that never ran and end in an
+        # unlifted instruction, 2 in a plain-Lua helper of the VM object; 21 before), and no
+        # state comparison is left over a boolean (`true <= 4`: the junk side of a key check)
         import re
         self.assertGreaterEqual(len(re.findall(r'(?m)^\s*for \w+ = ', text)), 20)
-        self.assertLessEqual(len(re.findall(r'(?m)^.* = \w+ and \w+ or not \w+ and \w+$', text)), 6)
+        self.assertLessEqual(len(re.findall(r'(?m)^.* = \w+ and \w+ or not \w+ and \w+$', text)), 14)
         self.assertIsNone(re.search(r'\b(?:true|false) <= \d', text))
         self.assertIn(structure.TRAP_NOTE, text)
+        self.assertGreater(text.count(structure.TRAP_CALL_NOTE), 50)
+        self.assertLessEqual(len(re.findall(r'exit\d+ = true', text)), 6)
         rep = '\n'.join(run.report(text))
         self.assertIn('result: PARTIAL', rep)
         self.assertIn('LIFT ERROR markers', rep)

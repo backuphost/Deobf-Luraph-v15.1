@@ -51,8 +51,12 @@ python3 deob.py INPUT --list                # what is inside (functions, VM disp
 
 Other options: `--work DIR` keeps intermediate files (the unwrapped VM chunk and its data buffer,
 the engines' dumps), `--timeout S`, `--engine-args "..."` passes options through to the engine
-(for example `--engine-args "--http-map replies.txt"` for `devm`, see below). `python3 deob.py -h`
-lists the options of the static path.
+(for example `--engine-args "--http-map replies.txt"` for `devm`, see below), `--no-run` forbids
+every step that executes the input (the container then stays closed and no engine is started).
+`python3 deob.py -h` lists the options of the static path.
+
+An input that is not recognised as the output of a known obfuscator is **not executed**; the tool
+says so and names `--engine trace` for a behaviour trace.
 
 Exit status:
 
@@ -62,8 +66,9 @@ Exit status:
 | 6 | result written, but **partial**: the report that was printed says what is missing |
 | 4 | a VM-only script and no engine produced a result (or `--engine static` on such a script) |
 | 3 | static result written, but it failed its own syntax check |
-| 2 | nothing recognised (not a Luraph product, no extractable function) |
+| 2 | nothing recognised (not a Luraph product, no extractable function); nothing was run |
 | 1 | error (file or interpreter missing, engine crashed without a result) |
+| 5 | the interpreter binary in `bin/` is for another CPU: run `./setup.sh` |
 | 7 | "form C" capture harness written (old static path, see `docs/static-tool.zh-CN.md`) |
 
 Each engine can also be run on its own: `python3 -m devm.run`, `python3 deobf/deob.py`.

@@ -84,6 +84,8 @@ def lower(entry_key, order, D, link, prefix, upnames, closure):
         if VR.peak_locals(body) <= 195:
             break
         body = VR.limit_locals(body, 0, budget)
+    if VR.MERGE_DO_TAILS:
+        body = VR.merge_do_tails(body)
     params = VR.extract_params(body)
     rend = CG.Renderer(names)
     return rend.block(body, ""), params, nerr, sr.fallbacks

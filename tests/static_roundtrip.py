@@ -71,7 +71,7 @@ def compiles(luau, text):
 
 
 def run_deob(inp, out, work, extra):
-    cmd = [sys.executable, '-B', os.path.join(ROOT, 'deob.py'), inp, '-o', out, '--work', work] + extra
+    cmd = [sys.executable, '-B', os.path.join(ROOT, 'deob.py'), '--engine', 'static', inp, '-o', out, '--work', work] + extra
     t = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
     return r.returncode, r.stdout + r.stderr, time.time() - t

@@ -33,7 +33,7 @@ automatically, and the run ends with a report of what, if anything, is left unre
 | proto-table, Luraph's own one-line output, encrypted second stage | message_1 | complete, 0 lift errors, reproduced by `tests/regress.py` |
 | factory (`factory(...)(upvalues)`), decompiled bytecode | Net, TeleportGuard | complete up to a few constants in branches no run reached |
 | factory, one-line output, self-decrypting code and lazily decoded constants | 25ms_get | partial: all modules, but unlifted instructions and unstructured exits remain |
-| v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,300 lines); code that never ran keeps about 25 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
+| v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,200 lines); code that never ran keeps about 20 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
 | v15.1 chunk cut out of its container, script mostly plain Lua kept in the VM object | examples/layer3.lua + examples/blob4.bin (`--chunk-arg`) | the script runs to its end; about 38,600 lines, 1 unlifted instruction in code that did not run |
 
 There is no key that opens every Luraph v15.1 script.  Every protected file carries its own virtual
@@ -71,6 +71,7 @@ line per kind of thing that is missing:
 | `lines use UPVAL_n` | a captured variable of a function whose creation was not lifted |
 | `values printed as nil --[[...]]` | a loop variable, argument or operand without a known source |
 | `for loops without their loop statement`, `functions printed as a stub` | what the words say |
+| `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 
 `run.report(text)` gives the second part for any result file (it skips a head written earlier).
 
@@ -224,6 +225,38 @@ Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
   `nil --[[forval]]` placeholders (123 of them in the layer3 result, 24 in the v15.2 sample,
   where `for k, v in <the VM table>` had lost what it iterates).  With the scratch form
   recognised they are `for` loops again.
+* **Numeric `for` loops kept in a table.**  v15.2 writes most numeric loops without a loop
+  instruction: a table holds `first - step`, limit and step (in shuffled slots, with a link to
+  the enclosing loop's table), and every round does `i = t[a] + t[s]; t[a] = i` and tests
+  `(step <= 0 and i >= limit) or (step > 0 and i <= limit)`.  `ircfg._recover_for_loops` turned
+  the v15.1 form of this back into `for i = first, limit, step`; the forms v15.2 adds are
+  recognised when `ircfg.V152` is set (run.py does that for this generation): the table is built
+  in a scratch register and copied (`T = {...}; n = 0; S = T`), the set-up statements in between
+  reuse the registers the bounds were read from (the bounds are then kept in registers of their
+  own, where the table was built), a bound is a call (`for i = 1, f(x) do`), and a loop inside
+  another loop is left by a jump (its set-up block is then reachable from its own body).
+  `DEVM_DEBUG_FOR=1` prints why a table-state loop was left as it is.  Left over in the sample:
+  13 loop tests of this kind (21 before): 11 in functions that never ran and end in an unlifted
+  instruction (the loop's back edge or its table is missing there), 2 in a plain-Lua helper that
+  Luraph keeps in the VM object, whose text is printed as it is.
+* **Repeated key checks.**  `flag = key ~= 437829938; if flag then <tamper> end; x = "table";
+  if flag then <tamper> end`: cutting the first test (`_cut_cold_magic`) leaves the second in a
+  block of its own, where the comparison is not visible; its tamper side then runs into the
+  state machine with a boolean in the state register (`if true <= 4 then`).  For v15.2 the cut
+  is repeated until nothing changes.
+* **The tamper response.**  One function of the start-up code loads the operand arrays of its own
+  VM function into registers and passes them on (the call itself does not lift: the closure was
+  never created in a run that passes the checks).  The second engine's notes (`deobf/V15_2.md`,
+  observed there in runs that failed a check) say what it does with them: it scrambles them and
+  never returns.  devm recognises the function by those loads (`structure.loads_own_code`),
+  labels it in the output, and the report counts its calls (93 in the sample's result: every
+  `if not check then ... end` in front of one is the protection's, not the script's).  Behind
+  such a call Luraph leaves a jump to an unrelated place; followed as control flow these jumps
+  put loops around straight-line code and jump into loop bodies.  With `ircfg.V152` a block ends
+  at the call (`_cut_after_traps`; the output says so at each place: "the stray jump Luraph
+  leaves behind the call is not followed").  This rests on the function not returning; if a
+  build's tamper response did return, the code after these places would be missing from the
+  result, at marked places only.
 * **Model.**  The v15.2 chunk has four interpreters with 4 + 6 + 3 + 4 dispatch loops; a loop head
   can be `while true do OP = CODE[PC]` with the opcode variable declared outside
   (`vmmodel.is_dispatch_loop(assigned=True)`).  The wrapper between factory and interpreter takes
@@ -231,7 +264,11 @@ Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
   list `i`); `Model.wrapper_numbers` finds them, the lifter binds them from the traced run or from
   the creating instruction (`FactoryLifter.wrapper_values`).  Only the interpreter the sample
   actually runs (the last one) is exercised; the stack-machine interpreter and the two others
-  have never been lifted from.
+  have never been lifted from.  Their wrapper roles were checked against the text of each
+  interpreter body (`tests/devm_v152.py`, `test_wrapper_roles`): interpreter 0
+  `function(J,i,U,S)`: keys J and i, upvalue list U (`U[F[pc]]`), S allocates the register
+  array; interpreter 1 (stack machine) `function(w,e,g,Q)`: w, g, Q numbers, upvalue list e;
+  interpreter 2 `function(w,e,g,g)`: key e, upvalue list w, the last g allocates.
 * **Executor API.**  In executor mode the script also gets `getrawmetatable`, `setrawmetatable`,
   `setreadonly`, `isreadonly`, `make_writeable`, `make_readonly` and a `clonefunction` that returns
   a new function; `request` behaves like native code (raw field reads, no metamethods, non-string
@@ -282,6 +319,14 @@ Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
   them is confirmed by the run.  `--mark-untaken` writes `-- not reached in the traced run`
   where such an arm starts (about 190 places in the sample; off by default because the comments
   keep small arms from folding into `and`/`or` expressions).
+* **A blacklist of deobfuscator globals.**  One of the start-up checks, as lifted: it walks
+  `getfenv()` and the tables behind its `__index` chain (three levels, about 50 keys each, names
+  shorter than 20 characters), hashes every name (FNV-1a, xor a constant) and adds up weights
+  from a table of 31 hashes; a sum of 220 or more is a failed check.  Hashing the identifiers of
+  this repository against that table names nine of the 31: `HANDLERS`, `__ENT`, `__PA`, `__PF`,
+  `__PID`, `__PK`, `__PLAST`, `__SKIPP`, `__SPIN`, the helper globals of the second engine in
+  `deobf/`.  No identifier of devm (`__LPH_*` and the rest) hashes to any of the 31 entries;
+  22 entries remain unnamed.  Instrumentation must stay out of the script's globals.
 * **What the sample is.**  A JNKIE (jnkie.com) key-system loader.  After Luraph's start-up probes
   it tests the executor (`PC-E01..E03`: raw metatable access, `clonefunction`; a `request` call
   whose options carry metamethod traps) and then sends

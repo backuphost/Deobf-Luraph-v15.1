@@ -675,7 +675,8 @@ class Structurer:
             elif t == 'error':
                 out.append(['comment', 'LIFT ERROR: ' + st[1]])
             elif t == 'trap':
-                out.append(['comment', 'tamper response (never taken in the traced run)'])
+                out.append(['comment', TRAP_CALL_NOTE if len(st) > 2 and st[2] == 'call'
+                            else 'tamper response (never taken in the traced run)'])
             elif t == 'cold':
                 if MARK_COLD and not (out and out[-1] == ['comment', COLD_NOTE]):
                     out.append(['comment', COLD_NOTE])
@@ -2036,6 +2037,8 @@ FLAT_FALLBACK = True
 # output.  Off by default (the committed v15.1 results were written without the label); run.py
 # switches it on for v15.2.
 NOTE_TRAPS = False
+# (behind a call of that function, where ircfg.ProtoCFG._cut_after_traps ended the block)
+TRAP_CALL_NOTE = 'tamper response, never taken in the traced run (the stray jump Luraph leaves behind the call is not followed)'
 TRAP_NOTE = "Luraph's tamper response: loads this function's own VM instruction arrays for a routine that scrambles them (the protection calls it where one of its checks fails)"
 
 
@@ -2195,6 +2198,7 @@ class Decompiler:
         return head + '\n' + '\n'.join(p.lines) + '\n' + '\t' * printer.level + 'end'
 
     def run(self):
+        ircfg_mod.TRAP_PROTOS = {k for k, p in self.protos.items() if loads_own_code(p)} if NOTE_TRAPS else set()
         if ircfg_mod.DROP_OPAQUE:
             ircfg_prepass(self.protos)
         params, vararg, ast = self.proto_ast(self.root_key)

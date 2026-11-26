@@ -219,7 +219,7 @@ def main():
             print('FAIL', name, detail)
 
     def deob(args, cwd):
-        r = subprocess.run([sys.executable, '-B', os.path.join(ROOT, 'deob.py')] + args, cwd=cwd,
+        r = subprocess.run([sys.executable, '-B', os.path.join(ROOT, 'deob.py'), '--engine', 'static'] + args, cwd=cwd,
                            capture_output=True, text=True, timeout=600, encoding='utf-8', errors='replace')
         return r.returncode, r.stdout + r.stderr
 
@@ -606,7 +606,7 @@ def main():
         tdir = os.path.join(tmp, 'tmpdir')
         os.mkdir(tdir)
         env = dict(os.environ, TMPDIR=tdir)
-        r = subprocess.run([sys.executable, '-B', os.path.join(ROOT, 'deob.py'), cin], cwd=tmp, env=env,
+        r = subprocess.run([sys.executable, '-B', os.path.join(ROOT, 'deob.py'), '--engine', 'static', cin], cwd=tmp, env=env,
                            capture_output=True, text=True, timeout=600, encoding='utf-8', errors='replace')
         check('container without -o: exit 4, says nothing was kept, temp dir is empty afterwards',
               r.returncode == 4 and '没有保存' in r.stdout and os.listdir(tdir) == [],

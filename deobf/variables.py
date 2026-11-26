@@ -599,6 +599,31 @@ class DoBlock:
         self.body = body
 
 
+MERGE_DO_TAILS = False      # (a front end switches it on: Luraph v15.2)
+
+
+def merge_do_tails(stmts, top=True):
+    """`do A; do B end end` -> `do A; B end`, and the same for a `do` that
+    ends an if branch or the function: the inner block's locals die where
+    the outer block ends anyway. limit_locals, run again with smaller
+    budgets, leaves ladders of such blocks (ten levels in a long main
+    function). Not at the end of a loop body (a `repeat` condition sees the
+    body's locals)."""
+    for st in stmts:
+        if isinstance(st, ST.SIf):
+            st.then[:] = merge_do_tails(st.then)
+            st.els[:] = merge_do_tails(st.els)
+        elif isinstance(st, ST.SLoop):
+            st.body[:] = merge_do_tails(st.body, False)
+        elif isinstance(st, DoBlock):
+            st.body[:] = merge_do_tails(st.body)
+    if top:
+        while stmts and isinstance(stmts[-1], DoBlock):
+            inner = stmts.pop()
+            stmts += inner.body
+    return stmts
+
+
 def assigned_names(stmts, out, bound=frozenset()):
     """Names plain assignments write outside the loops that bind them as
     loop variables."""
