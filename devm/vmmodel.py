@@ -529,13 +529,30 @@ class Model:
         return out
 
     def regs_name(self, it):
-        """Name of the interpreter's register array: the local initialised with `create(nregs)`."""
-        for st in it.func.body[:16]:
-            if st[0] != 'local':
-                continue
-            for name, e in zip(st[1], st[2]):
-                if e[0] == 'call' and e[1][0] == 'name' and len(e[2]) == 1 and e[2][0][0] == 'name':
-                    return name
+        """Name of the interpreter's register array: the local initialised with `create(nregs)`.
+        Luraph v14.4 and later call the allocator through the loader's state table
+        (`local R = STATE[n](nregs)`, `(STATE[n][m](nregs))`): accepted when no local of the prologue
+        has the bare-name form."""
+        def strip(e):
+            while e[0] == 'paren':
+                e = e[1]
+            return e
+        for indexed in (False, True):
+            for st in it.func.body[:16]:
+                if st[0] != 'local':
+                    continue
+                for name, e in zip(st[1], st[2]):
+                    if indexed:
+                        e = strip(e)
+                    if e[0] != 'call' or len(e[2]) != 1 or e[2][0][0] != 'name':
+                        continue
+                    f = e[1]
+                    if indexed:
+                        f = strip(f)
+                        while f[0] == 'index' and strip(f[2])[0] == 'num':
+                            f = strip(f[1])
+                    if f[0] == 'name':
+                        return name
         return 'nil'
 
     def step_vars(self):
@@ -1092,6 +1109,9 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
     cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1', 'budget=%d' % budget]
     if model.insn_tables:
         cmd.append('lazyinsn=1')
+    # the interpreters' function ids: the harness evaluates the init's key functions, which are
+    # closures of the VM on this route (harness.lua findConstFns)
+    cmd += ['interp=%d' % it.func.fid for it in model.interps if getattr(it.func, 'fid', None) is not None]
     cmd += list(options) + list(getattr(model, 'run_options', ()))
     errpath = os.path.join(workdir, tag + '.newproto.err')
     notes = []
@@ -1108,7 +1128,7 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
             raise
     with open(errpath, errors='replace') as f:
         stderr = f.read()
-    keep = ('[handover]', '[dumpnew]', '[dump]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
+    keep = ('[handover]', '[dumpnew]', '[dump]', '[keyfn]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
     notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
     if not os.path.exists(outjson):
         # how the run ended: the error message the harness printed in front of its `[end] error` line

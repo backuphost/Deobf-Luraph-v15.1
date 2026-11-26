@@ -164,6 +164,7 @@ end
 local protos = {}
 local done = false
 local lazyInsn = false       -- lazyinsn=1, see forceLazy
+local interpFid = {}         -- interp=<function id> (one per interpreter of the VM), see findConstFns
 local quietSteps = 0
 local quietHooks = false     -- VM code run by the harness itself (reading constant pools) is not traced
 
@@ -407,6 +408,27 @@ end
 -- The bootstrap installs tables of small functions that ignore their arguments and return a fixed
 -- number (runtime "key" material for self-modifying code). Record their values so the lifter can
 -- fold calls to them.
+-- In a native replay of the lifted init these are functions of the layer.  When the VM ran its own
+-- init (dumpnew=1) they are closures of the VM: functions made by one of its interpreters
+-- (interp=<function id>).  Those are called like a lazy constant is read: VM instructions against
+-- a budget, loops of the loader under the watchdog.
+local function isKeyFn(v)
+	if string.sub(debug.info(v, "s"), 1, 5) == "layer" then return true end
+	local id = fidOf[v]
+	return id ~= nil and interpFid[id] == true
+end
+local function callKeyFn(f, ...)
+	local N = rawget(_G, "__LPH_N")
+	if not N or not fidOf[f] then return pcall(f, ...) end
+	local wasQ, wasB, wasForcing = N.q, N.b, forcing
+	forcing = true
+	quietSteps = 0
+	N.q, N.b = true, N.s + 200000
+	local r = table.pack(pcall(f, ...))
+	forcing = wasForcing
+	N.q, N.b = wasQ, wasB
+	return unpack(r, 1, r.n)
+end
 local function findConstFns(root)
 	local seen, queue = {}, { root }
 	local qi = 1
@@ -415,7 +437,7 @@ local function findConstFns(root)
 		qi += 1
 		local n, all = 0, true
 		for k, v in next, t do
-			if type(v) == "function" and type(k) == "number" and string.sub(debug.info(v, "s"), 1, 5) == "layer" then
+			if type(v) == "function" and type(k) == "number" and isKeyFn(v) then
 				n += 1
 			else
 				all = false
@@ -428,8 +450,8 @@ local function findConstFns(root)
 		if all and n >= 2 then
 			local vals = {}
 			for k, f in next, t do
-				local ok1, a, extra = pcall(f, 1, 2, 3, 4)
-				local ok2, b = pcall(f, 977, 13, 40961, 7)
+				local ok1, a, extra = callKeyFn(f, 1, 2, 3, 4)
+				local ok2, b = callKeyFn(f, 977, 13, 40961, 7)
 				if ok1 and ok2 and type(a) == "number" and a == b and extra == nil then
 					constFns[f] = { k = k, value = a }
 				else
@@ -763,6 +785,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "mfplog" then mfpLog = tonumber(v) ~= 0
 	elseif k == "dumpnew" then dumpNew = tonumber(v) ~= 0
 	elseif k == "lazyinsn" then lazyInsn = tonumber(v) ~= 0
+	elseif k == "interp" then interpFid[tonumber(v)] = true
 	elseif k == "budget" then __LPH_N.b = tonumber(v)
 	elseif k == "binds" then recordBinds = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)

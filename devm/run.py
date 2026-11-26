@@ -92,7 +92,11 @@ def decompile(stage, L, protos):
     return text, d.stats
 
 
-def run_bootstrap(model_stage, boot_text, workdir, tag, log):
+def run_bootstrap(model_stage, boot_text, workdir, tag, log, options=()):
+    """Run the lifted init natively in the harness, in place of the VM's first program, and dump
+    the state when the real program starts.  options: the harness options of the run (numeric
+    ones in front of the layer file, see harness.lua); the options of a container (its carrier,
+    the chunk text and the data it is called with) come from the model."""
     boot = os.path.join(workdir, tag + '.boot.lua')
     with open(boot, 'w') as f:
         f.write(boot_text)
@@ -102,8 +106,13 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
     out = os.path.join(workdir, tag + '.stage2.json')
     if os.path.exists(out):
         os.remove(out)
-    r = subprocess.run([vmmodel.find_luau(), os.path.join(HERE, 'harness.lua'), '-a', model_stage.patched_path, out, boot],
-                       capture_output=True, text=True, errors='replace', timeout=900)
+    numeric = [o for o in options if re.match(r'^\w+=\d+$', o)]
+    named = [o for o in options if o not in numeric] + list(getattr(model_stage.model, 'run_options', ()))
+    try:
+        r = subprocess.run([vmmodel.find_luau(), os.path.join(HERE, 'harness.lua'), '-a', model_stage.patched_path, out] + numeric + [boot] + named,
+                           capture_output=True, text=True, errors='replace', timeout=900)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('bootstrap did not reach the real program: the native replay of the init did not end within 900 s')
     failed = 0
     for line in r.stderr.split('\n'):
         if 'failed environment check' in line:
@@ -112,7 +121,9 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
             log(line)
     log('[bootstrap] %d environment checks answered differently from Roblox (neutralised)' % failed)
     if not os.path.exists(out):
-        raise RuntimeError('bootstrap did not reach the real program:\n' + r.stderr[-3000:])
+        # (the first lines of the harness's output say why; its last lines are the stack trace)
+        why = [l for l in r.stderr.split('\n') if l.strip() and not l.startswith(('[fixkey]', '[keyfn]', 'stacktrace', '[C]'))]
+        raise RuntimeError('bootstrap did not reach the real program: ' + '; '.join(why[:3])[:600])
     with open(out) as f:
         return json.load(f)
 
@@ -164,6 +175,10 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
         src = f.read()
+    # builds for Lua 5.3/5.4 or LuaJIT are not Luau text: say so before the parser is tried
+    why = normalize.foreign_dialect(src)
+    if why:
+        raise DevmError('unsupported target', why)
     # Luraph's compressed container: the VM chunk is data that the shipped file decompresses and
     # loadstrings.  The model is built from the chunk; what is executed is the shipped file, with
     # the instrumented chunk compiled in place of the original (see container.py).
@@ -182,6 +197,9 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         if carrier:
             with open(carrier.chunk_src, encoding='latin-1') as f:
                 src = f.read()
+            why = normalize.foreign_dialect(src)
+            if why:
+                raise DevmError('unsupported target', 'the VM chunk inside the container: ' + why)
         else:
             # the text holds no dispatch loop and no chunk came out of it: say that, not just "no model"
             unopened = '; '.join(re.sub(r'^\[[^\]]*\] ', '', ln) for ln in probe[-2:]) or 'the container probe saw no chunk being loaded'
@@ -342,7 +360,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                     boot_text, info = bootstrap.patch(text1)
                     if info['fixkey']:
                         log('[%s] the init holds an encrypted second stage: lifting it through the native replay as well' % tag)
-                        data = run_bootstrap(stage, boot_text, workdir, tag, log)
+                        data = run_bootstrap(stage, boot_text, workdir, tag, log, common)
                         text2 = lift_program(stage, data, tag, log, oneline, 'real program')
                         b_errs, b_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
                         if b_errs < a_errs and b_nodes >= a_nodes:
@@ -377,7 +395,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         log('[%s] the loader runs a single root program and it holds no encrypted second stage: that program is the script' % tag)
         LAST_RUN['notes'] = ['[single-root] lifted from the state at the first interpreter entry']
         return cleanup.tidy(text1)
-    data = run_bootstrap(stage, boot_text, workdir, tag, log)
+    data = run_bootstrap(stage, boot_text, workdir, tag, log, common)
     return lift_program(stage, data, tag, log, oneline, 'real program')
 
 
@@ -504,7 +522,10 @@ def main(argv=None):
         print('devm: %s: %s' % (e.stage, e.reason))
         sys.exit(1)
     except (pe.PEError, RuntimeError, bootstrap.BootstrapError, SyntaxError, subprocess.TimeoutExpired) as e:
-        print('devm: %s: %s' % (failure_stage(e), ' '.join(str(e).split())[:400]))
+        msg = ' '.join(str(e).split())[:400]
+        if isinstance(e, SyntaxError):
+            msg = 'the text does not parse as Luau (%s)' % msg
+        print('devm: %s: %s' % (failure_stage(e), msg))
         sys.exit(1)
     except Exception as e:
         # not an expected way to fail: the traceback for whoever debugs it, then the one-line form
@@ -525,7 +546,9 @@ def failure_stage(e):
     """The stage name of the one-line failure message for an exception that is an expected way to fail."""
     msg = str(e)
     if isinstance(e, SyntaxError):
-        return 'unsupported target' if re.search(r'bad token|unexpected', msg) else 'damaged input'
+        # (a build for another Lua dialect was turned away before the parser, see normalize.foreign_dialect:
+        # what does not parse here is cut off, edited or corrupt)
+        return 'damaged input'
     if isinstance(e, subprocess.TimeoutExpired):
         return 'run failed'
     if 'no Luraph dispatch loop' in msg or 'no Luraph interpreter' in msg or 'cannot locate the dispatch loops' in msg:
