@@ -47,6 +47,18 @@ import deobf_plus as dp        # noqa: E402
 import luascope                # noqa: E402
 import luaubin                 # noqa: E402
 
+# form A in a file with VM dispatch loops: the static result has the plain functions only, the
+# main flow runs on the VM, so the result is partial (exit 6) and the last line says so
+FORM_A = 6
+FORM_A_LINE = ('result: PARTIAL: only the functions kept as plain Lua; the virtualized main flow is not in the '
+               'output (static)')
+
+
+def partial_line(log):
+    lines = [ln for ln in log.split('\n') if ln.strip()]
+    return bool(lines) and lines[-1] == FORM_A_LINE
+
+
 PART_HEAD = re.compile(r'^-- 第 (\d+) 段  原始偏移 (\d+) - (\d+)  \(([\d,]+) 字节\)  (.*)$', re.M)
 API = re.compile(r'GetService|Instance\s*[.:]\s*new|UDim2|Color3|TweenService')
 
@@ -155,6 +167,24 @@ def vm_only_chunk():
     """A chunk with nothing but VM code (two dispatch loops big enough to count)."""
     return ('return setmetatable({[1]=%s,[2]=%s,[9]=UDim2.new,[3]=%s},{}):yQ(...);'
             % (dispatcher(170), dispatcher(180), HELPER))
+
+
+def inline_vm():
+    """An inline VM ("form C" of the old static path): a header comment, sixteen handlers with six
+    short parameters that read no global, a method that keeps calling methods of the object, an
+    entry method that returns a closure, a cipher string of over 50,000 characters, and the tail
+    `setmetatable({...},{...}):E()(...)`.  Nothing in it reads a global (that would make the
+    handlers plain script functions, form A).  The old path ran it through a capture harness it
+    wrote next to the output (NAME.harness.lua, NAME.harness.harness.log)."""
+    hs = []
+    for i in range(1, 17):
+        body = ''.join('w=w*%d+(g-h)%%%d;' % (j % 7 + 2, j + 3) for j in range(300))
+        hs.append('[%d]=function(g,h,k,l,m,n)local w=k or 0;%sreturn w,l,m,n end' % (i, body))
+    hs.append('[17]=function(o)local c=0;repeat c=c+1;o:Q(c)until c>4;return c end')
+    hs.append('E=function(o)return function(...)return o[17](o,...)end end')
+    hs.append('[18]=[=[LPH' + 'aZ09' * 13500 + ']=]')        # (the payload literal starts with LPH)
+    return ('-- This file was protected using Luraph Obfuscator v15.1 [https://lura.ph/]\n'
+            'return setmetatable({' + ','.join(hs) + '},{__index=function(s,k)return function()end end}):E()(...)\n')
 
 
 def container(chunk):
@@ -297,8 +327,8 @@ def main():
             tag = 'object ' + (' '.join(flags) or '(default)')
             out = os.path.join(tmp, 'obj.out.lua')
             rc, log = deob([inp, '-o', out, '--min-size', '3000'] + flags, tmp)
-            check(tag + ': exit 0', rc == 0, log[-400:])
-            if rc != 0:
+            check(tag + ': exit 6, PARTIAL (the main flow runs on the VM)', rc == FORM_A and partial_line(log), log[-400:])
+            if rc != FORM_A:
                 continue
             text = open(out, encoding='utf-8').read()
             check(tag + ': output compiles', compiles(text))
@@ -423,8 +453,8 @@ def main():
         with open(hin, 'w', encoding='utf-8') as fh:
             fh.write(handed_object())
         rc, log = deob([hin, '-o', os.path.join(tmp, 'handed.out.lua'), '--min-size', '3000', '--inline-slots'], tmp)
-        check('handed slot table --inline-slots: exit 0', rc == 0, log[-500:])
-        if rc == 0:
+        check('handed slot table --inline-slots: exit 6 (PARTIAL)', rc == FORM_A, log[-500:])
+        if rc == FORM_A:
             text = open(os.path.join(tmp, 'handed.out.lua'), encoding='utf-8').read()
             head = text.split('\n', 8)[:8]
             n = re.search(r'注释标注 (\d+) 处，直接替换 0 处', log)
@@ -457,9 +487,10 @@ def main():
             fh.write(nsrc)
         nout = os.path.join(tmp, 'noui.out.lua')
         rc, log = deob([nin, '-o', nout, '--min-size', '3000'], tmp)
-        check('no-UI object: exit 0 (form A without a single UI name)', rc == 0, log[-600:])
+        check('no-UI object: exit 6, PARTIAL (form A without a single UI name)', rc == FORM_A and partial_line(log),
+              log[-600:])
         ntext = ''
-        if rc == 0:
+        if rc == FORM_A:
             ntext = open(nout, encoding='utf-8').read()
             found = parts('no-UI object', nsrc, ntext, rename=True)
             check('no-UI object: the plain function is the output, the dispatcher is not',
@@ -489,9 +520,9 @@ def main():
             fh.write(b'\xef\xbb\xbf' + nsrc.encode())
         bout = os.path.join(tmp, 'noui_bom.out.lua')
         rc, log = deob([bin_path, '-o', bout, '--min-size', '3000'], tmp)
-        check('BOM + VM object: exit 0 and the log says the mark was dropped', rc == 0 and 'BOM 已去掉' in log,
+        check('BOM + VM object: exit 6 and the log says the mark was dropped', rc == FORM_A and 'BOM 已去掉' in log,
               log[-400:])
-        if rc == 0 and ntext:
+        if rc == FORM_A and ntext:
             btext = open(bout, encoding='utf-8').read()
             check('BOM + VM object: same output as without the mark (file-name line aside)',
                   btext.split('\n')[2:] == ntext.split('\n')[2:] and not btext.startswith('\ufeff'), '')
@@ -507,8 +538,8 @@ def main():
               info['form'] == 'A' and info['vm']['dispatch_loops'] == 2
               and [x[2] for x in info['big_functions']] == [len(sfn)] and len(info['dispatchers']) == 1, str(info))
         rc, log = deob([sin_, '-o', os.path.join(tmp, 'noui_sm.out.lua'), '--min-size', '3000', '--keep-dispatchers'], tmp)
-        check('no-UI object --keep-dispatchers: exit 0', rc == 0, log[-500:])
-        if rc == 0:
+        check('no-UI object --keep-dispatchers: exit 6 (PARTIAL)', rc == FORM_A, log[-500:])
+        if rc == FORM_A:
             text = open(os.path.join(tmp, 'noui_sm.out.lua'), encoding='utf-8').read()
             found = parts('no-UI object --keep-dispatchers', ssrc, text, rename=True)
             check('no-UI object --keep-dispatchers: script function first, the dispatcher last and labelled',
@@ -733,6 +764,56 @@ def main():
                 rc, log = deob([sp, '-o', os.path.join(tmp, 'str.out.lua'), '--no-run'], tmp)
                 check('plain script, %s, --no-run: not executed' % name,
                       info['sandbox_run'] is False and rc == 2 and '--no-run：没有执行它' in log, log[-400:])
+
+        # --no-run forbids every step that executes the input.  An inline VM ("form C": handlers
+        # that read no global, a tail call chain, a long cipher string) used to be run by the old
+        # capture harness all the same; with --no-run nothing of it may run or be generated.
+        cin = os.path.join(tmp, 'inline.lua')
+        with open(cin, 'w', encoding='utf-8') as fh:
+            fh.write(inline_vm())
+        import inlinevm
+        check('inline VM: the test input has the form-C shape (static detector)',
+              inlinevm.detect(inline_vm())[0], '')
+        cwork = os.path.join(tmp, 'inline_work')
+        rc, log = deob([cin, '-o', os.path.join(tmp, 'inline.out.lua'), '--min-size', '3000', '--no-run',
+                        '--work', cwork], tmp)
+        made = sorted(os.listdir(cwork)) if os.path.isdir(cwork) else []
+        check('inline VM --no-run: exit 4, says --no-run skipped the dynamic path, nothing generated or run',
+              rc == 4 and '--no-run' in log and '[6e]' not in log and '[6c]' not in log
+              and not any('harness' in n for n in made),
+              log[-600:] + ' ' + str(made))
+
+        # --engine devm / deobf / trace start an engine, and every engine runs the input in its mock
+        for eng in ('devm', 'deobf', 'trace'):
+            r = subprocess.run([sys.executable, '-B', os.path.join(ROOT, 'deob.py'), cin, '-o',
+                                os.path.join(tmp, 'eng.out.lua'), '--engine', eng, '--no-run'], cwd=tmp,
+                               capture_output=True, text=True, timeout=120, encoding='utf-8', errors='replace')
+            elog = r.stdout + r.stderr
+            check('--engine %s --no-run: refused with exit 1, no engine started' % eng,
+                  r.returncode == 1 and '--no-run' in elog and '[devm]' not in elog and '[deobf]' not in elog
+                  and not os.path.exists(os.path.join(tmp, 'eng.out.lua')), elog[-400:])
+
+        # probe() on a container whose chunk is not Luraph: the sandbox ran (the container was
+        # opened), and the probe says so
+        pin = os.path.join(tmp, 'container_plain_chunk.lua')
+        with open(pin, 'w', encoding='utf-8') as fh:
+            fh.write(container('print("a chunk that is no VM")'))
+        info = deob_mod.probe(pin, work_dir=os.path.join(tmp, 'probe_cpc'))
+        sc = deob_mod.Scan(pin, say=lambda *a, **k: None, work_dir=os.path.join(tmp, 'scan_cpc'))
+        try:
+            sc.load()
+            sc.binaries()
+            sc.shells()
+            sc.front_check()
+            sc.unwrap()
+            ran = sc.sandbox_run
+        finally:
+            sc.cleanup(keep_work=False)
+        check('probe, container with a chunk that is not Luraph: damaged, and sandbox_run says what the scan did',
+              info['verdict'] == 'damaged' and info['sandbox_run'] is ran
+              and info['container'] is bool(sc.container), str(info) + ' scan ran=%s' % ran)
+        info = deob_mod.probe(pin, work_dir=os.path.join(tmp, 'probe_cpc_norun'), allow_run=False)
+        check('probe, the same container, allow_run=False: sandbox_run False', info['sandbox_run'] is False, str(info))
 
     print('%d checks, %d failure(s)' % (checks, failures))
     return 1 if failures else 0

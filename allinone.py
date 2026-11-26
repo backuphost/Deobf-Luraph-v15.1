@@ -258,11 +258,18 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
 _REASON_LINE = re.compile(r"^(?:devm|deobf): \S.*$")
 
 
+def _lines(text):
+    """The lines of an engine's output, split at line feeds only: str.splitlines() also splits at
+    characters such as U+2028 or a form feed, which text the script printed (and the engine quotes
+    in its report) may contain, and a `result:` line must not be made up that way."""
+    return [l.rstrip("\r") for l in text.split("\n")]
+
+
 def last_reason(text, engine):
     """The engine's own last word on why there is no result: its final `devm: <stage>:
     <reason>` / `deobf: <reason>` line when it prints one, else the exception line of a
     Python traceback, else its last non-empty line."""
-    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    lines = [l.rstrip() for l in _lines(text) if l.strip()]
     for l in reversed(lines):
         if _REASON_LINE.match(l):
             return l
@@ -351,14 +358,14 @@ def run_devm(inp, out, work=None, timeout=None, extra=()):
             shutil.rmtree(tmp, ignore_errors=True)
     report = []
     seen = False
-    for line in text.splitlines():
+    for line in _lines(text):
         if line.startswith("written "):
             seen = True
             continue
         if seen:
             report.append(line)
     ok = status == 0 and os.path.isfile(out) and os.path.getsize(out) > 0
-    result = [l for l in text.splitlines() if l.startswith("result: ")]
+    result = [l for l in _lines(text) if l.startswith("result: ")]
     complete = ok and bool(result) and result[-1].startswith("result: complete")
     why = []
     if ok and code_lines(out, substance=True) == 0:
@@ -396,7 +403,7 @@ def judge_deobf(out, text):
         head = f.read(400)
     if TRACE_HEADER in head:
         why.append("a behaviour trace, not lifted code")
-    lines = text.splitlines()
+    lines = _lines(text)
     result = [l for l in lines if l.startswith("result: ")]
     if result:
         last = result[-1]
@@ -477,7 +484,7 @@ def check_result(inp, out, work=None, timeout=None, cmd=None):
         cmd += ["--work", os.path.abspath(work)]
     say("[verify] comparing the result with the protected file in the mock (python3 -m devm.diffcheck)")
     status, text = _stream(cmd, timeout or DEFAULT_TIMEOUT)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [l.strip() for l in _lines(text) if l.strip()]
     last = lines[-1] if lines else "no output"
     if status is None:
         return "timeout", "the comparison was stopped after %d s" % (timeout or DEFAULT_TIMEOUT)
@@ -520,28 +527,17 @@ def after_static(scan, rc, args):
     if args.list or args.force or args.no_run:
         return None
     form = getattr(scan, "form", None)
-    if rc == 4 and form == "vm":
-        if scan.bare_chunk():
-            buf = scan.sibling_buffer()
-            if not buf:
-                return None         # the advice printed above says how to supply the buffer
-            say()
-            say("[auto] VM chunk + 同目录的数据 buffer → 自动交给去虚拟化器 devm"
-                " / handing the chunk and its buffer to the devirtualizer")
-            return "devm", ["--chunk-arg", str(buf)]
-        order = engine_order(scan)
+    if rc == PARTIAL and form == "A":
+        # form A: the static result has the functions the script kept as plain Lua, and the VM
+        # runs the rest (deob.py returns 6 only when the file has dispatch loops).  The engines
+        # recover the whole script; the static result is kept as the fallback (hand_over).
         say()
-        if order == ("deobf", "devm"):
-            say("[auto] Luraph v15.0 的 VM 布局 → 先交给第二个引擎 deobf（它能提升这种布局），没有完整结果再试 devm")
-            say("       the v15.0 VM layout: the second engine (deobf) lifts it, so it goes first; devm after it"
-                " (static only: --engine static)")
-        elif order == ("devm",):
-            say("[auto] Luraph v14 的 VM（脚本整体在 VM 里）→ 交给去虚拟化器 devm（只做静态分析：--engine static）")
-            say("       a v14 VM: the whole script runs on it; handing over to the devirtualizer (static only: --engine static)")
-        else:
-            say("[auto] 脚本主体在 VM 里 → 自动交给去虚拟化器 devm（只做静态分析：--engine static）")
-            say("       the script runs on Luraph's VM: handing over to the devirtualizer (static only: --engine static)")
-        return ("devm" if order == ("devm", "deobf") else order), []
+        say("[auto] 静态结果只有明文函数，主流程在 VM 里 → 交给引擎还原整个脚本（没有结果时保留静态结果，记为 PARTIAL）")
+        say("       the static result holds only the functions kept as plain Lua, the main flow runs on the VM:"
+            " handing the file to the engines (the static result is kept as the fallback)")
+        return _vm_plan(scan, quiet=True)
+    if rc == 4 and form == "vm":
+        return _vm_plan(scan)
     if rc == 2 and not scan.evidence():
         if not looks_like_lua(str(scan.inp)):
             return None
@@ -556,6 +552,37 @@ def after_static(scan, rc, args):
         say("       no known obfuscator and nothing was run.  For a behaviour trace (the script is run in a"
             " mock environment): --engine trace")
     return None
+
+
+def _vm_plan(scan, quiet=False):
+    """(engine, extra arguments) for a script that runs on Luraph's VM, or None (a VM chunk cut out
+    of its container, without its data buffer: the advice printed before says how to supply it).
+    quiet=True: the reason was said already, only the engine order is printed."""
+    if scan.bare_chunk():
+        buf = scan.sibling_buffer()
+        if not buf:
+            return None         # the advice printed above says how to supply the buffer
+        say()
+        say("[auto] VM chunk + 同目录的数据 buffer → 自动交给去虚拟化器 devm"
+            " / handing the chunk and its buffer to the devirtualizer")
+        return "devm", ["--chunk-arg", str(buf)]
+    order = engine_order(scan)
+    if quiet:
+        say("       engines / 引擎顺序: %s" % " -> ".join(order))
+    elif order == ("deobf", "devm"):
+        say()
+        say("[auto] Luraph v15.0 的 VM 布局 → 先交给第二个引擎 deobf（它能提升这种布局），没有完整结果再试 devm")
+        say("       the v15.0 VM layout: the second engine (deobf) lifts it, so it goes first; devm after it"
+            " (static only: --engine static)")
+    elif order == ("devm",):
+        say()
+        say("[auto] Luraph v14 的 VM（脚本整体在 VM 里）→ 交给去虚拟化器 devm（只做静态分析：--engine static）")
+        say("       a v14 VM: the whole script runs on it; handing over to the devirtualizer (static only: --engine static)")
+    else:
+        say()
+        say("[auto] 脚本主体在 VM 里 → 自动交给去虚拟化器 devm（只做静态分析：--engine static）")
+        say("       the script runs on Luraph's VM: handing over to the devirtualizer (static only: --engine static)")
+    return ("devm" if order == ("devm", "deobf") else order), []
 
 
 V14_LAYOUTS = ("fn-args", "fn-args-vararg", "table")
@@ -585,7 +612,25 @@ ENGINE_TEXT = {
 DEFAULT_TIMEOUT = 3600      # seconds per engine when --timeout is not given
 
 
-def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None, verify=False):
+def _use_fallback(out, fallback, reasons, trace=None):
+    """No engine lifted the script: the static result `fallback` = (file, what it lacks) becomes
+    the result, reported PARTIAL.  `trace`: the engine's result dict when it was only a behaviour
+    trace (dropped in favour of the static result, which is source)."""
+    path, missing = fallback
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    shutil.copyfile(path, out)
+    if trace is not None:
+        say("[!] %s gave only a behaviour trace, not the script's source: the static result is kept" % trace["engine"])
+    else:
+        say("[!] 没有引擎还原出脚本 / no engine recovered the script:")
+        for r in reasons:
+            say("    " + r)
+    say("[!] static result, PARTIAL → %s" % out)
+    say("result: PARTIAL: %s (static)" % missing)
+    return PARTIAL
+
+
+def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None, verify=False, fallback=None):
     """Run the engines for `engine` in order and print what came of it.  `engine`: 'devm'
     (devm, then the deobf engine as fallback), 'deobf', 'trace', or a tuple of engine names to
     try in that order.  Returns the front end's exit code:
@@ -604,7 +649,11 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None, ve
     to put the owner's own statements in front of a lifted result).
 
     verify=True: a lifted result is then compared with the protected file (check_result);
-    a result that behaves differently is not reported complete."""
+    a result that behaves differently is not reported complete.
+
+    fallback=(file, what it lacks): a partial result of the static path (deob.py, form A).  When
+    no engine lifted the script (no result, or only a behaviour trace), that file becomes the
+    result, reported PARTIAL with the reason it lacks."""
     out = out or default_output(inp)
     order = {"devm": ("devm", "deobf"), "deobf": ("deobf",), "trace": ("trace",)}.get(engine, engine)
     if isinstance(order, str) or not order or any(e not in ("devm", "deobf", "trace") for e in order):
@@ -636,6 +685,8 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None, ve
             if eng == "devm":
                 break
             say("[!] %s: PARTIAL result (%s)" % (res["engine"], "; ".join(res["why"]) or "see its report"))
+        if fallback is not None and (kept is None or kept[0].get("kind") == "trace"):
+            return _use_fallback(out, fallback, reasons, trace=kept[0] if kept else None)
         if kept is None:
             if os.path.exists(out):
                 os.remove(out)

@@ -1384,19 +1384,21 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
         # older tests here, which run it in the unwrap sandbox: tests/static_sandbox.py relies
         # on probe() doing that.  deob.py's own run ends at the verdict and runs nothing.)
         sc.unwrap()
-        if sc.inner:
-            out["layout"] = sc.inner["layout"]
-            if sc.inner["verdict"] != "luraph":
-                out["verdict"] = "damaged" if sc.inner["verdict"] == "not-luraph" else sc.inner["verdict"]
-                out["reason"] = out["error"] = "the chunk inside the container: " + sc.inner["reason"]
-                return out
+        # (filled before anything below can end the probe: sandbox_run is true exactly when the
+        # sandbox ran, whatever the chunk inside turns out to be)
         out["sandbox_run"] = sc.sandbox_run
         if sc.container:
             out["container"] = True
             out["chunk_path"] = sc.container["chunk_path"]
             out["buffer_path"] = sc.container["buffer_path"]
             out["chunk_name"] = sc.container["chunk_name"]
-        elif sc.unwrap_note and (sc.sandbox_run or "--no-run" in sc.unwrap_note):
+        if sc.inner:
+            out["layout"] = sc.inner["layout"]
+            if sc.inner["verdict"] != "luraph":
+                out["verdict"] = "damaged" if sc.inner["verdict"] == "not-luraph" else sc.inner["verdict"]
+                out["reason"] = out["error"] = "the chunk inside the container: " + sc.inner["reason"]
+                return out
+        if not sc.container and sc.unwrap_note and (sc.sandbox_run or "--no-run" in sc.unwrap_note):
             out["error"] = sc.unwrap_note
         sc.functions()
         if sc.parse_errors:
@@ -1419,14 +1421,24 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
     except Exception as e:      # noqa: BLE001  a probe reports, it does not raise
         out["error"] = f"{type(e).__name__}: {e}"
     finally:
+        out["sandbox_run"] = bool(sc.sandbox_run)      # (also when the scan stopped early)
         sc.cleanup(keep_work=True)
     return out
 
 
 # ---------------------------------------------------------------- 形态 B / C（旧路径）
 
-def try_dynamic_lift(inp_path, args, out_dir):
-    """形态 B：走动态路径，截获字节码 → 反编译 → 返回输出路径"""
+NO_RUN_DYNAMIC = ("  --no-run：动态路径（形态 B 截获字节码 / 形态 C 本地实跑）要运行输入，已跳过 / --no-run: the dynamic "
+                  "path (form B bytecode capture, form C local run) would execute the input; it was skipped")
+
+
+def try_dynamic_lift(inp_path, args, out_dir, allow_run=True):
+    """形态 B：走动态路径，截获字节码 → 反编译 → 返回输出路径。
+    The loader of the input is executed (in a stub environment): allow_run=False (--no-run)
+    returns None without running anything."""
+    if not allow_run:
+        print(NO_RUN_DYNAMIC)
+        return None
     try:
         import dynlift
     except Exception as e:
@@ -1462,10 +1474,15 @@ def try_dynamic_lift(inp_path, args, out_dir):
         shutil.rmtree(tmpd, ignore_errors=True)
 
 
-def form_c(inp, raw, args, out_dir):
+def form_c(inp, raw, args, out_dir, allow_run=True):
     """形态 C：内联展开 VM / 没能在 [2b] 剥开的容器。
     静态解剖 + 生成自跑捕获脚本并在本地实跑。产物写到 out_dir（不写到样本旁边）。
-    返回退出码，或 None 表示不是这种形态。"""
+    返回退出码，或 None 表示不是这种形态。
+    The capture harness runs the input: allow_run=False (--no-run) returns None before
+    anything is generated or run."""
+    if not allow_run:
+        print(NO_RUN_DYNAMIC)
+        return None
     try:
         import inlinevm
         is_inl, info = inlinevm.detect(raw)
@@ -2193,6 +2210,12 @@ def main():
     out_path = Path(args.output) if args.output else inp.with_name(inp.stem + "_反混淆.lua")
     engine_work = str(Path(args.work) / "engine") if args.work else None
     engine_extra = shlex.split(args.engine_args)
+    if args.no_run and args.engine in ("devm", "deobf", "trace"):
+        # every engine runs the input (in its mock environment): --no-run forbids exactly that
+        print("[✗] --engine %s 要在模拟环境里运行输入，--no-run 禁止运行：没有启动引擎（退出码 1）/ --engine %s runs "
+              "the input (in its mock environment) and --no-run forbids that: no engine was started (exit 1). "
+              "Drop --no-run, or use --engine static" % (args.engine, args.engine))
+        return 1
     if args.engine in ("devm", "deobf", "trace"):
         # the engine was named: no static scan, the engine unwraps the container itself.  Only
         # the front check is made (tokens and a compile, nothing is run): a damaged file or a
@@ -2250,16 +2273,30 @@ def main():
         # a work directory the tool made itself is temporary and always removed: what was
         # unwrapped is only kept where the user asked for it (--work, or next to -o)
         scan.cleanup(keep_work=False)
+    form_a_partial = rc == allinone.PARTIAL and scan.form == "A"
     if plan is None:
+        if form_a_partial:
+            print("result: PARTIAL: %s (static)" % FORM_A_MISSING)
         return rc
     engine, extra = plan
+    fallback, fb_dir = None, None
+    if form_a_partial and out_path.is_file():
+        # the static extraction is kept as the fallback: it is the result when no engine
+        # recovers the script (it stays partial: the main flow is not in it)
+        fb_dir = tempfile.mkdtemp(prefix="deob_static_")
+        fb = Path(fb_dir) / out_path.name
+        shutil.copyfile(out_path, fb)
+        fallback = (str(fb), FORM_A_MISSING)
     try:
         return allinone.hand_over(src_path, str(out_path), engine, work=engine_work,
                                   timeout=args.timeout, extra=extra + engine_extra,
-                                  post=lambda out, res: put_owner_text(out, owner, res), verify=args.verify)
+                                  post=lambda out, res: put_owner_text(out, owner, res), verify=args.verify,
+                                  fallback=fallback)
     finally:
         if tmp_in:
             shutil.rmtree(tmp_in, ignore_errors=True)
+        if fb_dir:
+            shutil.rmtree(fb_dir, ignore_errors=True)
 
 
 OWNER_NOTE = ("-- The input file has the following text of its owner's in front of the protected program "
@@ -2557,18 +2594,26 @@ def run(scan, args, inp, out_path, kept_work):
             if args.no_lift:
                 print("  --no-lift 已指定，跳过动态反编译。")
                 return 4, keep
-
             # 形态 B 才需要 luau_load 截获 + 反编译器；先诊断，不是就别去找反编译器
+            # (the diagnosis is a text search; forms B and C then run the input, which --no-run forbids)
             is_b, why = False, ""
             try:
                 import dynlift
                 is_b, why = dynlift.probe_loader(raw)
             except Exception as e:
                 why = f"动态模块不可用：{e}"
-            if not is_b:
+            if not scan.allow_run:
+                # forms B and C both execute the input (bytecode capture / capture harness)
+                print(NO_RUN_DYNAMIC)
+                print("  可以改用去虚拟化器（带 Roblox 模拟环境；它也要运行输入）/ the devirtualizer recovers it "
+                      "(it runs the input in its mock):")
+                print(f"      python3 -m devm.run {inp} -o 输出.lua")
+                if not args.force:
+                    return 4, keep
+            elif not is_b:
                 print("  ⚠ 动态路径（截获 luau_load）不适用于这个样本")
                 print("        " + why)
-                rc = form_c(inp, raw, args, out_dir)
+                rc = form_c(inp, raw, args, out_dir, allow_run=scan.allow_run)
                 if rc is not None:
                     return rc, keep
                 print()
@@ -2585,7 +2630,7 @@ def run(scan, args, inp, out_path, kept_work):
                 print("[6b] 尝试动态路径：在桩环境里截获字节码并反编译…")
                 print("     注意：会在隔离的本地桩环境中执行样本的 VM 加载器，")
                 print("           不联网、不接触真实 Roblox 环境。")
-                lifted = try_dynamic_lift(inp, args, out_dir)
+                lifted = try_dynamic_lift(inp, args, out_dir, allow_run=scan.allow_run)
                 if lifted:
                     print(f"[✓] 已还原源码 → {lifted}")
                     return 0, keep
@@ -2748,12 +2793,20 @@ def run(scan, args, inp, out_path, kept_work):
     if scan.container and kept_work:
         print(f"     剥壳得到的 chunk：{scan.container['chunk_path']}")
     if luraph and scan.form == "A" and scan.vm["dispatch_loops"]:
-        # form A is never the whole script: say what is missing and which tool recovers it
+        # form A is never the whole script: say what is missing and which tool recovers it.  The
+        # result is partial (exit 6); main() prints the `result:` line once it is clear that no
+        # engine takes over (automatic mode hands the file to the devirtualizer).
         print("[i] 输出是脚本里没被虚拟化的明文函数。被虚拟化的部分（主流程，以及这些函数通过 VM 对象"
               "创建的闭包）不在里面；要还原它们用去虚拟化器：")
         for line in devm_advice(scan, inp):
             print(line)
+        if ok and all_ok:
+            return allinone_code("PARTIAL"), keep
     return (0 if (ok and all_ok) else 3), keep
+
+
+# the last line of a static form-A result: what it lacks
+FORM_A_MISSING = "only the functions kept as plain Lua; the virtualized main flow is not in the output"
 
 
 if __name__ == "__main__":

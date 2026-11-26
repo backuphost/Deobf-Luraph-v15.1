@@ -8,6 +8,7 @@
 Needs bin/luau and bin/luau-ast (./setup.sh).
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,77 @@ class Decide(unittest.TestCase):
     def test_static_result_stands(self):
         self.assertIsNone(allinone.after_static(FakeScan(LAYER3, "A"), 0, flags()))
         self.assertIsNone(allinone.after_static(FakeScan(LAYER3, "A"), 3, flags()))
+
+    def test_partial_form_a_goes_to_the_engines(self):
+        # form A in a file with dispatch loops (deob.py exit 6): the main flow runs on the VM, so
+        # the engines get the file, in the documented order; the static result is the fallback
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "A", layout="setmt", version="15.1"), 6, flags()),
+                         ("devm", []))
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "A", layout="setmt", version="15.0"), 6, flags()),
+                         (("deobf", "devm"), []))
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "A", version="14.7"), 6, flags()), (("devm",), []))
+        # a chunk cut out of its container goes with its buffer, or not at all
+        self.assertIsNone(allinone.after_static(FakeScan(LAYER3, "A", bare=True), 6, flags()))
+        self.assertEqual(allinone.after_static(FakeScan(LAYER3, "A", bare=True, buffer=Path("x.buffer.bin")), 6, flags()),
+                         ("devm", ["--chunk-arg", "x.buffer.bin"]))
+        for kw in ({"list": True}, {"force": True}, {"no_run": True}):
+            self.assertIsNone(allinone.after_static(FakeScan(SAMPLE, "A"), 6, flags(**kw)), kw)
+
+
+class Fallback(unittest.TestCase):
+    """allinone.hand_over with the static result as fallback, engines replaced by stand-ins."""
+
+    def setUp(self):
+        self.saved = allinone.say, allinone.run_devm, allinone.run_deobf
+        self.said = []
+        allinone.say = lambda *a: self.said.append(" ".join(str(x) for x in a))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.static = os.path.join(self.tmp.name, "static.lua")
+        with open(self.static, "w") as f:
+            f.write("local function kept() return 1 end\nreturn { kept }\n")
+        self.out = os.path.join(self.tmp.name, "out.lua")
+
+    def tearDown(self):
+        allinone.say, allinone.run_devm, allinone.run_deobf = self.saved
+        self.tmp.cleanup()
+
+    def engines(self, devm, deobf):
+        def fake(res, text):
+            def run(inp, cand, **kw):
+                if res.get("ok"):
+                    with open(cand, "w") as f:
+                        f.write(text)
+                return dict(res)
+            return run
+        allinone.run_devm = fake(devm, "print('devm')\n")
+        allinone.run_deobf = fake(deobf, allinone.TRACE_HEADER + "\nprint('trace')\n")
+
+    def hand_over(self):
+        return allinone.hand_over("in.lua", self.out, "devm", fallback=(self.static, "only the plain functions"))
+
+    def test_no_engine_result_keeps_the_static_result_partial(self):
+        none = {"ok": False, "complete": False, "reason": "x: no result", "why": [], "engine": "devm"}
+        self.engines(none, dict(none, engine="deobf"))
+        self.assertEqual(self.hand_over(), allinone.PARTIAL)
+        with open(self.out) as f:
+            self.assertIn("kept", f.read())
+        self.assertEqual(self.said[-1], "result: PARTIAL: only the plain functions (static)")
+
+    def test_a_trace_does_not_replace_the_static_result(self):
+        self.engines({"ok": False, "complete": False, "reason": "devm: gave up", "why": [], "engine": "devm"},
+                     {"ok": True, "complete": False, "kind": "trace", "why": ["a behaviour trace"], "engine": "deobf"})
+        self.assertEqual(self.hand_over(), allinone.PARTIAL)
+        with open(self.out) as f:
+            self.assertIn("kept", f.read())
+        self.assertEqual(self.said[-1], "result: PARTIAL: only the plain functions (static)")
+
+    def test_a_lifted_result_replaces_the_static_one(self):
+        self.engines({"ok": True, "complete": False, "why": ["1 LIFT ERROR"], "engine": "devm", "report": []},
+                     {"ok": False, "complete": False, "reason": "unused", "why": [], "engine": "deobf"})
+        self.assertEqual(self.hand_over(), allinone.PARTIAL)
+        with open(self.out) as f:
+            self.assertIn("devm", f.read())
+        self.assertTrue(self.said[-1].startswith("result: PARTIAL: ") and self.said[-1].endswith("(devm)"), self.said[-1])
 
     def test_look_only_modes_hand_nothing_over(self):
         for kw in ({"list": True}, {"force": True}, {"no_run": True}):
@@ -274,11 +346,34 @@ class FrontEnd(unittest.TestCase):
         self.assertNotIn("[devm]", log)
         self.assertIn("v15.2", log)
 
-    def test_form_a_stays_static(self):
+    def test_form_a_without_its_buffer_stays_static_and_partial(self):
+        # examples/layer3.lua is a v15.1 chunk cut out of its container (form A: plain functions
+        # in the VM object, the main flow on the VM); its buffer is not next to it under the name
+        # this tool saves it with, so no engine can run it: the static result stands, PARTIAL
         rc, log = deob(LAYER3, "-o", self.out("a.lua"))
-        self.assertEqual(rc, 0, log[-600:])
+        self.assertEqual(rc, allinone.PARTIAL, log[-600:])
         self.assertNotIn("[devm]", log)
         self.assertTrue(parses(self.out("a.lua")))
+        self.assertEqual(log.rstrip().split("\n")[-1], "result: PARTIAL: only the functions kept as plain Lua; "
+                         "the virtualized main flow is not in the output (static)")
+
+    def test_form_a_goes_to_the_engines_and_falls_back_to_the_static_result(self):
+        # the same chunk next to its buffer (the names deob.py saves them under): automatic mode
+        # hands it to the engines; with a limit of a few seconds neither gives a result, and the
+        # static result is what is left, PARTIAL
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        chunk = os.path.join(d, "l3.chunk.lua")
+        shutil.copyfile(LAYER3, chunk)
+        shutil.copyfile(os.path.join(ROOT, "examples", "blob4.bin"), os.path.join(d, "l3.buffer.bin"))
+        rc, log = deob(chunk, "-o", self.out("fa.lua"), "--timeout", "4", timeout=600)
+        self.assertEqual(rc, allinone.PARTIAL, log[-1200:])
+        self.assertIn("[devm]", log)
+        self.assertIn("--chunk-arg", log)
+        self.assertTrue(parses(self.out("fa.lua")))
+        with open(self.out("fa.lua"), encoding="utf-8") as f:
+            self.assertIn("deob.py", f.read(400))           # the static result's own header
+        self.assertEqual(log.rstrip().split("\n")[-1], "result: PARTIAL: only the functions kept as plain Lua; "
+                         "the virtualized main flow is not in the output (static)")
 
     def test_missing_file(self):
         rc, _log = deob(self.out("nope.lua"))
