@@ -279,6 +279,10 @@ class Partial(Base):
             self.assertIn(what, v.text())
             self.assertGreater(v.data['matched'], 20)
 
+    def test_partial_and_another_ending(self):
+        a = 'print("a")\nerror("boom")\n'
+        self.expect(NOT_COMPARABLE, a, 'print("a")\n-- LIFT ERROR: call\n', r'same up to call 1, then the result ends \(returned\); it is partial')
+
     def test_partial_and_wrong_is_different(self):
         cut = GUI.index('conn:Disconnect()')
         bad = mutate(GUI[:cut], 'print("first")', 'print("FIRST")') + 'local v = __LPH_ENV[3]\n'

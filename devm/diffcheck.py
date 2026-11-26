@@ -637,7 +637,7 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
         return finish(NOT_COMPARABLE, 'same for the %s both made, but the %s was still running at the %s without a further call, while the %s %s' % (
             _n(m), late, orig.cut or res.cut, done, (res if orig.cut else orig).how_ended()))
     if orig.end != res.end:
-        why = stops_at() if res.end == 'error' else None
+        why = stops_at()
         if why:
             return finish(NOT_COMPARABLE, 'same up to call %d, then the result %s; the original %s' % (m, why, orig.how_ended()))
         return finish(DIFFERENT, 'the same %s, but the original %s and the result %s' % (_n(m), orig.how_ended(), res.how_ended()))
