@@ -12,7 +12,8 @@ v14 interpreters use and that the evaluator has to understand:
   `i = (i + step)`, loop state saved on a linked list or on an array stack;
 * the VARARG count clamped by a statement, also with an opaque test in front of the assignment;
 * registers above the top cleared with `for k in REGS`, with and without opaque tests in the loop;
-* parameters copied out of `{...}`, and by the interpreter's prologue;
+* parameters copied out of `{...}`, and by the interpreter's prologue; an argument read at the
+  position of the first vararg;
 * tests between slots of the loader's state table: decided from the dump when no code that runs
   writes the slot, kept as a run-time variable when code does;
 * a handler-local alias of the open-upvalue map, next to an interpreter variable of the same name
@@ -510,6 +511,24 @@ end
         self.assertEqual(m.errors, [])
         self.assertRegex(text, r'function\(\w+, \w+\)')
         self.assertNotIn('ARG_', text)
+
+
+    def test_argument_beyond_the_parameters_is_a_vararg(self):
+        # the interpreter keeps the position of the first vararg in a local and reads the
+        # argument table there
+        m = Mini("""elseif op == 20 then
+for i = 1, NP do
+R[i] = args[i]
+end
+elseif op == 34 then
+R[A[pc]] = args[firstva]
+""", prologue='local firstva = NP + 1', outer=PACKER)
+        inner = proto([(20, 0, 0, 0), (3, 4, 'print', 0), (1, 5, 1, 0), (5, 4, 0, 0),      # print(1)
+                       (34, 2, 0, 0), (4, 3, 1, 2), (2, 3, 0, 0)], nparams=1)
+        text = m.lift(proto([(8, 1, inner, 0), (2, 1, 0, 0)]))
+        self.assertEqual(m.errors, [])
+        self.assertNotIn('ARG_', text)
+        self.assertRegex(text, r'function\((\w+), \.\.\.\)\s*(local \w+ = )?print\(1\)\s*return \1 \+ \(?select\(1, \.\.\.\)\)?\s*end')
 
 
 class LoaderState(unittest.TestCase):
