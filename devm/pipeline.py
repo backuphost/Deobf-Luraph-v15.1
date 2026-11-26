@@ -118,17 +118,16 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def _run_script(self, options=(), budget=40000000, timeout=600):
+def _dump_script(self, options=(), budget=40000000, timeout=600):
     """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
     proto of the script.  The harness lets the VM run that init and dumps the state when the
-    returned proto is entered (vmmodel.run_dump_script); the script's program is then lifted
-    from that dump.  Nothing of the script itself runs.
+    returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
 
     The copy that is executed (self.run_model) keeps the protected call around the dispatch
     loops: inits compare stack frames.  The lifter's model (self.model) is the inlined text;
     function ids of the dump are translated (self.fid_map).
-    Returns the decompiled text, or None when the init did not hand over (self.run_notes says
-    how the run ended)."""
+    Returns the dump (as run_dump gives it), or None when the init did not hand over
+    (self.run_notes says how the run ended)."""
     import json
     import re
     m = self.model
@@ -144,8 +143,20 @@ def _run_script(self, options=(), budget=40000000, timeout=600):
     fid_map = getattr(self, 'fid_map', None)
     if fid_map is not None:
         text = re.sub(r'"fid":(\d+)', lambda x: '"fid":%d' % fid_map.get(int(x.group(1)), 10 ** 6), text)
-    raw = json.loads(text)
-    del text
+    return json.loads(text)
+
+
+Stage.dump_script = _dump_script
+
+
+def _run_script(self, options=(), budget=40000000, timeout=600):
+    """dump_script, then a plain lift of the script's program (no key-function search, no
+    opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
+    import re
+    raw = self.dump_script(options, budget=budget, timeout=timeout)
+    if raw is None:
+        return None
+    m = self.model
     self.dump = pe.Dump(raw, m)
     self.lifter = lifter.TableProtoLifter(m, self.dump)
     protos = self.lifter.lift_all(self.lifter.root_key)
@@ -154,11 +165,6 @@ def _run_script(self, options=(), budget=40000000, timeout=600):
     conf = [(k, c) for k, p in protos.items() for c in p.conflicts]
     self.log('[%s] script: lifted %d protos, %d instructions, %d errors, %d temp conflicts' % (
         self.tag, len(protos), nodes, len(errs), len(conf)))
-    kinds = {}
-    for _k, e in errs:
-        kinds.setdefault(re.sub(r'\d+', 'N', str(e[1]))[:100], []).append(e)
-    for k, v in sorted(kinds.items(), key=lambda kv: -len(kv[1]))[:12]:
-        self.log('    %4d x %s' % (len(v), k))
     self.protos = protos
     self.errors = errs
     self.conflicts = conf

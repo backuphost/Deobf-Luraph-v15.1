@@ -117,6 +117,38 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
+class TimeLimit(BaseException):
+    """Raised by time_limit() (not an Exception: evaluator code that treats any Exception as a
+    wrong guess must not swallow it)."""
+
+
+class time_limit:
+    """`with time_limit(seconds):` raises TimeLimit in the block when it runs longer (main thread,
+    POSIX; elsewhere no limit)."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.old = None
+
+    def _fire(self, *_):
+        raise TimeLimit('more than %d s' % self.seconds)
+
+    def __enter__(self):
+        import signal
+        import threading
+        if self.seconds and hasattr(signal, 'SIGALRM') and threading.current_thread() is threading.main_thread():
+            self.old = signal.signal(signal.SIGALRM, self._fire)
+            signal.alarm(int(self.seconds))
+        return self
+
+    def __exit__(self, *exc):
+        import signal
+        if self.old is not None:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self.old)
+        return False
+
+
 class DevmError(Exception):
     """An expected way for a run to end without a result: main() prints `devm: <stage>: <reason>`."""
 
@@ -126,7 +158,7 @@ class DevmError(Exception):
         self.reason = reason
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False, route='auto', budget=None, run_timeout=None):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -271,14 +303,37 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # Route A.  The loader runs a first program and wraps what it returns: that program is
         # Luraph's own init, the returned proto is the script.  Let the VM run its init in the
         # harness and lift from the state at the moment the script's proto is entered.
-        ircfg.UNFLATTEN = not oneline
-        try:
-            text = stage.run_script(common, **{k: v for k, v in (('budget', budget), ('timeout', run_timeout)) if v})
-        finally:
-            ircfg.UNFLATTEN = True
+        data = stage.dump_script(common, **{k: v for k, v in (('budget', budget), ('timeout', run_timeout)) if v})
         LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ()))
-        if text is not None:
-            return cleanup.tidy(text)
+        if data is not None:
+            text = lift_program(stage, data, tag, log, oneline, 'script')
+            if route == 'a' or not stage.errors:
+                return text
+            # The lift has errors.  Builds whose init decrypts the script data with a key it
+            # derives (Luraph v14.8) patch their own operands with values of key functions; the
+            # second-stage route recovers those from a native replay of the lifted init.  Try it
+            # (time-boxed) and keep whichever result has fewer unlifted instructions.
+            a_errs, a_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
+            try:
+                with time_limit(second_stage_limit):
+                    text1 = stage.run()
+                    boot_text, info = bootstrap.patch(text1)
+                    if info['fixkey']:
+                        log('[%s] the init holds an encrypted second stage: lifting it through the native replay as well' % tag)
+                        data = run_bootstrap(stage, boot_text, workdir, tag, log)
+                        text2 = lift_program(stage, data, tag, log, oneline, 'real program')
+                        b_errs, b_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
+                        if b_errs < a_errs and b_nodes >= a_nodes:
+                            log('[%s] result of the second-stage route kept: %d instructions with %d lift errors, against %d with %d '
+                                'from the state at the hand-over' % (tag, b_nodes, b_errs, a_nodes, a_errs))
+                            LAST_RUN['notes'] = [n for n in LAST_RUN['notes'] if n.startswith('[http]')]
+                            return text2
+                        log('[%s] result from the state at the hand-over kept (%d instructions, %d lift errors; second-stage '
+                            'route: %d, %d)' % (tag, a_nodes, a_errs, b_nodes, b_errs))
+            except (pe.PEError, RuntimeError, bootstrap.BootstrapError, subprocess.TimeoutExpired, TimeLimit) as e:
+                log('[%s] second-stage route not usable (%s): result from the state at the hand-over kept' % (
+                    tag, (type(e).__name__ + ' ' + str(e)).strip().split('\n')[0][:160]))
+            return text
         handover = '; '.join(n for n in stage.run_notes if not n.startswith('[http]'))[-600:] or 'the run ended without entering the script'
         log('[%s] the VM\'s init did not hand over to the script (%s)' % (tag, handover))
         if route == 'a':
@@ -299,6 +354,12 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         log('[%s] the loader runs a single root program and it holds no encrypted second stage: that program is the script' % tag)
         return cleanup.tidy(text1)
     data = run_bootstrap(stage, boot_text, workdir, tag, log)
+    return lift_program(stage, data, tag, log, oneline, 'real program')
+
+
+def lift_program(stage, data, tag, log, oneline, what):
+    """Lift and decompile the program a dump was taken at the start of (proto-table layout):
+    the dump of the native bootstrap replay, or the one taken when the VM's own init handed over."""
     # First with the key function values the bootstrap replay produced.  Junk arms behind opaque
     # predicates do not lift cleanly and must not be mistaken for wrong keys, so they are cut
     # before anything is solved for.
@@ -326,10 +387,17 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     if cut:
         log('[%s] %d opaque predicates resolved (junk branches removed)' % (tag, cut))
     errs = [(k, e) for k, p in protos.items() for e in p.errors]
-    log('[%s] real program: %d functions, %d instructions, %d lift errors' % (
-        tag, len(protos), sum(len(p.nodes) for p in protos.values()), len(errs)))
+    log('[%s] %s: %d functions, %d instructions, %d lift errors' % (
+        tag, what, len(protos), sum(len(p.nodes) for p in protos.values()), len(errs)))
     for k, e in errs[:20]:
         log('    error in proto %s: %s' % (k, e))
+    kinds = {}
+    for _k, e in errs:
+        kind = re.sub(r'\d+', 'N', str(e[1]))[:110]
+        kinds[kind] = kinds.get(kind, 0) + 1
+    for kind, c in sorted(kinds.items(), key=lambda kv: -kv[1])[:15]:
+        log('    lift errors by kind: %4d x %s' % (c, kind))
+    stage.protos, stage.errors = protos, errs
     ircfg.UNFLATTEN = not oneline
     try:
         text, stats = decompile(stage, L, protos)
