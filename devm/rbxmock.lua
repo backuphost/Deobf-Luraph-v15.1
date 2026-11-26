@@ -2094,7 +2094,8 @@ return function(G, fnames, libnames, opts)
 		local globals, stubs, nsaid = {}, {}, 0
 		for _, line in ipairs(P.notes) do
 			local g = string.match(line, "^%[script%] undefined global read: (.*)$")
-			local st = string.match(line, "^%[stub%] ([^:(]+)")
+			local st = string.match(line, "^%[stub%] (%S+)")
+			if st then st = string.gsub(st, ":$", "") end
 			if g then
 				globals[#globals + 1] = g
 			elseif st then
