@@ -303,6 +303,90 @@ class Tool(unittest.TestCase):
         self.assertLess(sent.index("getgenv().key"), sent.index("return(function"))
 
 
+@unittest.skipUnless(HAVE_LUAU, "needs bin/luau and bin/luau-ast (./setup.sh)")
+class OwnerText(unittest.TestCase):
+    """What the owner wrote in front of the protected program goes in front of an engine's
+    result, as it stands; Luraph's header comment and a Luarmor guard do not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scan(self, text):
+        p = os.path.join(self.tmp.name, "in.lua")
+        with open(p, "wb") as f:
+            f.write(text.encode("utf-8"))
+        sc = deob.Scan(p, say=lambda *a, **k: None, allow_run=False)
+        try:
+            sc.load()
+            sc.binaries()
+            sc.shells()
+            sc.front_check()
+            return sc.owner_text()
+        finally:
+            sc.cleanup()
+
+    def test_what_counts_as_the_owners_text(self):
+        self.assertEqual(self.scan(HEADER + FN_ARGS), "")
+        self.assertEqual(self.scan("-- my script\n" + HEADER + FN_ARGS), "")           # comments alone: nothing
+        self.assertEqual(self.scan(HEADER + 'getgenv().key = "abc"\n' + FN_ARGS), 'getgenv().key = "abc"')
+        self.assertEqual(self.scan("-- counts runs\nping() --note\n" + HEADER + "\n" + TABLE),
+                         "-- counts runs\nping() --note")
+        self.assertEqual(self.scan('_VERSION = "Luau";\n' + FN_ARGS), '_VERSION = "Luau";')   # no header at all
+        # the guard is not copied as code: its place is marked
+        got = self.scan("if not is_from_loader then warn('x') return end;\n" + HEADER + 'getgenv().k = 1\n' + FN_ARGS)
+        self.assertNotIn("is_from_loader", got)
+        self.assertIn("Luarmor loader guard", got)
+        self.assertIn("getgenv().k = 1", got)
+        # a chunk taken out of a container: `local B=...` is the chunk's own text
+        self.assertEqual(self.scan("local B=...;" + TABLE.replace(":A()(...)", ":A()")), "")
+
+    def put(self, owner, body):
+        import contextlib
+        import io
+        out = os.path.join(self.tmp.name, "out.lua")
+        with open(out, "w") as f:
+            f.write(body)
+        with contextlib.redirect_stdout(io.StringIO()):
+            how = deob.put_owner_text(out, owner)
+        with open(out) as f:
+            return how, f.read()
+
+    def test_text_goes_in_front_of_the_result(self):
+        how, text = self.put('getgenv().key = "abc"', 'print(getgenv().key)\n')
+        self.assertEqual(how, "code")
+        self.assertLess(text.index('getgenv().key = "abc"'), text.index("print(getgenv().key)"))
+        self.assertTrue(text.startswith(deob.OWNER_NOTE))
+        self.assertTrue(allinone.parses(os.path.join(self.tmp.name, "out.lua")))
+        # a statement that cannot stand in front of others goes in as a comment
+        how, text = self.put("return 1", "print(2)\n")
+        self.assertEqual(how, "comment")
+        self.assertIn("-- return 1", text)
+        self.assertTrue(allinone.parses(os.path.join(self.tmp.name, "out.lua")))
+        self.assertEqual(self.put("", "print(2)\n"), (None, "print(2)\n"))
+
+    def test_hand_over_calls_post_before_the_result_line(self):
+        # a real engine (the trace engine) on a plain miniature script
+        import contextlib
+        import io
+        src = os.path.join(self.tmp.name, "plain.lua")
+        with open(src, "w") as f:
+            f.write('print("hello")\n')
+        out = os.path.join(self.tmp.name, "trace.lua")
+        seen = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = allinone.hand_over(src, out, "trace", timeout=120, extra=["--no-pypy"],
+                                    post=lambda o: (seen.append(os.path.getsize(o)), print("POST")))
+        log = buf.getvalue().strip().splitlines()
+        self.assertEqual(rc, allinone.PARTIAL, log[-5:])
+        self.assertTrue(seen and seen[0] > 0)
+        self.assertTrue(log[-1].startswith("result: PARTIAL"), log[-3:])
+        self.assertLess(log.index("POST"), len(log) - 1)
+
+
 class _StandInDecoder:
     """What the front end expects of devm/container_static.py (the hand-over point): decode(text)
     -> None | object with chunk, chunk_name, data, data_kind, codec, notes; ContainerError with

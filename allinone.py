@@ -560,7 +560,7 @@ ENGINE_TEXT = {
 DEFAULT_TIMEOUT = 3600      # seconds per engine when --timeout is not given
 
 
-def hand_over(inp, out, engine, work=None, timeout=None, extra=()):
+def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None):
     """Run the engines for `engine` in order and print what came of it.  `engine`: 'devm'
     (devm, then the deobf engine as fallback), 'deobf', 'trace', or a tuple of engine names to
     try in that order.  Returns the front end's exit code:
@@ -572,7 +572,10 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=()):
 
     A complete result ends the sequence.  After a partial result of the deobf engine a later
     engine still gets its turn (and its result is taken only when it is complete); a partial
-    result of devm stands, since devm's report says exactly what is missing."""
+    result of devm stands, since devm's report says exactly what is missing.
+
+    `post(out)`, when given, is called once the result file is in place and before the final
+    `result:` line is printed (deob.py uses it to put the owner's own statements in front)."""
     out = out or default_output(inp)
     order = {"devm": ("devm", "deobf"), "deobf": ("deobf",), "trace": ("trace",)}.get(engine, engine)
     if isinstance(order, str) or not order or any(e not in ("devm", "deobf", "trace") for e in order):
@@ -616,6 +619,8 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=()):
         shutil.copyfile(cand, out)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    if post is not None:
+        post(out)
     # the last line is the front end's own verdict, in the engines' `result:` form
     if res["complete"]:
         say("[✓] devirtualized → %s" % out)

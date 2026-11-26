@@ -839,6 +839,34 @@ class Scan:
             f["stmt_end"] = self.fx.stmt_end
         return f
 
+    def owner_text(self):
+        """Statements the file's owner put in front of the protected program (`getgenv().x =
+        ...`, a loader line, `_VERSION = "Luau";`), with the comments that stand among them, as
+        they stand in the file: the text in front of the main `return` without Luraph's header
+        comment.  '' when there is no statement there (comments alone are not copied), or for
+        a chunk taken out of a container (what precedes its `return` is the chunk's own).
+        The engines' results hold the protected program only; main() puts this text in front
+        of them.  A Luarmor loader guard that front_check left out appears as the comment it
+        was replaced by."""
+        fx, f = self.fx, self.front
+        text = self._pre_unwrap or self.src
+        if fx is None or not f or f["verdict"] != "luraph" or f["bare_chunk"] \
+                or fx.main_return is None or fx.size != len(text):
+            return ""
+        if fx.headers and not fx.header_after_main:
+            code = fx.pre_header_code + fx.post_header_code
+        else:
+            code = fx.pre_code
+        import lphfront
+        if not code.strip() or lphfront._LOCAL_VARARG.match(code):
+            return ""       # (`local B=...;` in front of a chunk's `return` is the chunk's own text)
+        head = text[:fx.main_return]
+        for h in sorted((h for h in fx.headers if h["offset"] < fx.main_return),
+                        key=lambda h: -h["offset"]):
+            end = head.find("\n", h["offset"])
+            head = head[:h["offset"]] + ("" if end < 0 else head[end + 1:])
+        return head.strip("\n")
+
     def engine_text(self):
         """The text an engine must be given when it is not the file as it stands (JSON wrapper,
         lost line breaks, repairs of front_check), else None: the engines read the file."""
@@ -2140,11 +2168,13 @@ def main():
                     # of Luraph's own start-up code), so "devm" means devm alone here
                     engine = ("devm",)
             src_path, tmp_in = engine_input(scan, inp)
+            owner = scan.owner_text() if scan.front else ""
         finally:
             scan.cleanup(keep_work=False)
         try:
             return allinone.hand_over(src_path, str(out_path), engine, work=engine_work,
-                                      timeout=args.timeout, extra=engine_extra)
+                                      timeout=args.timeout, extra=engine_extra,
+                                      post=lambda out: put_owner_text(out, owner))
         finally:
             if tmp_in:
                 shutil.rmtree(tmp_in, ignore_errors=True)
@@ -2155,6 +2185,7 @@ def main():
     scan = Scan(inp, min_size=args.min_size, work_dir=work_dir, allow_run=not args.no_run,
                 keep_dispatchers=args.keep_dispatchers)
     plan = None
+    owner = ""
     src_path, tmp_in = str(inp), None
     try:
         rc, _keep = run(scan, args, inp, out_path, kept_work=work_dir is not None)
@@ -2163,6 +2194,7 @@ def main():
             plan = allinone.after_static(scan, rc, args)
         if plan is not None:
             src_path, tmp_in = engine_input(scan, inp)
+            owner = scan.owner_text() if scan.front_decisive() else ""
         elif rc == 4 and scan.form == "vm" and scan.front_decisive() and scan.bare_chunk() \
                 and not scan.sibling_buffer():
             print("[✗] 这是从容器里取出的 VM chunk，它的数据不在文件里：按现状无法处理（退出码 8）/ a VM chunk taken "
@@ -2177,10 +2209,41 @@ def main():
     engine, extra = plan
     try:
         return allinone.hand_over(src_path, str(out_path), engine, work=engine_work,
-                                  timeout=args.timeout, extra=extra + engine_extra)
+                                  timeout=args.timeout, extra=extra + engine_extra,
+                                  post=lambda out: put_owner_text(out, owner))
     finally:
         if tmp_in:
             shutil.rmtree(tmp_in, ignore_errors=True)
+
+
+OWNER_NOTE = ("-- The input file has the following text of its owner's in front of the protected program "
+              "(not obfuscated; copied as it stands):")
+OWNER_END = "-- (end of the owner's text; the recovered program follows)"
+
+
+def put_owner_text(out_path, owner):
+    """Put the owner's own statements (Scan.owner_text) in front of an engine's result.  When
+    the result does not parse any more with them (a statement that cannot stand in front of
+    other statements), they go in as comment lines instead.  Returns 'code', 'comment' or None
+    (nothing to add, no result file)."""
+    import allinone
+    out_path = Path(out_path)
+    if not owner or not out_path.is_file():
+        return None
+    body = read_source(out_path)
+    before = allinone.parses(str(out_path))
+    write_source(out_path, "\n".join((OWNER_NOTE, owner, OWNER_END, "", body)))
+    if before is not False and allinone.parses(str(out_path)) is False:
+        commented = "\n".join("-- " + line for line in owner.split("\n"))
+        write_source(out_path, "\n".join((OWNER_NOTE, commented, OWNER_END, "", body)))
+        how = "comment"
+    else:
+        how = "code"
+    print("[i] 文件里受保护程序前面属主自己加的语句已原样抄到结果最前面（%s）/ the owner's own statements in front of "
+          "the protected program were copied to the top of the result (%s)"
+          % ("作为注释" if how == "comment" else "代码", "as comment lines: they do not parse in front of it"
+             if how == "comment" else "as code"))
+    return how
 
 
 def engine_input(scan, inp):
