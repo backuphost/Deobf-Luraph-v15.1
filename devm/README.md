@@ -216,7 +216,15 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   `devm: init did not hand over: ...`, naming the last mocked calls of a second run with call
   logging.  The init is never written out as the script.  `--route b` is the older route: lift the
   init, replay it natively, recover the XOR key (`bootstrap.py`); `auto` tries it only for VMs whose
-  data is a buffer, after a failed hand-over or when the lift from the hand-over state has errors.
+  data is a buffer: after a failed hand-over, or when the lift from the hand-over state has errors
+  and the dump holds key functions the harness could not evaluate.
+* **Limits.**  The init may run `max(12 million, 60 per byte of VM text and container data)`
+  instructions (`--budget`), the run `max(150 s, budget / 400,000 + 50 s per megabyte)`
+  (`--run-timeout`): inits that decrypt their data run up to 32 instructions per byte, and the dump
+  decodes every lazy constant of the script.
+* **Lift errors without a marker.**  When instructions did not lift and the printed text has no
+  marker for them (they sit in code the text does not contain), the text gets a head line
+  `-- LIFT ERROR: N instruction(s) did not lift ...` and the result is PARTIAL.
 * **Failures are one line.**  A run that writes no result ends with `devm: <stage>: <reason>` and a
   non-zero status: `unsupported target` (a build for Lua 5.3/5.4 or LuaJIT: `normalize.foreign_dialect`
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
