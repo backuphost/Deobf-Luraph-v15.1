@@ -366,6 +366,36 @@ class Containers(unittest.TestCase):
                            ('return(function()local a=loadstring;' + loop + ' end)()(...)', False)):   # holds its loop itself
             self.assertEqual(container.may_be_container(text), want, text)
 
+    def test_order_of_static_decoder_and_probe(self):
+        # the v14 function container is read statically first; the v15 object container keeps
+        # the sandboxed probe first and asks the static decoder when the probe got no chunk
+        calls = []
+        real_static, real_unwrap = container.open_static, container.unwrap
+
+        def fake_static(path, src, workdir, tag, log=print):
+            calls.append('static')
+            return None
+
+        def fake_unwrap(path, workdir, tag, log=print, timeout=120):
+            calls.append('probe')
+            return None
+        container.open_static, container.unwrap = fake_static, fake_unwrap
+        try:
+            for text, want in (('return(function()local a=loadstring;return a("x") end)()(...)', ['static', 'probe']),
+                               ('return setmetatable({A=function(z)return loadstring(z.o) end},{}):A()(...)', ['probe', 'static']),
+                               ('return({A=function(z)return loadstring(z.o) end}):A()(...)', [])):
+                del calls[:]
+                with tempfile.TemporaryDirectory() as work:
+                    path = os.path.join(work, 'in.lua')
+                    with open(path, 'w') as f:
+                        f.write(text)
+                    with self.assertRaises(run.DevmError) as cm:
+                        run.deobfuscate(path, os.path.join(work, 'w'), log=lambda *a: None)
+                self.assertEqual(cm.exception.stage, 'no model')
+                self.assertEqual(calls, want, text)
+        finally:
+            container.open_static, container.unwrap = real_static, real_unwrap
+
     def test_stand_in_name(self):
         with tempfile.TemporaryDirectory() as work:
             c = container.stand_in(os.path.join(work, 'chunk.lua'), None, work, 't', 'Luraph   ')

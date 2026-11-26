@@ -59,6 +59,7 @@ class Carrier:
 # The two shapes a container has: Luraph v14's `return(function()local ... end)()(...)` (a function
 # without parameters; a VM in the fn-args layout takes its helpers as parameters, one in the table
 # layout starts `return({`) and v15's `return setmetatable({...},{}):M()(...)`.
+FN_SHAPE = re.compile(r'\breturn\s*\(\s*function\s*\(\s*\)')      # the v14 container
 _SHAPE = re.compile(r'\breturn\s*\(\s*function\s*\(\s*\)|\breturn\s+setmetatable\s*\(')
 
 

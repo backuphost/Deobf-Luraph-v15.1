@@ -223,22 +223,31 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # the instrumented chunk compiled in place of the original (see container.py).
     carrier = None
     unopened = None
+    def read_static():
+        """the container read without running it (the tree's static decoder, when it has one)"""
+        try:
+            c = container.open_static(path, src, workdir, tag, log)
+        except container.Damaged as e:
+            raise DevmError('damaged input', 'the file is a compressed Luraph container that cannot be opened: %s' % e)
+        if c:
+            with open(c.chunk_src, encoding='latin-1') as f:
+                text = f.read()
+            why = normalize.foreign_dialect(text)
+            if why:
+                raise DevmError('unsupported target', 'the VM chunk inside the container: ' + why)
+            return c, text
+        return None, src
+
+    # Luraph v14's container is a function without parameters: read statically first, the
+    # sandboxed probe (container.unwrap) is the fallback.  The v15 container is an object
+    # (`return setmetatable({...},{}):M()(...)`): there the probe comes first, as it always has,
+    # and the static decoder is asked when the probe did not get the chunk.
+    fn_container = not chunk_arg and container.FN_SHAPE.search(src) is not None
     if chunk_arg:
         carrier = container.stand_in(path, chunk_arg, workdir, tag, chunk_name or 'Luraph')
         log('[%s] VM chunk with its data buffer (%s): run through a stand-in for Luraph\'s container' % (tag, chunk_arg))
-    else:
-        # read without running anything where the tree has the static decoder; the sandboxed
-        # probe (container.unwrap) otherwise, and for whatever that decoder does not know
-        try:
-            carrier = container.open_static(path, src, workdir, tag, log)
-        except container.Damaged as e:
-            raise DevmError('damaged input', 'the file is a compressed Luraph container that cannot be opened: %s' % e)
-        if carrier:
-            with open(carrier.chunk_src, encoding='latin-1') as f:
-                src = f.read()
-            why = normalize.foreign_dialect(src)
-            if why:
-                raise DevmError('unsupported target', 'the VM chunk inside the container: ' + why)
+    elif fn_container:
+        carrier, src = read_static()
     if carrier is None and not chunk_arg and container.may_be_container(src):
         probe = []
 
@@ -255,6 +264,10 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         else:
             # the text holds no dispatch loop and no chunk came out of it: say that, not just "no model"
             unopened = '; '.join(re.sub(r'^\[[^\]]*\] ', '', ln) for ln in probe[-2:]) or 'the container probe saw no chunk being loaded'
+            if not fn_container:
+                carrier, src = read_static()
+                if carrier:
+                    unopened = None
     oneline = normalize.needs_reflow(src)
     if executor is None:
         # A script in Luraph's own one-line layout is what an executor is handed, and it expects
