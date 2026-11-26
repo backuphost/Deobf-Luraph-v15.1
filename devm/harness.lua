@@ -1361,6 +1361,8 @@ function populateSandbox()
 		for n, f in pairs(ex) do
 			if rawget(globals, n) == nil then rawset(globals, n, f) end
 		end
+		-- (the other usual name of identifyexecutor)
+		if rawget(globals, "getexecutorname") == nil then rawset(globals, "getexecutorname", rawget(globals, "identifyexecutor")) end
 		-- Metatable and read-only access, part of every executor's API (the "UNC" set).  They are
 		-- C closures like an executor's own (cwrap), and work on the mock's objects: mock
 		-- metatables are locked, the mock keeps the real ones in mock.rawMT.

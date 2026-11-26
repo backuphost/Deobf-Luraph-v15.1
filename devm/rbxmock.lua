@@ -57,9 +57,18 @@ return function(G, fnames, libnames, opts)
 	local cwrap = G.cwrap
 	local YIELD = cwrap and newproxy() or {}
 	local calllog = G.__LPH_CALLLOG
+	-- calls=1: the logging frame must not show.  f raises with error(msg, 2) (3 inside m()), which
+	-- names no position while f is the thread's only function; called from a Lua wrapper the same
+	-- level would name the wrapper ("rbxmock:62: ..." in front of every message a script compares).
+	-- Through pcall the level lands on a C function again and the message stays as it is.
 	local function logged(name, f)
 		if not calllog then return f end
-		return function(...) calllog(name, ...) return f(...) end
+		return function(...)
+			calllog(name, ...)
+			local r = table.pack(pcall(f, ...))
+			if r[1] then return unpack(r, 2, r.n) end
+			error(r[2], 0)
+		end
 	end
 	local function named(name, f)
 		f = logged(name, f)
@@ -1473,6 +1482,9 @@ return function(G, fnames, libnames, opts)
 	-- code asks for items by value and compares what comes back.
 	do
 		local enumTypes = {}
+		-- Old names of items that Roblox still accepts.  The API table lists current names only
+		-- (gen_roblox.py drops the dump's LegacyNames), so the ones met in scripts are kept here.
+		local LEGACY = { Font = { GothamSemibold = "GothamMedium" } }
 		local function enumItem(et, etName, name, value)
 			local u = newproxy(true)
 			local mt = getmetatable(u)
@@ -1520,6 +1532,9 @@ return function(G, fnames, libnames, opts)
 			end
 			if API.loaded then
 				for iname, v in string.gmatch(API.enums[etName], "([%w_]+)=(%-?%d+)") do item(iname, tonumber(v)) end
+				for old, new in pairs(LEGACY[etName] or {}) do
+					if items[old] == nil then items[old] = items[new] end
+				end
 			elseif etName == "PartType" then
 				item("Ball", 0) item("Block", 1) item("Cylinder", 2)
 			end
@@ -1544,7 +1559,12 @@ return function(G, fnames, libnames, opts)
 				if ms[k] then return ms[k] end
 				if API.loaded then
 					local it = rawType(k) == "string" and items[k] or nil
-					if it == nil then error(tostring(k) .. " is not a valid member of \"Enum." .. etName .. "\"", 2) end
+					if it == nil then
+						-- (said in the log: the table has no legacy names, so this can be the table's gap)
+						note("env", "Enum." .. etName .. "." .. tostring(k) .. " is not in the API table: answered with Roblox's error " ..
+							"for an unknown item (if it is an old name Roblox still accepts, the table lacks it)")
+						error(tostring(k) .. " is not a valid member of \"Enum." .. etName .. "\"", 2)
+					end
 					return it
 				end
 				if type(k) ~= "string" then return nil end
