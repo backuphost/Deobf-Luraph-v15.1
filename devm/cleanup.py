@@ -322,15 +322,20 @@ def _const_value(e, multi=False):
                     elif op == '*':
                         v = x * y
                     elif op == '^':
-                        v = float(x) ** float(y)
+                        try:
+                            v = float(x) ** float(y)
+                        except (OverflowError, ZeroDivisionError):
+                            v = math.inf        # (Luau: inf, no error)
                     elif y == 0:
-                        v = math.nan if op != '/' or x == 0 else math.copysign(math.inf, x)
+                        v = math.nan if op == '%' or x == 0 or x != x else math.copysign(math.inf, x) * math.copysign(1, y)
                     elif op == '/':
                         v = x / y
                     elif op == '//':
-                        v = math.floor(x / y)
+                        q = x / y
+                        v = math.floor(q) if math.isfinite(q) else q
                     else:
-                        v = x - math.floor(x / y) * y
+                        q = x / y
+                        v = x - math.floor(q) * y if math.isfinite(q) else math.nan
                 except (OverflowError, ValueError, ZeroDivisionError):
                     raise _NotConst()
                 if isinstance(v, complex):
@@ -376,7 +381,7 @@ def dead_constant_lines(text):
             continue
         try:
             _const_value(e)
-        except (_NotConst, RecursionError):
+        except Exception:       # (_NotConst, or anything the evaluator did not expect: keep the line)
             left.append(i)
             continue
         removable.append(i)
