@@ -189,6 +189,18 @@ def _unparen(e):
     return e
 
 
+def _steps_name(st, nm):
+    """`nm = nm + 1` / `nm += 1` (a stack pointer moving up)"""
+    if st is None:
+        return False
+    if st[0] == 'opassign':
+        return st[1] == '+' and st[2] == ('name', nm) and _unparen(st[3]) == ('num', 1)
+    if st[0] == 'assign' and len(st[1]) == 1 and len(st[2]) == 1 and st[1][0] == ('name', nm):
+        e = _unparen(st[2][0])
+        return e[0] == 'bin' and e[1] == '+' and {_unparen(e[2]), _unparen(e[3])} == {('name', nm), ('num', 1)}
+    return False
+
+
 class KNum(float):
     """A number derived from the loader's key functions. Unlike ordinary values it is tracked
     across instructions, because self-modifying code uses it as patch address / patch value."""
@@ -823,12 +835,28 @@ class PE:
         self.fvars, self.fstack, self.openups = self.state_sets[it.index]
 
     def _classify_state_vars(self, loops):
-        """Find interpreter-level locals used as for-loop state / open-upvalue map."""
+        """Find interpreter-level locals used as for-loop state / open-upvalue map.
+
+        Handlers name these variables directly or through a local of their own (`local u = G;
+        if u then for k, c in u do ...`), and a handler's other locals reuse the same letters.
+        So a name found in a handler is resolved to its declaration first: the interpreter's
+        variable, the interpreter's variable a handler-local alias copies, or nothing."""
         fvars = set()
         fstack = set()
         openups = set()
 
-        def visit(st, prev=None):
+        def res(nm, scopes):
+            for sc in reversed(scopes):
+                if nm in sc:
+                    return sc[nm]
+            return nm
+
+        def add(group, nm, scopes):
+            nm = res(nm, scopes)
+            if nm is not None:
+                group.add(nm)
+
+        def visit(st, prev, nxt, scopes):
             t = st[0]
             if t == 'assign' and len(st[1]) == len(st[2]):
                 # `stack = {..., stack}`, also as one target of a multiple assignment
@@ -843,27 +871,41 @@ class PE:
                 for tg, val in zip(st[1], st[2]):
                     while val[0] == 'paren':
                         val = val[1]
-                    if tg[0] != 'name' or val[0] != 'table':
+                    if val[0] != 'table':
+                        continue
+                    vals = [v for _, _, v in val[1]]
+                    if tg[0] == 'index' and len(st[1]) == 1:
+                        # the saved state on an array stack (v14.0.2 - v14.2):
+                        # `stack[top] = {[5]=limit, [4]=step, [1]=index}; top = top + 1`
+                        base, top = _unparen(tg[1]), _unparen(tg[2])
+                        if base[0] == 'name' and top[0] == 'name' and len(vals) >= 3 \
+                                and all(v[0] == 'name' for v in vals) and len({v[1] for v in vals}) == len(vals) \
+                                and any(_steps_name(x, top[1]) for x in (prev, nxt)):
+                            add(fstack, base[1], scopes)
+                            add(fstack, top[1], scopes)
+                            for v in vals:
+                                add(fvars, v[1], scopes)
+                        continue
+                    if tg[0] != 'name':
                         continue
                     nm = tg[1]
-                    vals = [v for _, _, v in val[1]]
                     if any(v == ('name', nm) for v in vals):
-                        fstack.add(nm)
+                        add(fstack, nm, scopes)
                         for v in vals:
                             if v[0] == 'name':
-                                fvars.add(v[1])
+                                add(fvars, v[1], scopes)
                     elif tmp and tmp[1] == nm and sum(1 for v in vals if v == ('name', tmp[0])) == 1 \
                             and len(vals) >= 3 and all(v[0] == 'name' for v in vals):
-                        fstack.add(nm)
-                        fvars.add(nm)
+                        add(fstack, nm, scopes)
+                        add(fvars, nm, scopes)
                         for v in vals:
                             if v[1] != tmp[0]:
-                                fvars.add(v[1])
+                                add(fvars, v[1], scopes)
             if t == 'forin' and len(st[2]) == 1 and st[2][0][0] == 'name' and len(st[1]) == 2:
                 body = st[3]
                 txt = repr(body)
                 if "('num', 3)" in txt and "('num', 2)" in txt:
-                    openups.add(st[2][0][1])
+                    add(openups, st[2][0][1], scopes)
             if t == 'if':
                 # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
                 # open[r] = nil end end`: handlers that end the scope of single registers
@@ -871,14 +913,33 @@ class PE:
                     if c[0] == 'name' and body and body[0][0] == 'local':
                         txt = repr(body[:3])
                         if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
-                            openups.add(c[1])
-            for blk in subblocks(st):
-                for i, sub in enumerate(blk):
-                    visit(sub, blk[i - 1] if i else None)
+                            add(openups, c[1], scopes)
+
+        def walk(block, scopes):
+            sc = {}
+            scopes = scopes + [sc]
+            for i, st in enumerate(block):
+                visit(st, block[i - 1] if i else None, block[i + 1] if i + 1 < len(block) else None, scopes)
+                t = st[0]
+                if t == 'fornum':
+                    walk(st[5], scopes + [{st[1]: None}])
+                elif t == 'forin':
+                    walk(st[3], scopes + [{n: None for n in st[1]}])
+                else:
+                    for blk in subblocks(st):
+                        walk(blk, scopes)
+                if t == 'local':
+                    # (a plain copy of an interpreter variable stands for it; any other local hides it)
+                    vals = [_unparen(e) for e in st[2]]
+                    new = [res(vals[j][1], scopes) if j < len(vals) and vals[j][0] == 'name' else None
+                           for j in range(len(st[1]))]
+                    for nm, v in zip(st[1], new):
+                        sc[nm] = v
+                elif t == 'localfunc':
+                    sc[st[1]] = None
 
         for l in loops:
-            for i, st in enumerate(l[2]):
-                visit(st, l[2][i - 1] if i else None)
+            walk(l[2], [])
         return fvars, fstack, openups
 
     # -- emission
@@ -1903,6 +1964,14 @@ class PE:
                             self.events.append(('fop',))
                     self.setvar(scope, nm, self.eval1(st[2][0], scope))
                 else:
+                    base = _unparen(tg[1])
+                    if base[0] == 'name' and base[1] in self.fstack and _unparen(st[2][0])[0] == 'table' \
+                            and self.is_state(scope, base[1]):
+                        # the saved for-loop state pushed on an array stack: `stack[top] = {...}`
+                        if self.perm is None:
+                            raise ForOp()
+                        self.events.append(('push',))
+                        return None
                     obj = self.eval1(tg[1], scope)
                     key = self.eval1(tg[2], scope)
                     self.setindex(obj, key, self.eval1(st[2][0], scope), tg[2])
