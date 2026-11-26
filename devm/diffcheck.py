@@ -477,9 +477,12 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
     data = {'original_events': len(eo), 'result_events': len(er_all), 'skipped': p, 'matched': m,
             'original_end': orig.how_ended(), 'result_end': res.how_ended(),
             'result_markers': dict(markers), 'masked_arguments': len(vol_o) + len(vol_r),
-            'requests': orig.requests[:20], 'placeholder_read': hole}
+            'requests': orig.requests[:20], 'placeholder_read': hole,
+            'both_ended': orig.end is not None and res.end is not None}
 
     def finish(code, headline):
+        if code == SAME and orig.requests:
+            headline += '; %s got no reply (what a reply would trigger is not compared)' % _n(len(orig.requests), 'request')
         v = Verdict(code, headline)
         v.data = data
         v.add('original: %s (and %d not compared: %s), %s' % (
