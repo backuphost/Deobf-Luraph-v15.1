@@ -353,6 +353,14 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   interpreter, the harness never hooked the one that runs the script, and the result was a few
   lines of start-up code with a `LIFT ERROR`.  With it the usual two-interpreter route applies
   (`payload: proto 36 is the script`).
+* **The open-upvalue map of that interpreter.**  Its handlers test and index the map through a
+  local copy (`local a, r = open, operand[pc]; if a then local c = a[r] ...`), and the copy's name
+  is usually also the name of some unrelated interpreter variable.  `pe._classify_state_vars` took
+  the copy's name (and the names of dispatch-test locals, which look like the pattern) for the
+  map: in one file the dispatch-mode variable was treated as the map and the lift stopped with
+  `interpreter returned before reaching dispatch loop`; in others a key the interpreter keeps in
+  a local was unknown to the lifter.  The classifier now follows the copy back to the
+  interpreter-level variable.
 * **The structuring passes of the generation** (`ircfg.UNFLATTEN`, `ircfg.V152`,
   `structure.FIT_SCOPES`, `NEST_ITEMS`, `NOTE_TRAPS`, `beautify.MERGE_ARMS`) are switched on by
   `run.v152_generation(model)`: wrapper keys, or an interpreter in the spelling above.  The older
@@ -382,10 +390,10 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   missing the arithmetic stays and the report says so (`functions return a parameter xor-ed with a
   large literal`, never `complete`).
 * **Key arithmetic on an interpreter local the lifter has no value for** shows as
-  `local v = nil --[[OPENUPS]] % 4294967296; local w = bit32.bxor(v - v % 1, 283475159)` in a v15.1
-  result (in v15.2 the wrapper keys make these constants).  `opaque._drop_blind_key_arith` removes
-  such a chain when nothing reads it, `opaque._fold_type_tests` decides the opaque test
-  `type(0) == "buffer"` in front of a junk arm.  The lifter still does not know that local.
+  `local v = (121107783 + nil) % 4294967296; local w = bit32.bxor(v - v % 1, 283475159)`: in code
+  that never ran (junk arms) the key was never set.  `opaque._drop_blind_key_arith` removes such
+  a chain when nothing reads it, `opaque._fold_type_tests` decides the opaque test
+  `type(0) == "buffer"` in front of a junk arm.
 * **v15.0** is a third layout: the function that makes a VM closure is a method of the VM object,
   written as a state machine that assigns the interpreter closure in one of its states.  devm does
   not model it and says so at once (`no model: Luraph v15.0 method-wrap layout is not supported by
