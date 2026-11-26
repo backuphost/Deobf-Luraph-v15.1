@@ -46,7 +46,7 @@ import sys
 __all__ = ['decode', 'Result', 'ContainerError']
 
 MAX_OUTPUT = 1 << 27            # per payload; also the LZMA dictionary size (Luraph's decoder has no window limit)
-_HEADER = re.compile(r'--[^\n]*?Luraph Obfuscator v[0-9][0-9.]*(?: *\[[^\]\n]*\])?')
+_HEADER = re.compile(r'^[ \t\ufeff]*--[^\n]*?Luraph Obfuscator v[0-9][0-9.]*(?: *\[[^\]\n]*\])?', re.M)
 
 
 class ContainerError(Exception):
@@ -317,10 +317,9 @@ def decode(text):
     body = _main_statement(tokens)
     if body is None and not any(t[0] != 'cut' for t in tokens):
         # the line break after the header comment was lost: the whole program sits in the comment
-        m = _HEADER.match(text.lstrip('\ufeff \t\r\n'))
+        m = _HEADER.search(text)
         if m and 'return' in text[m.end():m.end() + 64]:
-            off = len(text) - len(text.lstrip('\ufeff \t\r\n')) + m.end()
-            tokens = _lex(text, off)
+            tokens = _lex(text, m.end())
             body = _main_statement(tokens)
             if body is not None:
                 notes.append('the program follows the header comment on the same line (line break lost); read from there')
