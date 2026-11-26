@@ -1,4 +1,5 @@
 """Drives the partial evaluator over every instruction of every proto -> per-proto IR graph."""
+import math
 import os
 import struct
 
@@ -14,7 +15,7 @@ def ircfg_cells(cells):
 
 
 class Node:
-    __slots__ = ('key', 'tree', 'exposed', 'written', 'snap_in', 'error', 'kreads')
+    __slots__ = ('key', 'tree', 'exposed', 'written', 'snap_in', 'error', 'kreads', 'folded')
 
     def __init__(self, key):
         self.key = key
@@ -24,6 +25,7 @@ class Node:
         self.snap_in = None
         self.error = None
         self.kreads = set()
+        self.folded = False     # a test of a known constant was replaced by its live side
 
 
 class ProtoIR:
@@ -41,6 +43,7 @@ class ProtoIR:
 CAP = '__captured__'      # key in a known-register map: registers captured by reference
 ABS = '__truth__'         # ... and: frozenset of (register, 'T...' | 'F'), see known_after
 SYMPC = 'jump to a run-time computed instruction'
+NOVAL = object()          # known_after.cval: not a known constant
 
 
 class Samp(tuple):
@@ -61,6 +64,13 @@ def same_const(a, b):
     if isinstance(a, P.ConstFn):
         return a.k == b.k and a.value == b.value
     return False
+
+
+def same_fact(a, b):
+    """same_const, also for the strings / nil / library functions of known_after's ('V', r) entries."""
+    if same_const(a, b):
+        return True
+    return type(a) is type(b) and type(a) in (str, tuple) and a == b
 
 
 def same_value(a, b):
@@ -106,6 +116,7 @@ class Lifter:
         self.param_vals = {}        # parameter index -> opaque number every caller passes
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
+        self.pure_calls = False     # known_after computes library calls on constants (see there)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
         self.end_state = False      # the dump was taken at the end of the run (see PE.frozen)
         # an instruction that ran is only lifted in a code state the run recorded for it (lift_proto);
@@ -328,6 +339,9 @@ class Lifter:
                     return self.up_nums.get(e[1])
                 if e[0] == 'mv' and e[2] == 1:
                     return calls.get(e[1])
+                if e[0] == 'mv':
+                    v = calls.get((e[1], e[2]))
+                    return v if P.is_num(v) else None
                 if e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//'):
                     x, y = num2(e[2]), num2(e[3])
                     if x is None and e[1] == '%' and y == 4294967296 and e[2][0] in ('r', 't', 'up', 'upcell') and self.end_state:
@@ -357,12 +371,109 @@ class Lifter:
                     if isinstance(x, P.UpNum) or isinstance(y, P.UpNum):
                         return P.UpNum(r)
                     return P.norm(r)
+                if self.pure_calls and e[0] == 'bin' and e[1] in ('/', '^'):
+                    x, y = num(e[2]), num(e[3])
+                    if x is None or y is None or (e[1] == '/' and y == 0):
+                        return None
+                    try:
+                        r = float(x) / float(y) if e[1] == '/' else float(x) ** float(y)
+                    except (OverflowError, ZeroDivisionError, ValueError):
+                        return None
+                    return P.norm(r) if isinstance(r, float) and r == r and abs(r) < 2 ** 53 else None
+                if self.pure_calls and e[0] == 'un' and e[1] == '-':
+                    x = num(e[2])
+                    return None if x is None else P.norm(-x)
+                if self.pure_calls and e[0] == 'index':
+                    v = cval(e)             # (math.pi, math.huge)
+                    return v if P.is_num(v) else None
                 return None
+
+            def cval(e):
+                # The constant a value is known to be: a number, a string, or a library function
+                # (as ('kfn', name)); NOVAL otherwise.  Strings and functions are kept apart from
+                # the numbers (register r under ('V', r)): they only serve to compute calls of
+                # pure library functions on constants, the way Luraph v14 programs make the
+                # values they patch into their own operands.
+                if e[0] == 'k':
+                    return e[1] if e[1] is None or isinstance(e[1], (str, bool)) or P.is_num(e[1]) else NOVAL
+                if e[0] == 'kfn':
+                    return ('kfn', str(e[1]))
+                if e[0] == 'global':
+                    # (the program's own patch arithmetic relies on these being the libraries)
+                    return ('lib', e[1]) if e[1] in ('bit32', 'math', 'string') else NOVAL
+                if e[0] == 'index':
+                    if isinstance(e[1], tuple) and isinstance(e[2], tuple) and e[2][0] == 'k' and isinstance(e[2][1], str):
+                        lib = cval(e[1])
+                        if isinstance(lib, tuple) and lib[0] == 'lib':
+                            if lib[1] == 'math' and e[2][1] in ('pi', 'huge'):
+                                return math.pi if e[2][1] == 'pi' else math.inf
+                            return ('kfn', lib[1] + '.' + e[2][1])
+                    return NOVAL
+                v = NOVAL
+                if e[0] == 'r':
+                    v = known.get(('V', e[1]), NOVAL)
+                    if v is NOVAL and isinstance(known.get(e[1]), bool):
+                        v = known[e[1]]
+                elif e[0] == 't':
+                    v = temps.get(('V', e[1]), NOVAL)
+                elif e[0] == 'mv':
+                    v = calls.get((e[1], e[2]), NOVAL)
+                if v is NOVAL:
+                    v = num(e)
+                    return NOVAL if v is None else v
+                return v
+
+            def ctruth(e):
+                # the outcome of a test of a known constant, else None
+                v = cval(e)
+                return None if v is NOVAL else (v is not None and v is not False)
 
             calls = dict(calls or ())
             truth = {}
             cabs = {}
+            pure = self.pure_calls
             for st in stmts:
+                if pure and st[0] == 'call' and isinstance(st[2], tuple):
+                    f = cval(st[2])
+                    if isinstance(f, tuple) and f[0] == 'kfn':
+                        args = [cval(a) for a in st[3]]
+                        if st[4] is not None:
+                            # (all results of a call computed before: `f(g(x))`)
+                            n = calls.get(('n', st[4]))
+                            args = args + [calls[(st[4], i + 1)] for i in range(n)] if n is not None else [NOVAL]
+                        res = None
+                        if all(a is not NOVAL for a in args):
+                            try:
+                                res = P.fold_pure(f[1], args)
+                            except (TypeError, ValueError, OverflowError, ZeroDivisionError, IndexError, struct.error):
+                                res = None
+                        if res is not None:
+                            calls[('n', st[1])] = len(res)
+                            for i, v in enumerate(res):
+                                calls[(st[1], i + 1)] = v
+                            if res and P.is_num(res[0]):
+                                calls[st[1]] = P.norm(res[0])
+                if pure and st[0] == 'set' and isinstance(st[2], tuple) and st[1][0] in ('t', 'r'):
+                    e = st[2]
+                    v = cval(e)
+                    if v is NOVAL and e[0] == 'bin' and e[1] in ('==', '~=', '<', '<=', '>', '>='):
+                        # a comparison of two constants
+                        x, y = cval(e[2]), cval(e[3])
+                        if x is not NOVAL and y is not NOVAL and not isinstance(x, tuple) and not isinstance(y, tuple):
+                            if e[1] in ('==', '~='):
+                                same = (x == y) if (P.is_num(x) and P.is_num(y)) or type(x) is type(y) else False
+                                v = same == (e[1] == '==')
+                            elif (P.is_num(x) and P.is_num(y)) or (isinstance(x, str) and isinstance(y, str)):
+                                v = x < y if e[1] == '<' else x <= y if e[1] == '<=' else x > y if e[1] == '>' else x >= y
+                    elif v is NOVAL and e[0] == 'un' and e[1] == 'not' and ctruth(e[2]) is not None:
+                        v = not ctruth(e[2])
+                    if st[1][0] == 't':
+                        if v is None or isinstance(v, (str, tuple, bool)):
+                            temps[('V', st[1][1])] = v
+                    elif (v is None or isinstance(v, (str, tuple))) and st[1][1] not in known.get(CAP, ()):
+                        known[('V', st[1][1])] = v
+                    else:
+                        known.pop(('V', st[1][1]), None)
                 if st[0] == 'set' and isinstance(st[2], tuple):
                     e = st[2]
                     if e[0] in ('index', 'method') and isinstance(e[1], tuple):
@@ -460,6 +571,8 @@ class Lifter:
                         temps[st[1][1]] = v
                         self.temp_vals[st[1][1]] = v     # (a temporary can outlive the instruction
                                                          # as the value of an interpreter local)
+                    elif pure:
+                        temps[st[1][1]] = None           # (not known on this path, whatever another path found)
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
                     # where the new function's upvalues come from: opaque numbers among them are
                     # needed to lift it when it never ran (see instantiate)
@@ -524,6 +637,8 @@ class Lifter:
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
                     elif e[0] in ('t', 'bin', 'up', 'upcell', 'mv') and num2(e) is not None:
                         known[st[1][1]] = num2(e)
+                    elif pure and e[0] == 't' and isinstance(temps.get(('V', e[1])), bool):
+                        known[st[1][1]] = temps[('V', e[1])]
                     else:
                         known.pop(st[1][1], None)
                 elif st[0] == 'setmulti':
@@ -533,7 +648,14 @@ class Lifter:
                     # the closures that captured these registers keep a copy from here on
                     hi = st[2] if len(st) > 2 else None
                     known[CAP] = frozenset(r for r in known[CAP] if r < st[1] or (hi is not None and r > hi))
-            if term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
+            if term[0] == 'br' and pure and ctruth(term[1]) is not None:
+                # A test of a constant (Luraph v14 writes the values it patches into its own
+                # operands as `a and K1 or K2` chains over library calls on literals): only one
+                # side exists.  The other is not followed, and lift_proto takes it out of the tree.
+                live = ctruth(term[1])
+                self.folds[id(term)] = live
+                walk(term[2] if live else term[3], known, temps, calls, tabs)
+            elif term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
                 # (the not-a-number test inside a 32-bit multiply: only one side happens)
                 n0 = len(out)
                 walk(term[2] if truth[term[1][1]] else term[3], known, temps, calls)
@@ -569,6 +691,7 @@ class Lifter:
                 regs = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
                 for n in regs:
                     known.pop(n, None)
+                    known.pop(('V', n), None)
                 walk(term[3], known)
                 walk(term[4], known)
             elif term[0] == 'goto':
@@ -1042,7 +1165,36 @@ class Lifter:
                     for name, v in node.snap_in.items():
                         if name in snap and not same_value(v, snap[name]):
                             pir.conflicts.append((key2, name, v, snap[name]))
-                    continue
+                    if not self.pure_calls or node.error:
+                        continue
+                    # What is known about the registers decides tests of constants and gives the
+                    # values of patches, so it has to hold on every path to the instruction: what
+                    # this path does not confirm is withdrawn, here and (through the exits) in
+                    # what follows.  The instruction is lifted again only when its tree used it.
+                    old = node_in.get(key2) or {}
+                    lost = {r for r, v in old.items() if r != CAP and r != ABS and not (r in known and same_fact(known[r], v))}
+                    if not lost:
+                        continue
+                    relifts[key2] = relifts.get(key2, 0) + 1
+                    if os.environ.get('DEVM_TRACE_MEET'):
+                        print('MEET', key, key2, 'lost', sorted(map(str, lost)), 'kreads', node.kreads, 'folded', node.folded)
+                    if relifts[key2] > 6:
+                        lost = {r for r in old if r != CAP}       # (give up on this instruction: nothing is known)
+                    meet = {r: v for r, v in old.items() if r not in lost}
+                    node_in[key2] = meet
+                    if node.folded or node.kreads & {r[1] if isinstance(r, tuple) else r for r in lost} \
+                            or any(e[0] == 'goto' and len(e[1]) > 2 for e in tree_ends(node.tree)):
+                        known = meet
+                        snap = node.snap_in
+                        del pir.nodes[key2]
+                    else:
+                        self.folds = {}
+                        self.cur_node = (key, key2)
+                        ends = self.known_after(node.tree, meet)
+                        self.cur_node = None
+                        for end, kn in ends:
+                            work.append((end[1], end[2], kn, node, end, path))
+                        continue
             ran = pathmode and (key, key2[0], key2[1]) in self.oracle
             replay = bool(self.pe.replay_tables)
             rec = self.oracle.get((key, key2[0], key2[1])) if pathmode else None
@@ -1213,8 +1365,9 @@ class Lifter:
             self.folds = {}
             self.cur_node = (key, key2)
             ends = self.known_after(node.tree, known)
-            if self.folds and pathmode:
+            if self.folds and (pathmode or self.pure_calls):
                 node.tree = fold_tree(node.tree, self.folds)
+                node.folded = True
                 self.folds = {}
                 self.cur_node = None
                 ends = self.known_after(node.tree, known)
@@ -1459,6 +1612,7 @@ class TableProtoLifter(Lifter):
         self.root_key = self.base.vars[self.proto_param].id
         self.proto_objs[self.root_key] = self.base.vars[self.proto_param]
         self.pe.slot_policy = True
+        self.pure_calls = True
         self.slot_rounds = 0
 
     # attributes a caller sets between making the lifter and lift_all (kept when lift_all starts over)

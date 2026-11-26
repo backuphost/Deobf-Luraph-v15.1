@@ -510,11 +510,98 @@ def lua_packsize(fmt):
                 j += 1
             total += int(fmt[i:j]) if j > i else 4
             i = j
+        elif c == 'c':
+            # a string of fixed length: `c` with its byte count
+            j = i
+            while j < len(fmt) and fmt[j].isdigit():
+                j += 1
+            if j == i:
+                return None
+            total += int(fmt[i:j])
+            i = j
         elif c in sizes:
             total += sizes[c]
         else:
             return None
     return total
+
+
+def fold_pure(name, args):
+    """The results (a list) of a library function that has no effect and depends on nothing but its
+    arguments, called with constants; None when the call is not one this evaluator computes.
+    Luraph's VMs compute patch values and keys with such calls on literals.  (May raise what the
+    Python stand-in raises on arguments the library function rejects.)"""
+    if name == 'string.unpack' and len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
+        return lua_unpack(args[0], args[1])
+    if name in PURE and all(is_num(a) for a in args):
+        return [norm(PURE[name](*args))]
+    if name == 'string.packsize' and len(args) == 1 and isinstance(args[0], str):
+        r = lua_packsize(args[0])
+        return None if r is None else [r]
+    if name == 'string.len' and len(args) == 1 and isinstance(args[0], str):
+        return [len(args[0])]
+    if name == 'string.byte' and args and isinstance(args[0], str) and len(args) <= 3 \
+            and all(a is None or (is_num(a) and float(a).is_integer()) for a in args[1:]):
+        n = len(args[0])
+        i = int(args[1]) if len(args) > 1 and args[1] is not None else 1
+        j = int(args[2]) if len(args) > 2 and args[2] is not None else i
+        i = max(n + i + 1, 1) if i < 0 else max(i, 1)
+        j = n + j + 1 if j < 0 else min(j, n)
+        return [ord(c) for c in args[0][i - 1:j]] if i <= j else []
+    if name == 'math.modf' and len(args) == 1 and is_num(args[0]) and args[0] == args[0]:
+        x = float(args[0])
+        if x in (math.inf, -math.inf):
+            return [x, 0]
+        ip = float(math.trunc(x))
+        return [norm(ip), norm(x - ip)]
+    if name == 'math.round' and len(args) == 1 and is_num(args[0]) and args[0] == args[0] \
+            and abs(args[0]) < 2 ** 52:
+        # (Luau rounds halves away from zero)
+        return [norm(float(math.floor(args[0] + 0.5) if args[0] >= 0 else math.ceil(args[0] - 0.5)))]
+    return None
+
+
+def nested_close(st):
+    """The close-upvalues loop of Luraph v14.0.x:
+
+        for _, list in LISTS do for _, cell in list do
+            if cell[A] == REGS and cell[B] >= BASE then <detach the cell> end
+        end end
+
+    LISTS holds the capture lists of the closures a call made; a cell is {[A]=array, [B]=index}.
+    Returns (array expression, BASE expression) or None."""
+    if st[0] != 'forin' or len(st[1]) != 2 or len(st[2]) != 1 or st[2][0][0] != 'name' or len(st[3]) != 1:
+        return None
+    inner = st[3][0]
+    if inner[0] != 'forin' or len(inner[1]) != 2 or len(inner[2]) != 1 or _unparen(inner[2][0]) != ('name', st[1][1]) \
+            or len(inner[3]) != 1 or inner[3][0][0] != 'if':
+        return None
+    cell = ('name', inner[1][1])
+
+    def field(x):
+        x = _unparen(x)
+        return x[0] == 'index' and _unparen(x[1]) == cell and _unparen(x[2])[0] == 'num'
+
+    found = {}
+
+    def scan(c):
+        c = _unparen(c)
+        if c[0] == 'un' and c[1] == 'not':
+            scan(c[2])
+        elif c[0] == 'bin' and c[1] in ('and', 'or'):
+            scan(c[2])
+            scan(c[3])
+        elif c[0] == 'bin' and c[1] == '==':
+            if field(c[2]) != field(c[3]):
+                found['arr'] = c[3] if field(c[2]) else c[2]
+        elif c[0] == 'bin' and c[1] in ('>=', '<'):
+            if field(c[2]) and not field(c[3]):
+                found['base'] = c[3]
+    for c, _ in inner[3][0][1]:
+        scan(c)
+    if 'arr' in found and 'base' in found:
+        return found['arr'], found['base']
+    return None
 
 
 def lua_type(v):
@@ -749,6 +836,7 @@ class PE:
         self.inject = None          # (loop_idx, snapshot)
         self.seeking = False
         self.interp_scope = None
+        self.cell_lists = set()     # names of per-closure lists of capture lists (see nested_close)
         self.state_sets = {it.index: self._classify_state_vars(it.loops) for it in model.interps}
         self.set_interp(model.interp_funcs[id(model.interp)])
         self.events = []
@@ -961,6 +1049,10 @@ class PE:
                 if "('num', 3)" in txt and "('num', 2)" in txt \
                         and ("('index', " + cell in txt or "('index', ('paren', " + cell in txt):
                     add(openups, st[2][0][1], scopes)
+                if nested_close(st) is not None and res(st[2][0][1], scopes) == st[2][0][1]:
+                    # v14.0.x keeps, per closure, a list of the capture lists it made, in a local
+                    # of the closure maker (not of the interpreter)
+                    self.cell_lists.add(st[2][0][1])
             if t == 'if':
                 # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
                 # open[r] = nil end end`: handlers that end the scope of single registers
@@ -1113,6 +1205,8 @@ class PE:
                 # Roblox datatypes and executor functions (gethui, fireproximityprompt, ...)
                 return GlobalPath(name)
             raise PEError('unbound name %s' % name)
+        if self.cell_lists and name in self.cell_lists and s.owner != self.cur_interp.func.id:
+            return OPENUPS      # (a local of the closure maker: see nested_close)
         if s.owner == self.cur_interp.func.id and (self.state_scopes is None or id(s) in self.state_scopes):
             # interpreter-level state variables (names are only meaningful inside the interpreter)
             if name in self.openups:
@@ -1712,6 +1806,8 @@ class PE:
             # the loader wiring up the lazy constant tables of a proto it has just deserialized
             args[0].mt = args[1]
             return [args[0]]
+        if name == 'table.insert' and args and args[0] is OPENUPS:
+            return []           # (the closure maker's record of a capture list: VM bookkeeping)
         if name == 'getfenv':
             return [ENV]
         if name == 'setfenv':
@@ -1794,32 +1890,9 @@ class PE:
                 if ty:
                     return [ty]
         if not sym:
-            if name == 'string.unpack' and len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
-                r = lua_unpack(args[0], args[1])
-                if r is not None:
-                    return r
-            if name in PURE and all(is_num(a) for a in args):
-                return [keyed(norm(PURE[name](*args)), *args)]
-            if name == 'string.packsize' and len(args) == 1 and isinstance(args[0], str):
-                r = lua_packsize(args[0])
-                if r is not None:
-                    return [r]
-            if name == 'string.len' and len(args) == 1 and isinstance(args[0], str):
-                return [len(args[0])]
-            if name == 'string.byte' and args and isinstance(args[0], str) and len(args) <= 3 \
-                    and all(is_num(a) and float(a).is_integer() for a in args[1:]):
-                n = len(args[0])
-                i = int(args[1]) if len(args) > 1 else 1
-                j = int(args[2]) if len(args) > 2 else i
-                i = max(n + i + 1, 1) if i < 0 else max(i, 1)
-                j = n + j + 1 if j < 0 else min(j, n)
-                return [ord(c) for c in args[0][i - 1:j]] if i <= j else []
-            if name == 'math.modf' and len(args) == 1 and is_num(args[0]) and args[0] == args[0]:
-                x = float(args[0])
-                if x in (math.inf, -math.inf):
-                    return [x, 0]
-                ip = float(math.trunc(x))
-                return [norm(ip), norm(x - ip)]
+            r = fold_pure(name, args)
+            if r is not None:
+                return [keyed(r[0], *args)] if name in PURE else r
             if name == 'buffer.create' and args and is_num(args[0]) and 0 <= args[0] <= 1 << 26:
                 return [Buffer(bytes(int(args[0])))]
             if name == 'buffer.fromstring' and args and isinstance(args[0], str):
@@ -2234,6 +2307,12 @@ class PE:
                     return None
             it = self.evalargs(st[2], scope)
             if it and it[0] is OPENUPS:
+                nc = nested_close(st)
+                if nc is not None:
+                    if self.eval1(nc[0], scope) is not REGS:
+                        raise PEError('unrecognised close-upvalues loop')
+                    self.emit(('close', self.eval1(nc[1], scope)))
+                    return None
                 self.emit(('close', self.close_base(st, scope)))
                 return None
             if it and isinstance(it[0], LuaTable) and len(it) == 1:
