@@ -13,15 +13,14 @@ return function(G, fnames, libnames, opts)
 	--   [env]   something about the mock itself (a missing data file)
 	--   [stub]  a permissive stand-in handed out where the mock cannot know Roblox's answer
 	--   [script] what the script itself said or asked for (print / warn texts, undefined globals)
-	-- [stub] and [script] lines are kept in P.notes and written at the end of the run (harness.lua);
-	-- with P.live set (calls=1) they are also written as they happen.
-	-- P: the mock's own bookkeeping, kept in ONE field so that it stays out of the script's globals
-	-- (harness.lua copies every other field of M into them).
-	local P = { notes = {}, live = false, counts = {} }
+	-- [stub] lines and the undefined globals are kept in P.notes and written at the end of the run (harness.lua;
+	-- with P.live set, calls=1, as they happen); print / warn texts are written when they are said (now = true).
+	-- P: the mock's own bookkeeping, in ONE field so that it stays out of the script's globals (harness.lua).
+	local P = { notes = {}, live = false, counts = {}, full = false }
 	M.priv = P
 	local noted = {}
 	local ewrite = G.ewrite
-	local function note(tag, text)
+	local function note(tag, text, now)
 		local line = "[" .. tag .. "] " .. text
 		if noted[line] then
 			P.counts[line] += 1
@@ -29,8 +28,13 @@ return function(G, fnames, libnames, opts)
 		end
 		noted[line] = true
 		P.counts[line] = 1
-		if #P.notes < 400 then P.notes[#P.notes + 1] = line end
-		if ewrite and (tag == "env" or P.live) then ewrite(line .. "\n") end
+		if #P.notes < 400 then
+			P.notes[#P.notes + 1] = line
+		elseif now then      -- a script that prints without end: one last line, then silence
+			if P.full then return end
+			line, P.full = "[script] ... more print / warn lines that are not shown", true
+		end
+		if ewrite and (tag == "env" or P.live or now) then ewrite(line .. "\n") end
 	end
 	P.note = note
 	-- Every metatable the mock gives an object, by object: mock metatables are locked like the
@@ -1028,6 +1032,110 @@ return function(G, fnames, libnames, opts)
 				(tonumber(string.sub(hex, 5, 6), 16) or 0) / 255)
 		end))
 		M.Color3 = L
+	end
+	-- DateTime: a point in time with millisecond resolution (documented datatype; a key-system loader
+	-- compares DateTime.now().UnixTimestamp with numbers).  Constructors, the two properties, ToUniversalTime,
+	-- ToIsoDate and the numeric format tokens follow the documentation.  Not verified against the engine:
+	-- tostring(), the error texts, range checks; local time is taken as UTC; month and day names are English.
+	do
+		local DTMT = {}
+		local function datetime(ms)
+			ms = math.floor(ms)
+			local t = setmetatable({ UnixTimestamp = ms // 1000, UnixTimestampMillis = ms }, DTMT)
+			typeNames[t] = "DateTime"
+			return t
+		end
+		local function civil(ms)        -- -> year, month, day, hour, minute, second, millisecond, weekday (0 = Sunday)
+			local days, rest = ms // 86400000, ms % 86400000
+			local z = days + 719468
+			local era = z // 146097
+			local doe = z - era * 146097
+			local yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+			local doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+			local mp = (5 * doy + 2) // 153
+			local d, m = doy - (153 * mp + 2) // 5 + 1, mp < 10 and mp + 3 or mp - 9
+			return yoe + era * 400 + (m <= 2 and 1 or 0), m, d, rest // 3600000, rest // 60000 % 60, rest // 1000 % 60, rest % 1000,
+				(days + 4) % 7
+		end
+		local function fromCivil(y, m, d, h, mi, sec, ms)
+			y, m, d = y or 1970, m or 1, d or 1
+			if m <= 2 then y -= 1 end
+			local era = y // 400
+			local yoe = y - era * 400
+			local doy = (153 * (m > 2 and m - 3 or m + 9) + 2) // 5 + d - 1
+			local days = era * 146097 + yoe * 365 + yoe // 4 - yoe // 100 + doy - 719468
+			return datetime(days * 86400000 + (h or 0) * 3600000 + (mi or 0) * 60000 + (sec or 0) * 1000 + (ms or 0))
+		end
+		local months = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+			"November", "December" }
+		local weekdays = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" }
+		local function fields(self)
+			if typeNames[self] ~= "DateTime" then error("Expected ':' not '.' calling member function ToUniversalTime", 3) end
+			local y, m, d, h, mi, sec, ms = civil(self.UnixTimestampMillis)
+			return { Year = y, Month = m, Day = d, Hour = h, Minute = mi, Second = sec, Millisecond = ms }
+		end
+		local function format(self, fmt)
+			if typeNames[self] ~= "DateTime" then error("Expected ':' not '.' calling member function FormatUniversalTime", 3) end
+			if rawType(fmt) ~= "string" then error("Argument 1 missing or nil", 3) end
+			local y, m, d, h, mi, sec, ms, wd = civil(self.UnixTimestampMillis)
+			local h12 = (h + 11) % 12 + 1
+			local tokens = { YYYY = string.format("%04d", y), YY = string.format("%02d", y % 100), MMMM = months[m],
+				MMM = string.sub(months[m], 1, 3), MM = string.format("%02d", m), M = tostring(m), DD = string.format("%02d", d),
+				D = tostring(d), dddd = weekdays[wd + 1], ddd = string.sub(weekdays[wd + 1], 1, 3), HH = string.format("%02d", h),
+				H = tostring(h), hh = string.format("%02d", h12), h = tostring(h12), mm = string.format("%02d", mi), m = tostring(mi),
+				ss = string.format("%02d", sec), s = tostring(sec), SSS = string.format("%03d", ms), A = h < 12 and "AM" or "PM",
+				a = h < 12 and "am" or "pm" }
+			return (string.gsub(fmt, "%a+", function(word)
+				if tokens[word] then return tokens[word] end
+				if string.match(word, "^[YMDdHhmsSAaLlTZzQWwEeGgkXx]+$") then
+					note("env", "DateTime format token '" .. word .. "' is not modelled: left as it is")
+				end
+				return word
+			end))
+		end
+		DTMT.__index = { ToUniversalTime = fields, ToLocalTime = fields, FormatUniversalTime = format, FormatLocalTime = format,
+			ToIsoDate = function(self)
+				if typeNames[self] ~= "DateTime" then error("Expected ':' not '.' calling member function ToIsoDate", 2) end
+				local y, m, d, h, mi, sec = civil(self.UnixTimestampMillis)
+				return string.format("%04d-%02d-%02dT%02d:%02d:%02dZ", y, m, d, h, mi, sec)
+			end }
+		DTMT.__eq = function(a, b) return a.UnixTimestampMillis == b.UnixTimestampMillis end
+		DTMT.__tostring = function(a) return tostring(a.UnixTimestampMillis) end
+		local L = lib("DateTime")
+		local t0, c0 = os.time(), os.clock()
+		rawset(L, "now", named("DateTime.now", function() return datetime((t0 + (os.clock() - c0)) * 1000) end))
+		local function num(v, i, fname)
+			if rawType(v) ~= "number" then
+				error("invalid argument #" .. i .. " to '" .. fname .. "' (number expected, got " .. rawTypeof(v) .. ")", 3)
+			end
+			return v
+		end
+		rawset(L, "fromUnixTimestamp", named("DateTime.fromUnixTimestamp", function(sec)
+			return datetime(num(sec, 1, "fromUnixTimestamp") * 1000)
+		end))
+		rawset(L, "fromUnixTimestampMillis", named("DateTime.fromUnixTimestampMillis", function(ms)
+			return datetime(num(ms, 1, "fromUnixTimestampMillis"))
+		end))
+		rawset(L, "fromUniversalTime", named("DateTime.fromUniversalTime", fromCivil))
+		rawset(L, "fromLocalTime", named("DateTime.fromLocalTime", fromCivil))
+		rawset(L, "fromIsoDate", named("DateTime.fromIsoDate", function(text)
+			if rawType(text) ~= "string" then return nil end
+			local y, m, d, rest = string.match(text, "^(%d%d%d%d)%-(%d%d)%-(%d%d)(.*)$")
+			if not y then return nil end
+			local h, mi, sec, frac, zone = 0, 0, 0, "", ""
+			if rest ~= "" then
+				h, mi, sec, frac, zone = string.match(rest, "^T(%d%d):(%d%d):(%d%d)(%.?%d*)(.*)$")
+				if not h then return nil end
+			end
+			local shift = 0
+			local sign, zh, zm = string.match(zone, "^([+-])(%d%d):?(%d%d)$")
+			if sign then shift = (tonumber(zh) * 60 + tonumber(zm)) * (sign == "+" and -60000 or 60000)
+			elseif zone ~= "" and zone ~= "Z" then return nil end
+			local dt = fromCivil(tonumber(y), tonumber(m), tonumber(d), tonumber(h), tonumber(mi), tonumber(sec),
+				frac ~= "" and frac ~= "." and math.floor(tonumber("0" .. frac) * 1000 + 0.5) or 0)
+			return datetime(dt.UnixTimestampMillis + shift)
+		end))
+		M.DateTime = L
 	end
 	do
 		local L = lib("UDim")
@@ -2081,14 +2189,14 @@ return function(G, fnames, libnames, opts)
 				parts[i] = okt and rawType(text) == "string" and text or "?"
 			end
 			local text = string.gsub(string.sub(table.concat(parts, " ", 1, n), 1, 300), "[%c]", " ")
-			note("script", kind .. ": " .. text)
+			note("script", kind .. ": " .. text, true)
 		end
 	end
 	M.warn = named("warn", said("warn"))
 	M.print = named("print", said("print"))
 	-- What was noted during the run and not written yet, for the end of the run (harness.lua):
-	-- the script's own output in order, then one line each for the undefined globals it read and
-	-- for the permissive stand-ins it was given.
+	-- how often the script said a line it said more than once, then one line each for the undefined
+	-- globals it read and for the permissive stand-ins it was given.
 	P.flush = function()
 		if not ewrite then return end
 		local globals, stubs, nsaid = {}, {}, 0
@@ -2100,14 +2208,14 @@ return function(G, fnames, libnames, opts)
 				globals[#globals + 1] = g
 			elseif st then
 				stubs[#stubs + 1] = st
-			elseif string.sub(line, 1, 8) == "[script]" then
+			elseif string.sub(line, 1, 8) == "[script]" and P.counts[line] > 1 then
 				nsaid += 1
-				if nsaid <= 60 and not P.live then
-					ewrite(line .. (P.counts[line] > 1 and "  (x" .. P.counts[line] .. ")" or "") .. "\n")
+				if nsaid <= 60 then
+					ewrite("[script] said " .. P.counts[line] .. " times: " .. string.sub(line, 10) .. "\n")
 				end
 			end
 		end
-		if nsaid > 60 then ewrite("[script] ... " .. (nsaid - 60) .. " more print / warn lines\n") end
+		if nsaid > 60 then ewrite("[script] ... " .. (nsaid - 60) .. " more repeated print / warn lines\n") end
 		local function list(t)
 			local more = #t > 40 and (", ... " .. (#t - 40) .. " more") or ""
 			return table.concat(t, ", ", 1, math.min(#t, 40)) .. more

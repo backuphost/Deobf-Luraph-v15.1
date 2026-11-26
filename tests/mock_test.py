@@ -245,10 +245,34 @@ show("below", debug.info(2, "l"))
         self.assertEqual(got.get('signal'), 'suspended')
         self.assertEqual(got.get('below'), '')          # the chunk is the bottom of the stack, as in Roblox
 
+    def test_datetime(self):
+        # documented datatype; 2020-01-02T10:30:45Z is the documentation's own example (1577961045 s)
+        got, log = run('''
+local d = DateTime.fromUniversalTime(2020, 1, 2, 10, 30, 45, 250)
+show("type", typeof(d), typeof(DateTime.now()), type(DateTime))
+show("stamp", d.UnixTimestamp, d.UnixTimestampMillis, d:ToIsoDate())
+local u = d:ToUniversalTime()
+show("fields", u.Year, u.Month, u.Day, u.Hour, u.Minute, u.Second, u.Millisecond)
+show("epoch", DateTime.fromUnixTimestamp(0):ToIsoDate(), DateTime.fromUnixTimestampMillis(951782400000):ToIsoDate())
+show("iso", DateTime.fromIsoDate("2020-01-02T10:30:45Z").UnixTimestamp, DateTime.fromIsoDate("2020-01-02T10:30:45+01:00").UnixTimestamp,
+	DateTime.fromIsoDate("2020-01-02").UnixTimestamp, DateTime.fromIsoDate("yesterday"))
+show("format", d:FormatUniversalTime("YYYY-MM-DD HH:mm:ss", "en-us"), d:FormatUniversalTime("MMM D, YYYY h:mm A", "en-us"), d:FormatUniversalTime("dddd", "en-us"))
+show("now", math.abs(DateTime.now().UnixTimestamp - os.time()) <= 2, DateTime.now().UnixTimestamp < 4102444800, d == DateTime.fromUnixTimestampMillis(1577961045250))
+''')
+        self.assertEqual(got.get('type'), 'DateTime|DateTime|table', log)
+        self.assertEqual(got.get('stamp'), '1577961045|1577961045250|2020-01-02T10:30:45Z')
+        self.assertEqual(got.get('fields'), '2020|1|2|10|30|45|250')
+        self.assertEqual(got.get('epoch'), '1970-01-01T00:00:00Z|2000-02-29T00:00:00Z')
+        self.assertEqual(got.get('iso'), '1577961045|1577957445|1577923200|nil')
+        self.assertEqual(got.get('format'), '2020-01-02 10:30:45|Jan 2, 2020 10:30 AM|Thursday')
+        self.assertEqual(got.get('now'), 'true|true|true')
+        self.assertNotIn('[stub]', log)
+
     def test_script_output_is_logged(self):
         _, log = run('print("hello", 1, nil)\nwarn("careful")\nprint("hello", 1, nil)')
-        self.assertIn('[script] print: hello 1 nil  (x2)', log)
-        self.assertIn('[script] warn: careful', log)
+        # (written when said, so that a run that is stopped from outside has them; repeats are counted at the end)
+        self.assertEqual([l for l in log.split('\n') if l.startswith('[script]')],
+                         ['[script] print: hello 1 nil', '[script] warn: careful', '[script] said 2 times: print: hello 1 nil'])
 
 
 @unittest.skipUnless(LUAU, 'needs bin/luau')
