@@ -23,8 +23,6 @@ otherwise).  Files are picked at run time by directory and size, never by name:
   init, and the report has its `result:` line.
 """
 import os
-import re
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -209,8 +207,9 @@ def smallest(version, pred, limit=40):
 
 
 def plain_vm(text):
-    """A plain (not compressed) Luau-target VM file: it holds its dispatch loop itself."""
-    if re.search(r'\bgoto\b|>>|<<', text) or len(text) < 20000:
+    """A plain (not compressed) Luau-target VM file: it holds its dispatch loop itself.
+    (count_heads is 0 for a text the tokenizer cannot read, e.g. a Lua 5.3 build.)"""
+    if len(text) < 20000:
         return False
     return normalize.count_heads(text) > 0
 
