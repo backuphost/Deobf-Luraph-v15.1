@@ -17,14 +17,18 @@ hands it to the engine that can recover it:
 | Luraph **v14.0 - v14.9** (the whole script runs on Luraph's VM) | `devm` (devirtualizer) | the VM runs Luraph's own start-up program in the mock environment until it hands the script's program over; that program is lifted to Luau. The script itself is not run. |
 | Luraph **v15.0** | `deobf` first (dynamic engine), then `devm` | the script as Luau, lifted from a traced run |
 | Luraph script whose code runs on the VM (v15.1, **v15.2**) | `devm` (devirtualizer) | the script as Luau: control flow, strings, calls, closures. Local names are re-derived from use (protection discards them). Ends with a report of what, if anything, is left unrecovered. |
-| Luraph script that kept its code as plain Lua inside the VM object ("form A") | static extraction (`deob.py` itself) | those functions cut out, formatted and renamed. Every step is checked: formatting must keep the token stream, renaming must keep the syntax tree up to local names. |
+| Luraph script that kept some of its code as plain Lua inside the VM object ("form A") | static extraction (`deob.py` itself), then `devm` | the static path cuts those functions out, formats and renames them (every step is checked: formatting must keep the token stream, renaming must keep the syntax tree up to local names). The script's main flow still runs on the VM, so the file then goes to the engines like a VM script; the static extraction is the result only when no engine recovers the script, and it is reported **partial**. |
 | IronBrew1, or anything else | `deobf` (dynamic engine) | IronBrew1: devirtualized Luau. Unknown obfuscators: a behaviour trace on request (`--engine trace`). |
 
 If `devm` gives up on a Luraph script, the second, independent Luraph lifter in `deobf/` is tried
 before anything is reported as failed.
 
 Nothing here contacts the network and nothing touches Roblox. Scripts are run only inside mock
-environments (`devm/harness.lua` + `rbxmock.lua`, `deobf/envlog.luau`, `luasandbox.py`).
+environments (`devm/harness.lua` + `rbxmock.lua`, `deobf/envlog.luau`, `luasandbox.py`). In
+`devm`'s mock the script never gets the interpreter's own file and log functions: `readfile` /
+`writefile` are the mock's empty, read-only stand-ins in executor mode and absent otherwise, as in
+Roblox, and whatever the script prints or logs is a `[script]` line of the run's log, never a line
+the tool would read as its own.
 
 ## Setup
 
@@ -46,7 +50,7 @@ in the repository. `LUAU_BIN` / `LUAU_AST_BIN` point the tools at binaries kept 
 
 ```bash
 python3 deob.py INPUT [-o OUT]              # automatic
-python3 deob.py INPUT --engine static       # only unwrap + static extraction (fast, never runs the VM)
+python3 deob.py INPUT --engine static       # only unwrap + static extraction (fast, never starts an engine)
 python3 deob.py INPUT --engine devm         # force the devirtualizer
 python3 deob.py INPUT --engine deobf        # force the dynamic engine (its Luraph v15 lifter, IronBrew1)
 python3 deob.py INPUT --engine trace        # behaviour trace only (what the script did in the mock)
@@ -59,7 +63,10 @@ Other options: `--work DIR` keeps intermediate files (the unwrapped VM chunk and
 the engines' dumps), `--timeout S` (per engine, default 3600; on timeout, Ctrl-C or SIGTERM the
 engine and everything it started is stopped), `--engine-args "..."` passes options through to the engine
 (for example `--engine-args "--http-map replies.txt"` for `devm`, see below), `--no-run` forbids
-every step that executes the input (the container then stays closed and no engine is started).
+every step that executes the input: a container is opened only by the static decoder (never in
+the sandbox), the old dynamic paths of the static tool (bytecode capture, the "form C" capture
+harness) are skipped, no engine is started, and `--engine devm|deobf|trace --no-run` is refused
+(exit 1), since every engine runs the input in its mock environment.
 `python3 deob.py -h` lists the options of the static path.
 
 An input that is not recognised as the output of a known obfuscator is **not executed**; the tool
@@ -70,14 +77,14 @@ Exit status:
 | Code | Meaning |
 |---|---|
 | 0 | complete result written: the engine reports nothing missing (see "Limits" for what that does and does not mean) |
-| 6 | result written, but **partial**: the report that was printed says what is missing (unlifted code, a run that stopped early, only a behaviour trace, a result that does not parse) |
-| 4 | a VM-only script and no engine produced a result (or `--engine static` on such a script); the last lines are the engines' own reasons |
+| 6 | result written, but **partial**: the last line (`result: PARTIAL: ...`) and the report before it say what is missing (unlifted code, a run that stopped early, only a behaviour trace, a result that does not parse, or only the functions a form-A script kept as plain Lua while its main flow runs on the VM: with `--engine static` / `--no-run`, or when no engine recovered the script) |
+| 4 | a VM-only script and no engine produced a result (or `--engine static` / `--no-run` on such a script); the last lines are the engines' own reasons |
 | 8 | Luraph, but it cannot be processed as given: cut-off or edited text, a payload that does not decode, a build for Lua 5.3/5.4 or LuaJIT, a VM chunk without its data; the last line says what and where |
 | 3 | static result written, but it failed its own syntax check |
 | 2 | not Luraph (another obfuscator behind a Luraph header, an imitation, an empty file), or nothing recognised; the reason is the last line; nothing was run |
-| 1 | error (file or interpreter missing, engine crashed without a result) |
+| 1 | error (file or interpreter missing, engine crashed without a result), or `--engine devm/deobf/trace` together with `--no-run` |
 | 5 | the interpreter binary in `bin/` is for another CPU: run `./setup.sh` |
-| 7 | "form C" capture harness written (old static path, see `docs/static-tool.zh-CN.md`) |
+| 7 | "form C" capture harness written and run (old static path, see `docs/static-tool.zh-CN.md`; never with `--no-run`) |
 
 Each engine can also be run on its own: `python3 -m devm.run`, `python3 deobf/deob.py`.
 

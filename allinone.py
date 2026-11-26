@@ -19,7 +19,10 @@ cut down to its last line).  A result is judged before it is reported: the engin
 
 Which engines, in which order (engine_order): a v14 VM goes to devm only; v15.0 to deobf first,
 then devm; everything else to devm, then deobf.  When no engine produced a result the exit code
-is 4 and the last lines are the engines' own reasons (`devm: <stage>: <reason>`).
+is 4 and the last lines are the engines' own reasons (`devm: <stage>: <reason>`).  A form-A file
+that also has dispatch loops (its main flow runs on the VM) goes to the engines the same way; the
+static extraction is then only the fallback, reported PARTIAL (exit 6) when no engine lifts the
+script.
 
 Direct use, for a single engine:
 

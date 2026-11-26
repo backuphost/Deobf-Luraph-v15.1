@@ -40,6 +40,11 @@ Luraph v15.1 的常见形态是：
 脚本被整体虚拟化时（Luraph v15.2 的常见形态：容器里解出来的只有 VM 本体，没有明文业务
 函数），静态提取到剥壳为止：默认（--engine auto）接着自动交给去虚拟化器 devm；
 --engine static 时只说明情况并给出 `python3 -m devm.run` 的命令，退出码 4。
+形态 A（明文函数）的文件里还有 VM 分派循环时，主流程仍在 VM 里：静态结果只是一部分，退出码 6，
+最后一行 `result: PARTIAL: only the functions kept as plain Lua; the virtualized main flow is not in the
+output (static)`（--engine static / --no-run）；默认模式下文件交给引擎，静态结果只在没有引擎还原出
+脚本时作为结果（同样记为 PARTIAL）。--no-run：任何会执行输入的步骤都不做（沙箱剥容器、形态 B / C
+的动态路径、引擎）。
 
 识别（[2a]，libs/lphfront.py，只看 token，不执行）
 ----
@@ -2172,7 +2177,9 @@ def main():
                     help="被判为 VM 分派器的大函数也导出（排在最后，逐段标注为分派器）；"
                          "判定依据是结构：函数的大半是解释器分派循环")
     ap.add_argument("--no-run", action="store_true",
-                    help="完全不执行输入：跳过 [2b] 剥容器（那一步在沙箱里运行容器代码）")
+                    help="完全不执行输入：容器只用静态解码器打开（不进沙箱），跳过形态 B / C 的动态路径，不启动引擎；"
+                         "与 --engine devm/deobf/trace 同用时拒绝（退出码 1）/ never execute the input: containers "
+                         "are opened by the static decoder only, the dynamic paths are skipped, no engine is started")
     ap.add_argument("--vm-report", action="store_true",
                     help="形态 C（内联 VM）时导出 vm_anatomy.md 解剖报告")
     ap.add_argument("--work", help="保存剥壳得到的 VM chunk / 数据 buffer 的目录"
