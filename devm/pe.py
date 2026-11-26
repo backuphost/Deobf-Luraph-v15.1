@@ -1378,6 +1378,8 @@ class PE:
         if obj is VARARG_TBL:
             if isinstance(key, int):
                 return Sym(('arg', key))
+            if key == 'n':
+                return LinSym('args', 0)
             raise PEError('vararg table index %r' % (key,))
         if isinstance(obj, PackedTbl):
             if isinstance(key, int):
@@ -1742,6 +1744,9 @@ class PE:
             if isinstance(t, PackedTbl) and len(args) == 3 and args[1] == 1 and isinstance(args[2], LinSym) \
                     and args[2].id == t.id and args[2].k == 0:
                 return [MultiTail(t.id)]
+            if t is VARARG_TBL and len(args) == 3 and args[1] == 1 and isinstance(args[2], LinSym) \
+                    and args[2].id == 'args' and args[2].k == 0:
+                return [MultiTail('args')]
             if isinstance(t, LuaTable) and not sym:
                 a = args[1] if len(args) > 1 and args[1] is not None else 1
                 b = args[2] if len(args) > 2 and args[2] is not None else t.length()
@@ -2270,15 +2275,17 @@ class PE:
         for j, e in enumerate(exprs):
             if j == i:
                 call = _unparen(e)
-                f = None
+                f = self.eval1(call[1], scope)
+                failed = False
                 try:
-                    f = self.eval1(call[1], scope)
                     v = self.eval1(e, scope)
-                except PEError:
+                except PEError as ex:
+                    # (only a helper the evaluator cannot run; anything else is a real error)
+                    if not (isinstance(f, LFn) and str(ex).startswith('call of ')):
+                        raise
+                    failed = True
                     v = None
-                if v is not REGS:
-                    if not (v is None or (isinstance(v, LuaTable) and v.fresh)):
-                        return False        # not an allocation after all
+                if failed or (isinstance(v, LuaTable) and v.fresh and isinstance(f, LFn)):
                     if isinstance(f, LFn) and f.func is not None:
                         self.alloc_funcs.add(id(f.func))
                     try:
