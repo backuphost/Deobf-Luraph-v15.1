@@ -1228,6 +1228,12 @@ class PE:
     def setvar(self, scope, name, v):
         s = scope.lookup(name)
         if s is None:
+            if self.model.oneline and self.inject is not None and not self.seeking and not self.lazy_depth \
+                    and not isinstance(v, (LinSym, MultiTail)):
+                # a handler that assigns a free name: Luraph compiled this assignment of a global of
+                # the script into the interpreter itself (reads of such names: see getvar)
+                self.emit(('set', ('global', name), self.atom(v)))
+                return
             raise PEError('assignment to unbound name %s' % name)
         if s.owner == self.cur_interp.func.id and (name in self.fvars or name in self.fstack) \
                 and (self.state_scopes is None or id(s) in self.state_scopes):

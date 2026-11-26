@@ -320,12 +320,16 @@ def _pass(text):
                     nm = [re.match(r'^Name = %s,$' % STR, x.strip()) for x in lines[i + 1:end]]
                     nm = [x.group(1) for x in nm if x]
                     cls = m2.group(2)
-                    base = camel(nm[0]) if nm else camel(cls)
+                    base = camel(nm[0]) if nm else None
+                    if not base:
+                        # (no Name, or one that gives no identifier: an empty string, punctuation)
+                        nm, base = [], camel(cls)
                     if nm and cls.lower() not in base.lower() and not base.lower().endswith(('button', 'label', 'frame')):
                         short = {'TextLabel': 'Label', 'TextButton': 'Button', 'ImageLabel': 'Image',
                                  'ScrollingFrame': 'Scroll', 'ScreenGui': 'Gui', 'TextBox': 'Box'}.get(cls, cls)
                         base += short
-                    claim(m.group(1), base)
+                    if base:
+                        claim(m.group(1), base)
             elif rhs == '{':
                 end = _block(lines, i)
                 fields = [re.match(r'^(\w+) = (.+?),?$', x.strip()) for x in lines[i + 1:end] if _indent(x) == ind + 1]
