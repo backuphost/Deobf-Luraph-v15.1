@@ -816,7 +816,9 @@ def split_block(stmts, room):
     k = best[1]
     hoisted = {nm for nm, f in first.items() if f < k <= last.get(nm, f)}
     room2 = room - len(hoisted)
-    pre = sorted(hoisted, key=lambda nm: first[nm])
+    # (in declaration order; `first` was filled in that order. Sorting the set
+    # left names of one statement in hash order: different in every process)
+    pre = [nm for nm in first if nm in hoisted]
     out = [CG.LocalS(pre[j:j + 10], None) for j in range(0, len(pre), 10)]
     out.append(DoBlock(fit_locals(_unlocalize(stmts[:k], hoisted), room2)))
     return out + fit_locals(stmts[k:], room2)
@@ -876,6 +878,19 @@ def wrap_segments(stmts, room, chunk=None, dry=False):
             if k < len(life):
                 hoisted.add(life[k][1])
                 k += 1
+    if hoisted:
+        # the batches take more than needed: a hoisted name whose uses all lie
+        # in the segment that declares it closes nothing. Back in place (the
+        # cuts stay where they are; fewer names are active outside)
+        seg_end = {}
+        for a, b, _ in segs:
+            for i in range(a, b):
+                seg_end[i] = b
+        needed = {nm for i, names in enumerate(decl_at) for nm in names
+                  if nm in hoisted and last.get(nm, i) >= seg_end[i]}
+        if needed != hoisted:
+            hoisted = needed
+            segs = _segments(stmts, decl_at, last, hoisted)
     if dry:
         # (no changes made) an upper bound of the locals active at once afterwards
         def wraps(a, b, c):
@@ -883,19 +898,24 @@ def wrap_segments(stmts, room, chunk=None, dry=False):
         inner = [c for a, b, c in segs if wraps(a, b, c)]
         return len(hoisted) + sum(c for a, b, c in segs if not wraps(a, b, c)) + max(inner, default=0)
     rest = {}   # un-localized `local a, b = f()` -> its targets that stay put
+    bare = {}   # `local a, b` -> its names before the hoisted ones were taken out
+    unloc = set()
     if hoisted:
         # only hoist what actually lets a segment close; keep the rest in place
         for st in stmts:
             if isinstance(st, CG.LocalS):
+                bare[id(st)] = list(st.names)
                 st.names = [x for x in st.names if x not in hoisted]
             elif isinstance(st, CG.AssignS) and getattr(st, "is_local", False) and \
                     any(isinstance(t, CG.LocalName) and t.name in hoisted for t in st.targets):
                 st.is_local = False
+                unloc.add(id(st))
                 keep = [t.name for t in st.targets if isinstance(t, CG.LocalName) and t.name not in hoisted]
                 if keep:
                     rest[id(st)] = keep
     for min_cnt in (2, 1):
         out = []
+        back = []       # statements of segments left open: they get their declarations back
         for a, b, cnt in segs:
             seg = []
             for st in stmts[a:b]:
@@ -904,15 +924,29 @@ def wrap_segments(stmts, room, chunk=None, dry=False):
                 if id(st) in rest:
                     seg.append(CG.LocalS(rest[id(st)], None))
                 seg.append(st)
-            pre = [nm for i in range(a, b) for nm in decl_at[i] if nm in hoisted]
-            for j in range(0, len(pre), 10):
-                out.append(CG.LocalS(pre[j:j + 10], None))
             if cnt >= min_cnt and 1 < len(seg) and (b - a) < n:
+                pre = [nm for i in range(a, b) for nm in decl_at[i] if nm in hoisted]
+                for j in range(0, len(pre), 10):
+                    out.append(CG.LocalS(pre[j:j + 10], None))
                 out.append(DoBlock(seg))
-            else:
-                out += seg
-        if sum(len(declared_here(s_)) for s_ in out) <= room - 10:
+                continue
+            # a segment that stays open: nothing closes over its hoisted
+            # names, so they are declared where they were (`local x = v`,
+            # not `local x` in front and `x = v`)
+            for st in stmts[a:b]:
+                if isinstance(st, CG.LocalS):
+                    names = bare.get(id(st), st.names)
+                    if names:
+                        out.append(CG.LocalS(list(names), None))
+                    continue
+                out.append(st)
+                if id(st) in unloc:
+                    back.append(st)
+        late = sum(1 for st in back for t in st.targets if isinstance(t, CG.LocalName))
+        if sum(len(declared_here(s_)) for s_ in out) + late <= room - 10:
             break
+    for st in back:
+        st.is_local = True
     return out
 
 

@@ -21,6 +21,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import limits  # noqa: E402
 import luasym as S  # noqa: E402
 from luasym import Const, Reg, Pseudo, Global, Upval, Index, Bin, Un, TempVal, Vararg, ClosureExpr, Multi  # noqa: E402,F401
 
@@ -194,6 +195,9 @@ def merge_equivalent(entry, blocks, D):
                 cls[bid] = ids.setdefault(sig, len(ids))
             n = len(ids)
             while True:
+                # (one pass over all blocks per round, and as many rounds as
+                # the longest chain of copies: slow on a huge graph)
+                limits.check("lifting")
                 ids2 = {}
                 new = {}
                 for bid, b in blocks.items():

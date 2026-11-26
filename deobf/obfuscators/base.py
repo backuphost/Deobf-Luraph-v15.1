@@ -42,6 +42,11 @@ class Job:
                in output/); other intermediate files use the same base name
     debug      --debug: intermediate files stay in output/ and are announced
     obfuscator the plugin's label, e.g. "Luraph v15" (credit_header)
+    missing    what the result lacks, in words: deob.py ends with `result:
+               PARTIAL: <missing>` (or `result: complete` when this is empty).
+               A plugin adds to it with lacks(); a result that is the
+               behaviour trace is partial by nature (deob.py adds that)
+    run_status the traced run's status line (traceout.status_line)
     """
 
     def __init__(self, input_path, source, args, trace_path, debug, obfuscator=""):
@@ -52,6 +57,12 @@ class Job:
         self.trace_path = trace_path
         self.debug = debug
         self.obfuscator = obfuscator
+        self.missing = []
+        self.run_status = None
+
+    def lacks(self, what):
+        if what and what not in self.missing:
+            self.missing.append(what)
 
     def credit_header(self):
         """First lines of a result file: the credit and the detected obfuscator."""

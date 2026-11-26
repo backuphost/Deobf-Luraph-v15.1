@@ -15,6 +15,7 @@ import sys
 import time
 
 import harness
+import limits
 import traceout as trace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -170,12 +171,14 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     live harness (`live()` -> fetch function, while the long-lived harness
     made the current dump) the walks ask for them right away (a chain of
     constants, each needed to find the next, then takes one round instead
-    of one round per link)."""
+    of one round per link).
+    Returns what the lifted text lacks, in words (empty: a whole lift)."""
     from obfuscators.luraph_v15 import devirt
     args = job.args
     requested = set()
     last_bufs = ""
     text = None
+    unanswered = None   # why the constant rounds ended before their fixed point
     rounds = args.devirt_rounds
     # Intermediate rounds only need the constant requests and decrypted
     # strings, which come from walking each function: they skip the
@@ -187,6 +190,7 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     cache = devirt.WalkCache()
     t0 = time.time()
     for rnd in range(1, rounds + 1):
+        limits.check("lifting (constant round %d)" % rnd)
         t1 = time.time()
         full = not quick
         if quick:
@@ -216,6 +220,8 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
                 print("[*]   %d jumps of untaken paths into other code not followed (marked in the output)"
                       % stats["traps"], file=sys.stderr)
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
+                if new or not devirt.same_patches(last_bufs, bufs):
+                    unanswered = "the constant rounds ended after %d rounds with %d requests open" % (rnd, len(new))
                 break
             if quick:
                 print("[*]   the full lift needs more constants: continuing with full lifts", file=sys.stderr)
@@ -232,10 +238,12 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             print("[*]   constant run %.1fs (total %.0fs)" % (time.time() - t1, time.time() - t0), file=sys.stderr)
         if body is None:
             print("[!] constant request run failed: " + err[-500:], file=sys.stderr)
+            unanswered = "a constant request run failed: %d requests not answered" % len(new)
             break
         m = re.search(r"\x00PROTOS ([^\n]*)\n", body)
         if not m or m.group(1).startswith("error:"):
             print("[!] constant request run gave no protos", file=sys.stderr)
+            unanswered = "a constant request run gave no protos: %d requests not answered" % len(new)
             break
         with open(ppath, "w", encoding="utf-8", newline="\n") as f:
             f.write(m.group(1))
@@ -250,6 +258,18 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     header = (job.credit_header() +
               "-- Local names are inferred from use (the original names are not in the bytecode)\n")
     job.write(dpath, header + devirt.finish_text(text) + "\n")
+    missing = []
+    for key, what in (("errors", "unlifted blocks"), ("fallbacks", "unstructured jumps"),
+                      ("stubs", "functions not lifted"),
+                      ("traps", "jumps of untaken paths into other code not followed")):
+        if stats.get(key):
+            missing.append("%d %s" % (stats[key], what))
+    undecoded = text.count("--[[ constant not decoded ]]")
+    if undecoded:
+        missing.append("%d constants not decoded" % undecoded)
+    if unanswered:
+        missing.append(unanswered)
+    return missing
 
 
 def run(job):
@@ -285,6 +305,7 @@ def run(job):
     chunks = {}
     raw_chunks = {}     # key -> original source of a loadstring'd VM chunk (for devirt)
     body = None
+    prev = None         # the trace of the run before (kept when a rerun runs into the time limit)
     trapped = None      # (body, raw output) of the run that hit the last trap
     cfg = None
     for attempt in range(1, args.max_runs + 1):
@@ -313,12 +334,18 @@ def run(job):
             chunks = {k: patch_spin(v) for k, v in chunks.items()}
             cfg["spin"] = SPIN_CHECKS
             body, err = runner.run(patched, cfg, chunks)
+        if body is None and prev is not None and limits.expired():
+            # (the lift is cut short by the same limit; the trace stays a result)
+            print("[!] %s: keeping the trace of run %d" % (err, attempt - 1), file=sys.stderr)
+            body = prev
+            break
         if body is None:
             harness.save_raw(args.raw)
             runner.finish()
             sys.exit("[!] " + err)
         body = harness.take_p2d(body, cache_path, bridge is not None)
         found, body = harness.take_chunks(body)
+        prev = body
         added = 0
         nested = "nested" in shapes
         for key, src in found:
@@ -376,6 +403,10 @@ def run(job):
 
     notes = ["anti-tamper trap functions disabled: %s" % ", ".join("#%d" % p for p in skip)] if skip else []
     text = trace.header(job.input, notes) + body
+    # (said before the lift, which can fail or be cut short by the time limit)
+    status = trace.status_line(body, job)
+    lifted_lacks = None     # what a lifted text lacks (a list), None: no lifted text
+    failure = ["the run captured no VM functions"]      # why there is none
 
     def write_trace():
         job.write(job.trace_path, trace.render(text, args))
@@ -391,16 +422,32 @@ def run(job):
         ppath = job.path(".protos.json")
         if protos_json.startswith("error:"):
             print("[!] proto capture failed: " + protos_json, file=sys.stderr)
+            failure[0] = "the proto capture failed (%s)" % protos_json[:200]
         else:
             job.write(ppath, protos_json)
             if devirt_on:
                 # the lifter needs the original source of every VM chunk
                 chunk_paths = [job.write(job.path(".chunk_%s.luau" % key), src, encoding="latin-1")
                                for key, src in raw_chunks.items()]
-                lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths)
+                if "nested" not in shapes and not_reached(job, ppath, chunk_paths):
+                    if status != "finished":
+                        # Nothing of the script to lift: the lift would be
+                        # Luraph's start-up program, which is not the script.
+                        print("[!] the traced run stopped inside Luraph's start-up code, before the script's own "
+                              "code (%s): nothing of the script to lift" % status, file=sys.stderr)
+                        failure[0] = ("the traced run stopped in Luraph's start-up code, before the script's own "
+                                      "code (%s)" % status)
+                    else:
+                        lifted_lacks, failure[0] = lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath,
+                                                        chunk_paths)
+                        if lifted_lacks is not None:
+                            lifted_lacks.append("the script's main function was not identified: the output starts "
+                                                "with Luraph's start-up code")
+                else:
+                    lifted_lacks, failure[0] = lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath,
+                                                    chunk_paths)
     runner.finish()
-    trace.status_line(body)
-    if devirt_on and os.path.exists(dpath):
+    if devirt_on and lifted_lacks is not None and os.path.exists(dpath):
         # a lift full of calls to nil misread the VM: the trace is the better result
         with open(dpath, encoding="utf-8", errors="replace") as f:
             lifted = f.read()
@@ -410,29 +457,68 @@ def run(job):
         # trace has statements shows less than the trace does
         code = [ln for ln in lifted.split("\n") if ln.strip() and not ln.startswith("--")]
         stopped = bool(code) and code[-1].startswith('error("devirt: ') and len(code) < trace.stmt_count(body)
-        if not stopped and (nil_calls < 50 or nil_calls * 100 < lifted.count("\n")):
+        if not code:
+            # (a run that failed before the VM made its first closure: the
+            # "lift" of no function is the file header and nothing else)
+            print("[!] nothing was lifted: the traced run made no VM function (%s)" % status, file=sys.stderr)
+            job.lacks("nothing was lifted: the traced run made no VM function (%s)" % status)
+        elif not stopped and (nil_calls < 50 or nil_calls * 100 < lifted.count("\n")):
+            for what in lifted_lacks:
+                job.lacks(what)
+            if not trace.run_ended(status):
+                # (a run the tracer had to stop: a tamper response scrambles
+                # code, and what was dumped is then not the script's)
+                job.lacks("the traced run did not end (%s)" % status)
+            elif "nested" in shapes and status != "finished":
+                # (v15.2: one function holds Luraph's start-up code and the
+                # script, and its lift follows what the run executed: a run
+                # that stopped with an error did not show the rest)
+                job.lacks("the traced run stopped (%s): Luraph v15.2 code is recovered only as far as "
+                          "the run got" % status)
             return dpath
-        if stopped:
+        elif stopped:
             print("[!] the devirtualized output stops after %d lines (%s); the behaviour trace shows more: "
                   "writing it instead" % (len(code) - 1, code[-1][7:-2]), file=sys.stderr)
+            job.lacks("the lift stops on the main function's entry path (%s)" % code[-1][7:-2])
         else:
             print("[!] the devirtualized output is broken (%d calls of nil); writing the behaviour trace "
                   "instead" % nil_calls, file=sys.stderr)
+            job.lacks("the lift misread the VM (%d calls of nil)" % nil_calls)
         if not job.debug:
             os.remove(dpath)
         write_trace()
         return job.trace_path
     if devirt_on:
-        print("[!] devirtualization produced no output; writing the behaviour trace instead", file=sys.stderr)
+        print("[!] no devirtualized output; writing the behaviour trace instead", file=sys.stderr)
+        job.lacks(failure[0] or "the lift produced no output")
+        if not job.debug and os.path.exists(dpath):
+            os.remove(dpath)
         if not os.path.exists(job.trace_path):
             write_trace()
     return job.trace_path
 
 
+def not_reached(job, ppath, chunk_paths):
+    """True when the function the lift would start from is the program the
+    VM entered first, Luraph's own start-up program, and the run recorded no
+    function of it as the script's main function (devirt.script_not_reached)."""
+    from obfuscators.luraph_v15 import devirt
+    try:
+        return devirt.script_not_reached(job.source_path, ppath, chunk_paths)
+    except Exception as e:  # noqa: BLE001 - the lift itself reports what is wrong with the dump
+        if os.environ.get("DEVIRT_TB"):
+            import traceback
+            traceback.print_exc()
+        print("[!] could not tell the script's main function (%s: %s)" % (type(e).__name__, e), file=sys.stderr)
+        return False
+
+
 def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths):
     """devirtualize() with its constant rounds answered by one long-lived
     harness (started now, so the script runs while round 1 walks); a fresh
-    run per round if it fails or behaves differently."""
+    run per round if it fails or behaves differently.
+    Returns (what the lifted text lacks, None), or (None, why there is no
+    lifted text)."""
     args = job.args
     bridge = runner.bridge
     server = [None]
@@ -476,13 +562,16 @@ def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths)
             server[0] = None
         return runner.run(patched, c, chunks)
     try:
-        devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths, live)
+        return devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths, live), None
     except Exception as e:
         # never lose the run over a lifter bug: the trace is still a result
         print("[!] devirtualization failed: %s: %s" % (type(e).__name__, e), file=sys.stderr)
         if os.environ.get("DEVIRT_TB"):
             import traceback
             traceback.print_exc()
+        if isinstance(e, limits.TimeLimit):
+            return None, str(e)
+        return None, "the lift failed (%s: %s)" % (type(e).__name__, str(e)[:200])
     finally:
         if server[0] is not None:
             server[0].close()

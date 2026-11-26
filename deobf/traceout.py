@@ -46,7 +46,11 @@ def render(text, args, preamble=True):
         # the text tidy/fold get, markers included (for timing or diffing fold.py alone)
         with open(os.environ["DEOB_PRETIDY"], "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-    if not args.no_tidy:
+    import limits
+    if limits.expired():
+        # (the readability pass takes minutes on a long trace)
+        print("[!] time limit reached: the trace is written without the readability pass", file=sys.stderr)
+    elif not args.no_tidy:
         import tidy
         import spacing
         t = tidy.tidy(text, preamble=preamble and not args.keep_preamble, fold_code=not args.no_fold)
@@ -55,6 +59,28 @@ def render(text, args, preamble=True):
     return fold.strip_markers(text)
 
 
-def status_line(body):
+TRACE_HEADER = "-- Deobfuscated by deobf (dynamic trace)"
+
+
+def run_status(body):
+    """The run's status as envlog.luau reports it in the first line of the
+    trace: "finished", "script error: ...", "aborted: ...", "stopped in an
+    endless loop (truncated)", "Luraph anti-tamper triggered ..."."""
+    first = body.splitlines()[0] if body else ""
+    m = re.match(r"-- run status: (.*)", first)
+    return m.group(1).strip() if m else ""
+
+
+def run_ended(status):
+    """The script ran to its end, normally or by raising an error (as opposed
+    to a run the tracer stopped: an endless loop, the budget, a tamper trap)."""
+    return status == "finished" or status.startswith("script error:")
+
+
+def status_line(body, job=None):
+    """Print the run status; with a job, record it (job.run_status)."""
     status = body.splitlines()[0] if body else ""
     print("[*] " + status.lstrip("- "), file=sys.stderr)
+    if job is not None:
+        job.run_status = run_status(body)
+    return run_status(body)

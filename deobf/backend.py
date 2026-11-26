@@ -12,6 +12,8 @@ import os
 import sys
 import threading
 
+ABANDONED = [False]     # a lift thread was left running at the time limit (run_big_stack)
+
 
 def lower(entry_key, order, D, link, prefix, upnames, closure):
     """Luau lines of one function.
@@ -118,7 +120,12 @@ def finish_text(text):
 
 
 def run_big_stack(fn, *a):
-    """Deeply nested scripts need deep recursion: run in a thread with a big stack."""
+    """Deeply nested scripts need deep recursion: run in a thread with a big stack.
+    With a time limit (limits.py) the wait ends at the deadline with
+    limits.TimeLimit: the thread is left behind (a daemon: it cannot be
+    stopped, and ends with the process), so the caller can still write
+    what it has."""
+    import limits
     sys.setrecursionlimit(200000)
     threading.stack_size(256 * 1024 * 1024 - 4096)
     res = {}
@@ -128,9 +135,16 @@ def run_big_stack(fn, *a):
             res["v"] = fn(*a)
         except BaseException as ex:  # noqa: BLE001
             res["e"] = ex
-    t = threading.Thread(target=target)
+    t = threading.Thread(target=target, daemon=True)
     t.start()
-    t.join()
+    while True:
+        rest = limits.left()
+        t.join(None if rest is None else min(rest, 1.0) + 0.01)
+        if not t.is_alive():
+            break
+        if rest is not None and limits.expired():
+            ABANDONED[0] = True
+            raise limits.TimeLimit("time limit of %d s reached while lifting" % limits.LIMIT[0])
     if "e" in res:
         raise res["e"]
     return res.get("v")

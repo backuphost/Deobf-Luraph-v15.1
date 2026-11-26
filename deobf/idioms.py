@@ -532,8 +532,24 @@ def fold_single_use(body):
             ws[:] = [prev_st if w is st else w for w in ws]
         return True
 
+    def self_named(stmts):
+        """The tables of this block that a function stored into them names
+        (`local M = {}` + `function M.f() ... M.g() ... end`): such a function
+        was not written inside the constructor, so none of M's functions is
+        folded into it (as codegen.fold_tables)."""
+        named = set()
+        for st in stmts:
+            if isinstance(st, CG.AssignS) and len(st.targets) == 1 and isinstance(st.targets[0], CG.Index) \
+                    and isinstance(st.targets[0].obj, CG.LocalName) and len(st.values.items) == 1:
+                nm = st.targets[0].obj.name
+                if any(isinstance(x, CG.FuncE) and nm in getattr(x, "captures", ())
+                       for x in CG.walk(st.values.items[0])):
+                    named.add(nm)
+        return named
+
     def run(stmts):
         out = []
+        named = self_named(stmts)
         for st in stmts:
             for b in _sub_blocks(st):
                 b[:] = run(b)
@@ -557,6 +573,11 @@ def fold_single_use(body):
                             and isinstance(st.targets[0].obj, CG.LocalName)
                             and in_text(st.targets[0].obj.name)
                             and any(CG.has_side_effects(x) for x in st.values.items)) \
+                    and not (named and isinstance(st, CG.AssignS) and len(st.targets) == 1
+                             and isinstance(st.targets[0], CG.Index)
+                             and isinstance(st.targets[0].obj, CG.LocalName)
+                             and st.targets[0].obj.name in named
+                             and any(isinstance(x, CG.FuncE) for v in st.values.items for x in CG.walk(v))) \
                     and _fold_table_store(out[-1], st):
                 # bookkeeping: st's reads now happen in out[-1]; its read of x is gone
                 tname = st.targets[0].obj.name

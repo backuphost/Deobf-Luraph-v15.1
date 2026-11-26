@@ -31,6 +31,7 @@ if ROOT not in sys.path:
 
 from obfuscators.luraph_v15 import vmmap  # noqa: E402
 import backend  # noqa: E402
+import limits  # noqa: E402
 import luasym as S  # noqa: E402
 from luasym import (LTable, Builtin, LuaFunc, Buf, Unsupported, Expr, Const, Reg, Pseudo, Global,  # noqa: E402
                     Upval, Index, Bin, Un, IfExp, TempVal, Vararg, ClosureExpr, Multi, TempTail,
@@ -433,6 +434,11 @@ class OpaqueFn:
         self.node = None
         self.pf_tid = None      # a VM closure: table id of its proto
         self.mk_tid = None      # a v15.2 per-proto closure maker: table id of its proto key
+
+    def __repr__(self):
+        # (one object per function of the dump; no address: the text reaches
+        # the output in error markers and must be the same in every run)
+        return "<VM function lf%s>" % (self.lfid,)
 
 
 def operand_array(t):
@@ -871,6 +877,25 @@ WALK_RESTARTS = 64       # walks per function (each new jump register / carried 
                          # a stack VM finds its return-address slots one at a time)
 MAX_STACK_DEPTHS = 8     # stack VM: distinct stack depths per pc (see Program._walk)
 STACK_WALK_MAX = 30000   # stack VM: states per function before giving up on the carried stack pointer
+WALK_LIMIT = 400000      # states per function (a walk that reaches it is not lifted: WalkLimit)
+PACK_VARIANTS_MAX = 4    # sets of unread packs one state may be reached with (see Program._walk)
+WALK_NODES_MIN = 50000   # a walk above this many states AND above WALK_NODES_PER_PC states per
+WALK_NODES_PER_PC = 24   # instruction does not converge (measured on whole lifts: 1.3 per instruction)
+
+
+class WalkLimit(Unsupported):
+    """The walk of one function does not converge (its states multiply
+    without end) or ran into WALK_LIMIT: the function is not lifted."""
+
+
+_TEMP_VISIT = re.compile(r"\bT(-?\d+)_\d+_")
+
+
+def pack_site(text):
+    """fmt_expr() of a pack without the visit numbers of its call temps
+    (`T<pc>_<visit>_<n>`): the same for every walk state of the instruction
+    that made it."""
+    return _TEMP_VISIT.sub(r"T\1_", text)
 
 
 class ProtoLifter:
@@ -911,6 +936,7 @@ class ProtoLifter:
         self.pack_read = set()
         self.pack_unstable = set()   # (reg, text) packs left out of walk states (see Program._walk)
         self.pack_killed = set()     # (reg, text) unread packs overwritten somewhere
+        self.pack_sites = set()      # (reg, pack_site) left out of walk states whatever the visit
         self.ov = None          # overlay of the current run (child of the state's)
         self.ov_base = None
         self.in_prologue = False
@@ -996,6 +1022,10 @@ class ProtoLifter:
 
     def state_packs(self):
         """The unread packs carried into the next state."""
+        if self.pack_sites:
+            return tuple(sorted(((r, l) for r, l in self.packs.items() if r not in self.pack_read
+                                 and (r, fmt_expr(l)) not in self.pack_unstable
+                                 and (r, pack_site(fmt_expr(l))) not in self.pack_sites), key=lambda kv: kv[0]))
         return tuple(sorted(((r, l) for r, l in self.packs.items() if r not in self.pack_read
                              and (r, fmt_expr(l)) not in self.pack_unstable), key=lambda kv: kv[0]))
 
@@ -4445,6 +4475,8 @@ class Program:
         self.hot = hot = {work[0]} if cov else set()
         cold = []
         pack_sets = {}      # key without packs -> packs of its first state
+        pack_vars = {}      # key without packs -> every pack set it was reached with
+        pcs = set()         # (mode, pc) walked
         pending = set()     # new jump registers of a stack VM (one restart for all)
         depth_at = {}       # stack VM: (mode, pc) -> carried locals (the stack depth)
         hubs = set()        # stack VM: (mode, pc) of pop-and-jump instructions
@@ -4506,6 +4538,13 @@ class Program:
                     return s0, order, True
                 nodes[k] = node
                 order.append((k, node))
+                pcs.add(k[:2])
+                if len(order) > WALK_NODES_MIN and len(order) > WALK_NODES_PER_PC * len(pcs):
+                    # every instruction walked dozens of times over and ever
+                    # new states: no fixed point in sight (the node limit would
+                    # end it after minutes, with a graph nothing can structure)
+                    raise WalkLimit("the walk does not converge: %d states for %d instructions"
+                                    % (len(order), len(pcs)))
                 if os.environ.get("DEVIRT_ORDER"):
                     print("ORDER %d %s:%s sr=%s op=%s %s" % (len(order), s.mode, s.pc, s.sregs, lf.last_op,
                           getattr(node, "error", "") or ""), file=sys.stderr)
@@ -4516,6 +4555,8 @@ class Program:
             steps += 1
             if steps > limit * 20:
                 break
+            if not steps & 255:
+                limits.check("lifting")
             if lf.stack_base is not None and len(order) > STACK_WALK_MAX and getattr(st, "carry", None):
                 # a stack VM function whose states multiply (subroutine calls
                 # inlined per call site, counters on the stack): walk it the
@@ -4596,6 +4637,26 @@ class Program:
                         if os.environ.get("DEVIRT_ORDER"):
                             print("RESTART #5 at %s:%s jr=%s sr=%s" % (s.mode, s.pc, sorted(lf.jump_regs, key=repr), sorted(lf.state_regs, key=repr)), file=sys.stderr)
                         return s0, order, True
+                variants = pack_vars.setdefault(core, set())
+                if nk[5] not in variants:
+                    variants.add(nk[5])
+                    if len(variants) > PACK_VARIANTS_MAX:
+                        # One state reached with ever new unread packs: a call
+                        # result left in a register around a loop. Its temp is
+                        # named after the visit that made it, so every round
+                        # is a new state, whose call makes a new pack, and the
+                        # walk never ends (whole lifts: one pack set per
+                        # state). The packs that differ leave the walk states
+                        # by the instruction that made them (the register
+                        # still holds the table.pack), and the walk restarts.
+                        common = set.intersection(*[set(v) for v in variants])
+                        sites = {(r, pack_site(tx)) for v in variants for r, tx in v
+                                 if (r, tx) not in common} - lf.pack_sites
+                        if sites:
+                            lf.pack_sites |= sites
+                            if os.environ.get("DEVIRT_ORDER"):
+                                print("RESTART #7 at %s:%s packs=%s" % (s.mode, s.pc, sorted(sites)), file=sys.stderr)
+                            return s0, order, True
                 self.edges.setdefault(k, set()).add(nk)
                 if nk not in facts:
                     facts[nk] = nf
@@ -4730,7 +4791,7 @@ class FunctionLifter:
 
     def __init__(self, prog):
         self.prog = prog
-        self.stats = {"functions": 0, "errors": 0, "fallbacks": 0}
+        self.stats = {"functions": 0, "errors": 0, "fallbacks": 0, "stubs": 0}
         self.lifted = set()
 
     def lift(self, vm, vmobj, proto, upvals, upnames, depth=0):
@@ -4739,10 +4800,14 @@ class FunctionLifter:
         lf = ProtoLifter(vm, self.prog.dump, vmobj, proto, upvals, self.prog.globals)
         st = make_stepper(vm, lf)
         for _ in range(WALK_RESTARTS):
-            s0, order, restart = self.prog._walk(vm, lf, st, 400000)
+            s0, order, restart = self.prog._walk(vm, lf, st, WALK_LIMIT)
             if not restart:
                 break
         self.prog.requests |= lf.requests
+        if len(order) >= WALK_LIMIT:
+            # (cut off by the limit: a graph of that size with its open ends
+            # is not the function, and the back end would take hours over it)
+            raise WalkLimit("the walk was cut off at %d states" % len(order))
         walk = (self.prog.hot, self.prog.states)    # (frame_regs below walks other functions)
         if lf.reg_arrays:
             k0 = s0.key(vm.kstack_link)
@@ -4804,7 +4869,7 @@ class FunctionLifter:
             lf.walk_only = True
             st = make_stepper(cvm, lf)
             for _ in range(WALK_RESTARTS):
-                _, _, restart = self.prog._walk(cvm, lf, st, 400000)
+                _, _, restart = self.prog._walk(cvm, lf, st, WALK_LIMIT)
                 if not restart:
                     break
         except Unsupported:
@@ -4869,10 +4934,13 @@ class FunctionLifter:
                 params = self.params
             except Unsupported as ex:
                 lines = ["error(\"devirt: could not lift closure: %s\")" % str(ex).replace("\"", "'")]
+                self.stats["stubs"] += 1
             memo[ckey] = (lines, params)
         self.lifted.discard(id(proto))
         f = CG.FuncE(["function(%s)" % ", ".join(params)] + ["\t" + l for l in lines] + ["end"])
-        f.captures = set(upnames.values())
+        # (a list in upvalue order, not a set: variables.declare lists the names
+        # in this order, and a set's order differs from process to process)
+        f.captures = list(dict.fromkeys(upnames.values()))
         return f
 
 
@@ -4987,6 +5055,37 @@ def program_roots(prog):
     return [(tag, lst[0][1], lst[0][2]) for tag, lst in vms if tag == payload or loaders]
 
 
+def script_not_reached(source, protos_path, chunk_paths=()):
+    """True when lift_program would start from the program the VM entered
+    first (the first proto a closure was made of: Luraph's own start-up
+    program, which probes the environment, derives the keys and then calls
+    the script's main function) and the run recorded no function called by
+    it as the script's main function (`root_callee`): the run did not get
+    past the start-up code, or the script never touched the environment.
+    (Luraph v15.2 keeps start-up code and script in one function: its lifts
+    are judged by what the run covered, not by this.)"""
+    prog = Program(source, protos_path, chunk_paths)
+    if prog.dump.raw.get("root_callee") is not None:
+        return False
+    roots = program_roots(prog)
+    return bool(roots) and all((cap.get("__seq") or 0) == 1 for _, _, cap in roots)
+
+
+def chunk_lines(params, lines):
+    """The main function's lines as the chunk's top-level code. Its
+    parameters (variables.extract_params: names, then "..." when the rest
+    is read too) are the chunk's arguments."""
+    named = [p for p in params if p != "..."]
+    if not named:
+        return list(lines)      # (nothing, or only `...`: the chunk's own)
+    if len(named) == len(params):
+        return ["local %s = ..." % ", ".join(named)] + list(lines)
+    # names AND `...` for the rest: extract_params renumbered the vararg
+    # reads, and the chunk's own `...` starts at its first argument, so the
+    # code keeps its function
+    return ["return (function(%s)" % ", ".join(params)] + ["\t" + l for l in lines] + ["end)(...)"]
+
+
 def lift_program(source, protos_path, chunk_paths=(), fetch=None):
     """The root proto of every VM -> Luau text (plus stats and constant requests)."""
     prog = Program(source, protos_path, chunk_paths)
@@ -5025,9 +5124,7 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
         lines = fl.lift(vm, vmobj, proto, UpList(), {}, 0)
         if tag == payload and not loaders:
             out.append("")
-            if fl.params:
-                out.append("local %s = ..." % ", ".join(fl.params))
-            out += lines
+            out += chunk_lines(fl.params, lines)
             payload_pid = None
             continue
         out.append("local function vm_root_%s(%s)" % (pid, ", ".join(fl.params)))
@@ -5310,7 +5407,7 @@ def _walk_one(prog, vm, vmobj, proto, pkey):
         lf.walk_only = True
         st = make_stepper(vm, lf)
         for _ in range(WALK_RESTARTS):
-            s0, order, restart = prog._walk(vm, lf, st, 400000)
+            s0, order, restart = prog._walk(vm, lf, st, WALK_LIMIT)
             if not restart:
                 break
     except Unsupported:
