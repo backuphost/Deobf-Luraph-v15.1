@@ -234,6 +234,21 @@ class HubLine(unittest.TestCase):
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 57)))
 
 
+class MissingTarget(unittest.TestCase):
+    def test_jump_to_an_instruction_that_was_not_lifted(self):
+        """The control-flow graph of a function gets a marked stub where a jump leads to an instruction
+        the lifter did not produce (a KeyError in the structurer before: one such function among the
+        169 of a corpus script stopped the whole result)."""
+        from devm import ircfg
+        pir = lifter.ProtoIR(36)
+        n = lifter.Node((1, 1))
+        n.tree = ([('set', ('r', 1), ('k', 5))], ('br', ('r', 1), ([], ('goto', (1, 2), {})), ([], ('ret', [], None))))
+        pir.nodes[(1, 1)] = n
+        pir.entry = (1, 1)
+        cfg = ircfg.ProtoCFG(pir)
+        self.assertTrue(any(st[0] == 'error' for b in cfg.blocks.values() for st in b.stmts))
+
+
 class RootHint(unittest.TestCase):
     """The hint `the script is probably the first program; run again with --root N` is for a function
     on the second interpreter that is a helper of the build (arithmetic), not for a small script."""
