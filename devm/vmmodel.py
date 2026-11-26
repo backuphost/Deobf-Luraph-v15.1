@@ -34,11 +34,17 @@ def is_dispatch_loop(st, assigned=False):
     e = s0[2][0]
     if e[0] != 'index' or e[1][0] != 'name' or e[2][0] != 'name':
         return False
-    if body[1][0] == 'if':
+    if body[1][0] == 'if' or _outlined_test(body, s0):
         return True
     # one table per instruction (Luraph v14.0 - v14.2): local I = CODE[PC]; local OP = I[n]; PC = PC + 1; if
     # (normalize.normalise_heads writes every spelling of the head in this form)
-    if assigned or len(body) < 4 or len(s0[1]) != 1:
+    if assigned:
+        return False
+    return _insn_table_head(body, s0, e)
+
+
+def _insn_table_head(body, s0, e):
+    if len(body) < 4 or s0[0] != 'local' or len(s0[1]) != 1:
         return False
     s1, s2 = body[1], body[2]
     if s1[0] != 'local' or len(s1[1]) != 1 or len(s1[2]) != 1:
@@ -53,11 +59,31 @@ def is_dispatch_loop(st, assigned=False):
 
 def is_insn_table_loop(st):
     """True for a dispatch loop of the one-table-per-instruction form (see is_dispatch_loop)."""
-    return st[2][1][0] != 'if'
+    body = st[2]
+    return _insn_table_head(body, body[0], body[0][2][0])
 
 
+def _outlined_test(body, s0):
+    """`local OP = CODE[PC]; local T = OP >= 10; if T then ...`: the dispatch tree of an interpreter
+    whose tests are each computed into a local first (the second interpreter of the v15.1 corpus
+    builds; the first one of the same file has the usual form)."""
+    if len(body) < 3 or s0[0] != 'local':
+        return False
+    s1, s2 = body[1], body[2]
+    if s1[0] != 'local' or len(s1[1]) != 1 or len(s1[2]) != 1 or s2[0] != 'if' or not s2[1]:
+        return False
+    t = s1[2][0]
+    if t[0] != 'bin' or t[1] not in ('<', '<=', '>', '>=', '==', '~='):
+        return False
+    return ('name', s0[1][0]) in (t[2], t[3]) and s2[1][0][0] == ('name', s1[1][0])
+
+
+# the canonical heads (normalize.normalise_heads): `local OP = CODE[PC]; if`, the one-table-per-instruction
+# form `local I = CODE[PC]; local OP = I[n]; PC = PC + 1; if`, and the outlined first test
+# `local OP = CODE[PC]; local T = OP >= 10; if T`
 LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)(?:local\s+)?\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*'
-                          r'(?:local\s+\w+\s*=\s*\w+\[\w+\]\s*;?\s*\w+\s*=\s*\w+\s*\+\s*1\s*;?\s*)?if\b')
+                          r'(?:local\s+\w+\s*=\s*\w+\[\w+\]\s*;?\s*\w+\s*=\s*\w+\s*\+\s*1\s*;?\s*'
+                          r'|local\s+\w+\s*=\s*\w+\s*(?:[<>]=?|[~=]=)\s*\w+\s*;?\s*)?if\b')
 _NUM = r'(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*)'
 CELL_RE = re.compile(r'\b(\w+)\[' + _NUM + r'\]\[(\w+)\[' + _NUM + r'\]\]')
 

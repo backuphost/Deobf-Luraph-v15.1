@@ -35,6 +35,8 @@ automatically, and the run ends with a report of what, if anything, is left unre
 | factory, one-line output, self-decrypting code and lazily decoded constants | 25ms_get | partial: all modules, but unlifted instructions and unstructured exits remain |
 | v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,200 lines); code that never ran keeps about 20 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
 | v15.1 chunk cut out of its container, script mostly plain Lua kept in the VM object | examples/layer3.lua + examples/blob4.bin (`--chunk-arg`) | the script runs to its end; about 38,600 lines, 1 unlifted instruction in code that did not run |
+| v15.1 of the v15.2 generation (no wrapper keys; the script on a second interpreter whose dispatch tests go through locals) | the `v15.1` directory of the public sample corpus (not in the repository) | small test scripts come out whole and `complete`; larger scripts lift every instruction that ran, see "The v15.x files of the public sample corpus" for what is open |
+| v15.0: the closure maker is a method of the VM object, a state machine | the `v15.0` directory of that corpus | not modelled: refused at once with `no model: Luraph v15.0 method-wrap layout ...` (the second engine lifts these) |
 
 There is no key that opens every Luraph v15.1 script.  Every protected file carries its own virtual
 machine: opcode numbers, operand layout and handlers are generated per script, the decryption keys
@@ -71,6 +73,8 @@ line per kind of thing that is missing:
 | `lines use UPVAL_n` | a captured variable of a function whose creation was not lifted |
 | `values printed as nil --[[...]]` | a loop variable, argument or operand without a known source |
 | `for loops without their loop statement`, `functions printed as a stub` | what the words say |
+| `lines of Luraph's key arithmetic are left` | `v - v % 1` on a value cut to 32 bits: numbers the interpreter mixes into its keys, where they did not fold to a constant |
+| `functions return a parameter xor-ed with a large literal` | Luraph's per-call keys (`return bit32.bxor(p, K), ...`) where they could not be folded because a caller is not in the result |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 
 `run.report(text)` gives the second part for any result file (it skips a head written earlier).
@@ -384,6 +388,70 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   in a `LIFT ERROR`), so what the number is used for is not known.  devm does not forge the reply; everything behind it
   (the protected script) is not in the output.  `examples/v15.2/sample_src.luau` shares no
   strings or structure with what the loader does before that point.
+
+### The v15.x files of the public sample corpus
+
+Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sample corpus
+(`tests/devm_v15_corpus.py`; the corpus is not part of the repository, `LURAPH_CORPUS` names it).
+
+* **v15.1 builds are the v15.2 generation without wrapper keys.**  Luraph's start-up code (35
+  functions, the same in every file) runs on one interpreter, the script on a second one.  That
+  second interpreter writes its dispatch tree with every test computed into a local first,
+  `while true do local OP = CODE[PC]; local t = OP >= 10; if t then local t = OP >= 15; if t then`.
+  `vmmodel.is_dispatch_loop` accepts that form (`_outlined_test`); before, the model saw one
+  interpreter, the harness never hooked the one that runs the script, and the result was a few
+  lines of start-up code with a `LIFT ERROR`.  With it the usual two-interpreter route applies
+  (`payload: proto 36 is the script`).
+* **The open-upvalue map of that interpreter.**  Its handlers test and index the map through a
+  local copy (`local a, r = open, operand[pc]; if a then local c = a[r] ...`), and the copy's name
+  is usually also the name of some unrelated interpreter variable.  `pe._classify_state_vars` took
+  the copy's name (and the names of dispatch-test locals, which look like the pattern) for the
+  map: in one file the dispatch-mode variable was treated as the map and the lift stopped with
+  `interpreter returned before reaching dispatch loop`; in others a key the interpreter keeps in
+  a local was unknown to the lifter.  The classifier now follows the copy back to the
+  interpreter-level variable.
+* **The structuring passes of the generation** (`ircfg.UNFLATTEN`, `ircfg.V152`,
+  `structure.FIT_SCOPES`, `NEST_ITEMS`, `NOTE_TRAPS`, `beautify.MERGE_ARMS`) are switched on by
+  `run.v152_generation(model)`: wrapper keys, or an interpreter in the spelling above.  The older
+  v15.1 builds (`examples/layer3.lua`, the committed results) have neither and keep their results.
+* **Builds without a payload.**  Where the script's top level is part of Luraph's main function (as
+  in the repository's v15.2 sample; a key-system loader of the corpus is built that way) all
+  functions are on the first interpreter and the main function is what gets lifted.  For that, and
+  for `--root 1` on any of these files, the lift of the main function had to be made whole:
+  - the traced run's snapshots of tables that instructions change in place carry the table's
+    identity (`tid`), and a proto's own operand array seen through its lazy view
+    (`P = setmetatable({[0] = K}, decode)`) is not a shared table (`harness.lua` `codeVersion`,
+    `lifter.shared_snapshot_tables`): other functions' snapshot bases used to overwrite the main
+    function's code;
+  - trampolines land a few retired instructions in front of the jump hub; the whole line is kept
+    once per jump target (`lifter.hub_line`), also when it is reached through a jump that was
+    already specialised or through the hub's copy for arrivals without a target (`NO_TARGET`);
+  - an executed instruction is lifted in a code state the run recorded when the run recorded
+    versions for its function (not only for keyed wrappers), with the interpreter-local numbers
+    the run recorded for it (instructions that decrypt themselves with a key held in an
+    interpreter local);
+  - lazy constant decoders of these builds are state machines the evaluator runs itself: on
+    ciphertext they are cut off after `lifter.LAZY_LOOP_LIMIT` rounds.
+* **Luraph's per-call key** (v15.2 test scripts): a function takes one more parameter, every caller
+  passes a literal, the function returns `bit32.bxor(key, C)` as an extra first result and the
+  caller compares it with the number it must be.  `opaque._fold_call_keys` removes parameter,
+  argument and result where every caller is in the result and decides the test; where a caller is
+  missing the arithmetic stays and the report says so (`functions return a parameter xor-ed with a
+  large literal`, never `complete`).
+* **Key arithmetic on an interpreter local the lifter has no value for** shows as
+  `local v = (121107783 + nil) % 4294967296; local w = bit32.bxor(v - v % 1, 283475159)`: in code
+  that never ran (junk arms) the key was never set.  `opaque._drop_blind_key_arith` removes such
+  a chain when nothing reads it, `opaque._fold_type_tests` decides the opaque test
+  `type(0) == "buffer"` in front of a junk arm.
+* **v15.0** is a third layout: the function that makes a VM closure is a method of the VM object,
+  written as a state machine that assigns the interpreter closure in one of its states.  devm does
+  not model it and says so at once (`no model: Luraph v15.0 method-wrap layout is not supported by
+  this engine`, `run.method_wrap_layout`); the second engine (`deobf/`) lifts these files.
+* **A VM chunk without its buffer** creates no VM function: `run failed: the VM never started:
+  <how the run stopped> (a chunk cut out of a container needs its data: --chunk-arg)`.
+* **The `--root` hint** ("the script is probably the first program") is only given when the
+  function taken for the script calls nothing but pure library functions (a helper of the build);
+  it used to be printed for every small script.
 
 ### Names
 

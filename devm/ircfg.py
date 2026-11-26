@@ -2736,6 +2736,14 @@ class ProtoCFG:
         for key, node in self.pir.nodes.items():
             make(node.tree, key)
         self.entry = self.pir.entry
+        # A jump to an instruction the lifter never produced (its final pruning tolerates such
+        # targets), or a function without its first instruction: a marked stub in the text, so
+        # that the gap of one function does not stop the whole result.
+        missing = {s for b in list(self.blocks.values()) for s in b.succs() if s not in self.blocks}
+        if self.entry not in self.blocks:
+            missing.add(self.entry)
+        for key in sorted(missing, key=repr):
+            make(([('error', 'jump to an instruction that was not lifted')], ('ret', [], None)), key)
 
     def compute_preds(self):
         for b in self.blocks.values():

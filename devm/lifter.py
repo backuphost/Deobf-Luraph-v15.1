@@ -46,6 +46,9 @@ SYMPC = 'jump to a run-time computed instruction'
 NOVAL = object()          # known_after.cval: not a known constant
 
 
+NO_TARGET = -1      # third component of a hub copy's key for arrivals without a known jump target
+
+
 class Samp(tuple):
     """samples of a number that is not known (see known_after.num2)"""
 
@@ -814,6 +817,9 @@ class Lifter:
     def lift_node(self, interp, node, key2, snap, known, indirect, pkey, numknown=False):
         """Lift one instruction into node.tree; returns None or the error text."""
         self.pe.regknown = known
+        if self.end_state and any(isinstance(v, Samp) for v in known.values()):
+            # (samples of a number that is not known, see known_after: nothing the evaluator can read)
+            self.pe.regknown = {r: v for r, v in known.items() if not isinstance(v, Samp)}
         # (a never-run instruction that decrypts bytecode with a key it took from a register:
         # with the number that register held the decryption can be done -- see _upnum_retry)
         self.pe.sym_buf_error = bool(self.end_state and not self.pe.use_upnum and (self.up_nums or self.temp_vals)
@@ -890,7 +896,8 @@ class Lifter:
         self.pe.use_upnum = True
         snap2 = dict(snap)
         for name, v in snap.items():
-            if isinstance(v, Sym) and isinstance(v.e, tuple) and v.e[0] == 't' and v.e[1] in self.temp_vals:
+            if isinstance(v, Sym) and isinstance(v.e, tuple) and v.e[0] == 't' and v.e[1] in self.temp_vals \
+                    and not isinstance(self.temp_vals[v.e[1]], Samp):
                 snap2[name] = P.KNum(self.temp_vals[v.e[1]])
         try:
             return self.lift_node(interp, node, key2, snap2, known, indirect, pkey, numknown=True)
@@ -942,16 +949,8 @@ class Lifter:
             info = snaps.get(str(key))
             env = self.records[key - 1][1] if hasattr(self, 'records') and isinstance(key, int) else {}
             # the loader's shared tables (harness sharedBase)
-            shared = []
-            for ent in snaps.get('shared') or ():
-                holder = env.get(ent['name'])
-                obj = holder.h.get(ent['key']) if isinstance(holder, LuaTable) else None
-                # (two interpreters can each have a table under the same name: the entry belongs
-                # to this one only if its keys are this table's keys)
-                if isinstance(obj, LuaTable) and ent['base'] and \
-                        sum(1 for k in ent['base'] if P.is_num(obj.h.get(int(k)))) >= 0.95 * len(ent['base']):
-                    shared_ids.add(id(obj))
-                    shared.append((obj, ent['base']))
+            shared = shared_snapshot_tables(env, snaps.get('shared') or ())
+            shared_ids.update(id(obj) for obj, _ in shared)
             if info and env:
                 writes = []
                 for obj, base in shared:
@@ -1056,6 +1055,12 @@ class Lifter:
         # they belong to the path like the code does; the walk only keeps the first value to
         # arrive.  For an instruction that ran, the run's own value on entry is used.
         key_locals = ()
+        # (The same protection exists without wrapper keys, in v15.1 builds of that generation:
+        # what counts is that the traced run recorded versions of this function's code.)
+        defer = self.defer_foreign_state
+        if not defer and pathmode and isinstance(key, int):
+            info0 = (self.dump.data.get('snaps') or {}).get(str(key))
+            defer = bool(info0 and info0.get('vers'))
         if self.defer_foreign_state and hasattr(self, 'records') and isinstance(key, int):
             it0 = self.model.interps[self.records[key - 1][0]]
             key_locals = sorted({n for names in self.model.wrapper_numbers(it0).values() for n in names})
@@ -1107,8 +1112,17 @@ class Lifter:
                         indirect[key2] = r
                     else:
                         r = None
+                if r is None:
+                    r = hub_line(pir.nodes, node_in, indirect, key2)
                 if r is not None and P.is_num(known.get(r)) and not same_const(known[r], node_in[key2].get(r)):
                     key2 = key2 + (known[r],)
+                    if pred is not None:
+                        pred.tree = retarget_tree(pred.tree, {id(pend): key2})
+                elif r is not None and pathmode and not P.is_num(known.get(r)) and P.is_num(node_in[key2].get(r)):
+                    # ... and a path that arrives without the target (code no run took, reached
+                    # through a join that lost the register) gets a copy of its own: it must not
+                    # take the target away from the path that has one
+                    key2 = key2 + (NO_TARGET,)
                     if pred is not None:
                         pred.tree = retarget_tree(pred.tree, {id(pend): key2})
             if key2 in pir.nodes and pathmode and pir.nodes[key2].error and relifts.get(('err', key2), 0) < 6 \
@@ -1207,9 +1221,16 @@ class Lifter:
                 # without recorded code versions an instruction that ran is lifted from the state
                 # at the end of the run; otherwise every instruction from the state of its path
                 switch(path if (replay or not ran) else None)
-                if replay and ran and not rec.get('p') and self.defer_foreign_state:
+                if replay and ran and not rec.get('p') and defer:
                     pc2 = key2[:2]
-                    for name in key_locals:
+                    names = key_locals
+                    if not self.defer_foreign_state:
+                        # Without wrapper keys the keys are interpreter locals all the same: set
+                        # from registers (`key = R[x]`) and used by instructions that decrypt
+                        # themselves on first execution.  A number the walk brings along that is
+                        # not the one the run had here belongs to another path.
+                        names = [n for n in rec['v'] if P.is_num(snap.get(n)) and not isinstance(snap.get(n), bool)]
+                    for name in names:
                         v = rec['v'].get(name)
                         if P.is_num(v) and name in snap and not same_value(snap[name], P.norm(v)):
                             snap = dict(snap)
@@ -1425,6 +1446,13 @@ class Lifter:
                         stack.append(e[1])
             pir.nodes = {k: n for k, n in pir.nodes.items() if k in seen}
             pir.errors = [(k, n.error) for k, n in pir.nodes.items() if n.error]
+        if pir.entry not in pir.nodes:
+            # nothing was lifted, not even the first instruction (it waited for a code state that
+            # no path brought): the function is a marked stub, not a graph without an entry
+            node = pir.nodes[pir.entry] = Node(pir.entry)
+            node.error = 'the first instruction of the function could not be lifted'
+            node.tree = ([('error', node.error)], ('ret', [], None))
+            pir.errors.append((pir.entry, node.error))
         pir.children = self.queue[nq0:]
         if entry_params and pir.entry in pir.nodes:
             # A loop statement of the prologue is not executed again when single instructions are
@@ -1489,6 +1517,80 @@ class Lifter:
             done.add(k)
             self.protos[k] = self.lift_proto(k)
         return self.protos
+
+
+def shared_snapshot_tables(env, entries):
+    """[(table, base values)]: the `shared` entries of a traced run's snapshots (harness.lua
+    sharedBase: tables of numbers one level below a proto variable, as they were when the first
+    proto started) that belong to the proto whose variables are `env`."""
+    out = []
+    own = {id(v) for v in env.values() if isinstance(v, LuaTable)}
+    below = None
+    for ent in entries:
+        if not ent['base']:
+            continue
+        if 'tid' in ent:
+            # The entry names its table (its id in the dump).  Name and key only say where the
+            # harness first met it: another interpreter's protos hold the same table under another
+            # name, and every proto can have a table of its own under this one.
+            if below is None:
+                below = {t.id: t for h in env.values() if isinstance(h, LuaTable)
+                         for t in h.h.values() if isinstance(t, LuaTable) and id(t) not in own}
+            obj = below.get(ent['tid'])
+            if obj is not None:
+                out.append((obj, ent['base']))
+            continue
+        holder = env.get(ent['name'])
+        obj = holder.h.get(ent['key']) if isinstance(holder, LuaTable) else None
+        if not isinstance(obj, LuaTable) or id(obj) in own:
+            # (not one of this proto's own code arrays seen through a lazy view of it,
+            # `P = setmetatable({[0] = K}, decode)`: followed per proto, under its own name)
+            continue
+        # (a run recorded without table ids.  Two interpreters can each have a table under the same
+        # name: the entry belongs to this one only if its keys are this table's keys)
+        if sum(1 for k in ent['base'] if P.is_num(obj.h.get(int(k)))) >= 0.95 * len(ent['base']):
+            out.append((obj, ent['base']))
+    return out
+
+
+def hub_line(nodes, node_in, indirect, k):
+    """The register a trampoline jumps through, when instruction k leads to that jump in a
+    straight line of instructions without effect (builds whose trampolines land a few
+    instructions in front of the hub: block decryptors that ran once and are no-ops since).
+    The whole line is then kept once per jump target, like the hub itself: it is entered in
+    `indirect` ((loop, pc) -> register).  None when k is the jump itself or leads elsewhere."""
+    line, x, at = [], k, k
+    while len(line) < 64:
+        # (`at`: the node looked at.  Behind the first one it can be the copy of an instruction
+        # for one jump target, where a jump into the line was specialised already.)
+        r = indirect.get(x)
+        if r is not None and line:
+            # (a known hub: whatever copy of it the jump in front points at, also the copy for
+            # arrivals without a target, which carries an error)
+            for y in line:
+                indirect[y] = r
+            return r
+        nd = nodes.get(at)
+        if nd is None or nd.error or not nd.tree or nd.tree[0] or nd.tree[1][0] != 'goto':
+            return None
+        if r is None and len(nd.kreads) == 1:
+            r = next(iter(nd.kreads))
+            if not P.is_num((node_in.get(at) or {}).get(r)):
+                return None
+        if r is not None:
+            if not line:
+                return None     # (the jump itself: the caller's own case)
+            indirect[x] = r
+            for y in line:
+                indirect[y] = r
+            return r
+        at = nd.tree[1][1]
+        x2 = tuple(at[:2])
+        if nd.kreads or not isinstance(at[1], int) or x2 == x or x2 in line:
+            return None
+        line.append(x)
+        x = x2
+    return None
 
 
 def program_entries(model, oracle):
@@ -1699,6 +1801,9 @@ class TableProtoLifter(Lifter):
         return r[1][0]
 
 
+LAZY_LOOP_LIMIT = 20000
+
+
 class FactoryLifter(Lifter):
     """Family 2: factory(self, code arrays..., ...) -> wrap(upvalues) -> function(...).
 
@@ -1711,6 +1816,10 @@ class FactoryLifter(Lifter):
         super().__init__(model, dump, log)
         self.records = dump.proto_records()
         self.constprop = True
+        # A constant view that decodes on first use (`setmetatable({[0] = operands}, {__index = decode})`)
+        # is evaluated here for instructions that never ran.  Where such an instruction is still
+        # ciphertext the decoder reads a length out of garbage and loops over the whole buffer.
+        self.pe.lazy_loop_limit = LAZY_LOOP_LIMIT
         root = dump.root_vars()
         self.root_key = root['__pid']
         for it in model.interps:

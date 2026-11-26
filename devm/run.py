@@ -208,6 +208,37 @@ class DevmError(Exception):
         self.reason = reason
 
 
+def method_wrap_layout(model):
+    """Luraph v15.0: the VM object is `setmetatable({...}, {})` and the function that makes a VM
+    closure is one of its methods, written as a state machine that assigns the interpreter closure
+    in one of its states (`while true do if S <= 0 then ...; S, f = 1, function(...) ... end`)
+    instead of returning it from a wrapper.  Neither of the two layouts devm models."""
+    if model.factory_style or len(model.chain) != 2 or not re.match(r'(?:\s|--[^\n]*\n)*return\s*\(?\s*setmetatable\b', model.src):
+        return False
+    maker = model.chain[0]
+    if maker.body and maker.body[-1][0] == 'return' and maker.body[-1][1] and maker.body[-1][1][0][0] == 'func':
+        return False
+
+    def holds(node):
+        if isinstance(node, (list, tuple)):
+            if len(node) == 2 and node[0] == 'func' and node[1] is model.interp:
+                return True
+            return any(holds(x) for x in node if isinstance(x, (list, tuple)))
+        return False
+    return any(st[0] == 'while' and holds(st[2]) for st in maker.body)
+
+
+def v152_generation(model):
+    """Builds of the v15.2 generation: start-up code and (in some builds) the script's top level in
+    one flattened main function behind trampolines, tamper traps, numeric loops kept in tables.
+    v15.2 itself is known by its wrapper keys.  The v15.1 builds of this generation have none; they
+    are known by the interpreter that runs their script, whose dispatch tree computes every test
+    into a local first (vmmodel._outlined_test).  Earlier v15.1 builds have neither."""
+    if model.keyed_wrappers:
+        return True
+    return any(l[2][0][0] == 'local' and vmmodel._outlined_test(l[2], l[2][0]) for l in model.loops)
+
+
 def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
@@ -327,6 +358,9 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         stage.dump_timeout = run_timeout
     stage.model.run_options = carrier.harness_options() if carrier else []
     stage.carrier = carrier
+    if method_wrap_layout(stage.model):
+        # (the other engine lifts these; here the proto-table route would run for minutes and fail)
+        raise DevmError('no model', 'Luraph v15.0 method-wrap layout is not supported by this engine')
     if stage.model.factory_style:
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
@@ -335,15 +369,16 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # (a script in its shipped layout keeps its source's control flow: nothing to unflatten.
         # Luraph v15.2 does flatten: its start-up code and the script's main function share one
         # state machine, see README "Luraph v15.2")
-        ircfg.UNFLATTEN = not oneline or stage.model.keyed_wrappers
+        gen152 = v152_generation(stage.model)
+        ircfg.UNFLATTEN = not oneline or gen152
         ircfg.DROP_OPAQUE = oneline
         # (... and that function has several hundred locals once it is unflattened)
-        structure.FIT_SCOPES = stage.model.keyed_wrappers
+        structure.FIT_SCOPES = gen152
         # (layout and and/or rewrites that came with v15.2 support; the committed v15.1 results
         # were written without them and tests/regress.py compares text for text)
-        structure.NEST_ITEMS = beautify.MERGE_ARMS = stage.model.keyed_wrappers
+        structure.NEST_ITEMS = beautify.MERGE_ARMS = gen152
         # (v15.2 forms of table-state `for` loops and of repeated key checks, see ircfg.V152)
-        ircfg.V152 = structure.NOTE_TRAPS = stage.model.keyed_wrappers
+        ircfg.V152 = structure.NOTE_TRAPS = gen152
         structure.MARK_COLD = ircfg.KEEP_COLD = bool(mark_untaken)
         try:
             text = stage.run_traced()
@@ -641,7 +676,8 @@ def main(argv=None):
 
     def write_result(text):
         """the result file: the report first (see below), then the text; returns the report lines"""
-        lines = run_report(LAST_RUN['notes']) + report(text)
+        lines = run_report(LAST_RUN['notes']) + report(text, returned=any(
+            n.startswith('[oracle] script returned') for n in LAST_RUN['notes']))
         head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
         head += ['--   ' + ln for ln in lines]
         text = '\n'.join(head) + '\n' + text
@@ -664,7 +700,10 @@ def main(argv=None):
         msg = ' '.join(str(e).split())[:400]
         if isinstance(e, SyntaxError):
             msg = 'the text does not parse as Luau (%s)' % msg
-        print('devm: %s: %s' % (failure_stage(e), msg))
+        stage = failure_stage(e)
+        if msg.startswith(stage + ': '):
+            msg = msg[len(stage) + 2:]
+        print('devm: %s: %s' % (stage, msg))
         sys.exit(1)
     except Exception as e:
         # not an expected way to fail: the traceback for whoever debugs it, then the one-line form
@@ -681,9 +720,16 @@ def main(argv=None):
         print(line)
 
 
+STAGES = ('unsupported target', 'damaged input', 'no model', 'init did not hand over', 'run failed', 'lift failed')
+
+
 def failure_stage(e):
     """The stage name of the one-line failure message for an exception that is an expected way to fail."""
     msg = str(e)
+    for stage in STAGES:
+        if msg.startswith(stage + ': '):
+            # (raised with the stage in front, e.g. pipeline: 'run failed: the VM never started: ...')
+            return stage
     if isinstance(e, SyntaxError):
         # (a build for another Lua dialect was turned away before the parser, see normalize.foreign_dialect:
         # what does not parse here is cut off, edited or corrupt)
@@ -738,13 +784,24 @@ def run_report(notes):
     return out
 
 
-def report(text):
-    """What is left unrecovered in a result, in plain words."""
+# (by the lifter's own names for parameters and locals: a checksum routine of the script, or a
+# plain-Lua helper printed with its own text, also ends in `return bit32.bxor(x, 4294967295)`)
+KEY_LEFT = re.compile(r'(?m)^[ \t]*return bit32\.bxor\(p\d+, \d{7,}\)(?:,.*)?$')
+
+
+KEY_MIX = re.compile(r'(?m)^.*\b(v\d+) - \1 % 1\b.*$')
+
+
+def report(text, returned=None):
+    """What is left unrecovered in a result, in plain words.  `returned`: the traced run went to
+    the script's end (None: read it off the head of a file main() wrote)."""
     lines = text.split('\n')
     if lines and HEAD_MARK in lines[0]:
         # a file main() wrote: its head is an earlier report, not part of the result
         del lines[0]
         while lines and lines[0].startswith('--   '):
+            if returned is None and lines[0].startswith('--   traced run: the script returned'):
+                returned = True
             del lines[0]
         text = '\n'.join(lines)
     errs = text.count('LIFT ERROR')
@@ -766,6 +823,12 @@ def report(text):
     envrefs = code.count('__LPH_ENV[')
     regs = len(re.findall(r'\b(?:ARG|REG)_\d+\b', code))
     preps = sum(1 for ln in lines if '-- for-loop setup:' in ln)
+    # Luraph's per-call keys (opaque._fold_call_keys) where they could not be folded: a parameter
+    # xor-ed with a literal into an extra first result
+    keys = len(KEY_LEFT.findall(code))
+    # ... and the interpreter's own key arithmetic where it did not fold to a constant: a number
+    # cut to 32 bits and to an integer by hand (`v = x % 4294967296; w = v - v % 1`)
+    mixes = len(KEY_MIX.findall(code))
     # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
     # protection's own checks, which a reader should not take for the script's
     traps = []
@@ -776,7 +839,8 @@ def report(text):
                      'protection, not of the script' % (calls, m.group(1)))
     lines = max(1, text.count('\n'))
     out = []
-    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs):
+    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
+            or keys or mixes):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + traps
     out.append('result: PARTIAL')
@@ -806,11 +870,22 @@ def report(text):
         out.append('  %d for loops without their loop statement (only the set-up of the bounds was found)' % preps)
     if stubs:
         out.append('  %d functions printed as a stub (their body was not recovered)' % stubs)
+    if keys:
+        out.append('  %d functions return a parameter xor-ed with a large literal as their first result (`return bit32.bxor(p, K), ...`): '
+                   'this is how Luraph\'s per-call keys look, a number every caller passes and gets back changed.  They are folded '
+                   'away where every caller is in the result; these were left because that could not be shown (or the script does '
+                   'such arithmetic itself)' % keys)
+    if mixes:
+        out.append('  %d lines of Luraph\'s key arithmetic are left (`v - v %% 1` on a value cut to 32 bits): numbers the '
+                   'interpreter mixes into its keys, not part of the script' % mixes)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '
                    'not as its original structure' % depth)
-    if blank * 5 > lines:
+    if blank * 5 > lines and returned:
+        out.append('  the traced run went to the script\'s end, so those lines are in code it did not execute (branches '
+                   'not taken, functions nobody called): their constants stayed encrypted')
+    elif blank * 5 > lines:
         out.append('  most of the script did not run.  Usual causes: it waits for a server reply (see the [http] '
                    'lines above; --http-map), a key system, or an environment check that failed '
                    '(try --no-executor / --executor)')

@@ -895,6 +895,7 @@ class PE:
         self.model_writes = 0
         self.keyfn_used = set()
         self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
+        self.lazy_loop_limit = 200000   # rounds one loop of such a handler may take (lowered by the traced lifter)
         # Lifting a dump taken at the end of a run: instructions that were executed have already
         # left their mark on the VM state (decrypted code, decoded constants), so their writes to
         # that state are dropped (frozen).  Writes of the other instructions are applied and
@@ -1092,7 +1093,15 @@ class PE:
             if t == 'if':
                 # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
                 # open[r] = nil end end`: handlers that end the scope of single registers
+                # (not a test that was computed into a local just before, `local t = OP >= 10; if t
+                # then local ...`: the dispatch tree of some interpreters is written that way)
+                tested = None       # the variable a comparison was just stored in
+                if prev is not None and prev[0] in ('local', 'assign') and len(prev[1]) == 1 and len(prev[2]) == 1 \
+                        and prev[2][0][0] == 'bin' and prev[2][0][1] in CMP:
+                    tested = prev[1][0] if prev[0] == 'local' else prev[1][0][1] if prev[1][0][0] == 'name' else None
                 for c, body in st[1]:
+                    if c[0] == 'name' and c[1] == tested:
+                        continue
                     if c[0] == 'name' and body and body[0][0] == 'local':
                         txt = repr(body[:3])
                         if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
@@ -2296,7 +2305,7 @@ class PE:
                     if r[0] == 'return':
                         return r
                 n += 1
-                if n > 200000:
+                if n > 200000 or (self.lazy_depth and n > self.lazy_loop_limit):
                     raise PEError('runaway loop')
         if t == 'repeat':
             n = 0
