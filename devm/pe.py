@@ -466,6 +466,10 @@ def lua_unpack(fmt, data):
             endian = '>'
         elif c == ' ':
             pass
+        elif c == 'x':
+            pos += 1
+            if pos > len(raw):
+                return None
         elif c in 'bBhHlLjJTiI':
             n = sizes.get(c, 4)
             j = i
@@ -488,6 +492,29 @@ def lua_unpack(fmt, data):
             return None
     out.append(pos + 1)
     return out
+
+
+def lua_packsize(fmt):
+    """string.packsize for the fixed-size formats lua_unpack reads; None when not supported."""
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 8, 'J': 8, 'T': 8, 'f': 4, 'd': 8, 'n': 8, 'x': 1}
+    total = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        i += 1
+        if c in '<=> ':
+            continue
+        if c in 'iI':
+            j = i
+            while j < len(fmt) and fmt[j].isdigit():
+                j += 1
+            total += int(fmt[i:j]) if j > i else 4
+            i = j
+        elif c in sizes:
+            total += sizes[c]
+        else:
+            return None
+    return total
 
 
 def lua_type(v):
@@ -778,6 +805,17 @@ class PE:
         self.slot_writes = set()    # (table path, key) written in this lift
         for l in model.loops:
             self.pcvars[id(l)] = l[2][0][2][0][2][1]
+        # the statement of each interpreter's prologue that declares its register array (see local_regs)
+        self.regs_decl = {}
+        self.alloc_funcs = set()    # ids of loader functions that allocate register arrays
+        for it in model.interps:
+            name = model.regs_name(it)
+            for st in it.func.body[:16]:
+                if st[0] == 'local' and name in st[1]:
+                    i = st[1].index(name)
+                    if i < len(st[2]) and _unparen(st[2][i])[0] == 'call':
+                        self.regs_decl[id(st)] = i
+                    break
 
     # -- static helpers
     def _ancestors(self):
@@ -916,7 +954,12 @@ class PE:
             if t == 'forin' and len(st[2]) == 1 and st[2][0][0] == 'name' and len(st[1]) == 2:
                 body = st[3]
                 txt = repr(body)
-                if "('num', 3)" in txt and "('num', 2)" in txt:
+                # (the loop closes the cells it walks: it writes fields of its value variable.  The
+                # loop that clears registers above the top, `for k, v in R do ... R[k] = nil end`,
+                # never touches v, whatever numbers the opaque tests inside it mention.)
+                cell = repr(('name', st[1][1]))
+                if "('num', 3)" in txt and "('num', 2)" in txt \
+                        and ("('index', " + cell in txt or "('index', ('paren', " + cell in txt):
                     add(openups, st[2][0][1], scopes)
             if t == 'if':
                 # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
@@ -1351,6 +1394,8 @@ class PE:
         if obj is OPENUPS:
             return None
         if isinstance(obj, Lib):
+            if obj.name == 'math' and key in ('pi', 'huge'):
+                return math.pi if key == 'pi' else math.inf
             return Builtin(obj.name + '.' + key)
         if isinstance(obj, str):
             return Builtin('string.' + key)
@@ -1746,6 +1791,26 @@ class PE:
                     return r
             if name in PURE and all(is_num(a) for a in args):
                 return [keyed(norm(PURE[name](*args)), *args)]
+            if name == 'string.packsize' and len(args) == 1 and isinstance(args[0], str):
+                r = lua_packsize(args[0])
+                if r is not None:
+                    return [r]
+            if name == 'string.len' and len(args) == 1 and isinstance(args[0], str):
+                return [len(args[0])]
+            if name == 'string.byte' and args and isinstance(args[0], str) and len(args) <= 3 \
+                    and all(is_num(a) and float(a).is_integer() for a in args[1:]):
+                n = len(args[0])
+                i = int(args[1]) if len(args) > 1 else 1
+                j = int(args[2]) if len(args) > 2 else i
+                i = max(n + i + 1, 1) if i < 0 else max(i, 1)
+                j = n + j + 1 if j < 0 else min(j, n)
+                return [ord(c) for c in args[0][i - 1:j]] if i <= j else []
+            if name == 'math.modf' and len(args) == 1 and is_num(args[0]) and args[0] == args[0]:
+                x = float(args[0])
+                if x in (math.inf, -math.inf):
+                    return [x, 0]
+                ip = float(math.trunc(x))
+                return [norm(ip), norm(x - ip)]
             if name == 'buffer.create' and args and is_num(args[0]) and 0 <= args[0] <= 1 << 26:
                 return [Buffer(bytes(int(args[0])))]
             if name == 'buffer.fromstring' and args and isinstance(args[0], str):
@@ -1781,6 +1846,10 @@ class PE:
                 return [LinSym(mid, 0), PackedTbl(mid) if mid != 'args' else VARARG_TBL]
         if f.func is None:
             raise PEError('call of unresolved VM closure (line %s)' % f.line)
+        if id(f.func) in self.alloc_funcs and not self.seeking and not self.lazy_depth:
+            # an instruction calling the helper that allocates register arrays: a new table
+            n = args[0] if args and is_num(args[0]) else 0
+            return [self.emit_expr(('newtable', n))]
         if id(f.func) in self.native_ids and len(args) <= 3 and not self.lazy_depth \
                 and all(a is None or a is False or (isinstance(a, LuaTable) and a.fresh) for a in args):
             # non-virtualised function instantiated like a proto: native(nil, upvalue_list, nil)
@@ -2037,6 +2106,8 @@ class PE:
             return None
         if t == 'local':
             names = st[1]
+            if self.seeking and id(st) in self.regs_decl and self.local_regs(st, scope):
+                return None
             if len(names) == 1 and len(st[2]) == 1:
                 scope.vars[names[0]] = self.eval1(st[2][0], scope)
                 if self.trace is not None:
@@ -2184,6 +2255,47 @@ class PE:
             scope.vars[st[1]] = LFn(st[2], scope)
             return None
         raise PEError('exec: unknown stmt %s' % t)
+
+    def local_regs(self, st, scope):
+        """The prologue statement that declares the register array, `local R = ALLOC(nregs)`.
+        Luau-target builds allocate with table.create, which call_builtin answers with REGS; builds
+        in the Lua 5.1 dialect go through a helper of the loader (`function(n) return {unpack({}, 1,
+        n)} end`, reached by name or as a slot of the loader's state).  Whatever the allocator is,
+        the local the model names is the register array.  True when the statement was handled."""
+        i = self.regs_decl[id(st)]
+        names, exprs = st[1], st[2]
+        if i == len(exprs) - 1 and len(names) > len(exprs):
+            return False
+        vals = []
+        for j, e in enumerate(exprs):
+            if j == i:
+                call = _unparen(e)
+                f = None
+                try:
+                    f = self.eval1(call[1], scope)
+                    v = self.eval1(e, scope)
+                except PEError:
+                    v = None
+                if v is not REGS:
+                    if not (v is None or (isinstance(v, LuaTable) and v.fresh)):
+                        return False        # not an allocation after all
+                    if isinstance(f, LFn) and f.func is not None:
+                        self.alloc_funcs.add(id(f.func))
+                    try:
+                        n = [x for x in self.evalargs(call[2], scope) if is_num(x)]
+                    except PEError:
+                        n = []
+                    if n:
+                        self.nregs = int(n[0])
+                    v = REGS
+                vals.append(v)
+            elif j == len(exprs) - 1 and e[0] in ('call', 'mcall', 'vararg'):
+                vals.extend(self.evalmulti(e, scope))
+            else:
+                vals.append(self.eval1(e, scope))
+        for n, v in zip(names, self.adjust(vals, len(names))):
+            scope.vars[n] = v
+        return True
 
     def clamp_stmt(self, st, scope):
         """The VARARG instruction's count of extra arguments, clamped by a statement:

@@ -776,9 +776,12 @@ class Lifter:
         self.pe.keyfn_used = pir.keyfns = set()
         indirect = {}       # (loop, pc) of a jump-through-register instruction -> register
         interp = self.instantiate(key)
-        _, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
+        ir0, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
         if end[0] != 'goto':
             raise PEError('interpreter returned before reaching dispatch loop')
+        # parameters the interpreter copies into registers before its dispatch loop
+        # (`for i = 1, nparams do R[i] = args[i] end`, v14.0.2 - v14.2): see the end of this method
+        entry_params = [st for st in ir0 if st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'arg']
         entry, snap = end[1], end[2]
         if key in self.entry_override:
             entry, ovars = self.entry_override[key]
@@ -789,6 +792,7 @@ class Lifter:
                     snap[name] = P.norm(v)
             snap[pcv] = entry[1]
         pir.entry = entry
+        entry_snap = snap
         work = [(entry, snap, {}, None, None, None)]
         # Traced lifts: the writes instructions make to the code (decrypt a block, use it, encrypt
         # it again) belong to the path they are on.  Every queued instruction remembers its path
@@ -1264,6 +1268,20 @@ class Lifter:
             pir.nodes = {k: n for k, n in pir.nodes.items() if k in seen}
             pir.errors = [(k, n.error) for k, n in pir.nodes.items() if n.error]
         pir.children = self.queue[nq0:]
+        if entry_params and pir.entry in pir.nodes:
+            # A loop statement of the prologue is not executed again when single instructions are
+            # lifted (PE.exec_seek), so what it wrote exists only in the entry run: it becomes a
+            # block of its own in front of the first instruction, which may be a jump target.
+            # (A plain statement of the prologue is executed for every instruction; what the
+            # first instruction's own tree already holds is not repeated.)
+            first = pir.nodes[pir.entry].tree[0] if pir.nodes[pir.entry].tree else []
+            entry_params = [st for st in entry_params if st not in first]
+            if entry_params:
+                pre = Node((pir.entry[0], -1))
+                pre.tree = (entry_params, ('goto', pir.entry, entry_snap))
+                pre.snap_in = entry_snap
+                pir.nodes[pre.key] = pre
+                pir.entry = pre.key
         self.check_conflicts(pir)
         if self.end_state and isinstance(key, int):
             # registers that held one and the same number in every instruction that ran: key material
