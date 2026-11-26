@@ -534,6 +534,8 @@ def after_static(scan, rc, args):
         # form A: the static result has the functions the script kept as plain Lua, and the VM
         # runs the rest (deob.py returns 6 only when the file has dispatch loops).  The engines
         # recover the whole script; the static result is kept as the fallback (hand_over).
+        if scan.bare_chunk() and not scan.sibling_buffer():
+            return None             # a chunk without its data: the advice printed above says how to supply it
         say()
         say("[auto] 静态结果只有明文函数，主流程在 VM 里 → 交给引擎还原整个脚本（没有结果时保留静态结果，记为 PARTIAL）")
         say("       the static result holds only the functions kept as plain Lua, the main flow runs on the VM:"

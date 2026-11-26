@@ -353,6 +353,7 @@ class FrontEnd(unittest.TestCase):
         rc, log = deob(LAYER3, "-o", self.out("a.lua"))
         self.assertEqual(rc, allinone.PARTIAL, log[-600:])
         self.assertNotIn("[devm]", log)
+        self.assertNotIn("[auto]", log)                 # (nothing is said to be handed over)
         self.assertTrue(parses(self.out("a.lua")))
         self.assertEqual(log.rstrip().split("\n")[-1], "result: PARTIAL: only the functions kept as plain Lua; "
                          "the virtualized main flow is not in the output (static)")
