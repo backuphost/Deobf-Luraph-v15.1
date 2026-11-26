@@ -109,6 +109,7 @@ class Dump:
         self.cov = {int(tid): set(S.fix_int(x) for x in lst) for tid, lst in (d.get("cov") or {}).items()}
         self.cov_pcs = {tid: {x % 65536 for x in pairs} for tid, pairs in self.cov.items()}
         self.vm_used = False            # the lifted code names Luraph's VM object (luraph_vm)
+        self.vm_members = {}            # ... and these tables of constants in it (key -> LTable)
         self.u32_used = False           # ... and calls the number conversion helper (lph_u32, collapse_u32)
         self.late = self._lazy_late(d)
         # built now: the lifter writes into dump tables later
@@ -1248,6 +1249,18 @@ class ProtoLifter:
         self.reg_arrays.add(a.v)
         return Reg(REG_ARRAY + a.v), b
 
+    def vmobj_member(self, t):
+        """Key of the VM object's member `t` when that is a table of plain
+        constants (numbers, strings, booleans), else None."""
+        if not isinstance(self.vmobj, LTable):
+            return None
+        for k, v in self.vmobj.h.items():
+            if v is t:
+                plain = all(isinstance(x, (int, float, bytes)) for x in t.h.values()) \
+                    and all(isinstance(x, (int, float, bytes)) and not isinstance(x, bool) for x in t.h)
+                return k if plain and isinstance(k, (int, bytes)) and not isinstance(k, bool) else None
+        return None
+
     def library_name(self, t):
         for k, v in self.globals_tab.h.items():
             if v is t and isinstance(k, bytes):
@@ -1615,6 +1628,15 @@ class ProtoLifter:
                 # object is not part of the script
                 self.dump.vm_used = True
                 return Global("luraph_vm")
+            if getattr(self.vm, "scope", None) and v.meta is None and v.h:
+                mk = self.vmobj_member(v)
+                if mk is not None:
+                    # v15.2: a table of plain constants the VM object holds
+                    # (the numbers of Luraph's obfuscated number expressions):
+                    # a member of the named object, written out in its stub
+                    self.dump.vm_used = True
+                    self.dump.vm_members[mk] = v
+                    return Index(Global("luraph_vm"), Const(mk))
             if v.h:
                 lib = self.library_name(v)
                 if lib is not None:
@@ -2870,7 +2892,7 @@ TRAP = "untaken path goes on at instruction"
 
 def not_an_error(msg):
     """backend.lower: error blocks that are not unlifted code (cut_cold_jumps)."""
-    return str(msg).startswith(TRAP)
+    return str(msg).startswith((TRAP, RAISES))
 
 
 def cut_cold_jumps(order, s0, lf, walk, link):
@@ -3065,8 +3087,19 @@ def propagate(node, facts, succ, lf, pc=None):
         n, f = stack.pop()
         if n is None:
             continue
-        for st in n.stmts:
+        dead = False
+        for i_, st in enumerate(n.stmts):
+            if lf.state_on:
+                why = certain_error(st, f)
+                if why:
+                    dead = (i_, why)
+                    break
             apply_stmt_facts(st, f, lf)
+        if lf.state_on:
+            # (a verdict holds only while every visit gives the same one)
+            n.raises = dead if getattr(n, "raises", dead) == dead else False
+            if dead:
+                continue        # nothing behind that statement runs
         if n.cond is not None:
             v = truth_of(eval_fact(n.cond, f))
             n.decided = getattr(n, "decided", "unset")
@@ -3110,6 +3143,57 @@ def propagate(node, facts, succ, lf, pc=None):
                     n.outcome = Next(n.outcome.state.with_sregs(sr))
             succ.append((n.outcome.state, f))
     return None
+
+
+RAISES = "the script stops here with an error:"
+
+
+def certain_error(st, facts):
+    """The run-time error a statement raises on every run that gets here,
+    judged by the facts: the length of, or an index into, a register that
+    holds a number, a boolean or nil (Luau: no metatable can save those).
+    -> message text or None. (v15.2: a loader ends its failing checks this
+    way, `x = 0; for i = 1, #x`, in code a passed check shares with them;
+    what follows the statement belongs to the passing path only.)"""
+    if not isinstance(st, Assign):
+        return None
+    e = st.value        # (the statement's own operation: nothing conditional)
+    if isinstance(e, Un) and e.op == "Len":
+        what, r = "get length of", e.a
+    elif isinstance(e, Index):
+        what, r = "index", e.obj
+    else:
+        return None
+    fr = facts.get(r.n) if type(r) is Reg else None
+    if fr is None or fr[0] != "c":
+        return None
+    v = fr[1]
+    if v is None or isinstance(v, (bool, int, float)):
+        kind = "nil" if v is None else "boolean" if isinstance(v, bool) else "number"
+        return "attempt to %s a %s value" % (what, kind)
+    return None
+
+
+def cut_certain_errors(order):
+    """Nodes whose statement always raises (propagate: Node.raises) end
+    there: the statements up to it, then a marker instead of a successor."""
+    n_cut = 0
+    stack = [n for _, n in order]
+    while stack:
+        n = stack.pop()
+        if n is None:
+            continue
+        r = getattr(n, "raises", False)
+        if r and not getattr(n, "error", None):
+            i, why = r
+            n.stmts = n.stmts[:i + 1]
+            n.cond = n.then = n.els = None
+            n.outcome = None
+            n.error = "%s %s" % (RAISES, why)
+            n_cut += 1
+            continue
+        stack += [n.then, n.els]
+    return n_cut
 
 
 STATE_COMPARES = 8      # distinct constants in ordered compares that make a register a state register
@@ -3646,7 +3730,7 @@ class Stepper:
         lf = self.lf
         dump = lf.dump
         saved = (dump.fetcher, dump.vm_used, dump.u32_used, dict(dump.shared), dict(dump.buf_patch),
-                 dict(dump.tab_patch), set(dump.keyed_jumps), dict(dump.misses))
+                 dict(dump.tab_patch), set(dump.keyed_jumps), dict(dump.misses), dict(dump.vm_members))
         dump.fetcher = None
         n = 0
         try:
@@ -3674,7 +3758,7 @@ class Stepper:
         finally:
             (dump.fetcher, dump.vm_used, dump.u32_used) = saved[:3]
             for cur, old in ((dump.shared, saved[3]), (dump.buf_patch, saved[4]), (dump.tab_patch, saved[5]),
-                             (dump.misses, saved[7])):
+                             (dump.misses, saved[7]), (dump.vm_members, saved[8])):
                 cur.clear()
                 cur.update(old)
             dump.keyed_jumps.clear()
@@ -4679,6 +4763,8 @@ class FunctionLifter:
         drop_idle_closes(order, lf.captured_regs)
         settle_key_registers(order, s0, st, vm.kstack_link)
         merge_loop_tests(order, walk, lf, vm.kstack_link)
+        if lf.state_on:
+            cut_certain_errors(order)
         self.stats["traps"] = self.stats.get("traps", 0) + cut_cold_jumps(order, s0, lf, walk, vm.kstack_link)
         prefix = REG_PREFIX[depth % len(REG_PREFIX)]
         import structure as ST
@@ -4961,7 +5047,8 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
     if prog.dump.vm_used:
         shared += ["-- Luraph's interpreter object (its functions and tables; the protected script inspects it:",
                    "-- an integrity check of the interpreter). Not part of the script: not lifted.",
-                   "local luraph_vm = {}", ""]
+                   "local luraph_vm = {%s}" % ", ".join(
+                       vm_member_text(k, t) for k, t in sorted(prog.dump.vm_members.items(), key=repr)), ""]
     if prog.dump.u32_used:
         shared += ["-- Luraph's conversion of a number to a 32-bit unsigned integer. Its interpreter does this",
                    "-- inline after every step of its key and hash arithmetic; the lifted code calls this instead.",
@@ -4974,6 +5061,32 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
         out[at:at] = shared
     text = backend.polish("\n".join(out))
     return text, fl.stats, prog.requests, buffer_patches(prog.dump)
+
+
+def vm_member_text(key, t):
+    """`name = {items}`: a table of constants of the VM object (Dump.vm_members)."""
+    import codegen
+
+    def lit(v):
+        if isinstance(v, bytes):
+            return codegen.quote(v)
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        return S.fmt_num(v)
+    n = len(t.h)
+    if set(t.h) == set(range(1, n + 1)):
+        items = [lit(t.h[i]) for i in range(1, n + 1)]
+    else:
+        items = ["[%s] = %s" % (lit(k), lit(v)) for k, v in sorted(t.h.items(), key=repr)]
+    name = key.decode("latin-1") if isinstance(key, bytes) else None
+    if name is None or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name in lexer_keywords():
+        name = "[%s]" % lit(key)
+    return "%s = {%s}" % (name, ", ".join(items))
+
+
+def lexer_keywords():
+    return {"and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local", "nil",
+            "not", "or", "repeat", "return", "then", "true", "until", "while"}
 
 
 finish_text = backend.finish_text
