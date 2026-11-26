@@ -1151,7 +1151,8 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
     keep = ('[root]', '[handover]', '[dumpnew]', '[dump]', '[keyfn]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
     notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
     if calls:
-        made = [l[len('[call] '):] for l in stderr.split('\n') if l.startswith('[call] ')]
+        # (calls made after the budget stop belong to the unwinding of the stopped run)
+        made = [l[len('[call] '):] for l in stderr.split('[budget] ')[0].split('\n') if l.startswith('[call] ')]
         # (the harness logs the first 20000 calls only)
         notes.append('[calls] %d mocked calls%s; the last ones: %s' % (
             len(made), ' logged (there were more)' if len(made) >= 20000 else '',
