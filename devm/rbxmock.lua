@@ -1482,9 +1482,35 @@ return function(G, fnames, libnames, opts)
 	-- code asks for items by value and compares what comes back.
 	do
 		local enumTypes = {}
-		-- Old names of items that Roblox still accepts.  The API table lists current names only
-		-- (gen_roblox.py drops the dump's LegacyNames), so the ones met in scripts are kept here.
-		local LEGACY = { Font = { GothamSemibold = "GothamMedium" } }
+		-- Old names of items that Roblox still accepts (`Enum.RaycastFilterType.Blacklist`,
+		-- `Enum.Font.GothamSemibold`): the "LegacyNames" of Roblox's API dump.  The API table lists
+		-- current names only (gen_roblox.py drops them), so they are kept here: old name -> item.
+		local LEGACY = {
+			AccessoryType = { TeeShirt = "TShirt" },
+			AssetType = { TeeShirt = "TShirt", TeeShirtAccessory = "TShirtAccessory" },
+			AvatarAssetType = { TeeShirtAccessory = "TShirtAccessory" },
+			Axis = { Back = "Z", Bottom = "Y", Front = "Z", Left = "X", Right = "X", Top = "Y" },
+			BinType = { Laser = "Script", Rocket = "Script", Slingshot = "Script" },
+			CatalogSortType = { RecentlyUpdated = "RecentlyCreated" },
+			ConnectionError = { DisconnectNoResponse = "DisconnectRaknetErrors" },
+			ContextActionPriority = { Default = "Medium" },
+			ControlMode = { ["Mouse Lock Switch"] = "MouseLockSwitch" },
+			DeveloperMemoryTag = { PhysicsParts = "BaseParts" },
+			ExplosionType = { CratersAndDebris = "Craters" },
+			ExternalEditorMode = { CustomEditor = "UserSelectedEditor" },
+			FluidForces = { Enabled = "Experimental" },
+			Font = { GothamSemibold = "GothamMedium", Montserrat = "Gotham", MontserratBlack = "GothamBlack", MontserratBold = "GothamBold", MontserratMedium = "GothamMedium" },
+			FormFactor = { Block = "Brick" },
+			InputType = { Action1 = "NoInput", Action2 = "NoInput", Action3 = "NoInput", Action4 = "NoInput", Action5 = "NoInput", LeftTread = "NoInput", RightTread = "NoInput", Steer = "NoInput", Throtle = "NoInput", Throttle = "NoInput", UpDown = "NoInput" },
+			KeyCode = { Touch = "TouchPosition", Unknown = "None" },
+			Material = { Aluminum = "Foil", ["Corroded Metal"] = "CorrodedMetal" },
+			ModelLevelOfDetail = { Deactivated = "Disabled" },
+			QualityLevel = { ["Level  1"] = "Level01", ["Level  2"] = "Level02", ["Level  3"] = "Level03", ["Level  4"] = "Level04", ["Level  5"] = "Level05", ["Level  6"] = "Level06", ["Level  7"] = "Level07", ["Level  8"] = "Level08", ["Level  9"] = "Level09", ["Level 10"] = "Level10", ["Level 11"] = "Level11", ["Level 12"] = "Level12", ["Level 13"] = "Level13", ["Level 14"] = "Level14", ["Level 15"] = "Level15", ["Level 16"] = "Level16", ["Level 17"] = "Level17", ["Level 18"] = "Level18", ["Level 19"] = "Level19", ["Level 20"] = "Level20", ["Level 21"] = "Level21" },
+			RaycastFilterType = { Blacklist = "Exclude", Whitelist = "Include" },
+			Style = { ["Alternating Supports"] = "AlternatingSupports", ["Bridge Style Supports"] = "BridgeStyleSupports", ["No Supports"] = "NoSupports" },
+			SurfaceType = { Bumps = "Glue", Spawn = "Smooth", Unjoinable = "Smooth" },
+			ThreadPoolConfig = { PartialThread = "Auto" },
+		}
 		local function enumItem(et, etName, name, value)
 			local u = newproxy(true)
 			local mt = getmetatable(u)

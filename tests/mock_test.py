@@ -76,6 +76,8 @@ show("keycode", Enum.KeyCode.A.Value, Enum.KeyCode.Space.Value, Enum.NormalId.Fr
 local chain = Enum.NormalId:FromName("Left").EnumType:FromName("Left").EnumType:FromValue(4).EnumType:FromName("Front")
 show("chain", chain, chain.EnumType[chain.Name] == chain, chain.EnumType:FromValue(chain.Value) == chain)
 show("enums", #Enum:GetEnums() > 400, typeof(Enum:GetEnums()[1]))
+-- old names Roblox still accepts are the renamed item itself, and are not listed
+show("legacy", Enum.RaycastFilterType.Blacklist, Enum.Font.GothamSemibold == Enum.Font.GothamMedium, #Enum.RaycastFilterType:GetEnumItems())
 ''')
         self.assertEqual(got.get('ball'), 'Enum.PartType.Ball|0|Ball|PartType', log)
         self.assertEqual(got.get('byvalue'), 'Enum.PartType.Wedge|Enum.PartType.CornerWedge|nil')
@@ -86,6 +88,7 @@ show("enums", #Enum:GetEnums() > 400, typeof(Enum:GetEnums()[1]))
         self.assertEqual(got.get('keycode'), '97|32|5|0')
         self.assertEqual(got.get('chain'), 'Enum.NormalId.Front|true|true')
         self.assertEqual(got.get('enums'), 'true|Enum')
+        self.assertEqual(got.get('legacy'), 'Enum.RaycastFilterType.Exclude|true|2')
 
     def test_nothing_is_invented(self):
         got, log = run('''
