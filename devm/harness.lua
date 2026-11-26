@@ -163,14 +163,20 @@ end
 -- ---------------------------------------------------------------- hooks
 local protos = {}
 local done = false
+local lazyInsn = false       -- lazyinsn=1, see forceLazy
 local quietSteps = 0
 local quietHooks = false     -- VM code run by the harness itself (reading constant pools) is not traced
 
 -- Constant tables can carry an __index hook that decrypts entries on first use; touch every
 -- pending entry so the dump only ever sees plain values.
+local lazyForced, lazyStuck = 0, 0
+local forcing = false        -- true while forceLazy reads: __LPH_W / __LPH_OVER then stop a read that does not end
 local function forceLazy(root)
 	local seen, queue = {}, { root }
 	local qi = 1
+	local N = rawget(_G, "__LPH_N")
+	local wasQ, wasB = N and N.q, N and N.b
+	forcing = true
 	while qi <= #queue do
 		local t = queue[qi]
 		qi += 1
@@ -178,7 +184,32 @@ local function forceLazy(root)
 		if type(mt) == "table" and type(rawget(mt, "__index")) == "function" and type(rawget(t, 0)) == "table" then
 			local keys = {}
 			for k in next, rawget(t, 0) do keys[#keys + 1] = k end
-			for _, k in ipairs(keys) do pcall(function() return t[k] end) end
+			for _, k in ipairs(keys) do
+				-- The hook is code of the script's loader (a decoder loop) or VM code.  Called for a
+				-- key it does not expect it may never return: loops of the loader are counted while
+				-- N.q is set (__LPH_W), VM instructions against a budget of their own (__LPH_OVER).
+				quietSteps = 0
+				if N then N.q = true; N.b = N.s + 2000000 end
+				local ok, err = pcall(function() return t[k] end)
+				lazyForced += 1
+				if not ok and err == "__LPH_POOL_BUDGET" then
+					lazyStuck += 1
+					break
+				end
+			end
+		elseif lazyInsn and type(mt) == "table" and type(rawget(mt, "__index")) == "function" then
+			-- lazyinsn=1 (one table per instruction, Luraph v14.0 - v14.2): the instruction table
+			-- itself carries the hook; a constant not decoded yet is a nil field among its 7 or 8.
+			-- Only tables that look like an instruction (nothing but small array fields) are read.
+			local small = true
+			for k in next, t do
+				if type(k) ~= "number" or k < 0 or k > 9 or k ~= math.floor(k) then small = false break end
+			end
+			if small then
+				for k = 1, 8 do
+					if rawget(t, k) == nil then pcall(function() return t[k] end) end
+				end
+			end
 		end
 		for k, v in next, t do
 			if type(v) == "table" and not seen[v] and not libnames[v] and v ~= envTable then
@@ -187,6 +218,8 @@ local function forceLazy(root)
 			end
 		end
 	end
+	forcing = false
+	if N then N.q, N.b = wasQ, wasB end
 end
 
 -- Constant pools.  In some builds a proto's constant table is {[-1] = pool, [-2] = index array} with
@@ -413,7 +446,13 @@ end
 local function finish(root)
 	if done then return end
 	done = true
+	local t0 = os.clock()
 	forceLazy(root)
+	if lazyForced >= 1000 or lazyStuck > 0 then
+		-- (large scripts have hundreds of thousands of constants, each decoded by VM code)
+		ewrite(string.format("[dump] %d lazy constants read in %.1f s%s\n", lazyForced, os.clock() - t0,
+			lazyStuck > 0 and string.format("; %d table(s) with a hook that did not return for a pending key: left as they were", lazyStuck) or ""))
+	end
 	findConstFns(root)
 	emit("{")
 	emit('"root":' .. ser(root) .. ",")
@@ -624,7 +663,44 @@ end
 --   __LPH_S    protos replaced by a no-op                         branch decision is to be inverted
 --   __LPH_X    instruction numbers whose decision is inverted
 --   __LPH_R    ring of the last instructions (pid, loop, pc)
-__LPH_N = { c = 0, s = 0, f = false, t = 1, q = false }
+--   __LPH_N.w  dumpnew=1: the proto whose entry is the dump point (set by __LPH_MARK)
+--   __LPH_N.b  instruction budget of the counting hook (budget=<n>; __LPH_OVER is called beyond it)
+__LPH_N = { c = 0, s = 0, f = false, t = 1, q = false, w = nil, b = math.huge }
+-- dumpnew=1 (proto-table layout, see Model.patched_source(newproto=True)): the loader's call of the
+-- VM's first program, Luraph's own init, goes through __LPH_MARK.  What that program returns is the
+-- proto of the script; the interpreter-entry hooks compare their proto with it.
+local markSteps = nil
+function __LPH_MARK(p, ...)
+	if type(p) == "table" then
+		__LPH_N.w = p
+		markSteps = __LPH_N.s
+		ewrite("[handover] the VM's first program returned a proto after " .. __LPH_N.s .. " instructions\n")
+	else
+		ewrite("[handover] the VM's first program returned " .. typeof(p) .. ", not a proto (" .. __LPH_N.s .. " instructions)\n")
+	end
+	return p, ...
+end
+-- the counting hook ran out of budget: the program spins (Luraph's tamper response is an endless
+-- loop) or waits
+function __LPH_OVER()
+	if forcing then error("__LPH_POOL_BUDGET", 0) end
+	if aborted then error(ABORT, 0) end
+	ewrite("[budget] stopped after " .. __LPH_N.s .. " VM instructions" ..
+		(__LPH_N.w == nil and ": the VM's first program has not returned" or ": the script's proto was never entered") .. "\n")
+	abort()
+end
+-- proto-table layout, step hook: a number per proto table, given out by the closure maker
+local pidOf, pidN = setmetatable({}, { __mode = "k" }), 0
+function __LPH_PID(proto)
+	if type(proto) ~= "table" then return 0 end
+	local id = pidOf[proto]
+	if not id then
+		pidN += 1
+		id = pidN
+		pidOf[proto] = id
+	end
+	return id
+end
 -- __LPH_N.q: the harness itself is calling into the loader (servePools); __LPH_W is called from every
 -- loop of the loader then and stops one that does not end (garbage in, endless decoding)
 function __LPH_W()
@@ -686,6 +762,8 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "exercise" then exercise = tonumber(v) ~= 0
 	elseif k == "mfplog" then mfpLog = tonumber(v) ~= 0
 	elseif k == "dumpnew" then dumpNew = tonumber(v) ~= 0
+	elseif k == "lazyinsn" then lazyInsn = tonumber(v) ~= 0
+	elseif k == "budget" then __LPH_N.b = tonumber(v)
 	elseif k == "binds" then recordBinds = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
@@ -991,29 +1069,11 @@ function __LPH_RUN(names, n, ...)
 		return nil
 	end
 	if dumpNew then
-		-- dumpnew=1 (sample patched with newproto): this is called for closures of protos not in
-		-- __LPH_T only.  The first call registers every table of the first program; a later call
-		-- whose proto and code arrays are all new means the bootstrap has started the script.
-		local first = next(__LPH_T) == nil
-		local fresh = 0
-		for _, v in env do
-			if type(v) == "table" and not __LPH_T[v] then fresh += 1 end
-		end
-		local queue = {}
-		for _, v in env do if type(v) == "table" then queue[#queue + 1] = v end end
-		local qi = 1
-		while qi <= #queue do
-			local t = queue[qi]
-			qi += 1
-			if not __LPH_T[t] and not libnames[t] and t ~= envTable then
-				__LPH_T[t] = true
-				for _, v in next, t do
-					if type(v) == "table" and not __LPH_T[v] then queue[#queue + 1] = v end
-				end
-			end
-		end
-		if first or fresh < 4 then return nil end
-		ewrite("[dumpnew] the script starts at interpreter entry " .. runCount .. "\n")
+		-- dumpnew=1 (sample patched with newproto): the hook calls this for the proto __LPH_MARK
+		-- recorded only, i.e. when the VM's init has returned and the script's main function starts
+		if __LPH_N.w == nil then return nil end
+		ewrite("[dumpnew] the script starts at interpreter entry " .. runCount .. " (" .. __LPH_N.s .. " VM instructions, " ..
+			tostring(markSteps) .. " of them the init)\n")
 	elseif runCount < dumpAt then return nil end
 	local root = { kind = "run", vars = env }
 	finish(root)
@@ -1247,7 +1307,7 @@ function populateSandbox()
 		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
-		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T",
+		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T", "__LPH_MARK", "__LPH_OVER", "__LPH_PID",
 		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN", "__LPH_CARRY" }) do
 		local v = _G[n]
 		if v ~= nil then rawset(sandbox, n, v) end

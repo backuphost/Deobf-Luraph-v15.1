@@ -1,4 +1,5 @@
 """Drives the partial evaluator over every instruction of every proto -> per-proto IR graph."""
+import math
 import os
 import struct
 
@@ -14,7 +15,7 @@ def ircfg_cells(cells):
 
 
 class Node:
-    __slots__ = ('key', 'tree', 'exposed', 'written', 'snap_in', 'error', 'kreads')
+    __slots__ = ('key', 'tree', 'exposed', 'written', 'snap_in', 'error', 'kreads', 'folded')
 
     def __init__(self, key):
         self.key = key
@@ -24,6 +25,7 @@ class Node:
         self.snap_in = None
         self.error = None
         self.kreads = set()
+        self.folded = False     # a test of a known constant was replaced by its live side
 
 
 class ProtoIR:
@@ -41,6 +43,7 @@ class ProtoIR:
 CAP = '__captured__'      # key in a known-register map: registers captured by reference
 ABS = '__truth__'         # ... and: frozenset of (register, 'T...' | 'F'), see known_after
 SYMPC = 'jump to a run-time computed instruction'
+NOVAL = object()          # known_after.cval: not a known constant
 
 
 class Samp(tuple):
@@ -61,6 +64,13 @@ def same_const(a, b):
     if isinstance(a, P.ConstFn):
         return a.k == b.k and a.value == b.value
     return False
+
+
+def same_fact(a, b):
+    """same_const, also for the strings / nil / library functions of known_after's ('V', r) entries."""
+    if same_const(a, b):
+        return True
+    return type(a) is type(b) and type(a) in (str, tuple) and a == b
 
 
 def same_value(a, b):
@@ -106,6 +116,7 @@ class Lifter:
         self.param_vals = {}        # parameter index -> opaque number every caller passes
         self.blocked = {}           # proto -> instruction -> jump targets not to follow (opaque.prune_ir)
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
+        self.pure_calls = False     # known_after computes library calls on constants (see there)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
         self.end_state = False      # the dump was taken at the end of the run (see PE.frozen)
         # an instruction that ran is only lifted in a code state the run recorded for it (lift_proto);
@@ -328,6 +339,9 @@ class Lifter:
                     return self.up_nums.get(e[1])
                 if e[0] == 'mv' and e[2] == 1:
                     return calls.get(e[1])
+                if e[0] == 'mv':
+                    v = calls.get((e[1], e[2]))
+                    return v if P.is_num(v) else None
                 if e[0] == 'bin' and e[1] in ('+', '-', '*', '%', '//'):
                     x, y = num2(e[2]), num2(e[3])
                     if x is None and e[1] == '%' and y == 4294967296 and e[2][0] in ('r', 't', 'up', 'upcell') and self.end_state:
@@ -357,12 +371,109 @@ class Lifter:
                     if isinstance(x, P.UpNum) or isinstance(y, P.UpNum):
                         return P.UpNum(r)
                     return P.norm(r)
+                if self.pure_calls and e[0] == 'bin' and e[1] in ('/', '^'):
+                    x, y = num(e[2]), num(e[3])
+                    if x is None or y is None or (e[1] == '/' and y == 0):
+                        return None
+                    try:
+                        r = float(x) / float(y) if e[1] == '/' else float(x) ** float(y)
+                    except (OverflowError, ZeroDivisionError, ValueError):
+                        return None
+                    return P.norm(r) if isinstance(r, float) and r == r and abs(r) < 2 ** 53 else None
+                if self.pure_calls and e[0] == 'un' and e[1] == '-':
+                    x = num(e[2])
+                    return None if x is None else P.norm(-x)
+                if self.pure_calls and e[0] == 'index':
+                    v = cval(e)             # (math.pi, math.huge)
+                    return v if P.is_num(v) else None
                 return None
+
+            def cval(e):
+                # The constant a value is known to be: a number, a string, or a library function
+                # (as ('kfn', name)); NOVAL otherwise.  Strings and functions are kept apart from
+                # the numbers (register r under ('V', r)): they only serve to compute calls of
+                # pure library functions on constants, the way Luraph v14 programs make the
+                # values they patch into their own operands.
+                if e[0] == 'k':
+                    return e[1] if e[1] is None or isinstance(e[1], (str, bool)) or P.is_num(e[1]) else NOVAL
+                if e[0] == 'kfn':
+                    return ('kfn', str(e[1]))
+                if e[0] == 'global':
+                    # (the program's own patch arithmetic relies on these being the libraries)
+                    return ('lib', e[1]) if e[1] in ('bit32', 'math', 'string') else NOVAL
+                if e[0] == 'index':
+                    if isinstance(e[1], tuple) and isinstance(e[2], tuple) and e[2][0] == 'k' and isinstance(e[2][1], str):
+                        lib = cval(e[1])
+                        if isinstance(lib, tuple) and lib[0] == 'lib':
+                            if lib[1] == 'math' and e[2][1] in ('pi', 'huge'):
+                                return math.pi if e[2][1] == 'pi' else math.inf
+                            return ('kfn', lib[1] + '.' + e[2][1])
+                    return NOVAL
+                v = NOVAL
+                if e[0] == 'r':
+                    v = known.get(('V', e[1]), NOVAL)
+                    if v is NOVAL and isinstance(known.get(e[1]), bool):
+                        v = known[e[1]]
+                elif e[0] == 't':
+                    v = temps.get(('V', e[1]), NOVAL)
+                elif e[0] == 'mv':
+                    v = calls.get((e[1], e[2]), NOVAL)
+                if v is NOVAL:
+                    v = num(e)
+                    return NOVAL if v is None else v
+                return v
+
+            def ctruth(e):
+                # the outcome of a test of a known constant, else None
+                v = cval(e)
+                return None if v is NOVAL else (v is not None and v is not False)
 
             calls = dict(calls or ())
             truth = {}
             cabs = {}
+            pure = self.pure_calls
             for st in stmts:
+                if pure and st[0] == 'call' and isinstance(st[2], tuple):
+                    f = cval(st[2])
+                    if isinstance(f, tuple) and f[0] == 'kfn':
+                        args = [cval(a) for a in st[3]]
+                        if st[4] is not None:
+                            # (all results of a call computed before: `f(g(x))`)
+                            n = calls.get(('n', st[4]))
+                            args = args + [calls[(st[4], i + 1)] for i in range(n)] if n is not None else [NOVAL]
+                        res = None
+                        if all(a is not NOVAL for a in args):
+                            try:
+                                res = P.fold_pure(f[1], args)
+                            except (TypeError, ValueError, OverflowError, ZeroDivisionError, IndexError, struct.error):
+                                res = None
+                        if res is not None:
+                            calls[('n', st[1])] = len(res)
+                            for i, v in enumerate(res):
+                                calls[(st[1], i + 1)] = v
+                            if res and P.is_num(res[0]):
+                                calls[st[1]] = P.norm(res[0])
+                if pure and st[0] == 'set' and isinstance(st[2], tuple) and st[1][0] in ('t', 'r'):
+                    e = st[2]
+                    v = cval(e)
+                    if v is NOVAL and e[0] == 'bin' and e[1] in ('==', '~=', '<', '<=', '>', '>='):
+                        # a comparison of two constants
+                        x, y = cval(e[2]), cval(e[3])
+                        if x is not NOVAL and y is not NOVAL and not isinstance(x, tuple) and not isinstance(y, tuple):
+                            if e[1] in ('==', '~='):
+                                same = (x == y) if (P.is_num(x) and P.is_num(y)) or type(x) is type(y) else False
+                                v = same == (e[1] == '==')
+                            elif (P.is_num(x) and P.is_num(y)) or (isinstance(x, str) and isinstance(y, str)):
+                                v = x < y if e[1] == '<' else x <= y if e[1] == '<=' else x > y if e[1] == '>' else x >= y
+                    elif v is NOVAL and e[0] == 'un' and e[1] == 'not' and ctruth(e[2]) is not None:
+                        v = not ctruth(e[2])
+                    if st[1][0] == 't':
+                        if v is None or isinstance(v, (str, tuple, bool)):
+                            temps[('V', st[1][1])] = v
+                    elif (v is None or isinstance(v, (str, tuple))) and st[1][1] not in known.get(CAP, ()):
+                        known[('V', st[1][1])] = v
+                    else:
+                        known.pop(('V', st[1][1]), None)
                 if st[0] == 'set' and isinstance(st[2], tuple):
                     e = st[2]
                     if e[0] in ('index', 'method') and isinstance(e[1], tuple):
@@ -460,6 +571,12 @@ class Lifter:
                         temps[st[1][1]] = v
                         self.temp_vals[st[1][1]] = v     # (a temporary can outlive the instruction
                                                          # as the value of an interpreter local)
+                    elif pure:
+                        # (not known on this path, whatever another path found; and a later
+                        # instruction that sees this temporary in an interpreter local must not
+                        # get the other path's number)
+                        temps[st[1][1]] = None
+                        self.temp_vals.pop(st[1][1], None)
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
                     # where the new function's upvalues come from: opaque numbers among them are
                     # needed to lift it when it never ran (see instantiate)
@@ -488,6 +605,7 @@ class Lifter:
                             # (a number stays known until something is called: see below)
                             if not (P.is_num(known.get(r)) and not isinstance(known.get(r), bool)):
                                 known.pop(r, None)
+                            known.pop(('V', r), None)
                 if st[0] == 'call' and any(a == ('regs',) for a in st[3]):
                     # the register array itself escaped into a call: anything may have changed
                     known = {CAP: known[CAP]} if CAP in known else {}
@@ -524,6 +642,8 @@ class Lifter:
                         known[st[1][1]] = P.ConstFn(e[1], e[2])
                     elif e[0] in ('t', 'bin', 'up', 'upcell', 'mv') and num2(e) is not None:
                         known[st[1][1]] = num2(e)
+                    elif pure and e[0] == 't' and isinstance(temps.get(('V', e[1])), bool):
+                        known[st[1][1]] = temps[('V', e[1])]
                     else:
                         known.pop(st[1][1], None)
                 elif st[0] == 'setmulti':
@@ -533,7 +653,14 @@ class Lifter:
                     # the closures that captured these registers keep a copy from here on
                     hi = st[2] if len(st) > 2 else None
                     known[CAP] = frozenset(r for r in known[CAP] if r < st[1] or (hi is not None and r > hi))
-            if term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
+            if term[0] == 'br' and pure and ctruth(term[1]) is not None:
+                # A test of a constant (Luraph v14 writes the values it patches into its own
+                # operands as `a and K1 or K2` chains over library calls on literals): only one
+                # side exists.  The other is not followed, and lift_proto takes it out of the tree.
+                live = ctruth(term[1])
+                self.folds[id(term)] = live
+                walk(term[2] if live else term[3], known, temps, calls, tabs)
+            elif term[0] == 'br' and term[1][0] == 't' and term[1][1] in truth:
                 # (the not-a-number test inside a 32-bit multiply: only one side happens)
                 n0 = len(out)
                 walk(term[2] if truth[term[1][1]] else term[3], known, temps, calls)
@@ -569,6 +696,7 @@ class Lifter:
                 regs = (term[2] + 3,) if term[1] == 'num' else tuple(term[2])
                 for n in regs:
                     known.pop(n, None)
+                    known.pop(('V', n), None)
                 walk(term[3], known)
                 walk(term[4], known)
             elif term[0] == 'goto':
@@ -669,6 +797,13 @@ class Lifter:
                 raise PEError('bad numeric for loop op')
             return (([], ('forbr', 'num', min(writes) - 3, ([], endT), ([], endF)))), ex, wr
         if 'fcall' in kinds:
+            writesF = [s[1][1] for s in irF if s[0] == 'set' and s[1][0] == 'r']
+            if not writes and writesF and endF[0] == 'goto':
+                # the handler tests the negated condition (`a, b, c = iter(); if not a then else
+                # R[A+1] = b; R[A+2] = c; pc = target end`): as in the numeric case, the
+                # permissive "false" run is the one that stays in the loop
+                endT, endF = endF, endT
+                writes = writesF
             if endF[0] != 'goto' or not writes:
                 raise PEError('bad generic for loop op')
             return (([], ('forbr', 'gen', tuple(sorted(writes)), ([], endT), ([], endF)))), ex, wr
@@ -769,9 +904,12 @@ class Lifter:
         self.pe.keyfn_used = pir.keyfns = set()
         indirect = {}       # (loop, pc) of a jump-through-register instruction -> register
         interp = self.instantiate(key)
-        _, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
+        ir0, _, end, _, _, _ = self.run_once(interp, None, [], None, 'entry')
         if end[0] != 'goto':
             raise PEError('interpreter returned before reaching dispatch loop')
+        # parameters the interpreter copies into registers before its dispatch loop
+        # (`for i = 1, nparams do R[i] = args[i] end`, v14.0.2 - v14.2): see the end of this method
+        entry_params = [st for st in ir0 if st[0] == 'params' or (st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'arg')]
         entry, snap = end[1], end[2]
         if key in self.entry_override:
             entry, ovars = self.entry_override[key]
@@ -782,6 +920,7 @@ class Lifter:
                     snap[name] = P.norm(v)
             snap[pcv] = entry[1]
         pir.entry = entry
+        entry_snap = snap
         work = [(entry, snap, {}, None, None, None)]
         # Traced lifts: the writes instructions make to the code (decrypt a block, use it, encrypt
         # it again) belong to the path they are on.  Every queued instruction remembers its path
@@ -1031,7 +1170,36 @@ class Lifter:
                     for name, v in node.snap_in.items():
                         if name in snap and not same_value(v, snap[name]):
                             pir.conflicts.append((key2, name, v, snap[name]))
-                    continue
+                    if not self.pure_calls or node.error:
+                        continue
+                    # What is known about the registers decides tests of constants and gives the
+                    # values of patches, so it has to hold on every path to the instruction: what
+                    # this path does not confirm is withdrawn, here and (through the exits) in
+                    # what follows.  The instruction is lifted again only when its tree used it.
+                    old = node_in.get(key2) or {}
+                    lost = {r for r, v in old.items() if r != CAP and r != ABS and not (r in known and same_fact(known[r], v))}
+                    if not lost:
+                        continue
+                    relifts[key2] = relifts.get(key2, 0) + 1
+                    if os.environ.get('DEVM_TRACE_MEET'):
+                        print('MEET', key, key2, 'lost', sorted(map(str, lost)), 'kreads', node.kreads, 'folded', node.folded)
+                    if relifts[key2] > 6:
+                        lost = {r for r in old if r != CAP}       # (give up on this instruction: nothing is known)
+                    meet = {r: v for r, v in old.items() if r not in lost}
+                    node_in[key2] = meet
+                    if node.folded or node.kreads & {r[1] if isinstance(r, tuple) else r for r in lost} \
+                            or any(e[0] == 'goto' and len(e[1]) > 2 for e in tree_ends(node.tree)):
+                        known = meet
+                        snap = node.snap_in
+                        del pir.nodes[key2]
+                    else:
+                        self.folds = {}
+                        self.cur_node = (key, key2)
+                        ends = self.known_after(node.tree, meet)
+                        self.cur_node = None
+                        for end, kn in ends:
+                            work.append((end[1], end[2], kn, node, end, path))
+                        continue
             ran = pathmode and (key, key2[0], key2[1]) in self.oracle
             replay = bool(self.pe.replay_tables)
             rec = self.oracle.get((key, key2[0], key2[1])) if pathmode else None
@@ -1202,8 +1370,9 @@ class Lifter:
             self.folds = {}
             self.cur_node = (key, key2)
             ends = self.known_after(node.tree, known)
-            if self.folds and pathmode:
+            if self.folds and (pathmode or self.pure_calls):
                 node.tree = fold_tree(node.tree, self.folds)
+                node.folded = True
                 self.folds = {}
                 self.cur_node = None
                 ends = self.known_after(node.tree, known)
@@ -1257,6 +1426,21 @@ class Lifter:
             pir.nodes = {k: n for k, n in pir.nodes.items() if k in seen}
             pir.errors = [(k, n.error) for k, n in pir.nodes.items() if n.error]
         pir.children = self.queue[nq0:]
+        if entry_params and pir.entry in pir.nodes:
+            # A loop statement of the prologue is not executed again when single instructions are
+            # lifted (PE.exec_seek), so what it wrote (a `params` block, see PE.exec_core, or single
+            # `R[n] = argument n` statements) exists only in the entry run: it becomes a
+            # block of its own in front of the first instruction, which may be a jump target.
+            # (A plain statement of the prologue is executed for every instruction; what the
+            # first instruction's own tree already holds is not repeated.)
+            first = pir.nodes[pir.entry].tree[0] if pir.nodes[pir.entry].tree else []
+            entry_params = [st for st in entry_params if st not in first]
+            if entry_params:
+                pre = Node((pir.entry[0], -1))
+                pre.tree = (entry_params, ('goto', pir.entry, entry_snap))
+                pre.snap_in = entry_snap
+                pir.nodes[pre.key] = pre
+                pir.entry = pre.key
         self.check_conflicts(pir)
         if self.end_state and isinstance(key, int):
             # registers that held one and the same number in every instruction that ran: key material
@@ -1420,14 +1604,8 @@ class TableProtoLifter(Lifter):
                     counts[e[1][1]] = counts.get(e[1][1], 0) + 1
         self.proto_param = max(counts, key=counts.get)
         # tables handed to the wrapper's enclosing functions are loader state, not program data
-        program = set()
-        stack = [self.base.vars[self.proto_param]]
-        while stack:
-            t = stack.pop()
-            if id(t) in program:
-                continue
-            program.add(id(t))
-            stack.extend(x for x in t.h.values() if isinstance(x, LuaTable))
+        program = self.pe.program_ids = set()
+        self.mark_program(self.base.vars[self.proto_param])
         for f in model.chain[:-2]:
             for p in f.params:
                 v = self.base.vars.get(p)
@@ -1438,9 +1616,60 @@ class TableProtoLifter(Lifter):
                             self.pe.volatile.add(sub.path)
         self.root_key = self.base.vars[self.proto_param].id
         self.proto_objs[self.root_key] = self.base.vars[self.proto_param]
+        self.pe.slot_policy = True
+        self.pure_calls = True
+        self.slot_rounds = 0
+
+    # attributes a caller sets between making the lifter and lift_all (kept when lift_all starts over)
+    SETTINGS = ('blocked', 'entry_override', 'param_vals', 'constprop', 'end_state', 'oracle',
+                'defer_foreign_state', 'slot_rounds')
+
+    def mark_program(self, proto):
+        """Everything reachable from a proto is program data (code and constant arrays, nested
+        protos): the evaluator keeps it concrete and refuses run-time values stored into it."""
+        program = self.pe.program_ids
+        stack = [proto]
+        while stack:
+            t = stack.pop()
+            if id(t) in program:
+                continue
+            program.add(id(t))
+            stack.extend(x for x in t.h.values() if isinstance(x, LuaTable))
+
+    def on_closure(self, proto):
+        if isinstance(proto, LuaTable):
+            self.mark_program(proto)
+        return Lifter.on_closure(self, proto)
+
+    def lift_all(self, root_key):
+        """Lift every proto; again from the state of the dump when a loader-state slot that was
+        answered from the dump turned out to be written by code that runs (see PE.slot_policy).
+        Slots are only ever added to the run-time set, so this ends."""
+        protos = Lifter.lift_all(self, root_key)
+        while self.pe.slot_conflicts():
+            self.slot_rounds += 1
+            unstable = self.pe.unstable | self.pe.slot_writes
+            if self.slot_rounds > 8:
+                # (not seen in any file: stop telling slots apart, every loader table read from
+                # the dump so far is run-time state as a whole)
+                unstable |= {(path, None) for path, _ in self.pe.stable_reads}
+            # (what a caller may have set on the lifter before lifting stays; the evaluator, the
+            # dump's tables and everything lifted so far are made anew: `self.pe` and `self.dump`
+            # are other objects afterwards)
+            keep = {k: getattr(self, k) for k in self.SETTINGS}
+            overrides, server = self.pe.keyfn_override, self.dump.server
+            self.__init__(self.model, P.Dump(self.dump.data, self.model), self.log)
+            self.__dict__.update(keep)
+            self.pe.keyfn_override, self.dump.server = overrides, server
+            self.pe.unstable = unstable
+            if root_key not in self.proto_objs:
+                self.register(root_key)
+            protos = Lifter.lift_all(self, root_key)
+        return protos
 
     def register(self, key):
         self.proto_objs[key] = self.dump.tables[key]
+        self.mark_program(self.dump.tables[key])
 
     def instantiate(self, key):
         proto = self.proto_objs[key]
@@ -1462,6 +1691,11 @@ class TableProtoLifter(Lifter):
         r = pe.exec_block(self.wrap.body, sc)
         if not r or r[0] != 'return' or not isinstance(r[1][0], LFn):
             raise PEError('wrap did not return the interpreter closure')
+        # A closure maker with several interpreters picks one by the proto's kind: the names of
+        # its state variables (loop state, open upvalues) are those of that interpreter.
+        it = self.model.interp_funcs.get(id(r[1][0].func)) if r[1][0].func is not None else None
+        if it is not None and it is not pe.cur_interp:
+            pe.set_interp(it)
         return r[1][0]
 
 

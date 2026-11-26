@@ -189,6 +189,18 @@ def _unparen(e):
     return e
 
 
+def _steps_name(st, nm):
+    """`nm = nm + 1` / `nm += 1` (a stack pointer moving up)"""
+    if st is None:
+        return False
+    if st[0] == 'opassign':
+        return st[1] == '+' and st[2] == ('name', nm) and _unparen(st[3]) == ('num', 1)
+    if st[0] == 'assign' and len(st[1]) == 1 and len(st[2]) == 1 and st[1][0] == ('name', nm):
+        e = _unparen(st[2][0])
+        return e[0] == 'bin' and e[1] == '+' and {_unparen(e[2]), _unparen(e[3])} == {('name', nm), ('num', 1)}
+    return False
+
+
 class KNum(float):
     """A number derived from the loader's key functions. Unlike ordinary values it is tracked
     across instructions, because self-modifying code uses it as patch address / patch value."""
@@ -444,7 +456,7 @@ def lua_unpack(fmt, data):
     out = []
     pos = 0
     i = 0
-    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 8, 'J': 8, 'T': 8}
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 4, 'J': 4, 'T': 4}     # (Luau: j, J and T are 4 bytes)
     while i < len(fmt):
         c = fmt[i]
         i += 1
@@ -454,6 +466,10 @@ def lua_unpack(fmt, data):
             endian = '>'
         elif c == ' ':
             pass
+        elif c == 'x':
+            pos += 1
+            if pos > len(raw):
+                return None
         elif c in 'bBhHlLjJTiI':
             n = sizes.get(c, 4)
             j = i
@@ -476,6 +492,138 @@ def lua_unpack(fmt, data):
             return None
     out.append(pos + 1)
     return out
+
+
+def lua_packsize(fmt):
+    """string.packsize for the fixed-size formats lua_unpack reads; None when not supported."""
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 4, 'J': 4, 'T': 4, 'f': 4, 'd': 8, 'n': 8, 'x': 1}
+    total = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        i += 1
+        if c in '<=> ':
+            continue
+        if c in 'iI':
+            j = i
+            while j < len(fmt) and fmt[j].isdigit():
+                j += 1
+            total += int(fmt[i:j]) if j > i else 4
+            i = j
+        elif c == 'c':
+            # a string of fixed length: `c` with its byte count
+            j = i
+            while j < len(fmt) and fmt[j].isdigit():
+                j += 1
+            if j == i:
+                return None
+            total += int(fmt[i:j])
+            i = j
+        elif c in sizes:
+            total += sizes[c]
+        else:
+            return None
+    return total
+
+
+def fold_pure(name, args):
+    """The results (a list) of a library function that has no effect and depends on nothing but its
+    arguments, called with constants; None when the call is not one this evaluator computes.
+    Luraph's VMs compute patch values and keys with such calls on literals.  (May raise what the
+    Python stand-in raises on arguments the library function rejects.)"""
+    if name == 'string.unpack' and len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
+        return lua_unpack(args[0], args[1])
+    if name in PURE and all(is_num(a) for a in args):
+        return [norm(PURE[name](*args))]
+    if name == 'string.packsize' and len(args) == 1 and isinstance(args[0], str):
+        r = lua_packsize(args[0])
+        return None if r is None else [r]
+    if name == 'string.len' and len(args) == 1 and isinstance(args[0], str):
+        return [len(args[0])]
+    if name == 'string.byte' and args and isinstance(args[0], str) and len(args) <= 3 \
+            and all(a is None or (is_num(a) and float(a).is_integer()) for a in args[1:]):
+        n = len(args[0])
+        i = int(args[1]) if len(args) > 1 and args[1] is not None else 1
+        j = int(args[2]) if len(args) > 2 and args[2] is not None else i
+        i = max(n + i + 1, 1) if i < 0 else max(i, 1)
+        j = n + j + 1 if j < 0 else min(j, n)
+        return [ord(c) for c in args[0][i - 1:j]] if i <= j else []
+    if name == 'math.modf' and len(args) == 1 and is_num(args[0]) and args[0] == args[0]:
+        x = float(args[0])
+        if x in (math.inf, -math.inf):
+            return [x, 0]
+        ip = float(math.trunc(x))
+        return [norm(ip), norm(x - ip)]
+    if name == 'math.round' and len(args) == 1 and is_num(args[0]) and args[0] == args[0] \
+            and abs(args[0]) < 2 ** 52:
+        # (Luau rounds halves away from zero)
+        return [norm(float(math.floor(args[0] + 0.5) if args[0] >= 0 else math.ceil(args[0] - 0.5)))]
+    return None
+
+
+def closes_cells(st):
+    """`for k, cell in MAP do ... cell[A] = <x>; cell[B] = <y>; MAP[k] = nil ... end`: the loop that
+    closes open upvalues (each cell gets its own storage and leaves the map)."""
+    if st[0] != 'forin' or len(st[1]) != 2 or len(st[2]) != 1 or st[2][0][0] != 'name':
+        return False
+    key, cell, mp = ('name', st[1][0]), ('name', st[1][1]), st[2][0]
+    seen = {'cell': 0, 'gone': False}
+
+    def scan(block):
+        for s in block:
+            if s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and s[1][0][0] == 'index':
+                base, k = _unparen(s[1][0][1]), _unparen(s[1][0][2])
+                if base == cell and k[0] == 'num':
+                    seen['cell'] += 1
+                elif base == mp and k == key and _unparen(s[2][0]) == ('nil',):
+                    seen['gone'] = True
+            for b in subblocks(s):
+                scan(b)
+    scan(st[3])
+    return seen['gone'] and seen['cell'] >= 2
+
+
+def nested_close(st):
+    """The close-upvalues loop of Luraph v14.0.x:
+
+        for _, list in LISTS do for _, cell in list do
+            if cell[A] == REGS and cell[B] >= BASE then <detach the cell> end
+        end end
+
+    LISTS holds the capture lists of the closures a call made; a cell is {[A]=array, [B]=index}.
+    Returns (array expression, BASE expression) or None."""
+    if st[0] != 'forin' or len(st[1]) != 2 or len(st[2]) != 1 or st[2][0][0] != 'name' or len(st[3]) != 1:
+        return None
+    inner = st[3][0]
+    if inner[0] != 'forin' or len(inner[1]) != 2 or len(inner[2]) != 1 or _unparen(inner[2][0]) != ('name', st[1][1]) \
+            or len(inner[3]) != 1 or inner[3][0][0] != 'if':
+        return None
+    cell = ('name', inner[1][1])
+
+    def field(x):
+        x = _unparen(x)
+        return x[0] == 'index' and _unparen(x[1]) == cell and _unparen(x[2])[0] == 'num'
+
+    found = {}
+
+    def scan(c):
+        c = _unparen(c)
+        if c[0] == 'un' and c[1] == 'not':
+            scan(c[2])
+        elif c[0] == 'bin' and c[1] in ('and', 'or'):
+            scan(c[2])
+            scan(c[3])
+        elif c[0] == 'bin' and c[1] == '==':
+            if field(c[2]) != field(c[3]):
+                found['arr'] = c[3] if field(c[2]) else c[2]
+        elif c[0] == 'bin' and c[1] in ('>=', '<'):
+            if field(c[2]) and not field(c[3]):
+                found['base'] = c[3]
+    for c, _ in inner[3][0][1]:
+        scan(c)
+    if 'arr' in found and 'base' in found:
+        return found['arr'], found['base']
+    return None
 
 
 def lua_type(v):
@@ -710,7 +858,15 @@ class PE:
         self.inject = None          # (loop_idx, snapshot)
         self.seeking = False
         self.interp_scope = None
-        self.state_sets = {it.index: self._classify_state_vars(it.loops) for it in model.interps}
+        # names of per-closure lists of capture lists (see nested_close), per interpreter: the
+        # same name is something else in the closure maker of another interpreter
+        self.state_sets = {}
+        self.cell_lists_of = {}
+        for it in model.interps:
+            self.cell_lists = set()
+            self.state_sets[it.index] = self._classify_state_vars(it.loops)
+            self.cell_lists_of[it.index] = self.cell_lists
+        self.cell_lists = set().union(*self.cell_lists_of.values()) if self.cell_lists_of else set()
         self.set_interp(model.interp_funcs[id(model.interp)])
         self.events = []
         self.wrap_func = None
@@ -752,8 +908,31 @@ class PE:
         from . import luprint
         self.native_ids = {id(f) for f in model.funcs if luprint.native_shape(f)}
         self.volatile = set()       # paths of loader-state tables whose scalar fields change at run time
+        # Per-slot policy (proto-table layouts, set by TableProtoLifter).  The interpreters of
+        # v14 builds test loader-state slots against each other in front of junk arms (opaque
+        # tests), and keep run-time values of the program in loader tables.  A slot is answered
+        # from the dump as long as no code the evaluator executes writes it; a slot such code
+        # does write is a run-time variable.  Which is which is only known after everything has
+        # been lifted, so the lifter repeats the lift when a slot it answered from the dump
+        # turned out to be written (TableProtoLifter.lift_all).
+        self.slot_policy = False
+        self.program_ids = set()    # ids of the tables that are program data (protos, code arrays)
+        self.unstable = set()       # (table path, key) written by code that runs; (path, None): with a run-time key
+        self.stable_reads = set()   # (table path, key) answered from the dump in this lift
+        self.slot_writes = set()    # (table path, key) written in this lift
         for l in model.loops:
             self.pcvars[id(l)] = l[2][0][2][0][2][1]
+        # the statement of each interpreter's prologue that declares its register array (see local_regs)
+        self.regs_decl = {}
+        self.alloc_funcs = set()    # ids of loader functions that allocate register arrays
+        for it in model.interps:
+            name = model.regs_name(it)
+            for st in it.func.body[:16]:
+                if st[0] == 'local' and name in st[1]:
+                    i = st[1].index(name)
+                    if i < len(st[2]) and _unparen(st[2][i])[0] == 'call':
+                        self.regs_decl[id(st)] = i
+                    break
 
     # -- static helpers
     def _ancestors(self):
@@ -821,14 +1000,33 @@ class PE:
         """Select which interpreter's variable classification applies (names clash between interpreters)."""
         self.cur_interp = it
         self.fvars, self.fstack, self.openups = self.state_sets[it.index]
+        self.cell_lists = self.cell_lists_of.get(it.index, set())
+        # (the closure maker of this interpreter: the function right around it)
+        self.maker_id = it.chain[-2].id if it.chain and len(it.chain) >= 2 else None
 
     def _classify_state_vars(self, loops):
-        """Find interpreter-level locals used as for-loop state / open-upvalue map."""
+        """Find interpreter-level locals used as for-loop state / open-upvalue map.
+
+        Handlers name these variables directly or through a local of their own (`local u = G;
+        if u then for k, c in u do ...`), and a handler's other locals reuse the same letters.
+        So a name found in a handler is resolved to its declaration first: the interpreter's
+        variable, the interpreter's variable a handler-local alias copies, or nothing."""
         fvars = set()
         fstack = set()
         openups = set()
 
-        def visit(st, prev=None):
+        def res(nm, scopes):
+            for sc in reversed(scopes):
+                if nm in sc:
+                    return sc[nm]
+            return nm
+
+        def add(group, nm, scopes):
+            nm = res(nm, scopes)
+            if nm is not None:
+                group.add(nm)
+
+        def visit(st, prev, nxt, scopes):
             t = st[0]
             if t == 'assign' and len(st[1]) == len(st[2]):
                 # `stack = {..., stack}`, also as one target of a multiple assignment
@@ -843,27 +1041,54 @@ class PE:
                 for tg, val in zip(st[1], st[2]):
                     while val[0] == 'paren':
                         val = val[1]
-                    if tg[0] != 'name' or val[0] != 'table':
+                    if val[0] != 'table':
+                        continue
+                    vals = [v for _, _, v in val[1]]
+                    if tg[0] == 'index' and len(st[1]) == 1:
+                        # the saved state on an array stack (v14.0.2 - v14.2):
+                        # `stack[top] = {[5]=limit, [4]=step, [1]=index}; top = top + 1`
+                        base, top = _unparen(tg[1]), _unparen(tg[2])
+                        if base[0] == 'name' and top[0] == 'name' and len(vals) >= 3 \
+                                and all(v[0] == 'name' for v in vals) and len({v[1] for v in vals}) == len(vals) \
+                                and any(_steps_name(x, top[1]) for x in (prev, nxt)):
+                            add(fstack, base[1], scopes)
+                            add(fstack, top[1], scopes)
+                            for v in vals:
+                                add(fvars, v[1], scopes)
+                        continue
+                    if tg[0] != 'name':
                         continue
                     nm = tg[1]
-                    vals = [v for _, _, v in val[1]]
                     if any(v == ('name', nm) for v in vals):
-                        fstack.add(nm)
+                        add(fstack, nm, scopes)
                         for v in vals:
                             if v[0] == 'name':
-                                fvars.add(v[1])
+                                add(fvars, v[1], scopes)
                     elif tmp and tmp[1] == nm and sum(1 for v in vals if v == ('name', tmp[0])) == 1 \
                             and len(vals) >= 3 and all(v[0] == 'name' for v in vals):
-                        fstack.add(nm)
-                        fvars.add(nm)
+                        add(fstack, nm, scopes)
+                        add(fvars, nm, scopes)
                         for v in vals:
                             if v[1] != tmp[0]:
-                                fvars.add(v[1])
+                                add(fvars, v[1], scopes)
             if t == 'forin' and len(st[2]) == 1 and st[2][0][0] == 'name' and len(st[1]) == 2:
                 body = st[3]
                 txt = repr(body)
-                if "('num', 3)" in txt and "('num', 2)" in txt:
-                    openups.add(st[2][0][1])
+                # (the loop closes the cells it walks: it writes fields of its value variable.  The
+                # loop that clears registers above the top, `for k, v in R do ... R[k] = nil end`,
+                # never touches v, whatever numbers the opaque tests inside it mention.)
+                cell = repr(('name', st[1][1]))
+                if "('num', 3)" in txt and "('num', 2)" in txt \
+                        and ("('index', " + cell in txt or "('index', ('paren', " + cell in txt):
+                    add(openups, st[2][0][1], scopes)
+                elif not getattr(self.model, 'factory_style', False) and closes_cells(st) \
+                        and res(st[2][0][1], scopes) is not None:
+                    # the same loop whatever the cell's field numbers are (v14.1: 1 and 2)
+                    add(openups, st[2][0][1], scopes)
+                if nested_close(st) is not None and res(st[2][0][1], scopes) == st[2][0][1]:
+                    # v14.0.x keeps, per closure, a list of the capture lists it made, in a local
+                    # of the closure maker (not of the interpreter)
+                    self.cell_lists.add(st[2][0][1])
             if t == 'if':
                 # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
                 # open[r] = nil end end`: handlers that end the scope of single registers
@@ -871,15 +1096,39 @@ class PE:
                     if c[0] == 'name' and body and body[0][0] == 'local':
                         txt = repr(body[:3])
                         if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
-                            openups.add(c[1])
-            for blk in subblocks(st):
-                for i, sub in enumerate(blk):
-                    visit(sub, blk[i - 1] if i else None)
+                            add(openups, c[1], scopes)
+
+        def walk(block, scopes):
+            sc = {}
+            scopes = scopes + [sc]
+            for i, st in enumerate(block):
+                visit(st, block[i - 1] if i else None, block[i + 1] if i + 1 < len(block) else None, scopes)
+                t = st[0]
+                if t == 'fornum':
+                    walk(st[5], scopes + [{st[1]: None}])
+                elif t == 'forin':
+                    walk(st[3], scopes + [{n: None for n in st[1]}])
+                else:
+                    for blk in subblocks(st):
+                        walk(blk, scopes)
+                if t == 'local':
+                    # (a plain copy of an interpreter variable stands for it; any other local hides it)
+                    vals = [_unparen(e) for e in st[2]]
+                    new = [res(vals[j][1], scopes) if j < len(vals) and vals[j][0] == 'name' else None
+                           for j in range(len(st[1]))]
+                    for nm, v in zip(st[1], new):
+                        sc[nm] = v
+                elif t == 'localfunc':
+                    sc[st[1]] = None
 
         for l in loops:
-            for i, st in enumerate(l[2]):
-                visit(st, l[2][i - 1] if i else None)
+            walk(l[2], [])
         return fvars, fstack, openups
+
+    def slot_conflicts(self):
+        """Loader-state slots this lift answered from the dump although code that runs writes them."""
+        tabs = {p for p, k in self.slot_writes if k is None}
+        return {s for s in self.stable_reads if s in self.slot_writes or s[0] in tabs}
 
     # -- emission
     def newt(self):
@@ -992,6 +1241,10 @@ class PE:
                 # Roblox datatypes and executor functions (gethui, fireproximityprompt, ...)
                 return GlobalPath(name)
             raise PEError('unbound name %s' % name)
+        if self.cell_lists and name in self.cell_lists and (s.owner is None or s.owner == self.maker_id):
+            # a local of the closure maker (see nested_close): the scope the dump describes, or the
+            # maker's own when the evaluator instantiated the closure; not a local of some helper
+            return OPENUPS
         if s.owner == self.cur_interp.func.id and (self.state_scopes is None or id(s) in self.state_scopes):
             # interpreter-level state variables (names are only meaningful inside the interpreter)
             if name in self.openups:
@@ -1013,6 +1266,12 @@ class PE:
     def setvar(self, scope, name, v):
         s = scope.lookup(name)
         if s is None:
+            if self.model.oneline and self.inject is not None and not self.seeking and not self.lazy_depth \
+                    and not isinstance(v, (LinSym, MultiTail)):
+                # a handler that assigns a free name: Luraph compiled this assignment of a global of
+                # the script into the interpreter itself (reads of such names: see getvar)
+                self.emit(('set', ('global', name), self.atom(v)))
+                return
             raise PEError('assignment to unbound name %s' % name)
         if s.owner == self.cur_interp.func.id and (name in self.fvars or name in self.fstack) \
                 and (self.state_scopes is None or id(s) in self.state_scopes):
@@ -1084,6 +1343,11 @@ class PE:
                         vals = self.evalmulti(v, scope)
                         if vals and isinstance(vals[-1], MultiTail):
                             if n == 0 and len(vals) == 1:
+                                if vals[0].id == 'args':
+                                    # `{...}` of the closure's own arguments is the argument pack
+                                    # the vararg packer gives: `local h = {...}; R[i] = h[i]`
+                                    # copies parameters
+                                    return VARARG_TBL
                                 return PackedTbl(vals[0].id)
                             raise PEError('table constructor with open tail')
                         for x in vals:
@@ -1196,6 +1460,14 @@ class PE:
                     return vals[0] if vals else None
                 if isinstance(h, LuaTable):
                     return self.index(h, key, keyast)
+            if self.slot_policy and obj.path and not obj.fresh and not self.seeking and self.inject is not None \
+                    and id(obj) not in self.program_ids:
+                if (obj.path, key) in self.unstable or (obj.path, None) in self.unstable:
+                    if self.trace is not None:
+                        self.trace.append('   run-time slot read %s[%r]' % (obj.path, key))
+                    return self.emit_expr(('index', ('outer', obj.path), self.atom(key)))
+                self.stable_reads.add((obj.path, key))
+                return v
             if obj.path in self.volatile and (v is None or is_num(v) or isinstance(v, bool)) and not self.seeking \
                     and self.inject is not None:
                 # loader state that changes while the program runs (e.g. the stream position)
@@ -1244,6 +1516,8 @@ class PE:
         if obj is VARARG_TBL:
             if isinstance(key, int):
                 return Sym(('arg', key))
+            if key == 'n':
+                return LinSym('args', 0)
             raise PEError('vararg table index %r' % (key,))
         if isinstance(obj, PackedTbl):
             if isinstance(key, int):
@@ -1260,6 +1534,8 @@ class PE:
         if obj is OPENUPS:
             return None
         if isinstance(obj, Lib):
+            if obj.name == 'math' and key in ('pi', 'huge'):
+                return math.pi if key == 'pi' else math.inf
             return Builtin(obj.name + '.' + key)
         if isinstance(obj, str):
             return Builtin('string.' + key)
@@ -1284,6 +1560,8 @@ class PE:
         if isinstance(obj, LuaTable):
             if isinstance(key, (Sym, LinSym)):
                 if obj.path and not obj.fresh:
+                    if self.slot_policy and id(obj) not in self.program_ids:
+                        self.slot_writes.add((obj.path, None))
                     self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
                     return
                 raise PEError('symbolic key store into concrete table')
@@ -1301,6 +1579,18 @@ class PE:
                 if isinstance(val, LuaTable) and val.fresh:
                     self.parked = val
                 return
+            if self.slot_policy and not obj.fresh and obj.path and not self.seeking and self.inject is not None \
+                    and not self.lazy_depth and id(obj) not in self.program_ids and obj.path not in self.volatile \
+                    and not isinstance(val, (LinSym, MultiTail)):
+                # an instruction storing into a table of the loader (`shared[k] = R[a]`)
+                self.slot_writes.add((obj.path, key))
+                if isinstance(val, Sym) or (obj.path, key) in self.unstable or (obj.path, None) in self.unstable:
+                    # a run-time value, or a slot known to be read as a variable: the store happens
+                    # at run time, and the slot is not what the dump holds
+                    self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
+                    return
+                # (a constant: it stays a write of the model; if an instruction reads the slot
+                # from the dump, the lifter starts over with the slot as a variable)
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
                 raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key) + (' <%r was %r>' % (val, obj.h.get(key)) if os.environ.get('DEVM_PEDBG') else ''))
             if obj.path and not obj.fresh and not self.seeking and self.inject is not None \
@@ -1309,8 +1599,12 @@ class PE:
                 # this must happen at run time, not inside the evaluator's model
                 self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
                 self.state_writes.add((obj.path, key))
+                self.slot_writes.add((obj.path, key))
                 return
             if not obj.fresh:
+                if self.slot_policy and obj.path in self.volatile:
+                    # (written while an interpreter or a closure maker starts: at run time all the same)
+                    self.slot_writes.add((obj.path, key))
                 self.model_writes += 1
                 if self.write_log is not None and obj.path and obj.h.get(key) != val:
                     self.write_log.append((id(obj), key))
@@ -1366,6 +1660,8 @@ class PE:
                 return LinSym(v.id, 0)
             if isinstance(v, PackedList):
                 return len(v.vals)
+            if v is VARARG_TBL:
+                return LinSym('args', 0)
         if isinstance(v, (Special, UpRef, LinSym)):
             return self.emit_expr(('un', op, self.atom(v)))
         raise PEError('unop %s on %r' % (op, v))
@@ -1554,6 +1850,8 @@ class PE:
             # the loader wiring up the lazy constant tables of a proto it has just deserialized
             args[0].mt = args[1]
             return [args[0]]
+        if name == 'table.insert' and args and args[0] is OPENUPS:
+            return []           # (the closure maker's record of a capture list: VM bookkeeping)
         if name == 'getfenv':
             return [ENV]
         if name == 'setfenv':
@@ -1590,6 +1888,9 @@ class PE:
             if isinstance(t, PackedTbl) and len(args) == 3 and args[1] == 1 and isinstance(args[2], LinSym) \
                     and args[2].id == t.id and args[2].k == 0:
                 return [MultiTail(t.id)]
+            if t is VARARG_TBL and len(args) == 3 and args[1] == 1 and isinstance(args[2], LinSym) \
+                    and args[2].id == 'args' and args[2].k == 0:
+                return [MultiTail('args')]
             if isinstance(t, LuaTable) and not sym:
                 a = args[1] if len(args) > 1 and args[1] is not None else 1
                 b = args[2] if len(args) > 2 and args[2] is not None else t.length()
@@ -1633,12 +1934,9 @@ class PE:
                 if ty:
                     return [ty]
         if not sym:
-            if name == 'string.unpack' and len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
-                r = lua_unpack(args[0], args[1])
-                if r is not None:
-                    return r
-            if name in PURE and all(is_num(a) for a in args):
-                return [keyed(norm(PURE[name](*args)), *args)]
+            r = fold_pure(name, args)
+            if r is not None:
+                return [keyed(r[0], *args)] if name in PURE else r
             if name == 'buffer.create' and args and is_num(args[0]) and 0 <= args[0] <= 1 << 26:
                 return [Buffer(bytes(int(args[0])))]
             if name == 'buffer.fromstring' and args and isinstance(args[0], str):
@@ -1674,6 +1972,10 @@ class PE:
                 return [LinSym(mid, 0), PackedTbl(mid) if mid != 'args' else VARARG_TBL]
         if f.func is None:
             raise PEError('call of unresolved VM closure (line %s)' % f.line)
+        if id(f.func) in self.alloc_funcs and not self.seeking and not self.lazy_depth:
+            # an instruction calling the helper that allocates register arrays: a new table
+            n = args[0] if args and is_num(args[0]) else 0
+            return [self.emit_expr(('newtable', n))]
         if id(f.func) in self.native_ids and len(args) <= 3 and not self.lazy_depth \
                 and all(a is None or a is False or (isinstance(a, LuaTable) and a.fresh) for a in args):
             # non-virtualised function instantiated like a proto: native(nil, upvalue_list, nil)
@@ -1725,18 +2027,39 @@ class PE:
         return []
 
     def unpack_order(self, func, args, nums):
-        """(start, stop) for the VM's unpack-like helper, from `p = p or 1` in its body."""
-        start_param = None
-        for st in func.body:
-            if st[0] == 'assign' and st[1][0][0] == 'name' and _unparen(st[2][0])[0] == 'bin' and _unparen(st[2][0])[1] == 'or' \
-                    and _unparen(st[2][0])[3] == ('num', 1):
-                start_param = st[1][0][1]
-        if start_param in func.params:
-            i = func.params.index(start_param)
-            if i < len(args) and args[i] is not REGS:
-                a = args[i]
-                b = [x for j, x in enumerate(args) if j != i and x is not REGS][0]
-                return a, b
+        """(start, stop) for the VM's unpack-like helper, from `p = p or 1` (the start) or
+        `p = p or #t` (the stop) in its body, wherever in the body that default is set (v14.0.x
+        flattens the helper into a state machine)."""
+        found = {}
+
+        def default(name, d):
+            d = _unparen(d)
+            if d == ('num', 1):
+                found.setdefault('start', name)
+            elif d[0] == 'un' and d[1] == '#':
+                found.setdefault('stop', name)
+
+        def scan(block):
+            for st in block:
+                if st[0] == 'assign' and len(st[1]) == 1 and len(st[2]) == 1 and st[1][0][0] == 'name':
+                    e = _unparen(st[2][0])
+                    if e[0] == 'bin' and e[1] == 'or' and _unparen(e[2]) == st[1][0]:
+                        default(st[1][0][1], e[3])
+                if st[0] == 'if' and len(st[1]) == 1 and not st[2] and len(st[1][0][1]) == 1:
+                    # `if not p then p = 1 end`
+                    c, arm = _unparen(st[1][0][0]), st[1][0][1][0]
+                    if c[0] == 'un' and c[1] == 'not' and _unparen(c[2])[0] == 'name' and arm[0] == 'assign' \
+                            and len(arm[1]) == 1 and len(arm[2]) == 1 and arm[1][0] == _unparen(c[2]):
+                        default(arm[1][0][1], arm[2][0])
+                for b in subblocks(st):
+                    scan(b)
+        scan(func.body)
+        for which in ('start', 'stop'):
+            if found.get(which) in func.params:
+                i = func.params.index(found[which])
+                if i < len(args) and args[i] is not REGS:
+                    other = [x for j, x in enumerate(args) if j != i and x is not REGS][0]
+                    return (args[i], other) if which == 'start' else (other, args[i])
         if isinstance(nums[0], LinSym):
             return nums[1], nums[0]
         return nums[0], nums[1]
@@ -1865,6 +2188,8 @@ class PE:
                         if isinstance(r, int):
                             self.emit(('close', r, r))
                         return None
+            if len(st[1]) == 1 and self.clamp_stmt(st, scope):
+                return None
             for c, body in st[1]:
                 if self.cond(self.eval1(c, scope)):
                     return self.exec_block(body, scope)
@@ -1884,8 +2209,24 @@ class PE:
                         return None
                     if nm in self.openups and self.is_state(scope, nm):
                         return None
+                    if nm in self.fvars and self.is_state(scope, nm):
+                        # the step of a numeric for loop spelled out, `i = (i + step)`
+                        # (the compound form `i += step` is the opassign case below)
+                        rhs = _unparen(st[2][0])
+                        if rhs[0] == 'bin' and rhs[1] == '+' and ('name', nm) in (_unparen(rhs[2]), _unparen(rhs[3])):
+                            if self.perm is None:
+                                raise ForOp()
+                            self.events.append(('fop',))
                     self.setvar(scope, nm, self.eval1(st[2][0], scope))
                 else:
+                    base = _unparen(tg[1])
+                    if base[0] == 'name' and base[1] in self.fstack and _unparen(st[2][0])[0] == 'table' \
+                            and self.is_state(scope, base[1]):
+                        # the saved for-loop state pushed on an array stack: `stack[top] = {...}`
+                        if self.perm is None:
+                            raise ForOp()
+                        self.events.append(('push',))
+                        return None
                     obj = self.eval1(tg[1], scope)
                     key = self.eval1(tg[2], scope)
                     self.setindex(obj, key, self.eval1(st[2][0], scope), tg[2])
@@ -1912,6 +2253,8 @@ class PE:
             return None
         if t == 'local':
             names = st[1]
+            if self.seeking and id(st) in self.regs_decl and self.local_regs(st, scope):
+                return None
             if len(names) == 1 and len(st[2]) == 1:
                 scope.vars[names[0]] = self.eval1(st[2][0], scope)
                 if self.trace is not None:
@@ -1990,6 +2333,7 @@ class PE:
                 raise PEError('symbolic numeric for %r %r %r' % (a, b, c))
             i = a
             n = 0
+            ir0 = len(self.ir) if self.ir is not None else 0
             while (c > 0 and i <= b) or (c < 0 and i >= b):
                 sc = Scope(scope)
                 sc.vars[st[1]] = i
@@ -2007,6 +2351,16 @@ class PE:
                 n += 1
                 if n > 2000000:
                     raise PEError('runaway for')
+            if c == 1 and self.ir is not None and len(self.ir) > ir0:
+                # `for i = 1, nparams do R[i] = args[i] end`: the loop copied the function's fixed
+                # parameters and nothing else.  As one statement it says how many there are, which
+                # single register writes cannot (a first vararg fetched into the next register
+                # looks like one more parameter).
+                new = self.ir[ir0:]
+                base = new[0][1][1] if new[0][0] == 'set' and new[0][1][0] == 'r' else None
+                if isinstance(base, int) and all(x == ('set', ('r', base + k), ('arg', k + 1)) for k, x in enumerate(new)):
+                    del self.ir[ir0:]
+                    self.emit(('params', base, len(new)))
             return None
         if t == 'forin':
             if len(st[2]) == 3 and st[2][2] == ('nil',) and st[2][0][0] == 'name' and st[2][1][0] == 'name':
@@ -2018,6 +2372,12 @@ class PE:
                     return None
             it = self.evalargs(st[2], scope)
             if it and it[0] is OPENUPS:
+                nc = nested_close(st)
+                if nc is not None:
+                    if self.eval1(nc[0], scope) is not REGS:
+                        raise PEError('unrecognised close-upvalues loop')
+                    self.emit(('close', self.eval1(nc[1], scope)))
+                    return None
                 self.emit(('close', self.close_base(st, scope)))
                 return None
             if it and isinstance(it[0], LuaTable) and len(it) == 1:
@@ -2036,6 +2396,8 @@ class PE:
                             break
                         if r[0] == 'return':
                             return r
+                return None
+            if it and it[0] is REGS and len(it) == 1 and self.clears_regs(st, scope):
                 return None
             if it and it[0] is None:
                 raise PEError('for-in over nil')
@@ -2058,20 +2420,164 @@ class PE:
             return None
         raise PEError('exec: unknown stmt %s' % t)
 
-    def close_base(self, st, scope):
-        """for k, v in openups do if k >= X then ... -> X"""
-        body = st[3]
+    def local_regs(self, st, scope):
+        """The prologue statement that declares the register array, `local R = ALLOC(nregs)`.
+        Luau-target builds allocate with table.create, which call_builtin answers with REGS; builds
+        in the Lua 5.1 dialect go through a helper of the loader (`function(n) return {unpack({}, 1,
+        n)} end`, reached by name or as a slot of the loader's state).  Whatever the allocator is,
+        the local the model names is the register array.  True when the statement was handled."""
+        i = self.regs_decl[id(st)]
+        names, exprs = st[1], st[2]
+        if i == len(exprs) - 1 and len(names) > len(exprs):
+            return False
+        vals = []
+        for j, e in enumerate(exprs):
+            if j == i:
+                call = _unparen(e)
+                f = self.eval1(call[1], scope)
+                failed = False
+                try:
+                    v = self.eval1(e, scope)
+                except PEError as ex:
+                    # (only a helper the evaluator cannot run; anything else is a real error)
+                    if not (isinstance(f, LFn) and str(ex).startswith('call of ')):
+                        raise
+                    failed = True
+                    v = None
+                if failed or (isinstance(v, LuaTable) and v.fresh and isinstance(f, LFn)):
+                    if isinstance(f, LFn) and f.func is not None:
+                        self.alloc_funcs.add(id(f.func))
+                    try:
+                        n = [x for x in self.evalargs(call[2], scope) if is_num(x)]
+                    except PEError:
+                        n = []
+                    if n:
+                        self.nregs = int(n[0])
+                    v = REGS
+                vals.append(v)
+            elif j == len(exprs) - 1 and e[0] in ('call', 'mcall', 'vararg'):
+                vals.extend(self.evalmulti(e, scope))
+            else:
+                vals.append(self.eval1(e, scope))
+        for n, v in zip(names, self.adjust(vals, len(names))):
+            scope.vars[n] = v
+        return True
+
+    def clamp_stmt(self, st, scope):
+        """The VARARG instruction's count of extra arguments, clamped by a statement:
+        `n = nargs - nparams - 1; if n < 0 then n = -1 end` (also spelled `if not (n < 0) then else
+        n = -1 end`, `if n >= 0 then else n = -1 end`).  n becomes the symbolic count the
+        if-expression form gives (see eval1, 'ifexpr').  True when the statement was that."""
+        c, body = st[1][0]
+        other = st[2] or []
+        neg = False
+        c = _unparen(c)
+        while c[0] == 'un' and c[1] == 'not':
+            neg = not neg
+            c = _unparen(c[2])
+        if c[0] != 'bin' or c[1] not in CMP:
+            return False
+        op, a, b = c[1], _unparen(c[2]), _unparen(c[3])
+        if a[0] == 'num':
+            a, b = b, a
+            op = {'<': '>', '>': '<', '<=': '>=', '>=': '<='}[op]
+        if a[0] != 'name' or b[0] != 'num' or b[1] != 0 or op not in ('<', '>='):
+            return False
+        if op == '>=':
+            neg = not neg
+        if neg:
+            body, other = other, body
+        if other or not body:
+            return False
+        sc = scope.lookup(a[1])
+        cur = sc.vars[a[1]] if sc is not None else None
+        if not (isinstance(cur, LinSym) and cur.id == 'args'):
+            return False
+        s = body[-1]
+        if not (s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and s[1][0] == ('name', a[1])):
+            return False
+        v = _unparen(s[2][0])
+        if not ((v[0] == 'num' and v[1] == -1) or (v[0] == 'un' and v[1] == '-' and _unparen(v[2]) == ('num', 1))):
+            return False
+        for junk in body[:-1]:
+            # (an opaque test in front of the assignment: its arm must be dead)
+            if not (junk[0] == 'if' and len(junk[1]) == 1 and not junk[2] and repr(a) not in repr(junk[1][0][0])):
+                return False
+            try:
+                jv = self.eval1(junk[1][0][0], scope)
+            except PEError:
+                return False
+            if isinstance(jv, (Sym, LinSym, tuple)) or jv is FSTATE or truthy(jv):
+                return False
+        self.setvar(scope, a[1], LinSym('va', -1))
+        return True
+
+    def clears_regs(self, st, scope):
+        """`for k in REGS do if k > top then REGS[k] = nil end end`: the interpreter dropping the
+        registers above the top of the stack (after a call, a return of several values).  The
+        lifted code has no counterpart: registers are variables there.
+
+        Builds with opaque tests put them into the loop as well (`if S[15] == S[17] then <junk>
+        elseif k > top then REGS[k] = nil end`): a test that does not look at the loop variables
+        is evaluated, and only the arm it selects has to be a clearing arm."""
+        names = [repr(('name', n)) for n in st[1]]
         kname = st[1][0]
-        if body and body[0][0] == 'if':
-            c = body[0][1][0][0]
-            while c[0] == 'paren' or (c[0] == 'un' and c[1] == 'not'):
-                c = c[-1]
-            if c[0] == 'bin':
-                if c[2] == ('name', kname):
-                    return self.eval1(c[3], scope)
-                if c[3] == ('name', kname):
-                    return self.eval1(c[2], scope)
-        raise PEError('unrecognised close-upvalues loop')
+
+        def ok(block):
+            for s in block:
+                if s[0] == 'if':
+                    for c, b in list(s[1]) + ([(None, s[2])] if s[2] else []):
+                        if c is None or any(n in repr(c) for n in names):
+                            # the test on the register number (or the else arm after it)
+                            if not ok(b):
+                                return False
+                            continue
+                        try:
+                            v = self.eval1(c, scope)
+                        except PEError:
+                            return False
+                        if isinstance(v, (Sym, LinSym, tuple)) or v is FSTATE:
+                            return False
+                        if truthy(v):
+                            if not ok(b):
+                                return False
+                            break
+                elif s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and _unparen(s[2][0]) == ('nil',):
+                    tg = s[1][0]
+                    if not (tg[0] == 'index' and _unparen(tg[2]) == ('name', kname) and _unparen(tg[1])[0] == 'name'
+                            and self.eval1(tg[1], scope) is REGS):
+                        return False
+                else:
+                    return False
+            return True
+        return ok(st[3])
+
+    def close_base(self, st, scope):
+        """for k, v in openups do if k >= X then ... -> X  (the test need not be the first
+        statement or the first arm: opaque tests on loader state stand in front of it)"""
+        kname = ('name', st[1][0])
+
+        def find(block):
+            for s in block:
+                if s[0] != 'if':
+                    continue
+                for c, _ in s[1]:
+                    while c[0] == 'paren' or (c[0] == 'un' and c[1] == 'not'):
+                        c = c[-1]
+                    if c[0] == 'bin' and c[1] in CMP:
+                        if _unparen(c[2]) == kname:
+                            return c[3]
+                        if _unparen(c[3]) == kname:
+                            return c[2]
+                for b in subblocks(s):
+                    r = find(b)
+                    if r is not None:
+                        return r
+            return None
+        e = find(st[3])
+        if e is None:
+            raise PEError('unrecognised close-upvalues loop')
+        return self.eval1(e, scope)
 
     def exec_seek(self, st, scope):
         """Prologue / fast-forward execution towards the dispatch loop to resume."""

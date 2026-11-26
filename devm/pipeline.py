@@ -22,7 +22,7 @@ class Stage:
         m = self.model
         self.log('[%s] interpreter at line %d, %d dispatch loop(s), %s' % (
             self.tag, m.interp.line, len(m.loops), 'factory' if m.factory_style else 'proto-table'))
-        raw = vmmodel.run_dump(m, self.workdir, self.tag, self.layers)
+        raw = vmmodel.run_dump(m, self.workdir, self.tag, self.layers, timeout=getattr(self, 'dump_timeout', 600))
         self.dump = pe.Dump(raw, m)
         if m.factory_style:
             self.lifter = lifter.FactoryLifter(m, self.dump)
@@ -116,6 +116,71 @@ def _run_traced(self):
 
 
 Stage.run_traced = _run_traced
+
+
+def _dump_script(self, options=(), budget=None, timeout=150):
+    """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
+    proto of the script.  The harness lets the VM run that init and dumps the state when the
+    returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
+
+    The copy that is executed (self.run_model) keeps the protected call around the dispatch
+    loops: inits compare stack frames.  The lifter's model (self.model) is the inlined text;
+    function ids of the dump are translated (self.fid_map).
+    Returns the dump (as run_dump gives it), or None when the init did not hand over
+    (self.run_notes says how the run ended)."""
+    import json
+    import re
+    m = self.model
+    rm = getattr(self, 'run_model', None) or m
+    self.log('[%s] interpreter at line %d, %d dispatch loop(s) in %d interpreter(s), proto-table%s' % (
+        self.tag, m.interp.line, len(m.loops), len(m.interps), ', one table per instruction' if m.insn_tables else ''))
+    if not budget:
+        # Instructions the init may run.  Inits seen take up to 2 instructions per byte of the file
+        # where the init deserializes the script itself (v14.0 - v14.2: 2.36 million for 2.2 MB) and
+        # about 11 per byte of data where it decrypts it (v14.8); a failed check never ends.
+        budget = max(12000000, 40 * len(rm.src))
+    text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
+    self.run_notes = notes
+    for n in notes:
+        self.log('[%s]   %s' % (self.tag, n))
+    if text is None:
+        return None
+    fid_map = getattr(self, 'fid_map', None)
+    if fid_map is not None:
+        text = re.sub(r'"fid":(\d+)', lambda x: '"fid":%d' % fid_map.get(int(x.group(1)), 10 ** 6), text)
+    return json.loads(text)
+
+
+Stage.dump_script = _dump_script
+
+
+def _run_script(self, options=(), budget=None, timeout=150):
+    """dump_script, then a plain lift of the script's program (no key-function search, no
+    opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
+    import re
+    raw = self.dump_script(options, budget=budget, timeout=timeout)
+    if raw is None:
+        return None
+    m = self.model
+    self.dump = pe.Dump(raw, m)
+    self.lifter = lifter.TableProtoLifter(m, self.dump)
+    protos = self.lifter.lift_all(self.lifter.root_key)
+    nodes = sum(len(p.nodes) for p in protos.values())
+    errs = [(k, e) for k, p in protos.items() for e in p.errors]
+    conf = [(k, c) for k, p in protos.items() for c in p.conflicts]
+    self.log('[%s] script: lifted %d protos, %d instructions, %d errors, %d temp conflicts' % (
+        self.tag, len(protos), nodes, len(errs), len(conf)))
+    self.protos = protos
+    self.errors = errs
+    self.conflicts = conf
+    d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
+    self.text = d.run()
+    self.stats = d.stats
+    self.log('[%s] decompiled: %d lines, %d unstructured' % (self.tag, self.text.count('\n'), d.stats['unstructured']))
+    return self.text
+
+
+Stage.run_script = _run_script
 
 
 def _poke_list(self):

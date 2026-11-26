@@ -3219,6 +3219,17 @@ class ProtoCFG:
             self.nparams = n
             b.stmts = b.stmts[n:]
             self.param_regs = list(range(1, n + 1))
+        # An argument beyond the parameters is one of the varargs: v14 interpreters fetch it from
+        # their argument table at a fixed position (`R[a] = args[first_vararg]`), which the
+        # evaluator can only give as "argument number i".
+        np = self.nparams
+
+        def fix(e):
+            return ('varargn', e[1] - np) if e[0] == 'arg' and e[1] > np else e
+        for blk in self.blocks.values():
+            if any("('arg', " in repr(st) for st in blk.stmts + [blk.term]):
+                blk.stmts = [map_stmt(st, fix) for st in blk.stmts]
+                blk.term = map_stmt(blk.term, fix)
         for blk in self.blocks.values():
             for st in blk.stmts + [blk.term]:
                 for e in stmt_exprs(st)[0]:

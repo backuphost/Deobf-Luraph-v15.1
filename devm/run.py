@@ -117,8 +117,50 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False):
+class TimeLimit(BaseException):
+    """Raised by time_limit() (not an Exception: evaluator code that treats any Exception as a
+    wrong guess must not swallow it)."""
+
+
+class time_limit:
+    """`with time_limit(seconds):` raises TimeLimit in the block when it runs longer (main thread,
+    POSIX; elsewhere no limit)."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.old = None
+
+    def _fire(self, *_):
+        raise TimeLimit('more than %d s' % self.seconds)
+
+    def __enter__(self):
+        import signal
+        import threading
+        if self.seconds and hasattr(signal, 'SIGALRM') and threading.current_thread() is threading.main_thread():
+            self.old = signal.signal(signal.SIGALRM, self._fire)
+            signal.alarm(int(self.seconds))
+        return self
+
+    def __exit__(self, *exc):
+        import signal
+        if self.old is not None:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self.old)
+        return False
+
+
+class DevmError(Exception):
+    """An expected way for a run to end without a result: main() prints `devm: <stage>: <reason>`."""
+
+    def __init__(self, stage, reason):
+        Exception.__init__(self, '%s: %s' % (stage, reason))
+        self.stage = stage
+        self.reason = reason
+
+
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None):
     os.makedirs(workdir, exist_ok=True)
+    LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding='latin-1') as f:
         src = f.read()
@@ -126,14 +168,23 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # loadstrings.  The model is built from the chunk; what is executed is the shipped file, with
     # the instrumented chunk compiled in place of the original (see container.py).
     carrier = None
+    unopened = None
     if chunk_arg:
         carrier = container.stand_in(path, chunk_arg, workdir, tag)
         log('[%s] VM chunk with its data buffer (%s): run through a stand-in for Luraph\'s container' % (tag, chunk_arg))
     elif container.may_be_container(src):
-        carrier = container.unwrap(path, workdir, tag, log)
+        probe = []
+
+        def probe_log(line):
+            probe.append(line)
+            log(line)
+        carrier = container.unwrap(path, workdir, tag, probe_log)
         if carrier:
             with open(carrier.chunk_src, encoding='latin-1') as f:
                 src = f.read()
+        else:
+            # the text holds no dispatch loop and no chunk came out of it: say that, not just "no model"
+            unopened = '; '.join(re.sub(r'^\[[^\]]*\] ', '', ln) for ln in probe[-2:]) or 'the container probe saw no chunk being loaded'
     oneline = normalize.needs_reflow(src)
     if executor is None:
         # A script in Luraph's own one-line layout is what an executor is handed, and it expects
@@ -142,8 +193,15 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         executor = oneline
         log('[%s] environment: %s (override with --executor / --no-executor)' % (
             tag, 'executor' if executor else 'plain Roblox client'))
+    run_src = None
+    removed = []
     if oneline:
-        src, n = normalize.inline_protected_raw(src)
+        # every spelling of a dispatch-loop head becomes the canonical one (normalize.normalise_heads)
+        src, heads, rewritten = normalize.normalise_heads(src)
+        if rewritten:
+            log('[%s] %d of %d dispatch-loop heads normalised' % (tag, rewritten, heads))
+        run_src = src
+        src, n, removed = normalize.inline_protected_raw_info(src)
         if n:
             log('[%s] %d interpreter(s) ran their dispatch loops inside pcall: inlined for lifting' % (tag, n))
         src = normalize.reflow(src)
@@ -155,8 +213,28 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # Luraph ships one line and the script checks that (line numbers in its own error messages and
     # in debug.info must all agree), so the copy that is executed is always laid out as one line,
     # also when the input is a decompiler's multi-line rendering of the bytecode.
-    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
+    try:
+        stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
+    except RuntimeError as e:
+        if unopened is not None and 'no Luraph dispatch loop' in str(e):
+            raise DevmError('no model', 'no dispatch loop in the file itself, and the VM chunk it would load at run time was not obtained (%s)' % unopened)
+        raise
+    if run_src is not None and len(stage.model.chain) >= 2 and not stage.model.factory_style:
+        # closure makers that redeclare a name of the loader (Luraph v14.4): see normalize.unshadow
+        shadows = stage.model.shadowed_maker_names()
+        if shadows:
+            gone = set(removed)
+            keep = [i for i in range(len(stage.model.funcs_by_id) + len(removed)) if i not in gone]
+            new_src, k = normalize.unshadow(run_src, [(keep[fid], names) for fid, names in shadows])
+            if k:
+                log('[%s] %d local(s) of the closure maker redeclare a name of the loader (%s): renamed' % (
+                    tag, k, ', '.join(x for _f, names in shadows for x in names)))
+                run_src = new_src
+                src, n, removed = normalize.inline_protected_raw_info(run_src)
+                stage = pipeline.Stage(normalize.reflow(src), workdir, tag, log=log, oneline=True)
     stage.force_root = root
+    if run_timeout:
+        stage.dump_timeout = run_timeout
     stage.model.run_options = carrier.harness_options() if carrier else []
     stage.carrier = carrier
     if stage.model.factory_style:
@@ -214,12 +292,98 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                 tag, len(stage.errors), shown,
                 ', the others in code the output does not contain (cut as unreachable)' if shown < len(stage.errors) else ''))
         return text
-    text1 = stage.run()
-    boot_text, info = bootstrap.patch(text1)
+    # ---- proto-table layout (every Luraph v14 build)
+    common = (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + \
+        (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + \
+        (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
+    # The copy that is executed keeps `pcall(function() <dispatch loop> end)`: inits compare the
+    # stack frames they see (debug.info(level, "f")) with the VM's own closures, and the inlined
+    # copy does not pass.  The lifter's model is the inlined text; both number their functions in
+    # source order, the inlined one without the dissolved closures.
+    stage.run_model = stage.model
+    stage.fid_map = None
+    if removed and run_src is not None:
+        rm = vmmodel.Model(normalize.reflow(run_src), oneline=True)
+        gone = set(removed)
+        keep = [i for i in range(len(rm.funcs_by_id)) if i not in gone]
+        if len(keep) == len(stage.model.funcs_by_id):
+            rm.run_options = stage.model.run_options
+            stage.run_model = rm
+            stage.fid_map = {a: b for b, a in enumerate(keep)}
+        else:
+            log('[%s] the text with and without the protected calls do not line up (%d functions against %d): '
+                'the inlined copy is executed' % (tag, len(keep), len(stage.model.funcs_by_id)))
+    first = stage.run_model.first_program_call()
+    handover = None
+    # The second-stage route recovers the key of script data that the init decrypts in place.  Data
+    # that can be rewritten in place is a buffer (Luraph v14.7 and later); a VM that reads its data
+    # from a string has no such stage, and lifting its init to look for one is time spent for nothing.
+    in_place = re.search(r'\bbuffer\b', stage.model.src) is not None
+    if first and root is None and route in ('auto', 'a'):
+        # Route A.  The loader runs a first program and wraps what it returns: that program is
+        # Luraph's own init, the returned proto is the script.  Let the VM run its init in the
+        # harness and lift from the state at the moment the script's proto is entered.
+        data = stage.dump_script(common, **{k: v for k, v in (('budget', budget), ('timeout', run_timeout)) if v})
+        LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ()))
+        if data is not None:
+            text = lift_program(stage, data, tag, log, oneline, 'script')
+            if route == 'a' or not stage.errors or not in_place:
+                return text
+            # The lift has errors.  Builds whose init decrypts the script data with a key it
+            # derives (Luraph v14.8) patch their own operands with values of key functions; the
+            # second-stage route recovers those from a native replay of the lifted init.  Try it
+            # (time-boxed) and keep whichever result has fewer unlifted instructions.
+            a_errs, a_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
+            if preliminary:
+                preliminary(text)       # (the result so far is on disk should the second try be cut short)
+            try:
+                with time_limit(second_stage_limit):
+                    text1 = stage.run()
+                    boot_text, info = bootstrap.patch(text1)
+                    if info['fixkey']:
+                        log('[%s] the init holds an encrypted second stage: lifting it through the native replay as well' % tag)
+                        data = run_bootstrap(stage, boot_text, workdir, tag, log)
+                        text2 = lift_program(stage, data, tag, log, oneline, 'real program')
+                        b_errs, b_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
+                        if b_errs < a_errs and b_nodes >= a_nodes:
+                            log('[%s] result of the second-stage route kept: %d instructions with %d lift errors, against %d with %d '
+                                'from the state at the hand-over' % (tag, b_nodes, b_errs, a_nodes, a_errs))
+                            LAST_RUN['notes'] = [n for n in LAST_RUN['notes'] if n.startswith('[http]')]
+                            return text2
+                        log('[%s] result from the state at the hand-over kept (%d instructions, %d lift errors; second-stage '
+                            'route: %d, %d)' % (tag, a_nodes, a_errs, b_nodes, b_errs))
+            except (Exception, TimeLimit) as e:      # whatever goes wrong in the second try, the first result stands
+                log('[%s] second-stage route not usable (%s): result from the state at the hand-over kept' % (
+                    tag, (type(e).__name__ + ' ' + str(e)).strip().split('\n')[0][:160]))
+            return text
+        handover = '; '.join(n for n in stage.run_notes if not n.startswith('[http]'))[-600:] or 'the run ended without entering the script'
+        log('[%s] the VM\'s init did not hand over to the script (%s)' % (tag, handover))
+        if route == 'a' or route == 'auto' and not in_place:
+            raise DevmError('init did not hand over', handover)
+        log('[%s] trying the second-stage route: lift the init, run it natively, recover the key' % tag)
+    try:
+        text1 = stage.run()
+        boot_text, info = bootstrap.patch(text1)
+    except Exception as e:
+        if handover is None:
+            raise
+        raise DevmError('init did not hand over', '%s; second-stage route: %s' % (
+            handover, (type(e).__name__ + ': ' + str(e)).strip().split('\n')[0][:200]))
     if not info['fixkey']:
-        log('[%s] no encrypted second stage found: the first program is the script' % tag)
+        if first:
+            # never the init as "the script"
+            raise DevmError('init did not hand over', '%s; the lifted init has no encrypted second stage to recover a key for' % (
+                handover or 'route A was not tried'))
+        log('[%s] the loader runs a single root program and it holds no encrypted second stage: that program is the script' % tag)
+        LAST_RUN['notes'] = ['[single-root] lifted from the state at the first interpreter entry']
         return cleanup.tidy(text1)
     data = run_bootstrap(stage, boot_text, workdir, tag, log)
+    return lift_program(stage, data, tag, log, oneline, 'real program')
+
+
+def lift_program(stage, data, tag, log, oneline, what):
+    """Lift and decompile the program a dump was taken at the start of (proto-table layout):
+    the dump of the native bootstrap replay, or the one taken when the VM's own init handed over."""
     # First with the key function values the bootstrap replay produced.  Junk arms behind opaque
     # predicates do not lift cleanly and must not be mistaken for wrong keys, so they are cut
     # before anything is solved for.
@@ -247,10 +411,17 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     if cut:
         log('[%s] %d opaque predicates resolved (junk branches removed)' % (tag, cut))
     errs = [(k, e) for k, p in protos.items() for e in p.errors]
-    log('[%s] real program: %d functions, %d instructions, %d lift errors' % (
-        tag, len(protos), sum(len(p.nodes) for p in protos.values()), len(errs)))
+    log('[%s] %s: %d functions, %d instructions, %d lift errors' % (
+        tag, what, len(protos), sum(len(p.nodes) for p in protos.values()), len(errs)))
     for k, e in errs[:20]:
         log('    error in proto %s: %s' % (k, e))
+    kinds = {}
+    for _k, e in errs:
+        kind = re.sub(r'\d+', 'N', str(e[1]))[:110]
+        kinds[kind] = kinds.get(kind, 0) + 1
+    for kind, c in sorted(kinds.items(), key=lambda kv: -kv[1])[:15]:
+        log('    lift errors by kind: %4d x %s' % (c, kind))
+    stage.protos, stage.errors = protos, errs
     ircfg.UNFLATTEN = not oneline
     try:
         text, stats = decompile(stage, L, protos)
@@ -307,21 +478,61 @@ def main(argv=None):
     ap.add_argument('--chunk-arg', default=None, metavar='FILE',
                     help='the input is a VM chunk cut out of a Luraph container (`return setmetatable({...},{}):NAME(...)`); '
                          'FILE holds the bytes of the data buffer the container calls it with')
+    ap.add_argument('--route', choices=('auto', 'a', 'b'), default='auto',
+                    help='Luraph v14 builds: a = let the VM run its own init and lift the script from the state at the '
+                         'hand-over; b = lift the init, run it natively and recover the key of the second stage; '
+                         'auto = a, then b when the init does not hand over')
+    ap.add_argument('--budget', type=int, default=None, help='route a: VM instructions the init may run before it is stopped')
+    ap.add_argument('--run-timeout', type=int, default=None, help='route a: seconds the run may take')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
-    text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, mark_untaken=a.mark_untaken)
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
-    lines = run_report(LAST_RUN['notes']) + report(text)
+
+    def write_result(text):
+        """the result file: the report first (see below), then the text; returns the report lines"""
+        lines = run_report(LAST_RUN['notes']) + report(text)
+        head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
+        head += ['--   ' + ln for ln in lines]
+        text = '\n'.join(head) + '\n' + text
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return lines, text
+
+    try:
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result)
+    except DevmError as e:
+        print('devm: %s: %s' % (e.stage, e.reason))
+        sys.exit(1)
+    except (pe.PEError, RuntimeError, bootstrap.BootstrapError, SyntaxError, subprocess.TimeoutExpired) as e:
+        print('devm: %s: %s' % (failure_stage(e), ' '.join(str(e).split())[:400]))
+        sys.exit(1)
+    except Exception as e:
+        # not an expected way to fail: the traceback for whoever debugs it, then the one-line form
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        print('devm: internal error: %s: %s' % (type(e).__name__, ' '.join(str(e).split())[:300]))
+        sys.exit(1)
     # the report is also the head of the file: a result read later, without the run's output next
     # to it, must still say what it is and what it lacks
-    head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
-    head += ['--   ' + ln for ln in lines]
-    text = '\n'.join(head) + '\n' + text
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write(text)
+    lines, text = write_result(text)
     print('written', out, '(%d lines)' % text.count('\n'))
     for line in lines:
         print(line)
+
+
+def failure_stage(e):
+    """The stage name of the one-line failure message for an exception that is an expected way to fail."""
+    msg = str(e)
+    if isinstance(e, SyntaxError):
+        return 'unsupported target' if re.search(r'bad token|unexpected', msg) else 'damaged input'
+    if isinstance(e, subprocess.TimeoutExpired):
+        return 'run failed'
+    if 'no Luraph dispatch loop' in msg or 'no Luraph interpreter' in msg or 'cannot locate the dispatch loops' in msg:
+        return 'no model'
+    if msg.startswith(('dump failed', 'oracle run failed', 'bootstrap did not reach')):
+        return 'run failed'
+    return 'lift failed'
 
 
 HEAD_MARK = 'recovered by devm (python -m devm.run)'      # first line of a file main() writes
@@ -337,6 +548,15 @@ def run_report(notes):
         if m:
             out.append('traced run: the script %s (%s VM instructions)' % (
                 'returned' if m.group(1) == 'returned' else 'stopped with "%s"' % m.group(1)[len('stopped: '):], m.group(2)))
+    for n in notes:
+        m = re.match(r'\[dumpnew\] the script starts at interpreter entry (\d+) \((\d+) VM instructions', n)
+        if m:
+            out.append('the VM ran its own init (%s VM instructions) and handed over to the script; this result is a static '
+                       'lift of the script\'s program from the state at that moment: the script itself did not run' % m.group(2))
+        elif n.startswith('[single-root]'):
+            out.append('the VM has a single root program (no separate init that hands over): this result is a static lift of '
+                       'that program from the state at its first entry; nothing ran, and whatever Luraph\'s start-up code '
+                       'in it would have decoded at run time is still as the file stores it')
     reqs = [n for n in notes if n.startswith('[http]')]
     for n in reqs[:6]:
         out.append('  request: ' + re.sub(r' \[step \d+\]$', '', n[len('[http] '):]))
@@ -374,6 +594,10 @@ def report(text):
     ups = sum(1 for ln in lines if re.search(r'\bUPVAL_\d', ln))
     holes = len(re.findall(r'nil --\[\[', code))
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
+    # values the lifter could only name by where the dump holds them, and arguments / registers
+    # it could not connect to a variable
+    envrefs = code.count('__LPH_ENV[')
+    regs = len(re.findall(r'\b(?:ARG|REG)_\d+\b', code))
     preps = sum(1 for ln in lines if '-- for-loop setup:' in ln)
     # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
     # protection's own checks, which a reader should not take for the script's
@@ -385,7 +609,7 @@ def report(text):
                      'protection, not of the script' % (calls, m.group(1)))
     lines = max(1, text.count('\n'))
     out = []
-    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps):
+    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + traps
     out.append('result: PARTIAL')
@@ -396,6 +620,10 @@ def report(text):
                    '(a script can also do it on purpose: `t[nil]` reaches an __index handler)' % blank)
     if refs:
         out.append('  %d constants shown as __LPH_PROTOS[...]: a value the dump could not describe' % refs)
+    if envrefs:
+        out.append('  %d values shown as __LPH_ENV[...]: a value of Luraph\'s loader that the code uses and the lift could not name' % envrefs)
+    if regs:
+        out.append('  %d uses of ARG_n / REG_n: an argument or register the lifter could not connect to a variable' % regs)
     if vm:
         out.append('  %d uses of %s: the table that holds Luraph\'s interpreter, which the protected code also '
                    'uses as storage; the table itself is not in the result' % (vm, VM_NAME))
