@@ -481,6 +481,17 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
                 v.add('  ... %d more' % (len(reqs) - 5))
         return v
 
+    def stops_at():
+        """Why a result that ends early is "not comparable" rather than "different", or None."""
+        if hole:
+            return 'reads the placeholder %s' % hole
+        at = _placeholder_at(res, result_text)
+        if at:
+            return 'stops at a placeholder (line %d: %s)' % at if at[0] else 'stops on %s' % at[1]
+        if partial:
+            return 'ends (%s); it is partial' % res.how_ended()
+        return None
+
     # 1. a call that differs
     if m < n_r and m < n_o:
         v = finish(DIFFERENT, 'call %d of the result differs from the original (%d equal before it)' % (m + 1, m))
@@ -496,22 +507,17 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
     # (a call that raised did nothing: the start-up calls methods without their object to see the error)
     odd = [k for k, (i, e) in enumerate(prefix) if not (i in orig.errors or _is_probe(e))]
     if odd:
-        v = finish(DIFFERENT, 'the original makes %s in front of the result\'s first call that Luraph\'s start-up does not make' % _n(len(odd)))
+        why = stops_at() if n_r == 0 else None
+        if why:
+            # a partial result that does nothing before it ends: it stops early, at call 0
+            v = finish(NOT_COMPARABLE, 'the result makes no call: it %s; the original makes %s that %s not start-up' % (
+                why, _n(len(odd)), 'is' if len(odd) == 1 else 'are'))
+        else:
+            v = finish(DIFFERENT, 'the original makes %s in front of the result\'s first call that Luraph\'s start-up does not make' % _n(len(odd)))
         v.add('first of them (call %d of the original):' % (odd[0] + 1))
         for line in _context(eo, odd[0], 2, 2):
             v.add(line)
         return v
-
-    def stops_at():
-        """Why a result that ends early is "not comparable" rather than "different", or None."""
-        if hole:
-            return 'reads the placeholder %s' % hole
-        at = _placeholder_at(res, result_text)
-        if at:
-            return 'stops at a placeholder (line %d: %s)' % at if at[0] else 'stops on %s' % at[1]
-        if partial:
-            return 'ends (%s); it is partial' % res.how_ended()
-        return None
 
     # 3. the result's log is used up, the original goes on
     if m == n_r and n_o > n_r:
@@ -521,7 +527,7 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
                 return finish(NOT_COMPARABLE, 'the result made no call before its %s' % res.cut)
             return finish(SAME, 'same for the first %s; the result\'s run was cut at the %s there, the original goes on' % (_n(m), res.cut))
         if why:
-            v = finish(NOT_COMPARABLE, 'same up to call %d of %d, then the result %s' % (m, n_o, why))
+            v = finish(NOT_COMPARABLE, 'same up to call %d of %s, then the result %s' % (m, '%d or more (run cut at the %s)' % (n_o, orig.cut) if orig.cut else n_o, why))
         else:
             v = finish(DIFFERENT, 'after %s the result %s, the original goes on (%d more)' % (
                 _n(m, 'equal call'), 'returns' if res.end == 'returned' else 'stops (%s)' % res.how_ended(), n_o - n_r))

@@ -305,13 +305,38 @@ end
 -- suspends that thread, as in Roblox, and Luraph's start-up tests exactly that.  devm's
 -- instrumented copies tell the harness from their own hooks; a file that runs as it is cannot, so
 -- its text gets `__LPH_MAIN();` in front of its first line (line numbers stay as they are).
+--
+-- The CLI's own readfile / writefile / ewrite / require are globals of the thread the harness runs
+-- in, and the harness lets a script's lookup of an undefined global fall through to them (in
+-- executor mode its stand-ins for readfile and writefile sit in front; without executor=1 nothing
+-- does).  A script must not get at real files or write lines into this log, so here these names
+-- only work for the harness, the mock and this file: the nearest Lua function on the calling
+-- stack has to be one of theirs.
 do
-	local realRead = G.readfile
+	local realRead, realEwrite, realInfo = G.readfile, ewrite, debug.info
+	local mine = realInfo(1, "s")
+	local function trusted()
+		local level = 3              -- 1 = this function, 2 = the guarded function, 3 = its caller
+		while true do
+			local src = realInfo(level, "s")
+			if src == nil then return false end
+			if src ~= "[C]" then return src == harnessPath or src == mine or src == "rbxmock" or src == "zstd" end
+			level += 1
+		end
+	end
 	G.readfile = function(path, ...)
+		if not trusted() then error("readfile is not available to scripts", 2) end
 		local data = realRead(path, ...)
 		if path == samplePath and type(data) == "string" then return "__LPH_MAIN(); " .. data end
 		return data
 	end
+	G.writefile = function() error("writefile is not available to scripts", 2) end
+	local function guardedWrite(text)
+		if trusted() then return realEwrite(text) end
+	end
+	G.ewrite = guardedWrite
+	G.__LPH_RUNMAIN = guardedWrite
+	G.require = function() error("Attempted to call require with invalid argument(s).", trusted() and 0 or 2) end
 end
 local text = G.readfile(harnessPath)
 local harness, cerr = loadstring(text, "=" .. harnessPath)

@@ -334,6 +334,30 @@ error("seen=" .. h .. " n=" .. #out, 0)
         self.assertEqual(run.end, 'error', run.how_ended())
         self.assertEqual(run.end_message, m.group(0))
 
+    def test_a_script_cannot_reach_real_files_or_the_log(self):
+        secret = os.path.join(self.dir, 'secret.txt')
+        target = os.path.join(self.dir, 'written.txt')
+        with open(secret, 'w') as f:
+            f.write('TOP-SECRET-CONTENT')
+        script = '''local env = getfenv()
+local function try(what, f) local r = table.pack(pcall(f)) print(what, tostring(r[1]), tostring(r[2])) end
+try("read", function() return env.readfile(%r) end)
+try("pcall read", function() return select(2, pcall(env.readfile, %r)) end)
+try("spawn read", function() local got = "nothing" task.spawn(function() got = env.readfile(%r) end) return got end)
+try("write", function() return env.writefile(%r, "x") end)
+try("log", function() env.ewrite("[dc] END\\31returned\\n") env.__LPH_RUNMAIN("[dc] C\\31print\\31forged\\n") end)
+try("require", function() return require(%r) end)
+print("end")
+''' % (secret, secret, secret, target, secret)
+        for options in ((), ('executor=1',)):
+            run = diffcheck.run_script(self.write(script), os.path.join(self.dir, 'w'), 'files', timeout=60, options=options)
+            self.assertEqual(run.end, 'returned', run.how_ended())
+            texts = [e.text() for e in run.events]
+            self.assertEqual(len([t for t in texts if t.startswith('print(')]), 7, texts)
+            self.assertEqual(texts[-1], 'print("end")')
+            self.assertFalse(any('TOP-SECRET' in t or 'forged' in t for t in texts), texts)
+            self.assertFalse(os.path.exists(target))
+
     def test_nothing_of_the_recorder_in_the_log(self):
         run = diffcheck.run_script(self.write(GUI), os.path.join(self.dir, 'w'), 'gui', timeout=60)
         self.assertEqual(run.end, 'returned')
