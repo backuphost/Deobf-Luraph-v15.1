@@ -14,6 +14,8 @@
   diffcheck     devm.diffcheck tells same from different on scripts changed on purpose (tests/diffcheck_test.py)
   deobf         the second engine's result line, time limit, process hygiene, lifter fixes; with
                 LURAPH_CORPUS set also two files of the public corpus (tests/deobf_corpus.py)
+  recognise     header forms, main-statement shapes, verdicts and exit codes on miniature inputs; with
+                LURAPH_CORPUS set, also a few files per version of the sample corpus (tests/frontend_corpus.py)
 
 Everything needs the interpreter (./setup.sh).  Exit status 0 when every check passes.
 """
@@ -38,6 +40,7 @@ def checks(full):
         ("codecs", [PY, "-B", "tests/codecs_test.py"], {}, 1800),
         ("diffcheck", [PY, "-B", "tests/diffcheck_test.py"], {}, 900),
         ("deobf", [PY, "-B", "tests/deobf_corpus.py"], {}, 1800),
+        ("recognise", [PY, "-B", "tests/frontend_corpus.py"], {}, 1800),
     ]
     if full:
         out.insert(3, ("devm-full", [PY, "-B", "tests/devm_v152.py", "V152Full", "Layer3Full"],

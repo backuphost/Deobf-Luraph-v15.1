@@ -14,6 +14,12 @@ One JSON object per file is appended to the results file:
 
 `python3 tests/corpus.py --summary results.jsonl` prints the table again.
 
+    python3 tests/corpus.py DIR [DIR ...] --classify --out rows.jsonl [--jobs N] [--per-dir K] [--resume]
+
+only classifies (what `deob.py FILE --classify` prints, one row per file; no engine is started,
+a container is opened by the static decoder or in the unwrap sandbox) and tabulates verdict,
+wrapper and layout per directory.  `--summary` reads such a file too.
+
 This is a measuring tool, not a test: exit status is always 0.  The inputs are not part of the
 repository.
 """
@@ -32,7 +38,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 LUAU_AST = os.path.join(ROOT, "bin", "luau-ast")
 
-RC_NAMES = {0: "complete", 6: "partial", 4: "vm, no result", 3: "syntax check failed", 2: "not recognised",
+RC_NAMES = {0: "complete", 6: "partial", 4: "vm, no result", 3: "syntax check failed", 2: "not Luraph / not recognised",
+            8: "Luraph, cannot be processed (damaged / other Lua)",
             1: "error", 5: "wrong binary", 7: "form C harness", None: "timeout"}
 
 
@@ -67,7 +74,8 @@ def parses(path):
         r = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors="replace", timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return "Parse errors" not in r.stdout[:4000]
+    # luau-ast reports a syntax error on stderr and by its exit status, not on stdout
+    return r.returncode == 0 and "Parse errors" not in (r.stderr[:4000] + r.stdout[:4000])
 
 
 def one(path, engine, timeout, keep):
@@ -102,7 +110,48 @@ def one(path, engine, timeout, keep):
     return row
 
 
+def classify_one(path):
+    """One row of the classification table: deob.classify_file(path) plus path, size, secs."""
+    sys.path.insert(0, ROOT) if ROOT not in sys.path else None
+    import deob
+    t = time.time()
+    row = deob.classify_file(path)
+    row.pop("file", None)
+    row.update(path=path, size=os.path.getsize(path), secs=round(time.time() - t, 2))
+    return row
+
+
+def classify_summary(rows):
+    by = collections.defaultdict(list)
+    for r in rows:
+        by[os.path.basename(os.path.dirname(r["path"]))].append(r)
+
+    def vkey(v):
+        return [int(x) for x in re.findall(r"\d+", v)]
+
+    def kind(r):
+        w = r["wrapper"]
+        if w != "none":
+            c = r.get("container") or {}
+            w += "" if c.get("opened") else " (closed)"
+        return "%s | %s | %s" % (r["verdict"], w, r["layout"])
+    print("%-10s %5s  %s" % ("dir", "files", "verdict | wrapper | layout of the VM"))
+    total = collections.Counter()
+    for d in sorted(by, key=vkey):
+        c = collections.Counter(kind(r) for r in by[d])
+        print("%-10s %5d  %s" % (d, len(by[d]), "; ".join("%s: %d" % kv for kv in c.most_common())))
+        total.update(r["verdict"] for r in by[d])
+    print("%-10s %5d  %s" % ("all", len(rows), ", ".join("%s: %d" % kv for kv in total.most_common())))
+    odd = [r for r in rows if r["verdict"] != "luraph"]
+    if odd:
+        print("not processed as Luraph (%d):" % len(odd))
+        for r in sorted(odd, key=lambda r: (r["verdict"], r["path"])):
+            print("  %-18s %-34s %s" % (r["verdict"], "/".join(r["path"].split("/")[-2:]), (r.get("reason") or "")[:150]))
+
+
 def summary(rows):
+    if rows and "verdict" in rows[0] and "rc" not in rows[0]:
+        return classify_summary(rows)
     by = collections.defaultdict(list)
     for r in rows:
         by[os.path.basename(os.path.dirname(r["path"]))].append(r)
@@ -132,6 +181,8 @@ def main(argv=None):
     ap.add_argument("--keep")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--summary")
+    ap.add_argument("--classify", action="store_true",
+                    help="classify only (deob.classify_file), no engine; the rows are its fields")
     a = ap.parse_args(argv)
     if a.summary:
         with open(a.summary) as f:
@@ -147,6 +198,21 @@ def main(argv=None):
     files = [p for p in files if p not in done]
     if a.keep:
         os.makedirs(a.keep, exist_ok=True)
+    if a.classify:
+        print("%d files to classify, %d at a time" % (len(files), a.jobs), flush=True)
+        rows = []
+        with concurrent.futures.ProcessPoolExecutor(a.jobs) as pool, open(a.out, "a") as f:
+            for n, r in enumerate(pool.map(classify_one, files, chunksize=4), 1):
+                rows.append(r)
+                f.write(json.dumps(r) + "\n")
+                f.flush()
+                if n % 200 == 0:
+                    print("[%d/%d]" % (n, len(files)), flush=True)
+        if done:
+            with open(a.out) as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+        summary(rows)
+        return 0
     print("%d files, %d at a time, %d s each at most" % (len(files), a.jobs, a.timeout), flush=True)
     rows = []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:

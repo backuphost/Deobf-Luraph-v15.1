@@ -19,8 +19,9 @@ What the runner does (it is a sandbox for Luraph's outer CONTAINER, not for the 
   * the globals an executor adds and a key line in front of the protected code uses
     (getgenv, getrenv, shared, _G) exist.  `getgenv().SCRIPT_KEY = "..."` used to stop the run
     with "attempt to call a nil value";
-  * text in front of the "-- This file was protected using Luraph Obfuscator" comment (such
-    a key line) runs first, on its own; if it fails the container still runs.
+  * owner-added statements in front of the protected program (such a key line; text in front
+    of the "-- This file was generated|protected using Luraph Obfuscator" comment, or between
+    it and the main `return`) run first, on their own; if they fail the container still runs.
 
   --arg FILE   pass FILE's bytes as a buffer argument to the target chunk (repeatable): an
                inner chunk that a container starts with a buffer
@@ -90,7 +91,18 @@ local function capture(code, name)
   local probe, cerr
   if type(name) == "string" then probe, cerr = real_loadstring(code, name)
   else probe, cerr = real_loadstring(code, "=load") end
-  if not probe then return nil, cerr end
+  if not probe then
+    -- Luau does not compile it.  A text given the chunk name "Luraph..." is what a Luraph
+    -- container decoded all the same (a build for Lua 5.3 / LuaJIT): record it, so that the
+    -- caller can say what it is.  The container gets the compile error, as it would.
+    if type(name) == "string" and string.sub(name, 1, 6) == "Luraph" and #code > 64 then
+      LOADS = LOADS + 1
+      realprint(string.format("[LOAD %d] len=%d namehex=%s", LOADS, #code, hexof(name)))
+      realprint(string.format("[LOADFAIL %d] %s", LOADS, oneline(cerr)))
+      realprint("[LOADHEX " .. LOADS .. "] " .. hexof(code))
+    end
+    return nil, cerr
+  end
   LOADS = LOADS + 1
   local n = LOADS
   realprint(string.format("[LOAD %d] len=%d namehex=%s", n, #code,
@@ -168,10 +180,13 @@ local function compile(text, name)
   return chunk, lerr
 end
 
--- an owner-added key line in front of the Luraph header runs on its own
+-- owner-added statements in front of the protected program (a key line, a loader guard) run
+-- on their own.  SPLIT is where the program starts (0: nothing in front of it); mkfast.py
+-- finds it: the Luraph header comment, or the main `return` when statements stand between
+-- the header and it.
 local PRELUDE, MAIN = nil, SRC
-local hpos = string.find(SRC, "%-%-[^\n]-protected using Luraph Obfuscator")
-if hpos and hpos > 1 and string.find(string.sub(SRC, 1, hpos - 1), "%S") then
+local hpos = @SPLIT@
+if hpos > 1 and string.find(string.sub(SRC, 1, hpos - 1), "%S") then
   local main = compile(string.sub(SRC, hpos), "=target")
   if main then PRELUDE, MAIN = string.sub(SRC, 1, hpos - 1), string.sub(SRC, hpos) end
 end
@@ -205,6 +220,29 @@ realprint(string.format("[DONE] loads=%d", LOADS))
 '''
 
 
+def prelude_split(src):
+    """1-based offset where the protected program starts in `src`, 0 when nothing that must
+    run on its own stands in front of it.
+
+    The program starts at the Luraph header comment ("generated using" in v14.0.2 - v14.2,
+    "protected using" later).  When code stands between the header and the main `return`
+    (`getgenv().x = ...`), or the file has no header in front of its code, it starts at the
+    main `return`.  Code that declares locals stays with the program (`local B=...;return ...`
+    is one chunk: a chunk taken out of a container)."""
+    libs = os.path.join(HERE, 'libs')
+    if libs not in sys.path:
+        sys.path.insert(0, libs)
+    import lphfront
+    fx = lphfront.analyze(src)
+    if fx.main_return is None:
+        hit = lphfront.find_header(src)
+        return hit[0] + 1 if hit and src[:hit[0]].strip() else 0
+    toks, _coms, _dmg = lphfront.scan(src[:fx.main_return])
+    if not toks or any(t == 'local' for _k, t, _o in toks):
+        return 0
+    return fx.main_return + 1
+
+
 def build(src, minlen="512", stub=False, arg_files=(), call_result=True):
     """Text of the runner for the target source `src` (a latin-1 decoded str)."""
     import luasandbox
@@ -227,8 +265,10 @@ def build(src, minlen="512", stub=False, arg_files=(), call_result=True):
     # SRC is the target byte for byte (luasandbox.lua_string_expr: a long bracket per piece,
     # cut at carriage returns, which Luau would otherwise drop from "\r\n"), except for a
     # UTF-8 byte order mark in front of it, which no Luau accepts
-    literal = luasandbox.lua_string_expr(luasandbox.strip_bom(src))
+    src = luasandbox.strip_bom(src)
+    literal = luasandbox.lua_string_expr(src)
     runner = (luasandbox.bytes_str(RUNNER).replace('@MINLEN@', str(int(minlen)))
+              .replace('@SPLIT@', str(prelude_split(src)))
               .replace('@EMU@', emu)
               .replace('@STUB@', stub_src)
               .replace('@ARGS@', ', '.join(args))

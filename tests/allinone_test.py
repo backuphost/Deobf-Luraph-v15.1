@@ -39,15 +39,20 @@ def deob(*args, timeout=600):
 
 
 def parses(path):
-    out = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors="replace").stdout
-    return "Parse errors" not in out[:4000]
+    # luau-ast reports a syntax error on stderr and by its exit status, not on stdout
+    r = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors="replace")
+    return r.returncode == 0 and "Parse errors" not in (r.stderr[:4000] + r.stdout[:4000])
 
 
 class FakeScan:
     """What allinone.after_static reads from deob.Scan."""
 
-    def __init__(self, inp, form, bare=False, buffer=None, evidence=("头注释",)):
+    def __init__(self, inp, form, bare=False, buffer=None, evidence=("头注释",), layout=None, version=None):
         self.inp, self.form, self._bare, self._buffer, self._evidence = Path(inp), form, bare, buffer, list(evidence)
+        self._layout, self.header = layout, {"version": version}
+
+    def layout(self):
+        return self._layout
 
     def bare_chunk(self):
         return self._bare
@@ -78,6 +83,22 @@ class Decide(unittest.TestCase):
     def test_vm_goes_to_devm(self):
         self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm"), 4, flags()), ("devm", []))
 
+    def test_v14_vm_goes_to_devm_only(self):
+        for layout in ("fn-args", "table"):
+            self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", layout=layout, version="14.3"), 4, flags()),
+                             (("devm",), []))
+        # a v14 container that did not open in the front end: the layout follows the version
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", version="14.7"), 4, flags()), (("devm",), []))
+
+    def test_v150_goes_to_the_second_engine_first(self):
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", layout="setmt", version="15.0"), 4, flags()),
+                         (("deobf", "devm"), []))
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", layout="setmt", version="15.2"), 4, flags()),
+                         ("devm", []))
+
+    def test_exit_8_is_final(self):
+        self.assertIsNone(allinone.after_static(FakeScan(SAMPLE, "vm"), allinone.UNPROCESSABLE, flags()))
+
     def test_static_result_stands(self):
         self.assertIsNone(allinone.after_static(FakeScan(LAYER3, "A"), 0, flags()))
         self.assertIsNone(allinone.after_static(FakeScan(LAYER3, "A"), 3, flags()))
@@ -98,6 +119,121 @@ class Decide(unittest.TestCase):
                 f.write(b"\0\1\2\3" * 100)
             self.assertFalse(allinone.looks_like_lua(p))
             self.assertIsNone(allinone.after_static(FakeScan(p, "unknown", evidence=()), 2, flags()))
+
+
+def alive(pid):
+    """True while process `pid` runs (a zombie nobody has reaped yet does not run)."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            stat = f.read().decode("latin-1")
+        return stat[stat.rindex(")") + 2:].split()[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def gone(pids, within=10.0):
+    """True when none of `pids` runs any more `within` seconds from now."""
+    import time
+    end = time.time() + within
+    while time.time() < end:
+        if not any(alive(p) for p in pids):
+            return True
+        time.sleep(0.1)
+    return not any(alive(p) for p in pids)
+
+
+# A stand-in for an engine: it starts a child of its own (as devm starts `bin/luau
+# devm/harness.lua`), prints both process ids and its session id, then does what MODE says.
+FAKE_ENGINE = r"""
+import os, subprocess, sys, time
+mode = sys.argv[1]
+kid = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.2)"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("pids %d %d sid %d" % (os.getpid(), kid.pid, os.getsid(0)), flush=True)
+if mode == "leave-child":       # the engine ends, its child keeps running
+    sys.exit(0)
+while True:                     # mode "hang"
+    time.sleep(0.2)
+"""
+
+
+@unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc"), "needs POSIX process groups and /proc")
+class ProcessHygiene(unittest.TestCase):
+    """allinone._stream: an engine and everything it started end with it, whatever happens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.fake = os.path.join(cls.tmp.name, "fake_engine.py")
+        with open(cls.fake, "w") as f:
+            f.write(FAKE_ENGINE)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.pids = []
+
+    def tearDown(self):
+        import signal
+        for p in self.pids:             # whatever a failed test left behind
+            if alive(p):
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def stream(self, mode, timeout):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            status, text = allinone._stream([sys.executable, self.fake, mode], timeout, cwd=self.tmp.name)
+        words = text.split()
+        self.pids = [int(words[1]), int(words[2])]
+        return status, int(words[4])
+
+    def test_timeout_kills_the_engine_and_its_child(self):
+        status, sid = self.stream("hang", 2)
+        self.assertIsNone(status)                       # None = stopped by the time limit
+        self.assertTrue(gone(self.pids), "engine or its child still runs after the time limit")
+        self.assertNotEqual(sid, os.getsid(0))          # the engine had a session of its own
+        self.assertEqual(sid, self.pids[0])             # ... which it led
+
+    def test_nothing_stays_behind_an_engine_that_ended(self):
+        status, _sid = self.stream("leave-child", 60)
+        self.assertEqual(status, 0)
+        self.assertTrue(gone(self.pids), "the child of an engine that ended still runs")
+
+    def front_end(self):
+        """A front end of its own (a process that runs _stream on the fake engine); returns
+        (Popen, [engine pid, child pid])."""
+        code = ("import sys; sys.path.insert(0, %r); import allinone; "
+                "allinone._stream([sys.executable, %r, 'hang'], 600, cwd=%r)" % (ROOT, self.fake, self.tmp.name))
+        fe = subprocess.Popen([sys.executable, "-B", "-c", code], stdout=subprocess.PIPE, text=True,
+                              start_new_session=True)
+        words = fe.stdout.readline().split()
+        self.assertEqual(words[0], "pids", words)
+        self.pids = [int(words[1]), int(words[2])]
+        self.assertTrue(all(alive(p) for p in self.pids))
+        return fe
+
+    def test_killed_front_end_takes_the_engine_along(self):
+        import signal
+        fe = self.front_end()
+        os.killpg(fe.pid, signal.SIGKILL)               # what a supervising tool does on ITS time limit
+        fe.wait()
+        fe.stdout.close()
+        self.assertTrue(gone(self.pids), "engine or its child outlives a front end that was killed (SIGKILL)")
+
+    def test_terminated_front_end_takes_the_engine_along(self):
+        import signal
+        fe = self.front_end()
+        fe.send_signal(signal.SIGTERM)
+        self.assertEqual(fe.wait(timeout=20), 128 + signal.SIGTERM)
+        fe.stdout.close()
+        self.assertTrue(gone(self.pids), "engine or its child outlives a front end that was terminated (SIGTERM)")
 
 
 @unittest.skipUnless(os.path.exists(LUAU_AST), "needs bin/luau-ast (./setup.sh)")
@@ -147,6 +283,38 @@ class FrontEnd(unittest.TestCase):
     def test_missing_file(self):
         rc, _log = deob(self.out("nope.lua"))
         self.assertEqual(rc, 1)
+
+    def test_time_limit_ends_a_real_engine(self):
+        """The v15.2 example needs minutes in devm; with a limit of a few seconds the front end
+        stops the engine, says so in the engine's name as its reason, writes no result, and
+        leaves no interpreter of this tree running."""
+        def harnesses():
+            mine = set()
+            for name in os.listdir("/proc") if os.path.isdir("/proc") else ():
+                if not name.isdigit():
+                    continue
+                try:
+                    with open("/proc/%s/cmdline" % name, "rb") as f:
+                        cmd = f.read().decode("utf-8", "replace")
+                except OSError:
+                    continue
+                if "harness.lua" in cmd and (ROOT in cmd or os.path.realpath(ROOT) in cmd) and alive(int(name)):
+                    mine.add(int(name))
+            return mine
+        before = harnesses()
+        rc, log = deob(SAMPLE, "-o", self.out("limit.lua"), "--engine", "devm", "--timeout", "6", timeout=300)
+        self.assertEqual(rc, allinone.NO_RESULT, log[-800:])
+        self.assertIn("devm: timed out after 6 s", log)
+        self.assertFalse(os.path.exists(self.out("limit.lua")))
+        self.assertNotIn("Traceback", log)
+        left = set()
+        for _ in range(50):
+            left = harnesses() - before
+            if not left:
+                break
+            import time
+            time.sleep(0.1)
+        self.assertFalse(left, "interpreter processes left behind: %s" % sorted(left))
 
     @unittest.skipUnless(FULL, "set ALLINONE_FULL=1 (several minutes)")
     def test_v152_goes_through_devm(self):

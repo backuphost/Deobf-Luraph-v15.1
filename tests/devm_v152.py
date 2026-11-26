@@ -54,8 +54,8 @@ def have_luau():
 
 
 def parses(path):
-    out = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors='replace').stdout
-    return 'Parse errors' not in out[:4000]
+    r = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors='replace')
+    return r.returncode == 0 and 'Parse errors' not in (r.stderr[:4000] + r.stdout[:4000])
 
 
 def model_of(text):
