@@ -572,7 +572,11 @@ class Lifter:
                         self.temp_vals[st[1][1]] = v     # (a temporary can outlive the instruction
                                                          # as the value of an interpreter local)
                     elif pure:
-                        temps[st[1][1]] = None           # (not known on this path, whatever another path found)
+                        # (not known on this path, whatever another path found; and a later
+                        # instruction that sees this temporary in an interpreter local must not
+                        # get the other path's number)
+                        temps[st[1][1]] = None
+                        self.temp_vals.pop(st[1][1], None)
                 if st[0] == 'set' and isinstance(st[2], tuple) and st[2][0] == 'closure':
                     # where the new function's upvalues come from: opaque numbers among them are
                     # needed to lift it when it never ran (see instantiate)
