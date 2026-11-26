@@ -267,6 +267,13 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     except RuntimeError as e:
         if unopened is not None and 'no Luraph dispatch loop' in str(e):
             raise DevmError('no model', 'no dispatch loop in the file itself, and the VM chunk it would load at run time was not obtained (%s)' % unopened)
+        if 'no Luraph dispatch loop' in str(e):
+            # what the text does have, for whoever reads the message: endless loops in vararg functions
+            loops = len(re.findall(r'\bwhile\b|\brepeat\b', src))
+            raise DevmError('no model', 'no Luraph dispatch loop found%s: none of the %d loops of the text fetches an instruction and '
+                            'tests its opcode in a spelling devm knows (`local OP=CODE[PC]; if`, `local I=CODE[PC]; local OP=I[n]; '
+                            'PC=PC+1; if`, in `while <true>`/`repeat ... until false`)' % (
+                                ' in the VM chunk of the container' if carrier else '', loops))
         raise
     if run_src is not None and len(stage.model.chain) >= 2 and not stage.model.factory_style:
         # closure makers that redeclare a name of the loader (Luraph v14.4): see normalize.unshadow
