@@ -549,10 +549,10 @@ def lift_program(stage, data, tag, log, oneline, what, replayed=True):
     if hidden > 0:
         # Instructions that did not lift and are not in the printed text either (in a function or
         # a branch the printer left out).  The result must not pass for complete on that account.
-        log('[%s] %d of the %d lift errors are in code the text does not contain: listed at its head' % (tag, hidden, len(errs)))
-        head = ['-- LIFT ERROR (in code this text does not contain; proto %s): %s' % (k, ' '.join(str(e[1]).split())[:160])
-                for k, e in errs[:hidden][:20]]
-        text = '\n'.join(head) + '\n' + text
+        log('[%s] %d of the %d lift errors are in code the text does not contain: said at its head' % (tag, hidden, len(errs)))
+        texts = sorted({' '.join(str(e[1]).split())[:100] for _k, e in errs})
+        text = ('-- LIFT ERROR: %d instruction(s) did not lift and have no marker in the text below (they are in code the text '
+                'does not contain).  Lift errors of this run: %s\n' % (hidden, '; '.join(texts[:12]))) + text
     return text
 
 
