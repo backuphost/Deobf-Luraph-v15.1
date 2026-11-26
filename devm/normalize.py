@@ -361,6 +361,8 @@ def inline_protected_raw_info(src):
         else:
             succ_end = toks[els][3] if els is not None else toks[ifend][3]
             success = src[toks[then + 1][3]:succ_end].rstrip().rstrip(';')
+        if success.lstrip().startswith('return'):
+            success = 'do ' + success + ';end'      # (a `return` must end its block)
         # rewrite the closure body
         edits.append((toks[s][3], toks[body0][3], 'local %s;' % ','.join(vals)))
         depth = 0
@@ -436,7 +438,7 @@ def inline_protected_raw_info(src):
 
 class Head:
     """One dispatch-loop head found in a token list."""
-    __slots__ = ('start', 'if_tok', 'until', 'last', 'op', 'code', 'pc', 'insn', 'field', 'junk', 'plain', 'tail')
+    __slots__ = ('start', 'if_tok', 'until', 'last', 'op', 'code', 'pc', 'insn', 'field', 'junk', 'plain', 'tail', 'junk_names')
 
 
 def _head_fetch(toks, q):
@@ -498,6 +500,7 @@ def _head_fetch(toks, q):
     if par:
         plain = False
     junk = []
+    junk_names = []
     consts = []
     while tk(j) == 'op' and tv(j) == ',':
         text, k = number(j + 1)
@@ -509,6 +512,7 @@ def _head_fetch(toks, q):
         if len(consts) != len(names) - 1:
             return None
         junk.append('local %s=%s;' % (','.join(names[1:]), ','.join(consts)))
+        junk_names.extend(names[1:])
         names = names[:1]
         plain = False
     if tk(j) == 'op' and tv(j) == ';':
@@ -573,6 +577,7 @@ def _head_fetch(toks, q):
         if text is None:
             break
         junk.append('local %s=%s;' % (tv(j + 1), text))
+        junk_names.append(tv(j + 1))
         if tk(k) == 'op' and tv(k) == ';':
             k += 1
         j = k
@@ -581,6 +586,7 @@ def _head_fetch(toks, q):
         return None
     h.if_tok = j
     h.junk = ''.join(junk)
+    h.junk_names = junk_names
     if extra:
         h.op = ','.join(names)
     return h
@@ -659,8 +665,37 @@ def find_heads(toks):
                     h.plain = False
                     h.tail = after(a + par + 1)
                     out.append(h)
+    # A junk constant is hoisted in front of the loop, which is only the same program when the
+    # loop never assigns it: a loop that does is not taken for a dispatch loop.
+    out = [h for h in out if h.last is not None and not any(_assigned(toks, h.if_tok, h.last, x) for x in h.junk_names)]
     out.sort(key=lambda h: h.start)
     return out
+
+
+_ASSIGN_OPS = ('=', '+=', '-=', '*=', '/=', '//=', '%=', '^=', '..=')
+
+
+def _assigned(toks, a, b, name):
+    """True when tokens a..b-1 may assign or redeclare `name` (conservative)."""
+    for r in range(a, b):
+        if toks[r][0] != 'name' or toks[r][1] != name:
+            continue
+        if toks[r - 1][0] == 'op' and toks[r - 1][1] in ('.', ':'):
+            continue
+        j = r + 1
+        while toks[j][0] == 'op' and toks[j][1] == ',' and toks[j + 1][0] == 'name':
+            j += 2
+        if not (toks[j][0] == 'op' and toks[j][1] in _ASSIGN_OPS):
+            if toks[r - 1][0] == 'kw' and toks[r - 1][1] in ('local', 'for', 'function'):
+                return True
+            continue
+        i = r - 1
+        while toks[i][0] == 'op' and toks[i][1] == ',' and toks[i - 1][0] == 'name':
+            i -= 2
+        if toks[i][0] == 'op' and toks[i][1] in ('{', ',', '(', '['):
+            continue            # a field name in a table constructor, a named argument position
+        return True
+    return False
 
 
 def count_heads(src):
@@ -678,13 +713,15 @@ def normalise_heads(src):
     toks = [t for t in luparse.tokenize(src) if t[0] != 'eof']
     heads = find_heads(toks)
     edits = []
+    rewritten = 0
     for h in heads:
-        if h.plain:
-            continue
         if h.insn is not None:
             fetch = 'local %s=%s[%s];local %s=%s[%s];%s=%s+1;' % (h.insn, h.code, h.pc, h.op, h.insn, luparse_num(h.field), h.pc, h.pc)
         else:
             fetch = 'local %s=%s[%s];' % (h.op, h.code, h.pc)
+        if h.until is None and not h.junk and src[toks[h.start][3]:toks[h.if_tok][3]] == 'while true do ' + fetch:
+            continue        # canonical already
+        rewritten += 1
         # (a junk local hoisted in front of the loop must not capture a name the code after the
         # loop uses: such a loop gets a block of its own)
         scope = bool(h.junk) and h.tail
@@ -703,7 +740,7 @@ def normalise_heads(src):
         out.append(text)
         last = b
     out.append(src[last:])
-    return ''.join(out), len(heads), len(edits and [h for h in heads if not h.plain])
+    return ''.join(out), len(heads), rewritten
 
 
 def luparse_num(v):

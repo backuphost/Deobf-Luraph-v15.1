@@ -8,6 +8,8 @@
   interpreter   bin/luau and bin/luau-ast run and carry both patches (build_luau.py --check)
   static        the static tool's own suite (tests/static_all.py)
   devm          devm's container, model and harness checks for Luraph v15.2 (tests/devm_v152.py)
+  devm-v14      devm's loop-head normaliser, v14 model and hand-over route (tests/devm_v14.py; with
+                LURAPH_CORPUS set also one file per v14 layout of the sample corpus)
   structurer    deobf's structurer against random control-flow graphs (research/structure_fuzz.py)
   frontend      deob.py picks the right engine and reports truthfully (tests/allinone_test.py)
 
@@ -29,6 +31,7 @@ def checks(full):
         ("interpreter", [PY, "build_luau.py", "--check"], {}, 120),
         ("static", [PY, "-B", "tests/static_all.py"] + ([] if full else ["--quick"]), {}, 1800),
         ("devm", [PY, "-B", "tests/devm_v152.py"], {}, 600),
+        ("devm-v14", [PY, "-B", "tests/devm_v14.py"], {}, 900),
         ("structurer", [PY, "-B", "deobf/research/structure_fuzz.py", "0", "3000" if full else "500"], {}, 1800),
         ("frontend", [PY, "-B", "tests/allinone_test.py"], {"ALLINONE_FULL": "1"} if full else {}, 3600),
     ]
