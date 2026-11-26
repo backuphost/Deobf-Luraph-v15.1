@@ -4,9 +4,10 @@ derived from what they are initialised with (services, required modules, instanc
 Bytecode carries no local names, so this is cosmetic: every generated name (v12, p3) is unique in
 the file, which makes a token-level rename safe.
 """
+import math
 import re
 
-from . import opaque
+from . import luparse, opaque, pe
 
 KEYWORDS = {
     'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'if', 'in', 'local', 'nil', 'not',
@@ -151,6 +152,7 @@ def tidy(text):
     text = '\n'.join(ln for ln in text.split('\n') if not re.match(r'^\s*\(\{\}\)\[\d+\] = [-\w.]+$', ln))
     text = _loop_artifacts(text)
     text = opaque.strip(text)
+    text = drop_dead_constants(text)
     text = drop_unused(text)
     for _ in range(4):
         new = rename(text)
@@ -180,6 +182,233 @@ def drop_unused(text):
         text = '\n'.join(keep)
         if not changed:
             return text
+
+
+class _NotConst(Exception):
+    pass
+
+
+# Library functions that have no effect and depend on nothing but their arguments (with their
+# Luau behaviour on the arguments _const_value accepts)
+_STRING_PURE = ('string.unpack', 'string.packsize', 'string.byte', 'string.len', 'string.sub', 'string.char', 'string.rep')
+
+
+def _lua_number(v):
+    return pe.is_num(v)
+
+
+def _str_sub(s, i=1, j=-1):
+    n = len(s)
+    i = int(i)
+    j = int(j)
+    i = max(n + i + 1, 1) if i < 0 else max(i, 1)
+    j = n + j + 1 if j < 0 else min(j, n)
+    return s[i - 1:j] if i <= j else ''
+
+
+def _call_pure(name, args):
+    """The results of a pure library call on constants; _NotConst where it would raise in Luau or
+    is not one this evaluator knows."""
+    if name in pe.PURE:
+        if not args or not all(_lua_number(a) and math.isfinite(a) for a in args):
+            raise _NotConst()
+        if name.startswith('math.') and name not in ('math.max', 'math.min') and len(args) != 1:
+            raise _NotConst()
+        if name in ('bit32.lshift', 'bit32.rshift', 'bit32.arshift', 'bit32.lrotate', 'bit32.rrotate') and len(args) != 2:
+            raise _NotConst()
+        if name in ('bit32.extract', 'bit32.replace'):
+            # (Luau raises on a field outside 0..31)
+            at = 1 if name == 'bit32.extract' else 2
+            if not at < len(args) <= at + 2:
+                raise _NotConst()
+            f, w = args[at], args[at + 1] if len(args) > at + 1 else 1
+            if not (0 <= f <= 31 and 1 <= w and f + w <= 32):
+                raise _NotConst()
+    elif name == 'string.sub':
+        if not (1 <= len(args) <= 3 and isinstance(args[0], str) and all(_lua_number(a) and math.isfinite(a) for a in args[1:])):
+            raise _NotConst()
+        return [_str_sub(*args)]
+    elif name == 'string.char':
+        if not all(_lua_number(a) and a == int(a) and 0 <= a <= 255 for a in args):
+            raise _NotConst()
+        return [''.join(chr(int(a)) for a in args)]
+    elif name == 'string.rep':
+        if len(args) != 2 or not isinstance(args[0], str) or not _lua_number(args[1]) or not math.isfinite(args[1]) \
+                or len(args[0]) * max(0, int(args[1])) > 1 << 16:
+            raise _NotConst()
+        return [args[0] * max(0, int(args[1]))]
+    elif not _pure_name(name):
+        raise _NotConst()
+    try:
+        r = pe.fold_pure(name, list(args))
+    except Exception:
+        raise _NotConst()
+    if r is None:
+        raise _NotConst()
+    return r
+
+
+def _truthy(v):
+    return v is not None and v is not False
+
+
+def _const_value(e, multi=False):
+    """The value of an expression made of literals, arithmetic, comparisons, and/or/not and calls
+    of pure library functions on such values; _NotConst for anything else or for what would raise
+    at run time.  multi: the list of values (a call can give several)."""
+    k = e[0]
+    if k == 'call' and e[1][0] == 'index' and e[1][1][0] == 'name' and e[1][2][0] == 'str':
+        name = e[1][1][1] + '.' + e[1][2][1]
+        if not _pure_name(name):
+            raise _NotConst()
+        args = []
+        for i, a in enumerate(e[2]):
+            if i == len(e[2]) - 1:
+                args += _const_value(a, multi=True)
+            else:
+                args.append(_const_value(a))
+        r = _call_pure(name, args)
+        return r if multi else (r[0] if r else None)
+    if k == 'num':
+        v = e[1]
+    elif k == 'str':
+        v = e[1]
+    elif k == 'nil':
+        v = None
+    elif k in ('true', 'false'):
+        v = k == 'true'
+    elif k == 'paren':
+        v = _const_value(e[1])
+    elif k == 'index' and e[1] == ('name', 'math') and e[2] in (('str', 'pi'), ('str', 'huge')):
+        v = math.pi if e[2][1] == 'pi' else math.inf
+    elif k == 'un':
+        x = _const_value(e[2])
+        if e[1] == 'not':
+            v = not _truthy(x)
+        elif e[1] == '-' and _lua_number(x):
+            v = -x
+        elif e[1] == '#' and isinstance(x, str):
+            v = len(x)
+        else:
+            raise _NotConst()
+    elif k == 'bin':
+        op = e[1]
+        if op in ('and', 'or'):
+            x = _const_value(e[2])
+            if (op == 'and') != _truthy(x):
+                return [x] if multi else x
+            v = _const_value(e[3])
+        else:
+            x, y = _const_value(e[2]), _const_value(e[3])
+            if op in ('==', '~='):
+                v = (x == y and type(x) is type(y) or _lua_number(x) and _lua_number(y) and x == y) == (op == '==')
+            elif op in ('<', '<=', '>', '>='):
+                if not (_lua_number(x) and _lua_number(y) or isinstance(x, str) and isinstance(y, str)):
+                    raise _NotConst()
+                v = x < y if op == '<' else x <= y if op == '<=' else x > y if op == '>' else x >= y
+            elif op in ('+', '-', '*', '/', '%', '//', '^'):
+                if not (_lua_number(x) and _lua_number(y)):
+                    raise _NotConst()
+                try:
+                    if op == '+':
+                        v = x + y
+                    elif op == '-':
+                        v = x - y
+                    elif op == '*':
+                        v = x * y
+                    elif op == '^':
+                        v = float(x) ** float(y)
+                    elif y == 0:
+                        v = math.nan if op != '/' or x == 0 else math.copysign(math.inf, x)
+                    elif op == '/':
+                        v = x / y
+                    elif op == '//':
+                        v = math.floor(x / y)
+                    else:
+                        v = x - math.floor(x / y) * y
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    raise _NotConst()
+                if isinstance(v, complex):
+                    raise _NotConst()
+                if isinstance(v, int) and abs(v) >= 2 ** 53:
+                    v = float(v)        # (Luau numbers are doubles)
+            else:
+                raise _NotConst()
+    else:
+        raise _NotConst()
+    return [v] if multi else v
+
+
+_DEAD_DEF = re.compile(r'^\t*local (v\d+) = (.+)$')
+
+
+def dead_constant_lines(text):
+    """Indexes of the lines `local vN = E` where vN is read nowhere and E is made of literals,
+    arithmetic, comparisons, and/or/not and calls of pure library functions on constants: the
+    values Luraph v14 programs compute for the self-patches of their code (the lifter folds those
+    into the instructions they patch; the register assignment is left with no reader).
+    Returns (removable, left): removable when E evaluates without an error (dropping the line then
+    changes nothing a script can see), left when it has that shape but does not evaluate here."""
+    count = {}
+    for kind, s in tokens(text):
+        if kind == 'ident':
+            count[s] = count.get(s, 0) + 1
+    removable, left = [], []
+    for i, ln in enumerate(text.split('\n')):
+        m = _DEAD_DEF.match(ln)
+        if not m or count.get(m.group(1)) != 1 or not re.search(r'\d', m.group(2)):
+            continue
+        try:
+            # (the parser reads source bytes as latin-1, which is how the escapes come out; a
+            # character the printer wrote as itself is its UTF-8 bytes in the file)
+            p = luparse.Parser(m.group(2).encode('utf-8', 'surrogatepass').decode('latin-1'))
+            e = p.expr()
+            if p.peek()[0] != 'eof':
+                continue
+        except Exception:
+            continue
+        if not _const_shape(e):
+            continue
+        try:
+            _const_value(e)
+        except (_NotConst, RecursionError):
+            left.append(i)
+            continue
+        removable.append(i)
+    return removable, left
+
+
+def _const_shape(e):
+    """E has the shape of a constant expression (literals, operators, library calls on them)."""
+    k = e[0]
+    if k in ('num', 'str', 'nil', 'true', 'false'):
+        return True
+    if k == 'paren':
+        return _const_shape(e[1])
+    if k == 'un':
+        return _const_shape(e[2])
+    if k == 'bin':
+        return _const_shape(e[2]) and _const_shape(e[3])
+    if k == 'index':
+        return e[1] == ('name', 'math') and e[2] in (('str', 'pi'), ('str', 'huge'))
+    if k == 'call':
+        f = e[1]
+        return f[0] == 'index' and f[1][0] == 'name' and f[2][0] == 'str' and _pure_name(f[1][1] + '.' + f[2][1]) \
+            and all(_const_shape(a) for a in e[2])
+    return False
+
+
+def _pure_name(name):
+    return name in pe.PURE or name in _STRING_PURE or name in ('math.modf', 'math.round')
+
+
+def drop_dead_constants(text):
+    """Drops the removable lines of dead_constant_lines (see there)."""
+    drop, _left = dead_constant_lines(text)
+    if not drop:
+        return text
+    gone = set(drop)
+    return '\n'.join(ln for i, ln in enumerate(text.split('\n')) if i not in gone)
 
 
 def rename(text):

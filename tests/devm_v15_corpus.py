@@ -430,6 +430,55 @@ class CallKeys(unittest.TestCase):
         self.assertEqual(run.report(head + text), got)
 
 
+class StartupOnly(unittest.TestCase):
+    """The factory route lifts the VM's first program when the run made no program on another
+    interpreter: Luraph's start-up code, perhaps with the script's top level in it.  Never complete."""
+
+    def test_note(self):
+        from devm import pipeline
+        ran = ['[oracle] script returned after 900 instructions']
+        n = pipeline.startup_note(ran + ['[script] print: hi', '[http] GET https://example.invalid/x (no network) [step 5]'], None, 1, 3)
+        self.assertTrue(n.startswith('[startup] the run created no program on an interpreter other than the first one (3 modelled)'), n)
+        self.assertIn('top level ran inside that program (the run shows 1 line(s) of output, 1 request(s) from it)', n)
+        n = pipeline.startup_note(ran + ['[script] undefined globals read (nil, as in Roblox): x'], None, 1, 2)
+        self.assertIn('shows nothing the script did', n)
+        n = pipeline.startup_note(['[oracle] script stopped: boom after 5 instructions'], None, 1, 2)
+        self.assertIn('stopped before the script showed anything', n)
+        self.assertTrue(pipeline.startup_note(ran, 1, 1, 2).startswith('[startup] --root 1:'))
+
+    def test_report(self):
+        from devm import pipeline, run
+        notes = ['[oracle] script returned after 900 instructions', pipeline.startup_note(['[script] print: hi'], None, 1, 2)]
+        lines = run.report('print("hi")\n', notes=notes)
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('start-up code' in ln for ln in lines[1:]), lines)
+        rr = run.run_report(notes)
+        self.assertTrue(any(ln.startswith(run.STARTUP_LINE) for ln in rr), rr)
+        head = ['-- x.lua, %s.  How the run went and what this file lacks:' % run.HEAD_MARK] + ['--   ' + ln for ln in rr + lines]
+        self.assertEqual(run.report('\n'.join(head) + '\nprint("hi")\n'), lines)
+
+
+class HiddenErrors(unittest.TestCase):
+    """Factory route: instructions that did not lift and have no marker in the text."""
+
+    def test_count(self):
+        from devm import run
+        oracle = {(1, 1, 10): {}, (1, 1, 11): {}}
+        errors = [(1, ((1, 10), 'bad A')), (1, ((1, 11), 'bad B')), (1, ((1, 12), 'bad B')), (2, ((1, 3), 'bad C'))]
+        # nothing marked: two errors in code that ran, two in code that never did
+        self.assertEqual(run.hidden_errors(errors, oracle, 'print(1)'), (2, 2))
+        # one marker of B: which of the two it is is not known, the one that ran counts as hidden
+        self.assertEqual(run.hidden_errors(errors, oracle, '-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n'), (1, 1))
+        self.assertEqual(run.hidden_errors(errors, oracle, '-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n-- LIFT ERROR: bad B\n'), (0, 1))
+        self.assertEqual(run.hidden_errors(errors, oracle, '-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n-- LIFT ERROR: bad B\n'
+                                           '-- LIFT ERROR: bad C\n'), (0, 0))
+
+    def test_run_report(self):
+        from devm import run
+        self.assertEqual(run.run_report(['[cut] 3 instruction(s) that never ran did not lift']),
+                         ['  note: 3 instruction(s) that never ran did not lift'])
+
+
 class BlindKeyArithmetic(unittest.TestCase):
     """What the interpreter that runs the script leaves in a v15.1 result: key arithmetic on an
     interpreter local the lifter has no value for, and junk arms behind `type(<number>) == "buffer"`."""
