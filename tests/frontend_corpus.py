@@ -288,6 +288,140 @@ class Tool(unittest.TestCase):
         self.assertLess(sent.index("getgenv().key"), sent.index("return(function"))
 
 
+class _StandInDecoder:
+    """What the front end expects of devm/container_static.py (the hand-over point): decode(text)
+    -> None | object with chunk, chunk_name, data, data_kind, codec, notes; ContainerError with
+    an optional `.partial`.  This stand-in answers by a marker in the text; it decodes nothing."""
+
+    class ContainerError(Exception):
+        def __init__(self, message, partial=None):
+            super().__init__(message)
+            self.partial = partial
+
+    class Result:
+        def __init__(self, chunk, data=None, notes=()):
+            self.chunk, self.chunk_name, self.data = chunk, "Luraph", data
+            self.data_kind = "buffer" if data is not None else None
+            self.codec, self.notes = "lzma", list(notes)
+
+    CHUNK = ('return({A=function(t)return function(...)return t.B end end,B=...,C=string.byte}):A(...)').encode()
+
+    def __init__(self):
+        self.calls = 0
+
+    def decode(self, text):
+        self.calls += 1
+        if "--[[none]]" in text:
+            return None
+        if "--[[corrupt]]" in text:
+            raise self.ContainerError("first payload: not a stream")
+        if "--[[cut]]" in text:
+            raise self.ContainerError("the data payload is incomplete; the chunk was read",
+                                      self.Result(self.CHUNK, notes=["the data payload is incomplete"]))
+        return self.Result(self.CHUNK, b"\0\1\2\3" * 8)
+
+
+@unittest.skipUnless(HAVE_LUAU, "needs bin/luau and bin/luau-ast (./setup.sh)")
+class StaticDecoderHandOver(unittest.TestCase):
+    """deob.py and the static container decoder (devm/container_static.py, another part of the
+    tree): the front end uses it when it is importable, runs nothing then, and takes its
+    ContainerError as "damaged".  The decoder itself has its own tests; here a stand-in with
+    the same interface is put in its place."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dec = _StandInDecoder()
+        self._old = deob.static_container
+        deob.static_container = lambda: self.dec
+
+    def tearDown(self):
+        deob.static_container = self._old
+        self.tmp.cleanup()
+
+    def classify(self, name, text):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "wb") as f:
+            f.write(text.encode("utf-8"))
+        return deob.classify_file(p)
+
+    def test_container_is_opened_without_running_it(self):
+        ran = []
+        import fastsolve
+        old = fastsolve.solve
+        fastsolve.solve = lambda *a, **k: ran.append(a) or {"chunks": [], "blobs": [], "error": "", "timeout": False}
+        try:
+            row = self.classify("ok.lua", HEADER + CONTAINER)
+        finally:
+            fastsolve.solve = old
+        self.assertEqual(ran, [])                        # the sandbox was not asked
+        self.assertEqual((row["verdict"], row["wrapper"], row["layout"]), ("luraph", "container:fn0-lzma-1", "table"), row)
+        c = row["container"]
+        self.assertEqual((c["opened"], c["via"], c["data_kind"], c["data_bytes"], c["chunk_name"]),
+                         (True, "static", "buffer", 32, "Luraph"), row)
+        self.assertEqual(row["route"], "devm")
+
+    def test_container_error_is_damaged(self):
+        row = self.classify("bad.lua", HEADER + "--[[corrupt]]" + CONTAINER)
+        self.assertEqual((row["verdict"], row["validity"], row["layout"]), ("damaged", "payload-corrupt", "unknown"), row)
+        self.assertIn("not a stream", row["reason"])
+        self.assertNotIn("peek", row)
+
+    def test_chunk_of_a_damaged_container_gives_the_layout(self):
+        row = self.classify("cut.lua", HEADER + "--[[cut]]" + CONTAINER)
+        self.assertEqual((row["verdict"], row["layout"], row["entry"]), ("damaged", "table", ":M(...)"), row)
+        self.assertEqual(row["peek"], {"via": "static", "chunk_bytes": len(self.dec.CHUNK), "complete": False}, row)
+        self.assertEqual(row["route"], "")               # information only: nothing is handed over
+
+    def test_container_for_another_lua_is_read_not_run(self):
+        text = HEADER + CONTAINER.replace("local ok,f", "local q=1>>0;local ok,f")
+        row = self.classify("l53.lua", text)
+        self.assertEqual((row["verdict"], row["layout"]), ("unsupported-target", "table"), row)
+        self.assertTrue(row["peek"]["complete"], row)
+        # a text cut off inside the container: damaged from its own text, the chunk still read
+        row = self.classify("trunc.lua", text[:-12])
+        self.assertEqual((row["verdict"], row["layout"]), ("damaged", "table"), row)
+
+    def test_decoder_that_does_not_know_the_text_leaves_it_to_the_sandbox(self):
+        calls = []
+        import fastsolve
+        old = fastsolve.solve
+        fastsolve.solve = lambda *a, **k: calls.append(a) or {"chunks": [], "blobs": [], "error": "", "timeout": False}
+        try:
+            row = self.classify("none.lua", HEADER + "--[[none]]" + CONTAINER)
+        finally:
+            fastsolve.solve = old
+        self.assertEqual(len(calls), 1, row)
+        self.assertFalse(row["container"]["opened"], row)
+
+    def test_a_vm_is_not_given_to_the_decoder(self):
+        row = self.classify("vm.lua", HEADER + TABLE)
+        self.assertEqual((row["verdict"], row["wrapper"]), ("luraph", "none"), row)
+        self.assertEqual(self.dec.calls, 0)
+
+    def test_run_reports_the_layout_before_the_reason(self):
+        import contextlib
+        import io
+        p = os.path.join(self.tmp.name, "cut_run.lua")
+        with open(p, "wb") as f:
+            f.write((HEADER + "--[[cut]]" + CONTAINER).encode())
+        sc = deob.Scan(p, say=lambda *a, **k: None)
+        buf = io.StringIO()
+        try:
+            sc.load()
+            sc.binaries()
+            sc.shells()
+            sc.front_check()
+            sc.unwrap()
+            with contextlib.redirect_stdout(buf):
+                rc = deob.container_exit(sc)
+        finally:
+            sc.cleanup()
+        lines = buf.getvalue().strip().splitlines()
+        self.assertEqual(rc, allinone.UNPROCESSABLE, lines)
+        self.assertIn("table VM", lines[1])
+        self.assertIn("the data payload is incomplete", lines[-1])       # the reason is the last line
+
+
 class Formatter(unittest.TestCase):
     def test_hex_float_is_one_token(self):
         import deobf_plus

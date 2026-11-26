@@ -82,11 +82,18 @@ def _descendants(pid):
     return out
 
 
-def _kill_tree(proc):
+def _kill_tree(proc, group=True):
     """Stop an engine and everything it started.  (An engine that is merely killed leaves its
-    interpreter child, `bin/luau devm/harness.lua`, running at full speed.)"""
+    interpreter child, `bin/luau devm/harness.lua`, running at full speed.)  The engine leads
+    a process group of its own (_stream starts it in a new session): the group is killed,
+    then whatever /proc still lists as its descendant (a child that left the group)."""
     import signal
     victims = _descendants(proc.pid)
+    if group and hasattr(os, "killpg"):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
     try:
         proc.kill()
     except OSError:
@@ -102,30 +109,110 @@ def _on_term(signum, _frame):
     raise SystemExit(128 + signum)
 
 
+# The watchdog: a process of its own (own session) that holds the read end of a pipe whose
+# write end only the front end has.  End of file on that pipe = the front end is gone, in
+# whatever way (SIGKILL included, which nothing can catch): the watchdog kills the engine's
+# process group and ends.  One byte on the pipe = the engine is through: the watchdog just ends.
+_WATCHDOG = ("import os,signal,sys\n"
+             "fd=int(sys.argv[1]);pg=int(sys.argv[2])\n"
+             "try:\n"
+             "    b=os.read(fd,1)\n"
+             "except OSError:\n"
+             "    b=b''\n"
+             "if not b:\n"
+             "    try:\n"
+             "        os.killpg(pg,signal.SIGKILL)\n"
+             "    except OSError:\n"
+             "        pass\n")
+
+
+def _start_watchdog(pgid):
+    """Returns (write end of the watchdog's pipe, its Popen), or None when no watchdog runs."""
+    try:
+        r, w = os.pipe()
+    except OSError:
+        return None
+    try:
+        wd = subprocess.Popen([sys.executable, "-I", "-S", "-c", _WATCHDOG, str(r), str(pgid)], pass_fds=(r,),
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True, cwd="/")
+    except (OSError, ValueError):
+        os.close(r)
+        os.close(w)
+        return None
+    os.close(r)
+    return w, wd
+
+
+def _stop_watchdog(watchdog):
+    if watchdog is None:
+        return
+    w, wd = watchdog
+    try:
+        os.write(w, b"x")
+    except OSError:
+        pass
+    try:
+        os.close(w)
+    except OSError:
+        pass
+    try:
+        wd.wait(timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _reap_group(proc):
+    """The engine has ended by itself: nothing it started may stay behind.  Wait for the
+    leader WITHOUT reaping it (so that its id, which is the group's id, cannot be given to
+    another process yet), kill what is left of the group, then reap."""
+    import signal
+    try:
+        if hasattr(os, "waitid") and hasattr(os, "killpg"):
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except (OSError, ChildProcessError):
+        pass
+    proc.wait()
+
+
 def _stream(cmd, timeout, cwd=HERE, env=None):
     """Run cmd, pass its output through line by line, return (exit status or None on timeout,
     the output as text).  A Python traceback of the engine is not passed through line by
     line: its last line (the exception) is printed, marked as such; the full text is in the
-    returned output."""
+    returned output.
+
+    The engine runs in a session of its own, so it and everything it starts form one process
+    group that can be killed as a whole: on a timeout, when the front end is interrupted
+    (Ctrl-C, SIGTERM), when the engine has ended and left something running, and, through
+    the watchdog, when the front end itself is killed."""
     lines = []
     # SIGTERM to the front end must not leave the engine (and the interpreter it started) behind:
-    # turn it into an exception, so that the clean-up below runs.  (SIGKILL cannot be caught.)
+    # turn it into an exception, so that the clean-up below runs.  (SIGKILL cannot be caught:
+    # that is the watchdog's case.)
     import signal
     old_term = None
     try:
         old_term = signal.signal(signal.SIGTERM, _on_term)
     except (ValueError, OSError, AttributeError):      # not the main thread / no such signal
         old_term = None
+    own_session = os.name == "posix"
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, encoding="utf-8", errors="replace", bufsize=1)
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                            bufsize=1, start_new_session=own_session)
+    watchdog = _start_watchdog(proc.pid) if own_session else None
     timer = None
     timed_out = []
     if timeout:
         import threading
 
         def kill():
-            timed_out.append(True)
-            _kill_tree(proc)
+            if proc.returncode is None:     # (still running, or not reaped yet)
+                timed_out.append(True)
+                _kill_tree(proc, own_session)
         timer = threading.Timer(timeout, kill)
         timer.daemon = True
         timer.start()
@@ -145,13 +232,21 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
                 continue
             sys.stdout.write("    " + line)
             sys.stdout.flush()
-        proc.wait()
+        if own_session:
+            _reap_group(proc)
+        else:
+            proc.wait()
     except BaseException:
-        _kill_tree(proc)        # interrupted (Ctrl-C, SIGTERM as KeyboardInterrupt/SystemExit): take the engine down too
+        _kill_tree(proc, own_session)   # interrupted (Ctrl-C, SIGTERM as KeyboardInterrupt/SystemExit): take the engine down too
         raise
     finally:
         if timer:
             timer.cancel()
+        _stop_watchdog(watchdog)
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
         if old_term is not None:
             try:
                 signal.signal(signal.SIGTERM, old_term)
