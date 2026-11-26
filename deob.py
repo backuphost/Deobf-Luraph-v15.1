@@ -295,8 +295,10 @@ class UnwrapNote(str):
       'needs'    the container needs something this machine's tools do not have (Roblox's
                  EncodingService for a Zstd container when the static decoder is missing)
       'timeout'  the sandbox run was stopped
+      'no-run'   the static decoder does not know the container and running it was not allowed
       'failed'   nothing usable came out for another reason"""
     kind = "failed"
+    sandbox = False     # True when the input's code was run in the unwrap sandbox to get this
 
     def __new__(cls, text, kind="failed"):
         self = super().__new__(cls, text)
@@ -334,7 +336,7 @@ def peek_container(src):
     return r.chunk.decode("utf-8", errors="surrogateescape"), complete
 
 
-def unwrap_container(src, workdir, arg_files=(), call_result=True, timeout=300, say=print):
+def unwrap_container(src, workdir, arg_files=(), call_result=True, timeout=300, say=print, allow_sandbox=True):
     """Open Luraph's outer container and collect what it decodes.  The static decoder
     (static_container) is used when this tree has it; else, and when it does not know the
     container, the container is run in the bufemu sandbox (fastsolve.py / mkfast.py), where
@@ -375,6 +377,18 @@ def unwrap_container(src, workdir, arg_files=(), call_result=True, timeout=300, 
                     "data_path": str(data) if data else None, "data_kind": r.data_kind,
                     "chunk_name": r.chunk_name, "compiles": None, "via": "static",
                     "prelude": None}, UnwrapNote("; ".join(r.notes) or "静态解码（%s）" % r.codec, "ok")
+    if not allow_sandbox:
+        # (--no-run: what the static decoder does not know stays closed; nothing of it is run)
+        return None, UnwrapNote("静态解码器不认识这个容器，--no-run 不允许在沙箱里执行它，容器没有剥开 / the static "
+                                "decoder does not know this container and --no-run forbids running it in the "
+                                "sandbox: not opened", "no-run")
+    res, note = _unwrap_sandbox(src, workdir, arg_files, call_result, timeout)
+    note.sandbox = True
+    return res, note
+
+
+def _unwrap_sandbox(src, workdir, arg_files, call_result, timeout):
+    """unwrap_container's second way: run the container in the bufemu sandbox."""
     import fastsolve
     target = workdir / "target.lua"
     write_source(target, src)
@@ -987,8 +1001,17 @@ class Scan:
         else:
             say(f"[2b] 这一层像 Luraph 的容器（{why}），尝试剥壳（沙箱内执行，拦截 loadstring，不运行被加载的代码）…")
             self.sandbox_run = True
-        res, note = unwrap_container(self.src, self._tmp / "c0")
+        res, note = unwrap_container(self.src, self._tmp / "c0", allow_sandbox=self.allow_run)
         self.unwrap_note = note
+        if note.sandbox:
+            self.sandbox_run = True
+        if note.kind == "no-run":
+            self.unwrap_note = (f"这一层像 Luraph 的容器（{why}），但指定了 --no-run：没有执行它，容器没有剥开"
+                                "（静态解码器不认识它，剥开它要在沙箱里执行）/ --no-run: the static decoder does not "
+                                "know this container, so it was not opened and nothing was run")
+            self.container_info = {"opened": False, "kind": "no-run", "why": "--no-run"}
+            say("[2b] " + self.unwrap_note)
+            return False
         if res and decisive and res["via"] == "buffer":
             # a buffer that merely looks like Lua source is no answer for a container whose
             # loader we know: it must hand its chunk to loadstring
@@ -1018,9 +1041,13 @@ class Scan:
                     break
             elif self.has_big_func(self.src) or not looks_like_container(self.src):
                 break
+            if not self.allow_run:
+                break
             args = [self.container["buffer_path"]] if self.container["buffer_path"] else []
             deeper, _n2 = unwrap_container(self.src, self._tmp / f"c{depth + 1}", arg_files=args,
                                            call_result=False, timeout=120)
+            if _n2.sandbox:
+                self.sandbox_run = True
             if not deeper or len(deeper["text"]) >= len(self.src):
                 break
             self.container = deeper
