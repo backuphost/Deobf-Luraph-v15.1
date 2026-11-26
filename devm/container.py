@@ -41,12 +41,13 @@ def has_dispatch_loop(text):
 class Carrier:
     """A VM chunk plus the file that loads it."""
 
-    def __init__(self, carrier, chunk_src, chunk_arg=None, chunk_name=None, synthetic=False):
+    def __init__(self, carrier, chunk_src, chunk_arg=None, chunk_name=None, synthetic=False, data_kind=None):
         self.carrier = carrier          # the file the harness executes
         self.chunk_src = chunk_src      # the chunk's original text (what the carrier loadstrings)
-        self.chunk_arg = chunk_arg      # bytes of the buffer argument (file), if known
-        self.chunk_name = chunk_name
+        self.chunk_arg = chunk_arg      # bytes of the data argument (file), if known
+        self.chunk_name = chunk_name    # the name the chunk is loaded under ("Luraph" plus 0-4 spaces)
         self.synthetic = synthetic
+        self.data_kind = data_kind      # 'buffer' | 'string' | None: how the container hands the data over
 
     def harness_options(self):
         out = ['carrier=' + self.carrier, 'chunksrc=' + self.chunk_src]
@@ -55,9 +56,57 @@ class Carrier:
         return out
 
 
+# The two shapes a container has: Luraph v14's `return(function()local ... end)()(...)` (a function
+# without parameters; a VM in the fn-args layout takes its helpers as parameters, one in the table
+# layout starts `return({`) and v15's `return setmetatable({...},{}):M()(...)`.
+_SHAPE = re.compile(r'\breturn\s*\(\s*function\s*\(\s*\)|\breturn\s+setmetatable\s*\(')
+
+
 def may_be_container(src):
-    """Cheap test before running anything: the file can load code, and holds no dispatch loop itself."""
-    return re.search(r'\bloadstring\b', src) is not None and not has_dispatch_loop(src)
+    """Cheap test before running anything: the file can load code, has the outline of a container
+    and holds no dispatch loop itself.  (A plain VM also mentions loadstring when the script uses
+    it; that alone is no reason to run the container probe on it.)"""
+    return (re.search(r'\bloadstring\b', src) is not None and _SHAPE.search(src) is not None
+            and not has_dispatch_loop(src))
+
+
+class Damaged(Exception):
+    """The file is a compressed container that cannot be opened: cut off, or a payload is corrupt."""
+
+
+def open_static(path, src, workdir, tag, log=print):
+    """Open a compressed container without running it (devm/container_static.py, when the tree has
+    it).  Returns a Carrier, or None when the text is no such container or the decoder is absent.
+    Raises Damaged for a container that cannot be opened.
+
+    The chunk and its data are written next to the other intermediate files; the run still
+    executes the shipped file, which decodes the same text itself (see the module comment)."""
+    try:
+        from . import container_static
+    except ImportError:
+        return None
+    try:
+        res = container_static.decode(src)
+    except container_static.ContainerError as e:
+        raise Damaged(' '.join(str(e).split())[:300])
+    if res is None:
+        return None
+    prefix = os.path.join(workdir, tag)
+    chunk = prefix + '.chunk1.lua'
+    with open(chunk, 'wb') as f:
+        f.write(res.chunk)
+    arg = None
+    if res.data is not None:
+        arg = prefix + '.chunk1.arg1.bin'
+        with open(arg, 'wb') as f:
+            f.write(res.data)
+    log('[%s] Luraph container (%s), read without running it: a VM chunk of %d bytes, loaded under the chunk name "%s"%s' % (
+        tag, res.codec, len(res.chunk), res.chunk_name,
+        ' and called with (%s of %d bytes)' % (res.data_kind, len(res.data)) if res.data is not None else ''))
+    for n in getattr(res, 'notes', None) or ():
+        log('[%s]   %s' % (tag, n))
+    log('[%s]   chunk saved as %s%s' % (tag, chunk, ', its data as ' + arg if arg else ''))
+    return Carrier(os.path.abspath(path), chunk, arg, res.chunk_name, data_kind=res.data_kind)
 
 
 def unwrap(path, workdir, tag, log=print, timeout=120):
@@ -85,32 +134,40 @@ def unwrap(path, workdir, tag, log=print, timeout=120):
         chunk = '%s.chunk%s.lua' % (prefix, n)
         with open(chunk, encoding='latin-1') as f:
             text = f.read()
-        if not has_dispatch_loop(text):
+        # the VM chunk: Luraph's container loads it under the name "Luraph" (plus padding); a chunk
+        # under another name counts when a dispatch loop is found in it
+        if not (name.startswith('Luraph') or has_dispatch_loop(text)):
             continue
         arg = None
+        kind = None
         kinds = args.split(',') if args else []
         for i, k in enumerate(kinds):
-            if k.startswith('buffer:'):
+            # (the data of the VM: a buffer from v14.7 on, a string in v14.6)
+            if k.startswith(('buffer:', 'string:')):
                 arg = '%s.chunk%s.arg%d.bin' % (prefix, n, i + 1)
+                kind = k.split(':')[0]
                 break
         log('[%s] Luraph container: it loads a VM chunk of %s bytes under the chunk name "%s" and calls it with (%s)' % (
             tag, size, name, ', '.join(k.replace(':', ' of ') + (' bytes' if ':' in k else '') for k in kinds)))
-        log('[%s]   chunk saved as %s%s' % (tag, chunk, ', its buffer as ' + arg if arg else ''))
-        return Carrier(os.path.abspath(path), chunk, arg, name)
+        log('[%s]   chunk saved as %s%s' % (tag, chunk, ', its %s as %s' % (kind, arg) if arg else ''))
+        return Carrier(os.path.abspath(path), chunk, arg, name, data_kind=kind)
     return None
 
 
 STAND_IN = (
     '-- stand-in for the Luraph container this VM chunk was cut out of (written by devm)\n'
-    'return setmetatable({A=function(z)local s,b=__LPH_CARRY();local ok,f=pcall(loadstring,s,"Luraph",nil);'
+    'return setmetatable({A=function(z)local s,b=__LPH_CARRY();local ok,f=pcall(loadstring,s,%s,nil);'
     'assert(ok and type(f)=="function",f);return(f(b));end},{}):A()(...);\n')
 
 
-def stand_in(chunk_path, chunk_arg, workdir, tag):
+def stand_in(chunk_path, chunk_arg, workdir, tag, chunk_name='Luraph'):
     """Carrier for an already unwrapped chunk: same call shape as Luraph's container (the main
-    chunk calls a method, the method compiles the chunk as "Luraph" and calls it with the buffer,
-    the main chunk calls the result with `...`)."""
+    chunk calls a method, the method compiles the chunk under its name, "Luraph" plus the padding
+    the container used, and calls it with the buffer; the main chunk calls the result with `...`)."""
+    if not re.fullmatch(r'Luraph {0,8}', chunk_name or ''):
+        chunk_name = 'Luraph'
     path = os.path.join(workdir, tag + '.carrier.lua')
     with open(path, 'w') as f:
-        f.write(STAND_IN)
-    return Carrier(path, os.path.abspath(chunk_path), os.path.abspath(chunk_arg) if chunk_arg else None, 'Luraph', synthetic=True)
+        f.write(STAND_IN % ('"%s"' % chunk_name))
+    return Carrier(path, os.path.abspath(chunk_path), os.path.abspath(chunk_arg) if chunk_arg else None, chunk_name, synthetic=True,
+                   data_kind='buffer' if chunk_arg else None)

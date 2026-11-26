@@ -160,6 +160,24 @@ class time_limit:
         return False
 
 
+class Terminated(BaseException):
+    """devm was told to stop (SIGTERM / SIGHUP).  Raised in the main thread so that the run unwinds:
+    every place that waits for the harness kills it on the way out."""
+
+
+def stop_on_signals():
+    import signal
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def fire(signum, _frame):
+        raise Terminated(signum)
+    for name in ('SIGTERM', 'SIGHUP'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), fire)
+
+
 class DevmError(Exception):
     """An expected way for a run to end without a result: main() prints `devm: <stage>: <reason>`."""
 
@@ -169,7 +187,7 @@ class DevmError(Exception):
         self.reason = reason
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -185,9 +203,22 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     carrier = None
     unopened = None
     if chunk_arg:
-        carrier = container.stand_in(path, chunk_arg, workdir, tag)
+        carrier = container.stand_in(path, chunk_arg, workdir, tag, chunk_name or 'Luraph')
         log('[%s] VM chunk with its data buffer (%s): run through a stand-in for Luraph\'s container' % (tag, chunk_arg))
-    elif container.may_be_container(src):
+    else:
+        # read without running anything where the tree has the static decoder; the sandboxed
+        # probe (container.unwrap) otherwise, and for whatever that decoder does not know
+        try:
+            carrier = container.open_static(path, src, workdir, tag, log)
+        except container.Damaged as e:
+            raise DevmError('damaged input', 'the file is a compressed Luraph container that cannot be opened: %s' % e)
+        if carrier:
+            with open(carrier.chunk_src, encoding='latin-1') as f:
+                src = f.read()
+            why = normalize.foreign_dialect(src)
+            if why:
+                raise DevmError('unsupported target', 'the VM chunk inside the container: ' + why)
+    if carrier is None and not chunk_arg and container.may_be_container(src):
         probe = []
 
         def probe_log(line):
@@ -380,9 +411,13 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             raise DevmError('init did not hand over', handover)
         log('[%s] trying the second-stage route: lift the init, run it natively, recover the key' % tag)
     try:
-        text1 = stage.run()
-        boot_text, info = bootstrap.patch(text1)
-    except Exception as e:
+        # (after a failed hand-over this is a second try and gets the time of one)
+        with time_limit(second_stage_limit if handover is not None else 0):
+            text1 = stage.run()
+            boot_text, info = bootstrap.patch(text1)
+            if info['fixkey']:
+                data = run_bootstrap(stage, boot_text, workdir, tag, log, common)
+    except (Exception, TimeLimit) as e:
         if handover is None:
             raise
         raise DevmError('init did not hand over', '%s; second-stage route: %s' % (
@@ -395,7 +430,6 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         log('[%s] the loader runs a single root program and it holds no encrypted second stage: that program is the script' % tag)
         LAST_RUN['notes'] = ['[single-root] lifted from the state at the first interpreter entry']
         return cleanup.tidy(text1)
-    data = run_bootstrap(stage, boot_text, workdir, tag, log, common)
     return lift_program(stage, data, tag, log, oneline, 'real program')
 
 
@@ -496,6 +530,9 @@ def main(argv=None):
     ap.add_argument('--chunk-arg', default=None, metavar='FILE',
                     help='the input is a VM chunk cut out of a Luraph container (`return setmetatable({...},{}):NAME(...)`); '
                          'FILE holds the bytes of the data buffer the container calls it with')
+    ap.add_argument('--chunk-name', default=None, metavar='NAME',
+                    help='with --chunk-arg: the name the container loads the chunk under ("Luraph" plus 0-4 spaces; '
+                         'default "Luraph")')
     ap.add_argument('--route', choices=('auto', 'a', 'b'), default='auto',
                     help='Luraph v14 builds: a = let the VM run its own init and lift the script from the state at the '
                          'hand-over; b = lift the init, run it natively and recover the key of the second stage; '
@@ -516,8 +553,14 @@ def main(argv=None):
             f.write(text)
         return lines, text
 
+    stop_on_signals()
     try:
-        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result)
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result)
+    except Terminated as e:
+        if vmmodel.SERVER is not None:
+            vmmodel.SERVER.close()
+        print('devm: terminated: signal %s' % e.args[0])
+        sys.exit(128 + int(e.args[0]))
     except DevmError as e:
         print('devm: %s: %s' % (e.stage, e.reason))
         sys.exit(1)

@@ -1025,8 +1025,12 @@ def start_server(cmd, workdir):
     with open(errpath, 'w') as ef:
         proc = subprocess.Popen(cmd + ['serve=' + sdir], stdout=subprocess.DEVNULL, stderr=ef)
     deadline = time.time() + 1800
-    while time.time() < deadline and proc.poll() is None and not os.path.exists(os.path.join(sdir, 'ready')):
-        time.sleep(0.2)
+    try:
+        while time.time() < deadline and proc.poll() is None and not os.path.exists(os.path.join(sdir, 'ready')):
+            time.sleep(0.2)
+    except BaseException:       # (devm itself is being stopped: do not leave the harness behind)
+        proc.kill()
+        raise
     if proc.poll() is None and os.path.exists(os.path.join(sdir, 'ready')):
         SERVER = PoolServer(proc, sdir)
         atexit.register(SERVER.close)
