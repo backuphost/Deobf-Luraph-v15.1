@@ -1,5 +1,7 @@
-"""Checks for devm on the Luraph v15.1 builds of the public sample corpus (the v15.2 generation without
-wrapper keys: one interpreter, the main function behind jump-register hubs and block-wise decryption).
+"""Checks for devm on the Luraph v15.0-v15.2 builds of the public sample corpus.  The v15.1 ones are the
+v15.2 generation without wrapper keys: Luraph's start-up code on one interpreter (its main function
+behind jump-register hubs and block-wise decryption), the script on a second one whose dispatch tree
+computes every test into a local first.
 
     python3 tests/devm_v15_corpus.py            (from the repository root; seconds, needs bin/luau)
 
@@ -12,12 +14,19 @@ wrapper keys: one interpreter, the main function behind jump-register hubs and b
 * `lifter.hub_line`: the instructions without effect in front of a jump through a register belong to
   that jump (one copy per jump target), and nothing else does;
 * a traced run that created no VM function ends in `run failed: the VM never started: ...`;
-* the `--root` hint is given for a helper function (arithmetic only), not for every small script.
+* the `--root` hint is given for a helper function (arithmetic only), not for every small script;
+* `vmmodel.is_dispatch_loop`: `local OP = CODE[PC]; local T = OP >= 10; if T then` is a dispatch loop;
+* `opaque._fold_call_keys`: Luraph's per-call key (a parameter that only comes back xor-ed as an extra
+  first result) is removed where every caller is in view, and `run.report` does not say `complete`
+  where it is left;
+* `run.method_wrap_layout`: the v15.0 layout is recognised (devm refuses it at once).
 
-    LURAPH_CORPUS=/path/to/obfuscator-samples/Luraph DEVM_V15_CORPUS_FULL=1 python3 tests/devm_v15_corpus.py Corpus
+    LURAPH_CORPUS=/path/to/obfuscator-samples/Luraph python3 tests/devm_v15_corpus.py Corpus
 
-runs the smallest v15.1 file of the corpus that is not a container through the traced run and the
-lifter (10 minutes and more) and checks that the instructions the main function executed are lifted.
+builds the model of the smallest v15.1 file of the corpus that is not a container (two interpreters)
+and of the smallest v15.0 one (refused); with DEVM_V15_CORPUS_FULL=1 it also runs the v15.1 file through
+the traced run and the lifter: the script is the first function on the second interpreter (minutes),
+and Luraph's own main function lifts when asked for (`--root 1`; 10 minutes and more).
 The corpus is not part of the repository; without LURAPH_CORPUS these checks are skipped.
 """
 import json
@@ -268,43 +277,202 @@ class VmNeverStarted(unittest.TestCase):
         self.assertIn('--chunk-arg', str(cm.exception))
 
 
-def corpus_file():
-    """The smallest file of <corpus>/v15.1 that is a VM object itself (not a compressed container)."""
-    d = os.path.join(CORPUS or '', 'v15.1')
+class OutlinedDispatch(unittest.TestCase):
+    """The second interpreter of the v15.1 corpus builds computes every test of its dispatch tree into
+    a local first.  The model did not take its loops for dispatch loops, so the interpreter that runs
+    the script was never hooked and no function of the script was seen."""
+    LOOP = 'while true do local V=S[H];\nlocal j=V>=10;\nif j then local j=V>=15;\nif j then x=1 else x=2 end else x=3 end;\nH+=1;\nend'
+
+    def loop(self, text):
+        from devm import luparse
+        return luparse.parse(text)[0][0]
+
+    def test_tests_through_a_local(self):
+        self.assertTrue(vmmodel.is_dispatch_loop(self.loop(self.LOOP)))
+        self.assertTrue(vmmodel.is_dispatch_loop(self.loop(self.LOOP.replace('V>=10', '10<=V'))))
+        m = vmmodel.LOOP_HEAD_RE.search(self.LOOP)
+        self.assertEqual(self.LOOP[m.end(1):m.end(1) + 13], 'local V=S[H];')
+        # the usual form
+        usual = 'while true do local V=S[H];\nif V>=10 then x=1 else x=3 end;\nH+=1;\nend'
+        self.assertTrue(vmmodel.is_dispatch_loop(self.loop(usual)))
+        self.assertTrue(vmmodel.LOOP_HEAD_RE.search(usual))
+
+    def test_other_loops_are_not(self):
+        for body in ('local V=S[H];\nlocal j=W>=10;\nif j then x=1 end',         # the test is not of the opcode
+                     'local V=S[H];\nlocal j=V>=10;\nif k then x=1 end',         # the `if` is not on that local
+                     'local V=S[H];\nlocal j=V+10;\nif j then x=1 end',          # not a comparison
+                     'local V=S[H];\nlocal j=V>=10;\nx=1'):
+            self.assertFalse(vmmodel.is_dispatch_loop(self.loop('while true do ' + body + ' end')), body)
+
+
+class CallKeys(unittest.TestCase):
+    """opaque._fold_call_keys on text as the structurer writes it."""
+
+    def test_function_called_on_the_spot(self):
+        from devm import opaque
+        text = ('local v2 = (function(p1, p2)\n\tprint("Hello, " .. p2)\n\treturn bit32.bxor(p1, 348384287)\n'
+                'end)(225884115, "World")\nif v2 == 431315916 then\n\treturn\nend\nlocal v3 = bit32.bxor(v2, 294707725)')
+        self.assertEqual(opaque.strip(text), '(function(p2)\n\tprint("Hello, " .. p2)\nend)("World")')
+        # behind another statement the call needs its `;`, and a test that does not hold is dropped
+        text2 = 'print(1)\n' + text.replace('431315916', '431315917') + '\nprint(2)'
+        self.assertEqual(opaque.strip(text2), 'print(1)\n;(function(p2)\n\tprint("Hello, " .. p2)\nend)("World")\nprint(2)')
+
+    NAMED = ('local v25 = function(p5, p6, p7)\n\tlocal v50 = p5:Connect(p7)\n\tif not v50 then\n\t\treturn bit32.bxor(p6, 18485293)\n\tend\n'
+             '\treturn bit32.bxor(p6, 18485293), v50\nend\n'
+             'local v30, v31 = v25(a.Changed, 99887766, function(p9)\n\tprint(p9)\nend)\n'
+             'if v30 ~= 82721467 then\n\terror("tamper")\nend\nprint(v31)\n'
+             'v25(b.Changed, 12345678, print)\n'
+             'while true do\n\tlocal v40 = v25(b.Changed, 55555555, print)\n\tif v40 == 39167438 then\n\t\tbreak\n\tend\n\tprint("never")\nend\nprint("after")')
+
+    def test_function_called_by_name(self):
+        from devm import opaque
+        self.assertEqual(opaque.strip(self.NAMED), (
+            'local v25 = function(p5, p7)\n\tlocal v50 = p5:Connect(p7)\n\tif not v50 then\n\t\treturn\n\tend\n\treturn v50\nend\n'
+            'local v31 = v25(a.Changed, function(p9)\n\tprint(p9)\nend)\nprint(v31)\n'
+            'v25(b.Changed, print)\n'
+            'while true do\n\tv25(b.Changed, print)\n\tbreak\nend\nprint("after")'))
+
+    def test_left_alone(self):
+        from devm import opaque
+        for text in (self.NAMED.replace('v25(b.Changed, 12345678, print)', 'return v25(b.Changed, 12345678, print)'),   # the result travels on
+                     self.NAMED.replace('v25(b.Changed, 12345678, print)', 'v25(b.Changed, key, print)'),               # not a literal
+                     self.NAMED.replace('v25(b.Changed, 12345678, print)', 'keep(v25)'),                                # the function travels
+                     self.NAMED.replace('\tlocal v50 = p5:Connect(p7)', '\tlocal v50 = p5:Connect(p7, p6)'),          # the key is used
+                     self.NAMED.replace('\t\treturn bit32.bxor(p6, 18485293)\n', '\t\treturn\n')):                # a way out without it
+            self.assertEqual(opaque._fold_call_keys(text), text)
+
+    def test_report(self):
+        from devm import run
+        left = 'local v25 = function(p5, p6, p7)\n\tlocal v50 = p5:Connect(p7)\n\treturn bit32.bxor(p6, 18485293), v50\nend\nprint(v25)\n'
+        lines = run.report(left)
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('per-call' in ln for ln in lines[1:]), lines)
+        self.assertTrue(run.report('print("x")\n')[0].startswith('result: complete'))
+
+    def test_report_of_a_run_that_returned(self):
+        from devm import run
+        text = 'local a = (nil)[1]\nlocal b = (nil)[2]\nprint(1)\n'
+        self.assertTrue(any('most of the script did not run' in ln for ln in run.report(text)))
+        got = run.report(text, returned=True)
+        self.assertFalse(any('most of the script did not run' in ln for ln in got), got)
+        self.assertTrue(any('went to the script\'s end' in ln for ln in got), got)
+        head = '-- x.lua, %s.  How the run went and what this file lacks:\n--   traced run: the script returned (5 VM instructions)\n--   result: PARTIAL\n' % run.HEAD_MARK
+        self.assertEqual(run.report(head + text), got)
+
+
+# The v15.0 shape: the function that makes a VM closure is a method of the VM object and a state machine.
+V150 = '''return setmetatable({m=function(v,R,R,R,g,g)local a,I,C=nil,0,R[1];
+while true do if I<=0 then I,a=1,function(...)local pc,r=1,{...};
+while true do local op=C[pc];
+if op<=1 then r[1]=op;
+else return r[1];
+end;
+pc+=1;
+end;
+end;
+else return a;
+end;
+end;
+end},{}):m()(...);
+'''
+
+
+class MethodWrap(unittest.TestCase):
+    def test_v150_layout(self):
+        from devm import run
+        self.assertTrue(run.method_wrap_layout(vmmodel.Model(V150, oneline=True)))
+        # the same VM without the v15 object around it, and one whose maker returns the closure
+        self.assertFalse(run.method_wrap_layout(vmmodel.Model(V150.replace('return setmetatable({', 'return({').replace('},{}):m', '}):m'), oneline=True)))
+
+    def test_factory_layouts_are_not(self):
+        from devm import normalize, run
+        if not os.path.exists(LAYER3):
+            self.skipTest('needs examples/layer3.lua')
+        with open(LAYER3, encoding='latin-1') as f:
+            src = f.read()
+        src, _n = normalize.inline_protected_raw(src)
+        self.assertFalse(run.method_wrap_layout(vmmodel.Model(normalize.reflow(src), oneline=True)))
+
+
+def corpus_file(version='v15.1'):
+    """The smallest file of <corpus>/<version> that is a VM object itself (not a compressed container)."""
+    d = os.path.join(CORPUS or '', version)
     if not os.path.isdir(d):
         return None
-    best = None
-    for name in sorted(os.listdir(d)):
-        p = os.path.join(d, name)
+    from devm import container
+    for p in sorted((os.path.join(d, name) for name in os.listdir(d)), key=os.path.getsize):
         with open(p, encoding='latin-1') as f:
-            head = f.read(4096)
-        if 'setmetatable(' not in head or 'return(function()local' in head.replace(' ', ''):
-            continue
-        if best is None or os.path.getsize(p) < os.path.getsize(best):
-            best = p
-    return best
+            src = f.read()
+        if 'setmetatable(' in src[:4096] and not container.may_be_container(src):
+            return p
+    return None
 
 
-@unittest.skipUnless(CORPUS and os.environ.get('DEVM_V15_CORPUS_FULL') and have_luau(),
-                     'set LURAPH_CORPUS and DEVM_V15_CORPUS_FULL=1 (10 minutes and more)')
+def corpus_source(path):
+    from devm import normalize
+    with open(path, encoding='latin-1') as f:
+        src = f.read()
+    src, _n = normalize.inline_protected_raw(src)
+    return normalize.reflow(src)
+
+
+@unittest.skipUnless(CORPUS, 'set LURAPH_CORPUS')
 class Corpus(unittest.TestCase):
-    def test_main_function_is_lifted(self):
-        """The traced run returns, its snapshots name no proto's own array as shared, and the lifter
-        reaches the instructions the main function executed (it reached 8 to 119 of 8,000 to 11,000)."""
-        from devm import normalize, pipeline
+    def test_models(self):
+        """v15.1: start-up code and script each have their interpreter.  v15.0: refused at once."""
+        from devm import run
         path = corpus_file()
         if path is None:
             self.skipTest('no v15.1 VM file under LURAPH_CORPUS')
-        with open(path, encoding='latin-1') as f:
-            src = f.read()
-        src, _n = normalize.inline_protected_raw(src)
-        src = normalize.reflow(src)
+        model = vmmodel.Model(corpus_source(path), oneline=True)
+        self.assertTrue(model.factory_style)
+        self.assertGreaterEqual(len(model.interps), 2)
+        self.assertFalse(run.method_wrap_layout(model))
+        path = corpus_file('v15.0')
+        if path is not None:
+            self.assertTrue(run.method_wrap_layout(vmmodel.Model(corpus_source(path), oneline=True)))
+
+    @unittest.skipUnless(os.environ.get('DEVM_V15_CORPUS_FULL') and have_luau(), 'set DEVM_V15_CORPUS_FULL=1 (minutes)')
+    def test_script_is_the_payload(self):
+        """The traced run registers the script's functions (they run on the second interpreter) and the
+        lifter takes the first of them as the script; nothing that ran is left unlifted."""
+        from devm import pipeline
+        path = corpus_file()
+        if path is None:
+            self.skipTest('no v15.1 VM file under LURAPH_CORPUS')
+        logs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = pipeline.Stage(corpus_source(path), tmp, 'sample', log=logs.append, oneline=True)
+            stage.force_root = None
+            stage.harness_options = ['exercise=1', 'executor=1']
+            try:
+                text = stage.run_traced()
+            finally:
+                if vmmodel.SERVER is not None:
+                    vmmodel.SERVER.close()
+        self.assertTrue(any('[oracle] script' in ln for ln in logs), logs[-6:])
+        self.assertIsNotNone(stage.payload_root, logs[-6:])
+        self.assertGreater(stage.payload_root, 1)
+        self.assertFalse([e for k, e in stage.errors if (k, e[0][0], e[0][1]) in stage.oracle], 'unlifted instructions that ran')
+        self.assertNotIn('LIFT ERROR', text)
+        self.assertTrue(text.strip())
+
+    @unittest.skipUnless(os.environ.get('DEVM_V15_CORPUS_FULL') and have_luau(), 'set DEVM_V15_CORPUS_FULL=1 (10 minutes and more)')
+    def test_main_function_is_lifted(self):
+        """Asked for Luraph's own first program (--root 1): the traced run returns, its snapshots name
+        no proto's own array as shared, and the lifter reaches the instructions the main function
+        executed (it reached 8 to 119 of 8,000 to 11,000)."""
+        from devm import pipeline
+        path = corpus_file()
+        if path is None:
+            self.skipTest('no v15.1 VM file under LURAPH_CORPUS')
+        src = corpus_source(path)
         logs = []
         with tempfile.TemporaryDirectory() as tmp:
             stage = pipeline.Stage(src, tmp, 'sample', log=logs.append, oneline=True)
             self.assertTrue(stage.model.factory_style)
             self.assertFalse(stage.model.keyed_wrappers)
-            stage.force_root = None
+            stage.force_root = 1
             stage.harness_options = ['exercise=1', 'executor=1']
 
             class NoText:        # (the lift is what is checked here; structuring takes as long again)

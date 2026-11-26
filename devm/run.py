@@ -117,6 +117,26 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log):
         return json.load(f)
 
 
+def method_wrap_layout(model):
+    """Luraph v15.0: the VM object is `setmetatable({...}, {})` and the function that makes a VM
+    closure is one of its methods, written as a state machine that assigns the interpreter closure
+    in one of its states (`while true do if S <= 0 then ...; S, f = 1, function(...) ... end`)
+    instead of returning it from a wrapper.  Neither of the two layouts devm models."""
+    if model.factory_style or len(model.chain) != 2 or not re.match(r'(?:\s|--[^\n]*\n)*return\s*\(?\s*setmetatable\b', model.src):
+        return False
+    maker = model.chain[0]
+    if maker.body and maker.body[-1][0] == 'return' and maker.body[-1][1] and maker.body[-1][1][0][0] == 'func':
+        return False
+
+    def holds(node):
+        if isinstance(node, (list, tuple)):
+            if len(node) == 2 and node[0] == 'func' and node[1] is model.interp:
+                return True
+            return any(holds(x) for x in node if isinstance(x, (list, tuple)))
+        return False
+    return any(st[0] == 'while' and holds(st[2]) for st in maker.body)
+
+
 def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -159,6 +179,9 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     stage.force_root = root
     stage.model.run_options = carrier.harness_options() if carrier else []
     stage.carrier = carrier
+    if method_wrap_layout(stage.model):
+        # (the other engine lifts these; here the proto-table route would run for minutes and fail)
+        raise RuntimeError('no model: Luraph v15.0 method-wrap layout is not supported by this engine')
     if stage.model.factory_style:
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
@@ -311,7 +334,7 @@ def main(argv=None):
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
     text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, mark_untaken=a.mark_untaken)
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
-    lines = run_report(LAST_RUN['notes']) + report(text)
+    lines = run_report(LAST_RUN['notes']) + report(text, returned=any(n.startswith('[oracle] script returned') for n in LAST_RUN['notes']))
     # the report is also the head of the file: a result read later, without the run's output next
     # to it, must still say what it is and what it lacks
     head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
@@ -351,13 +374,19 @@ def run_report(notes):
     return out
 
 
-def report(text):
-    """What is left unrecovered in a result, in plain words."""
+KEY_LEFT = re.compile(r'(?m)^[ \t]*(?:return bit32\.bxor\(\w+, \d{7,}\)(?:,.*)?|(?:local )?\w+ = bit32\.bxor\((?:\w+, \d{7,}|\d{7,}, \w+)\))$')
+
+
+def report(text, returned=None):
+    """What is left unrecovered in a result, in plain words.  `returned`: the traced run went to
+    the script's end (None: read it off the head of a file main() wrote)."""
     lines = text.split('\n')
     if lines and HEAD_MARK in lines[0]:
         # a file main() wrote: its head is an earlier report, not part of the result
         del lines[0]
         while lines and lines[0].startswith('--   '):
+            if returned is None and lines[0].startswith('--   traced run: the script returned'):
+                returned = True
             del lines[0]
         text = '\n'.join(lines)
     errs = text.count('LIFT ERROR')
@@ -375,6 +404,9 @@ def report(text):
     holes = len(re.findall(r'nil --\[\[', code))
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
     preps = sum(1 for ln in lines if '-- for-loop setup:' in ln)
+    # Luraph's per-call keys (opaque._fold_call_keys) where they could not be folded: a parameter
+    # xor-ed with a literal into an extra first result, or such a result xor-ed on
+    keys = len(KEY_LEFT.findall(code))
     # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
     # protection's own checks, which a reader should not take for the script's
     traps = []
@@ -385,7 +417,7 @@ def report(text):
                      'protection, not of the script' % (calls, m.group(1)))
     lines = max(1, text.count('\n'))
     out = []
-    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps):
+    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or keys):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + traps
     out.append('result: PARTIAL')
@@ -411,11 +443,18 @@ def report(text):
         out.append('  %d for loops without their loop statement (only the set-up of the bounds was found)' % preps)
     if stubs:
         out.append('  %d functions printed as a stub (their body was not recovered)' % stubs)
+    if keys:
+        out.append('  %d lines xor a value with a large literal (`return bit32.bxor(p, K), ...`): this is how Luraph\'s per-call '
+                   'keys look, a number every caller passes and gets back changed.  They are folded away where every caller '
+                   'is in the result; these were left because that could not be shown (or the script does such arithmetic itself)' % keys)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '
                    'not as its original structure' % depth)
-    if blank * 5 > lines:
+    if blank * 5 > lines and returned:
+        out.append('  the traced run went to the script\'s end, so those lines are in code it did not execute (branches '
+                   'not taken, functions nobody called): their constants stayed encrypted')
+    elif blank * 5 > lines:
         out.append('  most of the script did not run.  Usual causes: it waits for a server reply (see the [http] '
                    'lines above; --http-map), a key system, or an environment check that failed '
                    '(try --no-executor / --executor)')
