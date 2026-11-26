@@ -452,6 +452,12 @@ return function(G, fnames, libnames, opts)
 		mt.__newindex = function(_, k, v)
 			if k == "Parent" then
 				setParent(u, v)
+			elseif k == "Name" then
+				-- a name is a string of at most 100 characters: the engine cuts a longer one (Luraph's
+				-- start-up code assigns a long name and counts what comes back)
+				if rawType(v) == "number" then v = tostring(v) end
+				if rawType(v) == "string" and #v > 100 then v = string.sub(v, 1, 100) end
+				d.props[k] = v
 			else
 				d.props[k] = v
 			end
