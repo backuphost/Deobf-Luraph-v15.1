@@ -795,10 +795,15 @@ class ContainerStatic(unittest.TestCase):
         with self.assertRaises(container_static.ContainerError) as cm:
             container_static.decode(text[:-7])
         self.assertEqual((cm.exception.partial.chunk, cm.exception.partial.data), (CHUNK, DATA))
-        # damaged payload text
+        # damaged payload text: the data payload (the chunk is still read), then the chunk payload
         second = text.index('LPH', first + 3)
-        with self.assertRaises(container_static.ContainerError):
-            container_static.decode(text[:second + 300] + text[second + 301:])
+        for cut in (second + 30, second + 300):
+            with self.assertRaises(container_static.ContainerError) as cm:
+                container_static.decode(text[:cut] + text[cut + 1:])
+            self.assertEqual((cm.exception.partial.chunk, cm.exception.partial.data), (CHUNK, None))
+        with self.assertRaises(container_static.ContainerError) as cm:
+            container_static.decode(text[:first + 200] + text[first + 201:])
+        self.assertIsNone(cm.exception.partial)
         # a plain v15 VM has one payload and no substitution table: not a container
         one = text[:second - 6] + text[text.index(']==]', second) + 5:]
         self.assertIsNone(container_static.decode(one))

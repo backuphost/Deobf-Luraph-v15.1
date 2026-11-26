@@ -449,36 +449,34 @@ def _decode_setmt(tokens, ret, notes):
     if _PERMUTATIONS is None:
         import itertools
         _PERMUTATIONS = list(itertools.permutations(range(5)))
-    found = None
-    for perm in _PERMUTATIONS:
-        ok = True
-        for raw in raws:
+    fits = []
+    for raw in raws:
+        good = set()
+        for perm in _PERMUTATIONS:
             head = _groups_to_bytes(raw, offset, perm, 3000)
             if head is None or head[:1] != b'\0':
-                ok = False
-                break
+                continue
             try:
                 dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[
                     {'id': lzma.FILTER_LZMA1, 'lc': 3, 'lp': 0, 'pb': 0, 'dict_size': 1 << 16}])
-                if not dec.decompress(head, 4096):
-                    ok = False
-                    break
+                if dec.decompress(head, 4096):
+                    good.add(perm)
             except lzma.LZMAError:
-                ok = False
-                break
-        if ok:
-            if found is not None:
-                raise ContainerError('the order of the base-85 digits cannot be told (two orders fit)')
-            found = perm
-    if found is None:
+                pass
+        fits.append(good)
+    both = fits[0] & fits[1]
+    if len(both) == 1:
+        found = next(iter(both))
+    elif len(both) > 1:
+        raise ContainerError('the order of the base-85 digits cannot be told (%d orders fit)' % len(both))
+    elif len(fits[0]) + len(fits[1]) == 1:
+        found = next(iter(fits[0] | fits[1]))   # one payload is damaged from its start on; the other still tells the order
+    else:
         raise ContainerError('the payloads decode in no order of the base-85 digits: corrupt payload text, or an '
                              'unknown variant of the v15 container')
     data85 = []
     for n, raw in enumerate(raws):
-        b = _groups_to_bytes(raw, offset, found)
-        if b is None:
-            raise ContainerError('payload %d: a base85 group is not a 32-bit value: the payload text is corrupt' % (n + 1))
-        data85.append(b)
+        data85.append(_groups_to_bytes(raw, offset, found))
     names = [t[1] for t in tokens[open_paren:stop] if t[0] == 'str' and t[1].startswith('Luraph') and not t[1][6:].strip(' ')]
     if names:
         name = names[0]
@@ -493,6 +491,8 @@ def _decode_setmt(tokens, ret, notes):
     outs, errors = [], []
     for n in (0, 1):
         try:
+            if data85[n] is None:
+                raise ContainerError('a base85 group is not a 32-bit value: the payload text is corrupt')
             out, unused = _lzma(data85[n])
             if unused > 3:
                 notes.append('payload %d: %d bytes after the LZMA end marker' % (n + 1, unused))

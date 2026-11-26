@@ -17,7 +17,8 @@
 --
 -- Every failure is error("zstd: <what>", 0).  The decoder never reads outside its input, never writes
 -- more than `limit` bytes, and every loop is bounded by the input or by a size the format fixes
--- (a block regenerates at most 128 KiB, a match never reaches before the start of its frame).
+-- (a block holds at most min(window, 128 KiB) bytes, a match never reaches before the start of its frame
+-- or beyond the window).
 --
 -- Only buffer, bit32, string, table and math are used; nothing global is written.  Run as a script
 -- (`luau zstd.lua -a IN OUT [LIMIT]`, the repository's patched interpreter) it decompresses a file.
@@ -617,12 +618,15 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 	if pos + (if single then 0 else 1) + didSize + fcsSize > n then
 		fail("truncated input (frame header)")
 	end
+	local window = 0
 	if not single then
 		local wd = readu8(src, pos)
 		pos += 1
 		if rshift(wd, 3) > 21 then -- windows above 2 GiB: no implementation accepts them
 			fail("frame needs a window of 2^" .. (10 + rshift(wd, 3)) .. " bytes")
 		end
+		window = 2 ^ (10 + rshift(wd, 3))
+		window += window / 8 * band(wd, 7)
 	end
 	local did = 0
 	for i = didSize - 1, 0, -1 do
@@ -643,6 +647,11 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 		fcs = readu32(src, pos) + readu32(src, pos + 4) * 4294967296
 	end
 	pos += fcsSize
+	if single then
+		window = fcs
+	end
+	-- Block_Maximum_Size: no block is larger than the window, or than 128 KiB
+	local blockLimit = if window < MAX_BLOCK then window else MAX_BLOCK
 	count(stats, "frames")
 	count(stats, if fcs then "frames_with_content_size" else "frames_without_content_size")
 	count(stats, if single then "frames_single_segment" else "frames_with_window_descriptor")
@@ -672,6 +681,9 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 		lastBlock = band(bh, 1) == 1
 		local btype = band(rshift(bh, 1), 3)
 		local bsize = rshift(bh, 3)
+		if bsize > blockLimit and btype < 3 then
+			fail("corrupt frame (block of " .. bsize .. " bytes, the frame allows " .. blockLimit .. ")")
+		end
 		if btype == 0 or btype == 1 then
 			local need = op + bsize
 			if need > maxop then
@@ -698,9 +710,6 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 			op = need
 		elseif btype == 2 then
 			local stop = pos + bsize
-			if bsize > MAX_BLOCK then
-				fail("corrupt frame (compressed block of " .. bsize .. " bytes)")
-			end
 			if stop > n then
 				fail("truncated input (compressed block)")
 			end
@@ -768,7 +777,7 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 				if p < 0 then
 					fail("corrupt block (sequence bit stream too short)")
 				end
-				local blockMax = bstart + MAX_BLOCK
+				local blockMax = bstart + blockLimit
 				for i = 1, nseq do
 					local ofc = ofSym[sof + 1]
 					local mlc = mlSym[sml + 1]
@@ -864,7 +873,7 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 					end
 					local need = op + ll + ml
 					if need > blockMax then
-						fail("corrupt block (it regenerates more than 128 KiB)")
+						fail("corrupt block (it regenerates more than the " .. blockLimit .. " bytes a block may hold)")
 					end
 					if need > maxop then
 						fail(if fcs then "corrupt frame (more data than its header announces)" else "the data expands beyond the limit of " .. limit .. " bytes")
@@ -882,6 +891,8 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 					end
 					if offset > op - fstart then
 						fail("corrupt block (match offset " .. offset .. " reaches before the start of the frame)")
+					elseif offset > window then
+						fail("corrupt block (match offset " .. offset .. " reaches beyond the window of " .. window .. " bytes)")
 					end
 					local from = op - offset
 					if offset >= ml then
@@ -919,8 +930,8 @@ local function frame(src, pos, n, out, cap, op, limit, st, stats)
 				bcopy(out, op, lit, lp, rest)
 				op = need
 			end
-			if op - bstart > MAX_BLOCK then
-				fail("corrupt block (it regenerates more than 128 KiB)")
+			if op - bstart > blockLimit then
+				fail("corrupt block (it regenerates more than the " .. blockLimit .. " bytes a block may hold)")
 			end
 			pos = stop
 		else
