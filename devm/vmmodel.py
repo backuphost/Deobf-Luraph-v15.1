@@ -1031,7 +1031,7 @@ def run_oracle(model, workdir, tag, options=()):
     return dump, out, note
 
 
-def run_dump_script(model, workdir, tag, options=(), budget=40000000, timeout=600):
+def run_dump_script(model, workdir, tag, options=(), budget=40000000, timeout=150):
     """Proto-table layout, route A: let the VM run its own first program (Luraph's init) under the
     harness and dump the state when the proto that program returned is entered, i.e. when the
     script's main function starts (patched_source(newproto=True), harness dumpnew=1).

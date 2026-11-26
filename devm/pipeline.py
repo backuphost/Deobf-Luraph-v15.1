@@ -118,7 +118,7 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def _dump_script(self, options=(), budget=40000000, timeout=600):
+def _dump_script(self, options=(), budget=40000000, timeout=150):
     """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
     proto of the script.  The harness lets the VM run that init and dumps the state when the
     returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
@@ -149,7 +149,7 @@ def _dump_script(self, options=(), budget=40000000, timeout=600):
 Stage.dump_script = _dump_script
 
 
-def _run_script(self, options=(), budget=40000000, timeout=600):
+def _run_script(self, options=(), budget=40000000, timeout=150):
     """dump_script, then a plain lift of the script's program (no key-function search, no
     opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
     import re
