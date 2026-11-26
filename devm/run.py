@@ -43,19 +43,40 @@ def lift_one(model, data, overrides, key):
     return L.lift_proto(key)
 
 
-def solve_keyfns(model, data, log):
-    """Lift everything; search values for key functions until no proto has lift errors."""
+def unknown_keyfns(data):
+    """Keys of the key functions a dump holds without a value (`{"cfn": null, "k": K}`: the
+    harness could not evaluate the function)."""
+    out = set()
+    stack = [data]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            if 'cfn' in v and 'k' in v:
+                if v['cfn'] is None:
+                    out.add(v['k'])
+                continue
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
+    return out
+
+
+def solve_keyfns(model, data, log, only=None):
+    """Lift everything; search values for key functions until no proto has lift errors.
+    only: the key functions to search values for (default: all a proto with errors uses)."""
     overrides = {}
     L = make_lifter(model, data, overrides)
     protos = L.lift_all(L.root_key)
     for _ in range(6):
-        bad = [k for k, p in protos.items() if p.errors and p.keyfns]
+        bad = [k for k, p in protos.items() if p.errors and p.keyfns and (only is None or p.keyfns & only)]
         if not bad:
             break
         changed = False
         for key in bad:
             base = len(protos[key].errors)
             for fn in sorted(protos[key].keyfns, key=str):
+                if only is not None and fn not in only:
+                    continue
                 good = []
                 best = (base, None)
                 for cand in range(-64, 513):
@@ -388,7 +409,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         data = stage.dump_script(common, **{k: v for k, v in (('budget', budget), ('timeout', run_timeout)) if v})
         LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ()))
         if data is not None:
-            text = lift_program(stage, data, tag, log, oneline, 'script')
+            text = lift_program(stage, data, tag, log, oneline, 'script', replayed=False)
             if route == 'a' or not stage.errors or not in_place or single:
                 return text
             # The lift has errors.  Builds whose init decrypts the script data with a key it
@@ -467,9 +488,15 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     return lift_program(stage, data, tag, log, oneline, 'real program')
 
 
-def lift_program(stage, data, tag, log, oneline, what):
+def lift_program(stage, data, tag, log, oneline, what, replayed=True):
     """Lift and decompile the program a dump was taken at the start of (proto-table layout):
-    the dump of the native bootstrap replay, or the one taken when the VM's own init handed over."""
+    the dump of the native bootstrap replay, or the one taken when the VM's own init handed over.
+
+    replayed: the dump comes from the native replay of the lifted init.  Its environment checks
+    were neutralised, so a key function can have a value and still the wrong one: values are
+    searched for every key function a proto with lift errors uses.  After the VM's own init
+    (replayed=False) the values are the ones the VM computed; only functions the harness could not
+    evaluate are searched (577 trial lifts per function and proto otherwise)."""
     # First with the key function values the bootstrap replay produced.  Junk arms behind opaque
     # predicates do not lift cleanly and must not be mistaken for wrong keys, so they are cut
     # before anything is solved for.
@@ -478,8 +505,9 @@ def lift_program(stage, data, tag, log, oneline, what):
     protos = L.lift_all(L.root_key)
     cuts = {}
     cut = opaque.prune_ir(protos, cuts)
-    if any(p.errors and p.keyfns for p in protos.values()):
-        L, protos, overrides = solve_keyfns(stage.model, data, log)
+    only = None if replayed else unknown_keyfns(data)
+    if any(p.errors and p.keyfns and (only is None or p.keyfns & only) for p in protos.values()):
+        L, protos, overrides = solve_keyfns(stage.model, data, log, only)
         cuts = {}
         cut = opaque.prune_ir(protos, cuts)
     for _ in range(4):

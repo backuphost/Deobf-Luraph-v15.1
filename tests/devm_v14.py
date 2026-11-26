@@ -30,9 +30,11 @@ With a corpus (LURAPH_CORPUS=<directory with one sub-directory per Luraph versio
 otherwise).  Files are picked at run time by directory and size, never by name:
 * one plain file each of the one-table-per-instruction form (v14.1), the parallel-array form (v14.3)
   and the table shape (v14.5): the model is found, the VM's init hands over, the result is not the
-  init, and the report has its `result:` line.
+  init, and the report has its `result:` line;
+* one plain v14.8 file: when its init hands over, the run reports the key-function values.
 """
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -417,6 +419,25 @@ class Corpus(unittest.TestCase):
         rep = run.run_report(run.LAST_RUN['notes']) + run.report(text)
         self.assertTrue(rep[0].startswith('the VM ran its own init'), rep)
         self.assertTrue(any(ln.startswith('result: ') for ln in rep), rep)
+
+    def test_key_functions(self):
+        """v14.8: the script patches its operands with values of functions the init installs; the
+        dump taken at the hand-over carries those values.  (Whether the init hands over at all is
+        a matter of the mock: a file whose init does not is skipped here.)"""
+        path = smallest('v14.8', plain_vm)
+        if path is None:
+            self.skipTest('no plain VM file in v14.8')
+        lines = []
+        with tempfile.TemporaryDirectory() as work:
+            try:
+                text = run.deobfuscate(path, work, log=lines.append, route='a', run_timeout=150, diagnose=False)
+            except run.DevmError as e:
+                if e.stage == 'init did not hand over':
+                    self.skipTest('the init of the picked file does not hand over in this mock')
+                raise
+        self.assertTrue(any(re.search(r'\[keyfn\] 1=\d+ 2=\d+', ln) for ln in lines), lines)
+        for mark in self.INIT_MARKS:
+            self.assertNotIn(mark, text)
 
     def test_instruction_tables(self):
         self.check('v14.1', True)
