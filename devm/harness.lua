@@ -2,6 +2,55 @@
 -- usage: luau harness.lua <patched_sample.lua> <out.json>
 local samplePath, outPath = ...
 local _G = getfenv() -- the CLI runs scripts in a sandboxed thread: script globals live here, not in the real _G
+
+-- ---------------------------------------------------------------- the CLI's own functions
+-- The CLI (luau_cli.patch) gives this file real file access (readfile, writefile), its stderr
+-- (ewrite, and __LPH_RUNMAIN, which is the same C function), C closures (cwrap), a scheduler
+-- resume (resumetop), the vector metatable (setvectormetatable), executor natives (__LPH_NATIVE)
+-- and the CLI's module loader (require, which reads and runs files from disk).  They are kept in
+-- locals here and taken out of every global table once the mock is built (hideHostGlobals): the
+-- script's world never sees them.  In executor mode the script gets the mock's stand-ins for
+-- readfile / writefile; in plain-client mode they are nil, as in Roblox.
+local readfile, writefile, cwrap = readfile, writefile, cwrap
+local hostRunmain, hostNative = __LPH_RUNMAIN, __LPH_NATIVE
+local HOST_NAMES = { "readfile", "writefile", "ewrite", "cwrap", "resumetop", "setvectormetatable", "__LPH_RUNMAIN",
+	"__LPH_NATIVE", "require", "loadfile", "dofile", "callgrind" }
+local realGlobals = getmetatable(_G) and rawget(getmetatable(_G), "__index")
+if type(realGlobals) ~= "table" then realGlobals = nil end
+-- Everything this file writes to stderr goes through ewrite below.  The Python side reads that log
+-- line by line and trusts lines by their leading tag ("[oracle] script returned ...", "[http] ...").
+-- Text that comes from the script (an URL, a member name, an error message, a chunk name in a
+-- stack trace) is part of the line the harness or the mock started, never a line of its own:
+-- characters other readers take for a line end become "?", and a line after the first one of a
+-- write that would read as a tagged log line (or as NOT REACHED / COMPILE ERROR) is indented by
+-- one space.  (Stack frames, "[C] ..." and "[string "..."]:n ...", are left as they are.)
+local ewrite = ewrite      -- (the CLI's: replaced by the checked writer below)
+do
+	local hostEwrite = ewrite
+	local function tagged(line)
+		if string.find(line, "^%[") then
+			return not (string.find(line, "^%[C%]") or string.find(line, '^%[string "'))
+		end
+		return string.find(line, "^NOT REACHED") ~= nil or string.find(line, "^COMPILE ERROR") ~= nil
+			or string.find(line, "^LAYER COMPILE ERROR") ~= nil
+	end
+	local function clean(s, all)
+		s = string.gsub(s, "[%z\1-\8\11-\31\127]", "?")
+		s = string.gsub(s, "\226\128[\168\169]", "?")      -- U+2028, U+2029
+		s = string.gsub(s, "\194\133", "?")                -- U+0085
+		if all and tagged(s) then s = " " .. s end
+		if string.find(s, "\n", 1, true) then
+			s = string.gsub(s, "\n([^\n]+)", function(line)
+				if tagged(line) then return "\n " .. line end
+				return nil
+			end)
+		end
+		return s
+	end
+	-- all=true: text that is the script's from its first character (an error message), so its
+	-- first line is treated like the others
+	ewrite = function(s, all) return hostEwrite(clean(tostring(s), all)) end
+end
 local layers = { select(3, ...) }
 local layerIdx = 0
 local traceMode = string.sub(outPath, -6) == ".trace"
@@ -1230,8 +1279,27 @@ local function clike(impl)
 end
 _G.__LPH_CLIKE = clike
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
+-- (the mock writes its log lines through the same checked writer; it reads ewrite, cwrap,
+-- resumetop and setvectormetatable from the table given to it while it is being built, and never later)
+rawset(_G, "ewrite", ewrite)
 local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames, { here = here, readfile = readfile })
 mockRef = mock
+-- Take the CLI's functions out of every global table: this thread's (where the harness and the
+-- mock look up their globals) and the engine's own, behind it (read-only: opened for this with
+-- the executor native, when the CLI has it).  From here on only the locals above have them.
+local function hideHostGlobals()
+	for _, n in ipairs(HOST_NAMES) do rawset(_G, n, nil) end
+	if realGlobals then
+		local setro = hostNative and hostNative.setreadonly
+		local frozen = table.isfrozen(realGlobals)
+		if frozen and setro then pcall(setro, realGlobals, false) end
+		if not table.isfrozen(realGlobals) then
+			for _, n in ipairs(HOST_NAMES) do rawset(realGlobals, n, nil) end
+			if frozen and setro then pcall(setro, realGlobals, true) end
+		end
+	end
+end
+hideHostGlobals()
 if executorEnv then mock.priv.executorLibs() end
 if _G.__LPH_CALLLOG then mock.priv.live = true end
 if scriptPath then mock.placeScript(scriptPath) end
@@ -1349,11 +1417,51 @@ local undefinedRead = {}
 -- The script's environment is a plain table, as in Roblox: reading an existing global must not run
 -- a metamethod (scripts measure the remaining C stack, and a Lua __index handler costs a level).
 -- Only names that are not predefined fall through to the lazy Roblox-library fallback.
+-- (the mock's own bookkeeping is not part of the script's world: scripts enumerate the global
+-- table behind their environment and look at every name they find, and what is in here writes
+-- the run's log)
+local mockInternal = { onHttp = true, onMfp = true, onMfpExpected = true, mfpDelta = true, mfpCalls = true, ctorCalls = true,
+	enumName = true, lib = true, newInstance = true, serverSide = true, stub = true, typeNames = true,
+	vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true,
+	priv = true }
+-- What a lookup may take from this thread's globals: the engine's standard library (whatever the
+-- engine's global table holds once the CLI's functions are out of it) and the hooks the
+-- instrumented copies call (__LPH_*).  Never the harness's own globals (its tables, the run-end
+-- hook, the call logger), whatever their names.
+local stdNames = {}
+for _, n in ipairs({ "assert", "collectgarbage", "error", "gcinfo", "getfenv", "getmetatable", "ipairs", "loadstring",
+	"newproxy", "next", "pairs", "pcall", "print", "rawequal", "rawget", "rawlen", "rawset", "select", "setfenv",
+	"setmetatable", "tonumber", "tostring", "type", "typeof", "unpack", "xpcall", "_VERSION", "bit32", "buffer",
+	"coroutine", "debug", "math", "os", "string", "table", "utf8", "vector" }) do stdNames[n] = true end
+if realGlobals then
+	for k in pairs(realGlobals) do
+		if type(k) == "string" and string.sub(k, 1, 2) ~= "__" then stdNames[k] = true end
+	end
+end
+stdNames._G = nil
+for _, n in ipairs(HOST_NAMES) do stdNames[n] = nil end
+local HOOK_DENY = { __LPH_RUNMAIN = true, __LPH_NATIVE = true, __LPH_AFTER = true, __LPH_CALLLOG = true, __LPH_CLIKE = true }
+local function shareable(k)
+	if type(k) ~= "string" then return false end
+	if stdNames[k] then return true end
+	return string.sub(k, 1, 6) == "__LPH_" and not HOOK_DENY[k]
+end
+-- `ewrite` as the script sees it: what it is given goes into the run's log as a [script] line,
+-- like print (the probe scripts of the tests report through it); never a line of its own.
+local scriptEwrite = function(...)
+	local okt, text = pcall(tostring, (...))
+	text = okt and type(text) == "string" and text or "?"
+	text = string.gsub(string.gsub(string.sub(text, 1, 2000), "\n$", ""), "%c", " ")
+	mock.priv.note("script", "ewrite: " .. text, true)
+end
+if cwrap then scriptEwrite = cwrap("ewrite", scriptEwrite) end
 local fallback = setmetatable({}, {
 	__index = function(t, k)
 		if traceMode and string.sub(tostring(k), 1, 5) ~= "__LPH" then ewrite("[global] " .. tostring(k) .. "\n") end
-		local v = mock[k]
-		if v == nil then v = _G[k] end
+		local v = nil
+		if not mockInternal[k] then v = mock[k] end
+		if v == nil and k == "ewrite" then v = scriptEwrite end
+		if v == nil and shareable(k) then v = _G[k] end
 		if v == nil and type(k) == "string" and mock.priv.knownLib(k) then
 			v = rbxLib(k)
 		end
@@ -1384,7 +1492,7 @@ function populateSandbox()
 	end
 	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
 		"rawset", "rawlen", "select", "setmetatable", "tonumber", "tostring", "type", "typeof", "ipairs", "pairs",
-		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
+		"pcall", "xpcall", "unpack", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
 		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T", "__LPH_MARK", "__LPH_OVER", "__LPH_PID", "__LPH_ENTER",
@@ -1392,17 +1500,11 @@ function populateSandbox()
 		local v = _G[n]
 		if v ~= nil then rawset(sandbox, n, v) end
 	end
-	-- (the mock's own bookkeeping is not part of the script's world: scripts enumerate the
-	-- global table behind their environment and look at every name they find)
-	local internal = { onHttp = true, onMfp = true, onMfpExpected = true, mfpDelta = true, mfpCalls = true, ctorCalls = true,
-		enumName = true, lib = true, newInstance = true, serverSide = true, stub = true, typeNames = true,
-		vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true,
-		priv = true }
 	for k, v in pairs(mock) do
-		if type(k) == "string" and not internal[k] then rawset(sandbox, k, v) end
+		if type(k) == "string" and not mockInternal[k] then rawset(sandbox, k, v) end
 	end
 	for _, n in ipairs({ "game", "workspace", "script", "Enum", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim",
-		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
+		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared",
 		"TweenInfo", "NumberRange", "NumberSequence", "ColorSequence", "BrickColor", "Ray", "Region3", "Font",
 		"Path2DControlPoint", "DateTime", "PhysicalProperties", "Axes", "Faces", "Vector3int16", "Vector2int16",
 		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable",
@@ -1419,6 +1521,18 @@ function populateSandbox()
 	-- anti-cheat code treats an environment that only inherits _G / shared as an executor's.
 	local globals = sandbox
 	rawset(globals, "_G", {})       -- the scripts' shared table, not the CLI's own globals
+	-- require: the CLI's own loader reads and runs files from disk.  The script gets Roblox's
+	-- require instead: the game's ModuleScripts do not exist here, so a module is a permissive
+	-- stand-in (as any member the mock has no answer for), and a string is refused as Roblox does.
+	do
+		local function impl(m)
+			if type(m) == "string" then error("Attempted to call require with invalid argument(s).", cwrap and 0 or 2) end
+			return mock.stub("require(" .. tostring(m) .. ")")
+		end
+		local f = cwrap and cwrap("require", impl) or impl
+		fnames[f] = "require"
+		rawset(globals, "require", f)
+	end
 	if executorEnv and rawget(globals, "request") == nil then
 		-- executor HTTP: nothing is sent.  Every call is logged and answered with a canned reply
 		-- (httpreply=<text>, default empty body), so the script's handling of it can be traced.
@@ -1456,17 +1570,6 @@ function populateSandbox()
 		if rawget(globals, "gethwid") == nil then rawset(globals, "gethwid", function() return "devm-offline-hwid" end) end
 		for _, n in ipairs({ "setclipboard", "toclipboard" }) do
 			if rawget(globals, n) == nil then rawset(globals, n, function() end) end
-		end
-		-- require(ModuleScript): the game's modules do not exist here; hand out a permissive stub
-		do
-			local realRequire = rawget(globals, "require")
-			local function impl(m)
-				if type(m) == "string" and realRequire then return realRequire(m) end
-				return mock.stub("require(" .. tostring(m) .. ")")
-			end
-			local f = cwrap and cwrap("require", impl) or impl
-			fnames[f] = "require"
-			rawset(globals, "require", f)
 		end
 		-- the rest of the usual executor API, inert: hooks install nothing, fire* do nothing
 		local genv = setmetatable({}, { __index = globals })
@@ -1550,7 +1653,7 @@ function populateSandbox()
 			-- `clonefunction(f) ~= f`).  Lua closures are cloned by the VM (__LPH_NATIVE); a C
 			-- function gets a C trampoline.  Without the native the function itself is returned.
 			do
-				local nat = _G.__LPH_NATIVE and _G.__LPH_NATIVE.clonefunction
+				local nat = hostNative and hostNative.clonefunction
 				more.clonefunction = function(...)
 					local f = ...
 					if type(f) ~= "function" then argErr(1, "clonefunction", "function", f, select("#", ...)) end
@@ -1573,8 +1676,8 @@ function populateSandbox()
 			-- (__LPH_NATIVE): only those see behind a lock the script itself put on a table
 			-- (`setmetatable({}, {__metatable = "locked"})`, which scripts use to test the
 			-- executor) and can lift table.freeze.  The Lua versions above are the fallback.
-			local native = _G.__LPH_NATIVE or {}
-			if not _G.__LPH_NATIVE then
+			local native = hostNative or {}
+			if not hostNative then
 				ewrite("[env] this luau binary predates the executor natives of devm/luau_cli.patch (__LPH_NATIVE): " ..
 					"getrawmetatable, setrawmetatable, setreadonly and clonefunction are approximations, and a script " ..
 					"that tests them (key-system loaders do) stops in its executor check; rebuild the CLI with the patch\n")
@@ -1768,16 +1871,22 @@ mock.setfenv = function(f, env)
 	if type(f) == "number" and f > 0 then f += 1 end
 	return realSetfenv(f, env)
 end
+-- (the harness's globals and the engine's own global table are never handed to the script: they
+-- are what a function of the harness, of the mock or a thread the script did not make has)
+local function ownEnv(env)
+	if env == _G or (realGlobals and env == realGlobals) then return sandbox end
+	return env
+end
 mock.getfenv = function(f)
 	if foreign(f) then return sandbox end
 	if f == nil then f = 1 end
+	if f == 0 then return sandbox end
 	if type(f) == "number" and f > 0 then
 		local ok, env = pcall(realGetfenv, f + 2)
 		if not ok then return sandbox end
-		if env == _G then return sandbox end
-		return env
+		return ownEnv(env)
 	end
-	return realGetfenv(f)
+	return ownEnv(realGetfenv(f))
 end
 fnames[mock.setfenv] = "setfenv"
 -- debug.info must describe harness/mock functions the way it describes the C functions they
@@ -1905,9 +2014,7 @@ if cwrap then
 			if byLevel and cGlobals then return cGlobals end
 			return sandbox
 		end
-		local env = realGetfenv(f)
-		if env == _G then return sandbox end
-		return env
+		return ownEnv(realGetfenv(f))
 	end)
 	mock.setfenv = nativeT("setfenv", function(co, f, env)
 		if type(env) ~= "table" then
@@ -2261,7 +2368,7 @@ local function pokePass()
 		" fields of executed instructions put back)\n")
 end
 
-function __LPH_AFTER(ok, message)
+local function afterRun(ok, message)
 	if mock.priv and mock.priv.flush then mock.priv.flush() end       -- what the script printed, read and was handed (rbxmock.lua)
 	if carrierPath and chunkLoads == 0 then
 		ewrite("[carrier] the script never handed the expected chunk text to loadstring: nothing was instrumented\n")
@@ -2299,7 +2406,7 @@ function __LPH_AFTER(ok, message)
 		return
 	end
 	if not ok and not aborted then
-		ewrite(tostring(message) .. "\n")
+		ewrite(tostring(message) .. "\n", true)       -- (the script's text from its first character)
 		ewrite("[end] error after " .. math.max(stepCount, __LPH_N.s) .. " instructions, " .. __LPH_N.c .. " closure entries\n")
 	end
 	if traceMode then
@@ -2311,7 +2418,16 @@ function __LPH_AFTER(ok, message)
 		error("hook not reached")
 	end
 end
-if __LPH_RUNMAIN then
+-- Called by the CLI once the script's main thread has ended.  The CLI would print an error
+-- raised in here to stderr as it is; it goes through the checked writer instead.
+function __LPH_AFTER(ok, message)
+	local okA, err = pcall(afterRun, ok, message)
+	if not okA then
+		ewrite(tostring(err) .. "\n", true)
+		error("the harness's end-of-run step failed (see the line above)", 0)
+	end
+end
+if hostRunmain then
 	-- depth=<n>: run the script n C calls deeper (a ModuleScript inside n nested requires)
 	for _ = 1, extraDepth do
 		local inner = fn

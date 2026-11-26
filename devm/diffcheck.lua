@@ -365,11 +365,10 @@ end
 -- its text gets `__LPH_MAIN();` in front of its first line (line numbers stay as they are).
 --
 -- The CLI's own readfile / writefile / ewrite / require are globals of the thread the harness runs
--- in, and the harness lets a script's lookup of an undefined global fall through to them (in
--- executor mode its stand-ins for readfile and writefile sit in front; without executor=1 nothing
--- does).  A script must not get at real files or write lines into this log, so here these names
--- only work for the harness, the mock and this file: the nearest Lua function on the calling
--- stack has to be one of theirs.
+-- in.  The harness keeps them in locals and takes them out of every global table before the
+-- script runs ("the CLI's own functions" in harness.lua), so a script never sees them.  As a
+-- second line, here these names only work for the harness, the mock and this file: the nearest
+-- Lua function on the calling stack has to be one of theirs.
 do
 	local realRead, realEwrite, realInfo = G.readfile, ewrite, debug.info
 	local mine = realInfo(1, "s")

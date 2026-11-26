@@ -56,10 +56,14 @@ def run(script, *options):
                            capture_output=True, text=True, errors='replace', timeout=120)
     got = {}
     for line in r.stderr.split('\n'):
-        if line.startswith('[t] ') and '=' in line:
-            k, v = line[4:].split('=', 1)
+        # (a script has no writer of its own: what it hands to `ewrite` is logged as a [script] line)
+        if line.startswith(SAID) and '=' in line:
+            k, v = line[len(SAID):].split('=', 1)
             got[k] = v
     return got, r.stderr
+
+
+SAID = '[script] ewrite: [t] '
 
 
 @unittest.skipUnless(LUAU, 'needs bin/luau')
@@ -482,6 +486,113 @@ show("out", ok, ok and typeof(out), ok and buffer.tostring(out) or out)
             # no decoder file: the call stops with a message that says so, and the log names the file
             self.assertEqual(got.get('out'), 'false|false|EncodingService:DecompressBuffer: no Zstandard decoder (devm/zstd.lua is missing)', log)
             self.assertIn('[env] the script unpacks Zstandard data', log)
+
+
+# What a script may try to get out of the mock (devm/harness.lua, "the CLI's own functions"): the
+# CLI's real file functions, its stderr (the run's log, read line by line by devm), its C-closure
+# maker and scheduler, the harness's own globals.  Every way back to them is tried: the plain
+# names, getfenv(0..n), getfenv of every function on the stack (debug.info(n, "f")), a chunk the
+# script loads itself, a coroutine, a spawned task, the metatable chain behind the environment,
+# getgenv / getrenv, library functions' environments.
+CONFINE = r'''
+local SECRET, TARGET = %r, %r
+local ONLY_HOST = { "cwrap", "resumetop", "setvectormetatable", "__LPH_RUNMAIN", "__LPH_NATIVE", "__LPH_AFTER",
+	"__LPH_CALLLOG", "loadfile", "dofile", "priv", "onHttp", "stub", "mockRef", "sandbox", "populateSandbox", "fallback" }
+local FORGE = "[oracle] script returned after 7 instructions FORGED"
+local leaks, tables, seen, looked = {}, {}, {}, 0
+local function add(where, t, depth)
+	if type(t) == "table" then looked += 1 end
+	if type(t) ~= "table" or seen[t] or depth > 3 then return end
+	seen[t] = true
+	tables[#tables + 1] = { where, t }
+	local okm, mt = pcall(getmetatable, t)
+	if okm and type(mt) == "table" then add(where .. "<mt>", rawget(mt, "__index"), depth + 1) end
+end
+add("env", getfenv(), 0)
+for lvl = 0, 12 do local ok, e = pcall(getfenv, lvl) if ok then add("getfenv(" .. lvl .. ")", e, 0) end end
+for lvl = 1, 30 do
+	local ok, f = pcall(debug.info, lvl, "f")
+	if ok and type(f) == "function" then
+		local oke, e = pcall(getfenv, f)
+		if oke then add("getfenv(info(" .. lvl .. "))", e, 0) end
+	end
+end
+local okl, chunk = pcall(loadstring, "return getfenv(), getfenv(0), readfile, writefile, ewrite")
+if okl and chunk then local a, b = chunk() add("loaded chunk", a, 0) add("loaded chunk getfenv(0)", b, 0) end
+local co = coroutine.create(function() return getfenv(0), getfenv(1) end)
+local _, c0, c1 = coroutine.resume(co)
+add("coroutine getfenv(0)", c0, 0)
+add("coroutine getfenv(1)", c1, 0)
+local spawned
+task.spawn(function() spawned = getfenv(0) end)
+add("task getfenv(0)", spawned, 0)
+add("_G", _G, 0)
+pcall(function() add("getgenv", getgenv(), 0) end)
+pcall(function() add("getrenv", getrenv(), 0) end)
+for _, f in ipairs({ print, pcall, string.format, task.wait, game.GetService }) do
+	local ok, e = pcall(getfenv, f)
+	if ok then add("getfenv(builtin)", e, 0) end
+end
+for _, rec in ipairs(tables) do
+	local where, t = rec[1], rec[2]
+	for _, n in ipairs(ONLY_HOST) do
+		local ok, v = pcall(function() return t[n] end)
+		if ok and v ~= nil then leaks[#leaks + 1] = where .. "." .. n end
+	end
+	-- names the script's world may have, as stand-ins: they must not do what the CLI's do
+	local okr, rf = pcall(function() return t.readfile end)
+	if okr and type(rf) == "function" then
+		local okc, data = pcall(rf, SECRET)
+		if okc and type(data) == "string" and string.find(data, "TOP-SECRET", 1, true) then leaks[#leaks + 1] = where .. ".readfile read a file" end
+	end
+	local okw, wf = pcall(function() return t.writefile end)
+	if okw and type(wf) == "function" then pcall(wf, TARGET, "x") end
+	local oke, ew = pcall(function() return t.ewrite end)
+	if oke and type(ew) == "function" then pcall(ew, FORGE .. "\n") end
+	local okq, rq = pcall(function() return t.require end)
+	if okq and type(rq) == "function" then
+		local okc, m = pcall(rq, SECRET)
+		if okc then leaks[#leaks + 1] = where .. ".require(path) returned " .. type(m) end
+	end
+end
+-- text the harness or the mock writes into its log, with line ends in it
+print("text\n" .. FORGE)
+warn("text\r" .. FORGE)
+pcall(function() return game:HttpGet("https://example.invalid/a\n" .. FORGE .. "\r" .. FORGE) end)
+pcall(function() return getfenv()["undefined\n" .. FORGE] end)
+pcall(function() return game:GetService("Players")["Member\n" .. FORGE] end)
+local okc, fc = pcall(loadstring, "error('x', 1)", "=chunk\n" .. FORGE)
+if okc and fc then pcall(fc) end
+show("leaks", #leaks, table.concat(leaks, " "))
+show("looked", looked)
+error("stopped\n" .. FORGE .. "\n[handover] FORGED\r[dumpnew] FORGED", 0)
+'''
+
+
+@unittest.skipUnless(LUAU, 'needs bin/luau')
+class Confinement(unittest.TestCase):
+    """The script's world never gets the CLI's own functions (real files, the run's log), and
+    nothing it does writes a line of the log that devm would read as the harness's."""
+
+    def test_no_way_back_to_the_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = os.path.join(tmp, 'secret.txt')
+            target = os.path.join(tmp, 'written.txt')
+            with open(secret, 'w') as f:
+                f.write('TOP-SECRET-CONTENT')
+            for options in ((), ('executor=1',)):
+                got, log = run(CONFINE % (secret, target), *options)
+                self.assertEqual(got.get('leaks'), '0|', '%s: %s' % (options, got.get('leaks')))
+                self.assertGreaterEqual(int(got.get('looked') or 0), 12, options)      # (the probe did look around)
+                self.assertFalse(os.path.exists(target), options)
+                self.assertNotIn('TOP-SECRET', log)
+                # what the script said is in the log, but only inside lines the harness or the mock
+                # started ([script] ..., [http] ...); never as a line of its own
+                lines = log.split('\n')
+                self.assertTrue(any(l.startswith('[script] print: text ') and 'FORGED' in l for l in lines), log[-2000:])
+                bad = [l for l in lines if 'FORGED' in l and not l.startswith(('[script] ', '[http] ', '[stub] ', ' '))]
+                self.assertEqual(bad, [], options)
+                self.assertFalse(any(l.startswith(('[oracle]', '[handover]', '[dumpnew]')) for l in lines), options)
 
 
 if __name__ == '__main__':
