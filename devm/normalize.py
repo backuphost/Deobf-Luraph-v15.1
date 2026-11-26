@@ -708,3 +708,124 @@ def normalise_heads(src):
 
 def luparse_num(v):
     return repr(int(v)) if float(v).is_integer() else repr(v)
+
+
+def unshadow(src, makers):
+    """Rename locals of closure makers that redeclare a name of the enclosing loader.
+
+    makers = [(position of the maker in the source-order list of `function` keywords, names)].
+    Luraph v14.4 closure makers cache loader state and then reuse the name
+    (`local w={A[18],A,...};local A=(S[1]);`).  The harness dumps the interpreter's surroundings by
+    name from inside the interpreter, so the loader's `A` would be lost, and the lifter, which
+    executes the maker's body again, needs it.  Each such local gets the suffix `__s` from the end
+    of its declaration to the end of the maker (nothing in that range can mean the outer variable).
+    Only declarations at the top level of the maker's body are handled.  Returns (text, renames)."""
+    toks = [t for t in luparse.tokenize(src) if t[0] != 'eof']
+    n = len(toks)
+    exprif = _expr_ifs(toks)
+    fkw = [q for q in range(n) if toks[q][0] == 'kw' and toks[q][1] == 'function']
+    edits = {}
+    count = 0
+    OPEN, CLOSE = ('function', 'if', 'do', 'repeat'), ('end', 'until')
+    for ordinal, names in makers:
+        if ordinal >= len(fkw) or not names:
+            continue
+        f = fkw[ordinal]
+        # end of the parameter list
+        q = f + 1
+        while q < n and not (toks[q][0] == 'op' and toks[q][1] == ')'):
+            q += 1
+        body0 = q + 1
+        # matching end
+        depth = 0
+        fend = None
+        for q in range(f, n):
+            k, v = toks[q][0], toks[q][1]
+            if k != 'kw' or q in exprif:
+                continue
+            if v in OPEN:
+                depth += 1
+            elif v in CLOSE:
+                depth -= 1
+                if depth == 0:
+                    fend = q
+                    break
+        if fend is None:
+            continue
+        pending = set(names)
+        depth = 0           # blocks
+        br = []             # open brackets
+        q = body0
+        while q < fend and pending:
+            k, v = toks[q][0], toks[q][1]
+            if k == 'kw' and q not in exprif:
+                if v in OPEN:
+                    depth += 1
+                elif v in CLOSE:
+                    depth -= 1
+            elif k == 'op' and v in ('(', '[', '{'):
+                br.append(v)
+            elif k == 'op' and v in (')', ']', '}') and br:
+                br.pop()
+            if k == 'kw' and v == 'local' and depth == 0 and not br and q + 1 < fend and toks[q + 1][0] == 'name':
+                decl = []
+                j = q + 1
+                while toks[j][0] == 'name':
+                    decl.append(j)
+                    if toks[j + 1][0] == 'op' and toks[j + 1][1] == ',':
+                        j += 2
+                    else:
+                        j += 1
+                        break
+                clash = [d for d in decl if toks[d][1] in pending]
+                if clash:
+                    # end of the statement: `;` or the next statement keyword outside brackets and blocks
+                    e = j
+                    d2 = 0
+                    b2 = 0
+                    while e < fend:
+                        k2, v2 = toks[e][0], toks[e][1]
+                        if k2 == 'kw' and e not in exprif and v2 in OPEN and not (v2 == 'if' and d2 == 0 and b2 == 0):
+                            d2 += 1
+                        elif k2 == 'kw' and e not in exprif and v2 in CLOSE:
+                            d2 -= 1
+                        elif k2 == 'op' and v2 in ('(', '[', '{'):
+                            b2 += 1
+                        elif k2 == 'op' and v2 in (')', ']', '}'):
+                            b2 -= 1
+                        elif d2 == 0 and b2 == 0 and (k2 == 'op' and v2 == ';' or k2 == 'kw' and e not in exprif and v2 in (
+                                'local', 'return', 'if', 'while', 'for', 'repeat', 'break', 'continue')):
+                            break
+                        e += 1
+                    for d in clash:
+                        x = toks[d][1]
+                        pending.discard(x)
+                        edits[d] = x + '__s'
+                        inbr = []
+                        for r in range(e, fend):
+                            kr, vr = toks[r][0], toks[r][1]
+                            if kr == 'op' and vr in ('(', '[', '{'):
+                                inbr.append(vr)
+                            elif kr == 'op' and vr in (')', ']', '}') and inbr:
+                                inbr.pop()
+                            elif kr == 'name' and vr == x:
+                                prev = toks[r - 1]
+                                if prev[0] == 'op' and prev[1] in ('.', ':'):
+                                    continue
+                                if inbr and inbr[-1] == '{' and prev[0] == 'op' and prev[1] in ('{', ',', ';') \
+                                        and toks[r + 1][0] == 'op' and toks[r + 1][1] == '=':
+                                    continue        # a field name in a table constructor
+                                edits[r] = x + '__s'
+                        count += 1
+            q += 1
+    if not edits:
+        return src, 0
+    out = []
+    last = 0
+    for q in sorted(edits):
+        pos = toks[q][3]
+        out.append(src[last:pos])
+        out.append(edits[q])
+        last = pos + len(toks[q][1])
+    out.append(src[last:])
+    return ''.join(out), count

@@ -173,6 +173,19 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # in debug.info must all agree), so the copy that is executed is always laid out as one line,
     # also when the input is a decompiler's multi-line rendering of the bytecode.
     stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
+    if run_src is not None and len(stage.model.chain) >= 2 and not stage.model.factory_style:
+        # closure makers that redeclare a name of the loader (Luraph v14.4): see normalize.unshadow
+        shadows = stage.model.shadowed_maker_names()
+        if shadows:
+            gone = set(removed)
+            keep = [i for i in range(len(stage.model.funcs_by_id) + len(removed)) if i not in gone]
+            new_src, k = normalize.unshadow(run_src, [(keep[fid], names) for fid, names in shadows])
+            if k:
+                log('[%s] %d local(s) of the closure maker redeclare a name of the loader (%s): renamed' % (
+                    tag, k, ', '.join(x for _f, names in shadows for x in names)))
+                run_src = new_src
+                src, n, removed = normalize.inline_protected_raw_info(run_src)
+                stage = pipeline.Stage(normalize.reflow(src), workdir, tag, log=log, oneline=True)
     stage.force_root = root
     stage.model.run_options = carrier.harness_options() if carrier else []
     stage.carrier = carrier

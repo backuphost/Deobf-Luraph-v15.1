@@ -615,6 +615,27 @@ class Model:
                     counts[e[1][1]] = counts.get(e[1][1], 0) + 1
         return max(counts, key=counts.get) if counts else None
 
+    def shadowed_maker_names(self):
+        """[(function id of a closure maker, [its top-level locals that redeclare a name of the
+        enclosing loader])] for the proto-table layout (see normalize.unshadow)."""
+        out = []
+        seen = set()
+        for it in self.interps:
+            if len(it.chain) < 2:
+                continue
+            wrap = it.chain[-2]
+            if id(wrap) in seen or not hasattr(wrap, 'fid'):
+                continue
+            seen.add(id(wrap))
+            outer = set(self._visible_names(wrap)) - set(wrap.params)
+            clash = []
+            for st in wrap.body:
+                if st[0] == 'local':
+                    clash.extend(n for n in st[1] if n in outer and n not in clash)
+            if clash:
+                out.append((wrap.fid, clash))
+        return out
+
     @property
     def insn_tables(self):
         """True when the dispatch loops fetch one table per instruction (Luraph v14.0 - v14.2)."""
