@@ -244,6 +244,9 @@ show("below", debug.info(2, "l"))
         self.assertEqual(got.get('ran'), 'dead|abcde')
         self.assertEqual(got.get('signal'), 'suspended')
         self.assertEqual(got.get('below'), '')          # the chunk is the bottom of the stack, as in Roblox
+        # a recovered script can carry placeholders such as __LPH_ENV["M"]: it is run like any other text
+        got, log = run('local x = __LPH_ENV\nlocal co = task.spawn(function() task.wait() end)\nshow("status", coroutine.status(co), x)')
+        self.assertEqual(got.get('status'), 'suspended|nil', log)
 
     def test_clocks_and_wait_results(self):
         # tick() counts from the Unix epoch; a wait returns the time that passed: at least what was asked

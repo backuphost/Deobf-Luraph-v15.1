@@ -1902,11 +1902,14 @@ end
 local src = readfile(samplePath)
 -- The mock has to know the script's main thread: task.wait / signal:Wait() suspend every other
 -- thread of the script (rbxmock.lua), and Luraph's start-up code (v15.x) checks that a spawned
--- thread that waits is suspended.  An instrumented copy says so at its first proto (__LPH_PROTO);
--- a file without any hook is given a call of __LPH_MAIN in front of its first token: same line,
--- no frame left on the stack, and the answers are the same in both kinds of run.
+-- thread that waits is suspended.  A copy instrumented for a factory VM says so at its first proto
+-- (__LPH_PROTO).  Every other text (an unmodified file, a recovered script, a copy with the
+-- proto-table hooks, which do not mark the thread) is given a call of __LPH_MAIN in front of its
+-- first token: same line, no frame left on the stack, and the answers are the same in every kind of run.
 local fn, err
-if not string.find(src, "__LPH_", 1, true) then fn = loadstring("__LPH_MAIN();" .. src, "=sample") end
+if not string.find(src, "__LPH_PROTO", 1, true) and not string.find(src, "__LPH_MAIN", 1, true) then
+	fn = loadstring("__LPH_MAIN();" .. src, "=sample")
+end
 if not fn then fn, err = loadstring(src, "=sample") end
 if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
