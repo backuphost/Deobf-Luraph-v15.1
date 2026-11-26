@@ -158,7 +158,7 @@ class DevmError(Exception):
         self.reason = reason
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -328,6 +328,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             # second-stage route recovers those from a native replay of the lifted init.  Try it
             # (time-boxed) and keep whichever result has fewer unlifted instructions.
             a_errs, a_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
+            if preliminary:
+                preliminary(text)       # (the result so far is on disk should the second try be cut short)
             try:
                 with time_limit(second_stage_limit):
                     text1 = stage.run()
@@ -344,7 +346,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                             return text2
                         log('[%s] result from the state at the hand-over kept (%d instructions, %d lift errors; second-stage '
                             'route: %d, %d)' % (tag, a_nodes, a_errs, b_nodes, b_errs))
-            except (pe.PEError, RuntimeError, bootstrap.BootstrapError, subprocess.TimeoutExpired, TimeLimit) as e:
+            except (Exception, TimeLimit) as e:      # whatever goes wrong in the second try, the first result stands
                 log('[%s] second-stage route not usable (%s): result from the state at the hand-over kept' % (
                     tag, (type(e).__name__ + ' ' + str(e)).strip().split('\n')[0][:160]))
             return text
@@ -356,16 +358,18 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     try:
         text1 = stage.run()
         boot_text, info = bootstrap.patch(text1)
-    except (pe.PEError, RuntimeError, bootstrap.BootstrapError) as e:
+    except Exception as e:
         if handover is None:
             raise
-        raise DevmError('init did not hand over', '%s; second-stage route: %s' % (handover, str(e).strip().split('\n')[0][:200]))
+        raise DevmError('init did not hand over', '%s; second-stage route: %s' % (
+            handover, (type(e).__name__ + ': ' + str(e)).strip().split('\n')[0][:200]))
     if not info['fixkey']:
         if first:
             # never the init as "the script"
             raise DevmError('init did not hand over', '%s; the lifted init has no encrypted second stage to recover a key for' % (
                 handover or 'route A was not tried'))
         log('[%s] the loader runs a single root program and it holds no encrypted second stage: that program is the script' % tag)
+        LAST_RUN['notes'] = ['[single-root] lifted from the state at the first interpreter entry']
         return cleanup.tidy(text1)
     data = run_bootstrap(stage, boot_text, workdir, tag, log)
     return lift_program(stage, data, tag, log, oneline, 'real program')
@@ -476,23 +480,36 @@ def main(argv=None):
     ap.add_argument('--run-timeout', type=int, default=None, help='route a: seconds the run may take')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
+    out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
+
+    def write_result(text):
+        """the result file: the report first (see below), then the text; returns the report lines"""
+        lines = run_report(LAST_RUN['notes']) + report(text)
+        head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
+        head += ['--   ' + ln for ln in lines]
+        text = '\n'.join(head) + '\n' + text
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return lines, text
+
     try:
-        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout)
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result)
     except DevmError as e:
         print('devm: %s: %s' % (e.stage, e.reason))
         sys.exit(1)
     except (pe.PEError, RuntimeError, bootstrap.BootstrapError, SyntaxError, subprocess.TimeoutExpired) as e:
         print('devm: %s: %s' % (failure_stage(e), ' '.join(str(e).split())[:400]))
         sys.exit(1)
-    out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
-    lines = run_report(LAST_RUN['notes']) + report(text)
+    except Exception as e:
+        # not an expected way to fail: the traceback for whoever debugs it, then the one-line form
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        print('devm: internal error: %s: %s' % (type(e).__name__, ' '.join(str(e).split())[:300]))
+        sys.exit(1)
     # the report is also the head of the file: a result read later, without the run's output next
     # to it, must still say what it is and what it lacks
-    head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
-    head += ['--   ' + ln for ln in lines]
-    text = '\n'.join(head) + '\n' + text
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write(text)
+    lines, text = write_result(text)
     print('written', out, '(%d lines)' % text.count('\n'))
     for line in lines:
         print(line)
@@ -530,6 +547,10 @@ def run_report(notes):
         if m:
             out.append('the VM ran its own init (%s VM instructions) and handed over to the script; this result is a static '
                        'lift of the script\'s program from the state at that moment: the script itself did not run' % m.group(2))
+        elif n.startswith('[single-root]'):
+            out.append('the VM has a single root program (no separate init that hands over): this result is a static lift of '
+                       'that program from the state at its first entry; nothing ran, and whatever Luraph\'s start-up code '
+                       'in it would have decoded at run time is still as the file stores it')
     reqs = [n for n in notes if n.startswith('[http]')]
     for n in reqs[:6]:
         out.append('  request: ' + re.sub(r' \[step \d+\]$', '', n[len('[http] '):]))
