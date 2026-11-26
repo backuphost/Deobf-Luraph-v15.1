@@ -69,7 +69,6 @@ sit in the plugin's folder (Luraph's `options.txt`).
 ## Usage
 
 ```
-# from the Decompiler folder
 python deobf/deob.py samples/source1-obfuscated.lua  # -> samples/output/source1-obfuscated.lua
 python deobf/deob.py <script> --detect           # prints NAME<tab>confidence<tab>label
 python deobf/deob.py <script> --obfuscator NAME  # skip detection
@@ -77,31 +76,31 @@ python deobf/deob.py <script> --no-devirt        # fast: behaviour trace only
 python deobf/deob.py <script> --debug            # all intermediate files in <input folder>/output/
 ```
 
-- Exit status 0 with a result file, 1 on failure. For the bot: run one
-  `deob.py` subprocess per upload (with a timeout, `-o` into a temp folder);
-  modules keep global state (Path2D cache, `LAST_RAW`), so don't import and
-  call it in a long-lived process.
-- Scripts that read settings from `_G`/`getgenv()` or check game state stop
-  early (e.g. `kick("You didn't add username or webhook")`). Drive them further
-  with `--cfg "prelude=rawset(G,'webhook','x') setprop(game,'PlaceId',123)"`
-  (Luau run before the script, untraced; `G`, `genv`, `shared`, `game`, `env`,
-  `setprop(proxy, key, value)`) and `--cfg falsy=name1,name2` (calls of those
-  method/function names return `false`).
-- Path2D answers come from the offline engine model (`envlog.luau`
-  `CHAIN.p2d`, bit-exact; `research/path2d/README.md`); "N Path2D answers
-  computed by the offline engine model".
-- `--studio` (rarely needed) serves each harness on `127.0.0.1:34889` via a
-  `*.studio_loader.luau` (MCP `execute_luau`); engine Path2D answers go to
-  `<script>.path2d` (preferred offline). **Danger:** an endless-loop tamper
-  response freezes Studio: evaluate just the Path2D calls instead.
+- Exit status 0 with a result file, 1 on failure. **Last line** (stdout): `result: complete` or
+  `result: PARTIAL: <what is missing>` (`Job.lacks()`: unlifted blocks, unstructured jumps, a run
+  the tracer had to stop, ...; a behaviour trace is always PARTIAL); nothing produced: status 1,
+  last stderr line `deobf: <reason>` (`deob.run`). `--time-limit S` bounds the whole command
+  (`limits.py`: harness timeouts are cut to the time left, the lift thread is given up at the
+  deadline and the trace is written, without its tidy pass if late). Harness processes are
+  started with `limits.spawn`: none outlives the engine, even when it is killed.
+- For the bot: one `deob.py` subprocess per upload (`-o` into a temp folder); modules keep
+  global state (Path2D cache, `LAST_RAW`), so don't import and call it in a long-lived process.
+- Scripts that read settings from `_G`/`getgenv()` or check game state stop early (e.g.
+  `kick("You didn't add username or webhook")`). Drive them further with `--cfg
+  "prelude=rawset(G,'webhook','x') setprop(game,'PlaceId',123)"` (Luau run before the script,
+  untraced; `G`, `genv`, `shared`, `game`, `env`, `setprop(proxy, key, value)`) and `--cfg
+  falsy=name1,name2` (calls of those method/function names return `false`).
+- Path2D answers come from the offline engine model (`envlog.luau` `CHAIN.p2d`, bit-exact;
+  `research/path2d/README.md`); "N Path2D answers computed by the offline engine model".
+- `--studio` (rarely needed) serves each harness on `127.0.0.1:34889` via a `*.studio_loader.luau`
+  (MCP `execute_luau`); engine Path2D answers go to `<script>.path2d` (preferred offline).
+  **Danger:** an endless-loop tamper response freezes Studio: evaluate just the Path2D calls instead.
 - Other options (`--raw FILE`, `--keep-harness`, `--input-text`, `--strings`,
   plugin options, ...): `deob.py --help`.
-- **PyPy**: inputs over `PYPY_MIN_SIZE` (350 KB) re-exec under PyPy (`pypy3`
-  on PATH or winget's `PyPy.PyPy.3.11`). Lifting ~2x faster warm, but JIT
-  warmup costs ~4 s: pays off only on big scripts.
-- The trace's tidy/fold pass only runs when the trace is written (`--debug`,
-  `--no-devirt`, or lifting failed); on a 250k-statement trace it takes
-  minutes. `DEOB_PRETIDY=FILE` saves its input.
+- **PyPy**: inputs over `PYPY_MIN_SIZE` (350 KB) re-exec under PyPy (`pypy3` on PATH or winget's
+  `PyPy.PyPy.3.11`). Lifting ~2x faster warm, but JIT warmup costs ~4 s: pays off only on big scripts.
+- The trace's tidy/fold pass only runs when the trace is written (`--debug`, `--no-devirt`, or
+  lifting failed); on a 250k-statement trace it takes minutes. `DEOB_PRETIDY=FILE` saves its input.
 - `python deobf/names.py file` renames locals in any lifted file.
 
 ## Adding an obfuscator
@@ -369,7 +368,8 @@ hold for every change to the shared runtime:
   substitutes the prep values into the header compares (constant bounds:
   a plain jump). Never make it a `for`: the structurer copied a latch-less
   loop ~100k times (27 MB); left alone, the header reads the VM's hidden
-  loop slots (`M_1 <= 0`, undefined names).
+  loop slots (`M_1 <= 0`, undefined names). Generic `for` likewise
+  (`_run_once_forin`): the hidden iterator's one call becomes `f(s, ctl)`.
 - Luau's 200-active-locals limit: `variables.limit_locals` -> `fit_locals`:
   small closed `do ... end` segments (`wrap_segments`) when their estimate
   (`dry=True`) fits, else `split_block` (one closed prefix, e.g. a loader and

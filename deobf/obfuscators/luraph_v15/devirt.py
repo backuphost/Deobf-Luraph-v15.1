@@ -5064,6 +5064,21 @@ def script_not_reached(source, protos_path, chunk_paths=()):
     return bool(roots) and all((cap.get("__seq") or 0) == 1 for _, _, cap in roots)
 
 
+def chunk_lines(params, lines):
+    """The main function's lines as the chunk's top-level code. Its
+    parameters (variables.extract_params: names, then "..." when the rest
+    is read too) are the chunk's arguments."""
+    named = [p for p in params if p != "..."]
+    if not named:
+        return list(lines)      # (nothing, or only `...`: the chunk's own)
+    if len(named) == len(params):
+        return ["local %s = ..." % ", ".join(named)] + list(lines)
+    # names AND `...` for the rest: extract_params renumbered the vararg
+    # reads, and the chunk's own `...` starts at its first argument, so the
+    # code keeps its function
+    return ["return (function(%s)" % ", ".join(params)] + ["\t" + l for l in lines] + ["end)(...)"]
+
+
 def lift_program(source, protos_path, chunk_paths=(), fetch=None):
     """The root proto of every VM -> Luau text (plus stats and constant requests)."""
     prog = Program(source, protos_path, chunk_paths)
@@ -5102,19 +5117,7 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
         lines = fl.lift(vm, vmobj, proto, UpList(), {}, 0)
         if tag == payload and not loaders:
             out.append("")
-            named = [p for p in fl.params if p != "..."]
-            if named and len(named) < len(fl.params):
-                # named parameters AND `...` for the rest (extract_params
-                # renumbered the vararg reads): the chunk's own `...` starts
-                # at its first argument, so the code keeps its function
-                out.append("return (function(%s)" % ", ".join(fl.params))
-                out += ["\t" + l for l in lines]
-                out.append("end)(...)")
-            else:
-                if named:
-                    out.append("local %s = ..." % ", ".join(named))
-                # (only `...`: the chunk's own, nothing to declare)
-                out += lines
+            out += chunk_lines(fl.params, lines)
             payload_pid = None
             continue
         out.append("local function vm_root_%s(%s)" % (pid, ", ".join(fl.params)))

@@ -19,7 +19,7 @@ numeric for compiled to plain instructions (TABLE_FOR, Luraph v15.2): the
 loop state is a table in an ordinary register, see try_table_numeric; it is
 rewritten into the protocol above first.
 """
-from luasym import Const, Reg, Pseudo, Bin, Un, Index, NewTable, TempVal, ClosureExpr
+from luasym import Const, Reg, Pseudo, Bin, Un, Index, NewTable, TempVal, ClosureExpr, Multi
 
 # recognize numeric for loops whose state is a table in a register (a front
 # end switches it on: Luraph v15.2)
@@ -48,6 +48,8 @@ def recognize(entry, blocks, D):
             found["for"] += 1
         elif try_generic(h, blocks, D):
             found["forin"] += 1
+        else:
+            _run_once_forin(h, blocks, D)
     # drop VM loop bookkeeping (LPH_JIT loop variables stay while a loop
     # that was not recognized still reads them)
     read = set()
@@ -726,6 +728,77 @@ def try_generic(h, blocks, D):
         import copy
         pb.stmts += [copy.copy(s) for s in pre]
     return True
+
+
+def _run_once_forin(h, blocks, D):
+    """try_generic's header with the loop's prep in the same block: the body
+    always leaves (returns), so there is no back edge and the loop runs at
+    most once (the generic counterpart of _run_once_for). The loop state is
+    a hidden VM slot (Luraph: a coroutine made from f, s, ctl and called per
+    iteration, giving "more?" and the loop variables), which has no name in
+    Luau: left alone, its call is printed as a call of an undefined name.
+    The one call of it is the first step of the iteration: `f(s, ctl)` gives
+    the variables, and "more?" is `first variable ~= nil`. Returns False
+    (not a `for`: the structurer needs a back edge for one)."""
+    if h.kind != "cond" or not h.stmts or not isinstance(h.stmts[-1], D.CallStmt):
+        return False
+    call = h.stmts[-1]
+    if not is_pseudo(call.fn) or call.args.items or call.args.tail is not None:
+        return False
+    if not (isinstance(h.cond, TempVal) and h.cond.t == call.t and h.cond.i == 1):
+        return False
+    at = None
+    for i, s in enumerate(h.stmts[:-1]):
+        if isinstance(s, D.Assign) and is_pseudo(s.target, call.fn.name, call.fn.depth):
+            at = i if isinstance(s.value, D.GenIter) else None
+    if at is None or not _pure_moves(h.stmts[at + 1:-1], D):
+        return False
+    args = h.stmts[at].value.args
+    if args is None or args.tail is not None or len(args.items) != 4:
+        return False        # (the VM object, f, s, ctl)
+    f, s_, ctl = args.items[1:]
+    t = call.t
+    # every use of the call's values: values[1] is "more?", values[i + 1] the i-th variable
+    todo = []
+    for b in blocks.values():
+        todo += [(b, "stmts"), (b, "cond"), (b, "values")]
+    seen = set()
+    uses = []           # (holder, key): holder.key / holder[key] is a TempVal of t
+    while todo:
+        holder, key = todo.pop()
+        x = holder[key] if isinstance(holder, list) else getattr(holder, key, None)
+        if x is None or isinstance(x, (str, int, float, bytes, bool)):
+            continue
+        if isinstance(x, TempVal):
+            if x.t == t:
+                uses.append((holder, key))
+            continue
+        if isinstance(x, tuple):
+            if any(isinstance(y, TempVal) and y.t == t for y in x):
+                return False    # (not rewritable in place)
+            x = list(x)
+        if id(x) in seen:
+            continue
+        seen.add(id(x))
+        if isinstance(x, list):
+            todo += [(x, i) for i in range(len(x))]
+            continue
+        if type(x).__name__ in ("LTable", "Scope", "LuaFunc"):
+            continue
+        if getattr(x, "t", None) == t and x is not call:
+            return False        # (the values as a list: `T[i...]`, their count)
+        d = getattr(x, "__dict__", None)
+        if d is not None:
+            todo += [(x, k) for k in d]
+    for holder, key in uses:
+        x = holder[key] if isinstance(holder, list) else getattr(holder, key)
+        new = Bin("CompareNe", TempVal(t, 1), Const(None)) if x.i == 1 else TempVal(t, x.i - 1)
+        if isinstance(holder, list):
+            holder[key] = new
+        else:
+            setattr(holder, key, new)
+    h.stmts = h.stmts[:at] + [D.CallStmt(t, f, Multi([s_, ctl]))] + h.stmts[at + 1:-1]
+    return False
 
 
 def _walk(e):
