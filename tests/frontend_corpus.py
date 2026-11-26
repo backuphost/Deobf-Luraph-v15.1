@@ -643,6 +643,54 @@ class Corpus(unittest.TestCase):
                     self.assertFalse(row["container"]["opened"], (d, row))
         self.assertGreater(seen, 20)
 
+    def test_containers_open(self):
+        """Per directory, the two smallest compressed containers (found by their main statement
+        among the 40 smallest files): each one opens (by the static decoder when the tree has
+        it, else in the sandbox), what it holds has the layout of its version, and a
+        two-payload container hands its data over.  Without the static decoder a Zstd
+        container stays closed and says what it needs."""
+        static = deob.static_container() is not None
+        seen = opened = 0
+        for d in sorted(os.listdir(CORPUS)):
+            if not (d.startswith("v14") or d.startswith("v15")):
+                continue
+            folder = os.path.join(CORPUS, d)
+            files = sorted((os.path.getsize(os.path.join(folder, f)), f) for f in os.listdir(folder))
+            picks = []
+            for _size, name in files[:40]:
+                text = deob.read_source(os.path.join(folder, name))
+                c = lphfront.classify(lphfront.recover(text)[0])
+                if c["verdict"] == "luraph" and c["wrapper"].startswith("container:") and c["wrapper"] != "container:other":
+                    picks.append(name)
+                    if len(picks) == 2:
+                        break
+            key = _version_key(d)
+            want = ("fn-args", "fn-args-vararg") if key < [14, 4] else (("table",) if key < [15] else ("setmt",))
+            for name in picks:
+                row = deob.classify_file(os.path.join(folder, name))
+                seen += 1
+                if row["verdict"] != "luraph":
+                    self.assertIn(row["verdict"], ("damaged", "unsupported-target"), (d, row))
+                    self.assertTrue(row["reason"], (d, row))
+                    continue
+                c = row["container"]
+                if not c["opened"]:
+                    self.assertFalse(static, (d, row))
+                    self.assertEqual((c["kind"], "zstd" in row["wrapper"]), ("needs", True), (d, row))
+                    continue
+                opened += 1
+                self.assertIn(row["layout"], want, (d, row))
+                self.assertTrue(c["chunk_name"].startswith("Luraph"), (d, row))
+                if row["wrapper"].endswith("-2"):
+                    self.assertIn(c["data_kind"], ("buffer", "string"), (d, row))
+                    self.assertGreater(c["data_bytes"], 0, (d, row))
+                else:
+                    self.assertIsNone(c["data_kind"], (d, row))
+                if static and "setmt" not in row["wrapper"]:
+                    self.assertEqual(c["via"], "static", (d, row))
+        self.assertGreater(seen, 10)
+        self.assertGreater(opened, 8)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
