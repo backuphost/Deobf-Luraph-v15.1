@@ -529,13 +529,30 @@ class Model:
         return out
 
     def regs_name(self, it):
-        """Name of the interpreter's register array: the local initialised with `create(nregs)`."""
-        for st in it.func.body[:16]:
-            if st[0] != 'local':
-                continue
-            for name, e in zip(st[1], st[2]):
-                if e[0] == 'call' and e[1][0] == 'name' and len(e[2]) == 1 and e[2][0][0] == 'name':
-                    return name
+        """Name of the interpreter's register array: the local initialised with `create(nregs)`.
+        Luraph v14.4 and later call the allocator through the loader's state table
+        (`local R = STATE[n](nregs)`, `(STATE[n][m](nregs))`): accepted when no local of the prologue
+        has the bare-name form."""
+        def strip(e):
+            while e[0] == 'paren':
+                e = e[1]
+            return e
+        for indexed in (False, True):
+            for st in it.func.body[:16]:
+                if st[0] != 'local':
+                    continue
+                for name, e in zip(st[1], st[2]):
+                    if indexed:
+                        e = strip(e)
+                    if e[0] != 'call' or len(e[2]) != 1 or e[2][0][0] != 'name':
+                        continue
+                    f = e[1]
+                    if indexed:
+                        f = strip(f)
+                        while f[0] == 'index' and strip(f[2])[0] == 'num':
+                            f = strip(f[1])
+                    if f[0] == 'name':
+                        return name
         return 'nil'
 
     def step_vars(self):
@@ -745,7 +762,9 @@ class Model:
         newproto: proto-table layout, route A: the loader's first-program call goes through
                 __LPH_MARK, which learns the proto that program returns; the entry hook of every
                 interpreter calls __LPH_RUN when exactly that proto is entered (a comparison, no
-                call: the init measures its own call stack).
+                call: the init measures its own call stack).  A loader without such a call runs a
+                single root program: the hook then calls __LPH_ENTER for protos that are not
+                marked as part of the root program.
         count:  every dispatch loop counts its instructions in __LPH_N.s and calls __LPH_OVER once
                 the budget __LPH_N.b is used up (inlined; used with newproto).
         """
@@ -847,8 +866,15 @@ class Model:
                             captured.add(id(wrap))
                             edits.append((wrap.body_pos, 'local __lph_p=%s;' % pp))
                         pp = '__lph_p'
-                    edits.append((it.func.body_pos, 'if %s==__LPH_N.w then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
-                        pp, lst, len(names), ','.join(names))))
+                    if mark:
+                        edits.append((it.func.body_pos, 'if %s==__LPH_N.w then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
+                            pp, lst, len(names), ','.join(names))))
+                    else:
+                        # a single root program (no first-program call): the hook fires for every
+                        # proto the harness has not marked as part of the root program (a table
+                        # read, no call), see __LPH_ENTER in harness.lua
+                        edits.append((it.func.body_pos, 'if __LPH_T[%s]==nil then local __r = __LPH_ENTER(%s,%s,%d,%s) if __r then return __r(...) end end;' % (
+                            pp, pp, lst, len(names), ','.join(names))))
                 else:
                     edits.append((it.func.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         for f in self.meta_closures():
@@ -1008,8 +1034,12 @@ def start_server(cmd, workdir):
     with open(errpath, 'w') as ef:
         proc = subprocess.Popen(cmd + ['serve=' + sdir], stdout=subprocess.DEVNULL, stderr=ef)
     deadline = time.time() + 1800
-    while time.time() < deadline and proc.poll() is None and not os.path.exists(os.path.join(sdir, 'ready')):
-        time.sleep(0.2)
+    try:
+        while time.time() < deadline and proc.poll() is None and not os.path.exists(os.path.join(sdir, 'ready')):
+            time.sleep(0.2)
+    except BaseException:       # (devm itself is being stopped: do not leave the harness behind)
+        proc.kill()
+        raise
     if proc.poll() is None and os.path.exists(os.path.join(sdir, 'ready')):
         SERVER = PoolServer(proc, sdir)
         atexit.register(SERVER.close)
@@ -1069,13 +1099,18 @@ def run_oracle(model, workdir, tag, options=()):
     return dump, out, note
 
 
-def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=150):
+def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=150, calls=False):
     """Proto-table layout, route A: let the VM run its own first program (Luraph's init) under the
     harness and dump the state when the proto that program returned is entered, i.e. when the
     script's main function starts (patched_source(newproto=True), harness dumpnew=1).
 
     budget: VM instructions the run may execute before the harness stops it.  Inits seen hand over
     after 6 thousand to 0.9 million instructions; a failed check ends in Luraph's endless loop.
+
+    calls: diagnosis run with the harness's call logging (calls=1).  The notes then get one line
+    `[calls] ...` with the last mocked Roblox / executor calls the run made.  Call logging puts one
+    more closure around every mock function, which a script can notice: not for the run a result
+    is taken from.
 
     Returns (dump or None, notes): notes are the harness's lines about the run ([handover],
     [dumpnew], [budget], [http], ...) plus one line of ours when the run had to be stopped."""
@@ -1092,6 +1127,11 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
     cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1', 'budget=%d' % budget]
     if model.insn_tables:
         cmd.append('lazyinsn=1')
+    # the interpreters' function ids: the harness evaluates the init's key functions, which are
+    # closures of the VM on this route (harness.lua findConstFns)
+    cmd += ['interp=%d' % it.func.fid for it in model.interps if getattr(it.func, 'fid', None) is not None]
+    if calls:
+        cmd.append('calls=1')
     cmd += list(options) + list(getattr(model, 'run_options', ()))
     errpath = os.path.join(workdir, tag + '.newproto.err')
     notes = []
@@ -1108,14 +1148,28 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
             raise
     with open(errpath, errors='replace') as f:
         stderr = f.read()
-    keep = ('[handover]', '[dumpnew]', '[dump]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
+    keep = ('[root]', '[handover]', '[dumpnew]', '[dump]', '[keyfn]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
     notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
+    if calls:
+        # (calls made after the budget stop belong to the unwinding of the stopped run)
+        made = [l[len('[call] '):] for l in stderr.split('[budget] ')[0].split('\n') if l.startswith('[call] ')]
+        # (the harness logs the first 20000 calls only)
+        notes.append('[calls] %d mocked calls%s; the last ones: %s' % (
+            len(made), ' logged (there were more)' if len(made) >= 20000 else '',
+            '; '.join(c[:90] for c in made[-6:]) or 'none'))
     if not os.path.exists(outjson):
         # how the run ended: the error message the harness printed in front of its `[end] error` line
+        # (message, then `stacktrace:` with one line per frame and an empty line)
         lines = stderr.strip().split('\n')
         for i, l in enumerate(lines):
-            if l.startswith('[end] error') and i and not lines[i - 1].startswith(keep):
-                notes.insert(max(0, len(notes) - 1), '[error] ' + lines[i - 1][:300])
+            if not l.startswith('[end] error'):
+                continue
+            j = i - 1
+            while j > 0 and lines[j] != 'stacktrace:':
+                j -= 1
+            msg = lines[j - 1] if j > 0 else next((x for x in reversed(lines[:i]) if x.strip()), '')
+            if msg.strip() and not msg.startswith(keep):
+                notes.insert(max(0, len(notes) - 1), '[error] ' + msg[:300])
         if not notes:
             notes = ['[stderr] ' + l for l in lines[-3:] if l]
         return None, notes

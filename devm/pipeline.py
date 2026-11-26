@@ -118,7 +118,7 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def _dump_script(self, options=(), budget=None, timeout=150):
+def _dump_script(self, options=(), budget=None, timeout=None):
     """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
     proto of the script.  The harness lets the VM run that init and dumps the state when the
     returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
@@ -134,11 +134,23 @@ def _dump_script(self, options=(), budget=None, timeout=150):
     rm = getattr(self, 'run_model', None) or m
     self.log('[%s] interpreter at line %d, %d dispatch loop(s) in %d interpreter(s), proto-table%s' % (
         self.tag, m.interp.line, len(m.loops), len(m.interps), ', one table per instruction' if m.insn_tables else ''))
+    # what the init works through: the VM text (it holds the script data of a plain file) and, for
+    # a container, the data the container hands to the chunk
+    size = len(rm.src)
+    arg = getattr(getattr(self, 'carrier', None), 'chunk_arg', None)
+    if arg and os.path.exists(arg):
+        size += os.path.getsize(arg)
     if not budget:
         # Instructions the init may run.  Inits seen take up to 2 instructions per byte of the file
         # where the init deserializes the script itself (v14.0 - v14.2: 2.36 million for 2.2 MB) and
-        # about 11 per byte of data where it decrypts it (v14.8); a failed check never ends.
-        budget = max(12000000, 40 * len(rm.src))
+        # 11 to 32 per byte of data where it decrypts it (v14.8, v14.9: 82 million for 2.5 MB); a
+        # failed check never ends.
+        budget = max(12000000, 60 * size)
+    if not timeout:
+        # (time for the budget at 400,000 counted instructions a second, which is what a busy
+        # machine does, plus the dump: every lazy constant of the script is decoded, 25 to 50 s per
+        # megabyte)
+        timeout = max(150, budget // 400000 + 50 * size // 1000000)
     text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
     self.run_notes = notes
     for n in notes:
@@ -154,7 +166,25 @@ def _dump_script(self, options=(), budget=None, timeout=150):
 Stage.dump_script = _dump_script
 
 
-def _run_script(self, options=(), budget=None, timeout=150):
+def _last_calls(self, options=(), budget=12000000, timeout=120):
+    """After a hand-over that did not happen: the same run once more with call logging, to say
+    which mocked calls the init made last (the probe it failed is usually among them).
+    Returns one line, or None when that run told nothing."""
+    rm = getattr(self, 'run_model', None) or self.model
+    try:
+        _text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag + '.calls', options, budget=budget, timeout=timeout, calls=True)
+    except Exception:
+        return None
+    for n in notes:
+        if n.startswith('[calls] '):
+            return n[len('[calls] '):]
+    return None
+
+
+Stage.last_calls = _last_calls
+
+
+def _run_script(self, options=(), budget=None, timeout=None):
     """dump_script, then a plain lift of the script's program (no key-function search, no
     opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
     import re

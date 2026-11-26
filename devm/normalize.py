@@ -4,11 +4,62 @@ Raw Luraph output is one enormous line; the model, the harness (debug.info line 
 lifter all identify closures by the line they start on.  Only whitespace between tokens is touched:
 a line break after every `;` and in front of every `function` keyword.
 """
+import re
+
 from . import luparse
 
 
 def needs_reflow(src):
     return src.count('function') > 4 * (src.count('\n') + 1)
+
+
+# Luraph also builds for Lua 5.3 / 5.4 and for LuaJIT.  Those files are no Luau text: the checks
+# below name what gives them away, before the parser trips over it somewhere in the middle.
+_DIALECT_RE = re.compile(r'''
+    (?P<skip>--\[(?P<ceq>=*)\[.*?\](?P=ceq)\]|--[^\n]*
+            |\[(?P<seq>=*)\[.*?\](?P=seq)\]
+            |"(?:[^"\\\n]|\\.|\\\n)*"|'(?:[^'\\\n]|\\.|\\\n)*'
+            |`(?:[^`\\]|\\.)*`
+            |["'`][^\n]*|\[=*\[.*)          # (a string cut off by the end of a truncated file)
+  | (?P<hexfloat>\b0[xX](?:[0-9a-fA-F]*\.[0-9a-fA-F]+|[0-9a-fA-F]+\.?)[pP][+-]?\d+)
+  | (?P<suffix>\b(?:0[xX][0-9a-fA-F]+|\d+)(?:ULL|LL|ull|ll)\b)
+  | (?P<shl><<)
+  | (?P<shr>>>)
+  | (?P<bnot>~(?!=))
+  | (?P<bitop>[&|])
+  | (?P<goto>\bgoto[ \t]+[A-Za-z_]\w*\b(?!\s*[=.\[(:,]))
+  | (?P<label>::[ \t]*[A-Za-z_]\w*[ \t]*::)
+''', re.S | re.X)
+
+
+def foreign_dialect(src):
+    """None for text Luau can read; otherwise a sentence naming the Lua dialect the file was built
+    for and what in the text says so.  A token scan outside strings and comments, no parsing.
+    `~` alone, `<<`, `goto NAME`, `::label::`, hexadecimal floats and LL/ULL number suffixes exist in
+    no Luau program.  `&`, `|` and `>>` do exist in Luau type annotations, so they only count in a
+    file without line structure (Luraph's own one-line layout has no annotations)."""
+    hits = {}
+    for m in _DIALECT_RE.finditer(src):
+        k = m.lastgroup
+        if k == 'skip' or k in ('ceq', 'seq'):
+            continue
+        hits[k] = hits.get(k, 0) + 1
+    oneline = needs_reflow(src)
+    lua53 = hits.get('bnot', 0) + hits.get('shl', 0)
+    if oneline:
+        lua53 += hits.get('bitop', 0) + hits.get('shr', 0)
+    jit = hits.get('suffix', 0)
+    other = hits.get('goto', 0) + hits.get('label', 0) + hits.get('hexfloat', 0)
+    if not (lua53 or jit or other):
+        return None
+    seen = []
+    for k, text in (('bnot', 'the operator ~'), ('shl', 'the operator <<'), ('shr', 'the operator >>'),
+                    ('bitop', 'the operators & |'), ('goto', 'goto'), ('label', '::labels::'),
+                    ('hexfloat', 'hexadecimal floats'), ('suffix', 'LL/ULL numbers')):
+        if hits.get(k) and (oneline or k not in ('bitop', 'shr')):
+            seen.append('%s (%d)' % (text, hits[k]))
+    target = 'LuaJIT' if jit else 'Lua 5.3/5.4' if lua53 else 'Lua 5.2 or later / LuaJIT'
+    return 'the file is built for %s, not for Luau: it uses %s' % (target, ', '.join(seen))
 
 
 def reflow(src):

@@ -164,6 +164,7 @@ end
 local protos = {}
 local done = false
 local lazyInsn = false       -- lazyinsn=1, see forceLazy
+local interpFid = {}         -- interp=<function id> (one per interpreter of the VM), see findConstFns
 local quietSteps = 0
 local quietHooks = false     -- VM code run by the harness itself (reading constant pools) is not traced
 
@@ -171,6 +172,9 @@ local quietHooks = false     -- VM code run by the harness itself (reading const
 -- pending entry so the dump only ever sees plain values.
 local lazyForced, lazyStuck = 0, 0
 local forcing = false        -- true while forceLazy reads: __LPH_W / __LPH_OVER then stop a read that does not end
+local function readField(t, k)
+	return t[k]
+end
 local function forceLazy(root)
 	local seen, queue = {}, { root }
 	local qi = 1
@@ -190,7 +194,7 @@ local function forceLazy(root)
 				-- N.q is set (__LPH_W), VM instructions against a budget of their own (__LPH_OVER).
 				quietSteps = 0
 				if N then N.q = true; N.b = N.s + 2000000 end
-				local ok, err = pcall(function() return t[k] end)
+				local ok, err = pcall(readField, t, k)
 				lazyForced += 1
 				if not ok and err == "__LPH_POOL_BUDGET" then
 					lazyStuck += 1
@@ -407,6 +411,27 @@ end
 -- The bootstrap installs tables of small functions that ignore their arguments and return a fixed
 -- number (runtime "key" material for self-modifying code). Record their values so the lifter can
 -- fold calls to them.
+-- In a native replay of the lifted init these are functions of the layer.  When the VM ran its own
+-- init (dumpnew=1) they are closures of the VM: functions made by one of its interpreters
+-- (interp=<function id>).  Those are called like a lazy constant is read: VM instructions against
+-- a budget, loops of the loader under the watchdog.
+local function isKeyFn(v)
+	if string.sub(debug.info(v, "s"), 1, 5) == "layer" then return true end
+	local id = fidOf[v]
+	return id ~= nil and interpFid[id] == true
+end
+local function callKeyFn(f, ...)
+	local N = rawget(_G, "__LPH_N")
+	if not N or not fidOf[f] then return pcall(f, ...) end
+	local wasQ, wasB, wasForcing = N.q, N.b, forcing
+	forcing = true
+	quietSteps = 0
+	N.q, N.b = true, N.s + 200000
+	local r = table.pack(pcall(f, ...))
+	forcing = wasForcing
+	N.q, N.b = wasQ, wasB
+	return unpack(r, 1, r.n)
+end
 local function findConstFns(root)
 	local seen, queue = {}, { root }
 	local qi = 1
@@ -415,7 +440,7 @@ local function findConstFns(root)
 		qi += 1
 		local n, all = 0, true
 		for k, v in next, t do
-			if type(v) == "function" and type(k) == "number" and string.sub(debug.info(v, "s"), 1, 5) == "layer" then
+			if type(v) == "function" and type(k) == "number" and isKeyFn(v) then
 				n += 1
 			else
 				all = false
@@ -428,8 +453,8 @@ local function findConstFns(root)
 		if all and n >= 2 then
 			local vals = {}
 			for k, f in next, t do
-				local ok1, a, extra = pcall(f, 1, 2, 3, 4)
-				local ok2, b = pcall(f, 977, 13, 40961, 7)
+				local ok1, a, extra = callKeyFn(f, 1, 2, 3, 4)
+				local ok2, b = callKeyFn(f, 977, 13, 40961, 7)
 				if ok1 and ok2 and type(a) == "number" and a == b and extra == nil then
 					constFns[f] = { k = k, value = a }
 				else
@@ -680,13 +705,46 @@ function __LPH_MARK(p, ...)
 	end
 	return p, ...
 end
+-- dumpnew=1 for a loader that runs a single root program (Luraph v14.9: no first-program call to
+-- mark; the root program is Luraph's start-up code, which builds the script's program itself and
+-- calls it).  The entry hooks call __LPH_ENTER for every proto that is not in __LPH_T.  At the
+-- first entry, the root program's, everything reachable from its proto goes into __LPH_T: that is
+-- the root program.  The first proto entered later that is not in it did not exist when the root
+-- program started: the script.
+local rootSeen = false
+function __LPH_ENTER(proto, names, n, ...)
+	if quietHooks or type(proto) ~= "table" then return nil end
+	if not rootSeen then
+		rootSeen = true
+		local queue, qi, count = { proto }, 1, 1
+		__LPH_T[proto] = true
+		while qi <= #queue do
+			local t = queue[qi]
+			qi += 1
+			for k, v in next, t do
+				if type(v) == "table" and __LPH_T[v] == nil and not libnames[v] and v ~= envTable then
+					__LPH_T[v] = true
+					count += 1
+					queue[#queue + 1] = v
+				end
+			end
+		end
+		ewrite("[root] the VM's root program starts (" .. count .. " tables of program data)\n")
+		return nil
+	end
+	__LPH_N.w = proto
+	markSteps = __LPH_N.s
+	ewrite("[handover] the root program entered a program that did not exist when it started, after " .. __LPH_N.s .. " instructions\n")
+	return __LPH_RUN(names, n, ...)
+end
 -- the counting hook ran out of budget: the program spins (Luraph's tamper response is an endless
 -- loop) or waits
 function __LPH_OVER()
 	if forcing then error("__LPH_POOL_BUDGET", 0) end
 	if aborted then error(ABORT, 0) end
 	ewrite("[budget] stopped after " .. __LPH_N.s .. " VM instructions" ..
-		(__LPH_N.w == nil and ": the VM's first program has not returned" or ": the script's proto was never entered") .. "\n")
+		(rootSeen and ": the root program entered no program other than its own" or
+		__LPH_N.w == nil and ": the VM's first program has not returned" or ": the script's proto was never entered") .. "\n")
 	abort()
 end
 -- proto-table layout, step hook: a number per proto table, given out by the closure maker
@@ -763,6 +821,7 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "mfplog" then mfpLog = tonumber(v) ~= 0
 	elseif k == "dumpnew" then dumpNew = tonumber(v) ~= 0
 	elseif k == "lazyinsn" then lazyInsn = tonumber(v) ~= 0
+	elseif k == "interp" then interpFid[tonumber(v)] = true
 	elseif k == "budget" then __LPH_N.b = tonumber(v)
 	elseif k == "binds" then recordBinds = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
@@ -1307,7 +1366,7 @@ function populateSandbox()
 		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
-		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T", "__LPH_MARK", "__LPH_OVER", "__LPH_PID",
+		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T", "__LPH_MARK", "__LPH_OVER", "__LPH_PID", "__LPH_ENTER",
 		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN", "__LPH_CARRY" }) do
 		local v = _G[n]
 		if v ~= nil then rawset(sandbox, n, v) end

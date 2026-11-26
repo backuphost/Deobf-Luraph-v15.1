@@ -189,6 +189,52 @@ against these changes: their inputs are not in the repository.
 
 Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
 
+### Luraph v14 (one-line output, proto-table layout): the VM runs its own init
+
+Every Luraph v14 file is the proto-table layout in one of three spellings: one table per instruction
+(v14.0.2 - v14.2), parallel opcode/operand arrays (v14.3), and the same VM with its loader outlined
+into the methods of one table (v14.4 - v14.9).  What differs per file is decoration.
+
+* **Loop heads.**  `normalize.normalise_heads` rewrites every spelling of a dispatch-loop head
+  (fetch in parentheses, `repeat ... until false`, a truthy literal for `true`, junk constant locals)
+  to one of two canonical forms; the model, the evaluator and the container test know only those.
+* **The first program is not the script.**  The loader runs a first program and wraps what it
+  returns (`P = WRAP(P, U)(args); return WRAP(P, U)`): Luraph's own init (environment probes, lazy
+  constants, in v14.8 the decryption of the script data).  `--route a` (the default) lets the VM run
+  that init in the harness, on a copy that keeps `pcall(function() <loop> end)` around its loops,
+  and dumps the state when exactly the proto the init returned is entered
+  (`Model.first_program_call`, `__LPH_MARK`, `vmmodel.run_dump_script`).  Nothing of the script
+  runs.  The result is a static lift of the script's program; the report says so.
+* **A single root program** (v14.9): no first-program call.  The root program starts with the same
+  start-up code, builds the script's program and calls it itself.  The dump is taken when a program
+  is entered that did not exist when the root program started (`__LPH_ENTER`).  A run that is
+  stopped before that falls back to the second-stage route and, when the lifted root program holds
+  no encrypted second stage, ends `devm: init did not hand over`; a root program that returns
+  without entering anything is the script itself and is lifted from its first entry.
+* **Key functions.**  From v14.8 on the script patches its own operands with the values of small
+  functions the init installs.  At the hand-over they are closures of the VM; the harness calls
+  each one twice under a budget and writes the value into the dump (`findConstFns`).
+* **When the init does not hand over** (the mock answers one of its probes differently from Roblox
+  and Luraph spins, or it waits), the run ends by an instruction budget and the tool ends with
+  `devm: init did not hand over: ...`, naming the last mocked calls of a second run with call
+  logging.  The init is never written out as the script.  `--route b` is the older route: lift the
+  init, replay it natively, recover the XOR key (`bootstrap.py`); `auto` tries it only for VMs whose
+  data is a buffer: after a failed hand-over, or when the lift from the hand-over state has errors
+  and the dump holds key functions the harness could not evaluate.
+* **Limits.**  The init may run `max(12 million, 60 per byte of VM text and container data)`
+  instructions (`--budget`), the run `max(150 s, budget / 400,000 + 50 s per megabyte)`
+  (`--run-timeout`): inits that decrypt their data run up to 32 instructions per byte, and the dump
+  decodes every lazy constant of the script.
+* **Lift errors without a marker.**  When instructions did not lift and the printed text has no
+  marker for them (they sit in code the text does not contain), the text gets a head line
+  `-- LIFT ERROR: N instruction(s) did not lift ...` and the result is PARTIAL.
+* **Failures are one line.**  A run that writes no result ends with `devm: <stage>: <reason>` and a
+  non-zero status: `unsupported target` (a build for Lua 5.3/5.4 or LuaJIT: `normalize.foreign_dialect`
+  looks before the parser is tried), `damaged input` (text that does not parse, a container that
+  does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.
+* **Containers.**  With `devm/container_static.py` in the tree the container is read without
+  running it; otherwise by the sandboxed probe.  Either way the run executes the shipped file.
+
 ### Luraph v15.2 and the compressed container
 
 `examples/v15.2/sample.luau` is the reference (the only v15.2 sample so far).
