@@ -168,14 +168,23 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # loadstrings.  The model is built from the chunk; what is executed is the shipped file, with
     # the instrumented chunk compiled in place of the original (see container.py).
     carrier = None
+    unopened = None
     if chunk_arg:
         carrier = container.stand_in(path, chunk_arg, workdir, tag)
         log('[%s] VM chunk with its data buffer (%s): run through a stand-in for Luraph\'s container' % (tag, chunk_arg))
     elif container.may_be_container(src):
-        carrier = container.unwrap(path, workdir, tag, log)
+        probe = []
+
+        def probe_log(line):
+            probe.append(line)
+            log(line)
+        carrier = container.unwrap(path, workdir, tag, probe_log)
         if carrier:
             with open(carrier.chunk_src, encoding='latin-1') as f:
                 src = f.read()
+        else:
+            # the text holds no dispatch loop and no chunk came out of it: say that, not just "no model"
+            unopened = '; '.join(re.sub(r'^\[[^\]]*\] ', '', ln) for ln in probe[-2:]) or 'the container probe saw no chunk being loaded'
     oneline = normalize.needs_reflow(src)
     if executor is None:
         # A script in Luraph's own one-line layout is what an executor is handed, and it expects
@@ -204,7 +213,12 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # Luraph ships one line and the script checks that (line numbers in its own error messages and
     # in debug.info must all agree), so the copy that is executed is always laid out as one line,
     # also when the input is a decompiler's multi-line rendering of the bytecode.
-    stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
+    try:
+        stage = pipeline.Stage(src, workdir, tag, log=log, oneline=True)
+    except RuntimeError as e:
+        if unopened is not None and 'no Luraph dispatch loop' in str(e):
+            raise DevmError('no model', 'no dispatch loop in the file itself, and the VM chunk it would load at run time was not obtained (%s)' % unopened)
+        raise
     if run_src is not None and len(stage.model.chain) >= 2 and not stage.model.factory_style:
         # closure makers that redeclare a name of the loader (Luraph v14.4): see normalize.unshadow
         shadows = stage.model.shadowed_maker_names()
