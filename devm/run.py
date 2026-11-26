@@ -544,7 +544,16 @@ def lift_program(stage, data, tag, log, oneline, what, replayed=True):
         text, stats = decompile(stage, L, protos)
     finally:
         ircfg.UNFLATTEN = True
-    return cleanup.tidy(text)
+    text = cleanup.tidy(text)
+    hidden = len(errs) - text.count('LIFT ERROR')
+    if hidden > 0:
+        # Instructions that did not lift and are not in the printed text either (in a function or
+        # a branch the printer left out).  The result must not pass for complete on that account.
+        log('[%s] %d of the %d lift errors are in code the text does not contain: listed at its head' % (tag, hidden, len(errs)))
+        head = ['-- LIFT ERROR (in code this text does not contain; proto %s): %s' % (k, ' '.join(str(e[1]).split())[:160])
+                for k, e in errs[:hidden][:20]]
+        text = '\n'.join(head) + '\n' + text
+    return text
 
 
 VM_OBJECT = re.compile(r'__LPH_PROTOS\[(\d+)\]\["self"\]')
