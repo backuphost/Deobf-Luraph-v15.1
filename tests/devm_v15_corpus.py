@@ -173,6 +173,16 @@ class HubLine(unittest.TestCase):
         self.assertEqual(lifter.hub_line(self.nodes, self.node_in, indirect, (2, 59)), 44)
         self.assertEqual(indirect, {(2, 59): 44, (2, 60): 44})
 
+    def test_jump_into_the_line_already_specialised(self):
+        """The instruction in front of the hub was lifted when the hub was known: its jump points at
+        the hub's copy for that target.  It still belongs to the line."""
+        self.nodes[(2, 59)] = node((2, 59), (2, 60, 100))
+        self.nodes[(2, 60, 100)] = node((2, 60, 100), (2, 101), kreads={44})
+        self.node_in[(2, 60, 100)] = {44: 100}
+        indirect = {(2, 60): 44}
+        self.assertEqual(lifter.hub_line(self.nodes, self.node_in, indirect, (2, 58)), 44)
+        self.assertEqual(indirect, {(2, 58): 44, (2, 59): 44, (2, 60): 44})
+
     def test_not_the_jump_itself_and_not_code(self):
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 60)))       # the caller's own case
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 20)))       # an instruction with an effect

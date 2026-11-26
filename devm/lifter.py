@@ -1368,15 +1368,17 @@ def hub_line(nodes, node_in, indirect, k):
     instructions in front of the hub: block decryptors that ran once and are no-ops since).
     The whole line is then kept once per jump target, like the hub itself: it is entered in
     `indirect` ((loop, pc) -> register).  None when k is the jump itself or leads elsewhere."""
-    line, x = [], k
+    line, x, at = [], k, k
     while len(line) < 64:
-        nd = nodes.get(x)
+        # (`at`: the node looked at.  Behind the first one it can be the copy of an instruction
+        # for one jump target, where a jump into the line was specialised already.)
+        nd = nodes.get(at)
         if nd is None or nd.error or not nd.tree or nd.tree[0] or nd.tree[1][0] != 'goto':
             return None
         r = indirect.get(x)
         if r is None and len(nd.kreads) == 1:
             r = next(iter(nd.kreads))
-            if not P.is_num(node_in[x].get(r)):
+            if not P.is_num((node_in.get(at) or {}).get(r)):
                 return None
         if r is not None:
             if not line:
@@ -1385,8 +1387,9 @@ def hub_line(nodes, node_in, indirect, k):
             for y in line:
                 indirect[y] = r
             return r
-        x2 = nd.tree[1][1]
-        if nd.kreads or len(x2) != 2 or x2 == x or x2 in line:
+        at = nd.tree[1][1]
+        x2 = tuple(at[:2])
+        if nd.kreads or not isinstance(at[1], int) or x2 == x or x2 in line:
             return None
         line.append(x)
         x = x2
