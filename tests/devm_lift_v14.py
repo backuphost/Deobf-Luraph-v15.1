@@ -19,7 +19,12 @@ v14 interpreters use and that the evaluator has to understand:
 * a handler-local alias of the open-upvalue map, next to an interpreter variable of the same name
   as the alias; the close-upvalues loop with an opaque test around its real test;
 * a register array that comes from a Lua helper of the loader instead of table.create;
-* folded library calls on literals.
+* folded library calls on literals;
+* a program that patches its own operands with values it computes from library calls on
+  constants, also through `a and K1 or K2` chains; a value that differs between two paths is not
+  a patch value;
+* the close-upvalues loop of v14.0.x over the capture lists a call made (a local of the closure
+  maker), and the insert that records such a list.
 
 With LURAPH_CORPUS set to a checkout of the public sample corpus (a directory with one
 sub-directory per Luraph version) and bin/luau present, CorpusLift also runs the whole of devm on a
@@ -49,6 +54,7 @@ VM = '''return (function(create, pack, unpack, cowrap, coyield, env, S, shared, 
 %(loader)s
 local function wrap(P, U)
 local OPS, A, B, C, NP = P[1], P[2], P[3], P[4], P[5]
+%(maker)s
 return function(...)
 local R = %(alloc)s
 local pc = 1
@@ -142,8 +148,9 @@ def proto(code, nparams=0):
 class Mini:
     """The VM with extra handlers, a program for it, and the lift."""
 
-    def __init__(self, handlers='', prologue='', alloc='create(8)', state=None, shared=None, outer='', loader=''):
-        self.src = outer + VM % {'handlers': handlers, 'prologue': prologue, 'alloc': alloc, 'loader': loader}
+    def __init__(self, handlers='', prologue='', alloc='create(8)', state=None, shared=None, outer='', loader='', maker=''):
+        self.src = outer + VM % {'handlers': handlers, 'prologue': prologue, 'alloc': alloc, 'loader': loader,
+                                 'maker': maker}
         self.model = vmmodel.Model(self.src, oneline=True)
         self.state = state if state is not None else [0, 0, 0, 0]
         self.shared = shared if shared is not None else {}
@@ -701,6 +708,152 @@ class Builtins(unittest.TestCase):
         self.assertEqual(self.pe.index(pe.Lib('math'), 'pi', None), __import__('math').pi)
         self.assertEqual(self.pe.index(pe.Lib('math'), 'huge', None), float('inf'))
         self.assertIsInstance(self.pe.index(pe.Lib('math'), 'floor', None), pe.Builtin)
+
+
+class PatchValues(unittest.TestCase):
+    """Luraph v14 programs compute numbers with library calls on constants and store them into
+    operands of instructions that run later."""
+    HANDLERS = """elseif op == 30 then
+R[A[pc]] = R[B[pc]][C[pc]]
+elseif op == 31 then
+R[A[pc]] = R[A[pc]](R[A[pc] + 1], R[A[pc] + 2])
+elseif op == 32 then
+B[C[pc]] = R[A[pc]]
+elseif op == 33 then
+R[A[pc]] = R[B[pc]] < R[C[pc]]
+"""
+    TAIL = [(3, 4, 'print', 0), (1, 5, 999, 0), (5, 4, 0, 0), (2, 4, 0, 0)]
+
+    def lift(self, head):
+        # head computes a value into a register and stores it into the operand of the LOADK of TAIL
+        m = Mini(self.HANDLERS)
+        return m, m.lift(proto(head + self.TAIL))
+
+    def test_library_call_on_constants(self):
+        # print(bit32.band(205, 7)) with the argument arriving through a patched operand
+        m, text = self.lift([(3, 1, 'bit32', 0), (30, 1, 1, 'band'), (1, 2, 205, 0), (1, 3, 7, 0), (31, 1, 0, 0),
+                             (32, 1, 0, 8)])
+        self.assertEqual(m.errors, [])
+        self.assertIn('print(5)', text)
+        self.assertNotIn('999', text)
+
+    def test_string_library_and_arithmetic(self):
+        # string.byte("A", 1) + 1 = 66
+        m, text = self.lift([(3, 1, 'string', 0), (30, 1, 1, 'byte'), (1, 2, 'A', 0), (1, 3, 1, 0), (31, 1, 0, 0),
+                             (1, 2, 1, 0), (4, 1, 1, 2), (32, 1, 0, 10)])
+        self.assertEqual(m.errors, [])
+        self.assertIn('print(66)', text)
+
+    def test_and_or_chain_over_constants(self):
+        # x = false and <skipped> or 9: the test of the constant has one outcome
+        m, text = self.lift([(1, 1, False, 0), (7, 1, 3, 0), (1, 1, 9, 0), (32, 1, 0, 6)])
+        self.assertEqual(m.errors, [])
+        self.assertIn('print(9)', text)
+        self.assertNotIn('if ', text)
+        # x = 9; if true then else x = 162 end: the assignment in the dead arm is not the value
+        m, text = self.lift([(1, 1, 9, 0), (1, 2, True, 0), (7, 2, 4, 0), (1, 1, 162, 0), (32, 1, 0, 7)])
+        self.assertEqual(m.errors, [])
+        self.assertIn('print(9)', text)
+        self.assertNotIn('162', text)
+
+    def test_comparison_of_constants(self):
+        # x = (3 < 5) and 7 or 8  ->  7 (the jump over `x = 8` is taken)
+        m, text = self.lift([(1, 1, 3, 0), (1, 2, 5, 0), (33, 3, 1, 2), (1, 1, 7, 0), (7, 3, 6, 0), (1, 1, 8, 0),
+                             (9, 7, 7, 0), (32, 1, 0, 10)])
+        self.assertEqual(m.errors, [])
+        self.assertIn('print(7)', text)
+        self.assertNotIn('print(8)', text)
+
+    def test_a_value_that_differs_between_paths_is_not_a_patch_value(self):
+        # x = 8; if cond then else x = 7 end; <operand> = x: no single value exists
+        m, text = self.lift([(3, 1, 'cond', 0), (1, 2, 8, 0), (7, 1, 4, 0), (1, 2, 7, 0), (32, 2, 0, 7)])
+        self.assertTrue(any('self-modifying store of a run-time value' in e[1] for e in m.errors), m.errors)
+        self.assertNotIn('print(7)', text)
+        self.assertNotIn('print(8)', text)
+
+    def test_run_time_value_is_still_an_error(self):
+        m, text = self.lift([(3, 1, 'f', 0), (32, 1, 0, 4)])
+        self.assertTrue(any('self-modifying store of a run-time value' in e[1] for e in m.errors), m.errors)
+
+    def test_fold_pure(self):
+        f = pe.fold_pure
+        self.assertEqual(f('bit32.band', [205, 7]), [5])
+        self.assertEqual(f('string.byte', ['AB', 1, None]), [65])
+        self.assertEqual(f('string.packsize', ['>>H= >H  c243 =']), [247])
+        self.assertEqual(f('string.packsize', ['c']), None)
+        self.assertEqual(f('math.round', [2.5]), [3])
+        self.assertEqual(f('math.round', [-2.5]), [-3])
+        self.assertEqual(f('string.unpack', ['<i8', 'J' + '\0' * 7]), [74, 9])
+        self.assertIsNone(f('os.time', []))
+        self.assertIsNone(f('string.rep', ['a', 3]))
+
+
+class CaptureLists(unittest.TestCase):
+    """v14.0.x: the closure maker keeps a list of the capture lists its closure made; functions
+    that return walk it and detach the cells that still point into their registers."""
+    HANDLERS = """elseif op == 35 then
+repeat
+local kept = {}
+for _, list in lists do
+for _, cell in list do
+if not (cell[2] == R and cell[1] >= A[pc]) then
+else
+local r = cell[1]
+if not kept[r] then
+kept[r] = {R[r]}
+end
+cell[2] = kept[r]
+cell[1] = 1
+end
+end
+end
+until true
+elseif op == 36 then
+coyield(lists, {{[2] = R, [1] = A[pc]}})
+"""
+
+    def mini(self):
+        m = Mini(self.HANDLERS, maker='local lists = alloc({}, S)')
+        m.extra = {'alloc': tag(fn='setmetatable'), 'coyield': tag(fn='table.insert')}
+        return m
+
+    def test_recognised(self):
+        m = self.mini()
+        p = pe.PE(m.model, None)
+        self.assertEqual(p.cell_lists, {'lists'})
+        loops = []
+
+        def find(block):
+            for st in block:
+                if st[0] == 'forin':
+                    loops.append(st)
+                for b in pe.subblocks(st):
+                    find(b)
+        find(m.model.loops[0][2])
+        outer = [st for st in loops if pe.nested_close(st)]
+        self.assertEqual(len(outer), 1)
+        arr, base = pe.nested_close(outer[0])
+        self.assertEqual(arr, ('name', 'R'))
+        self.assertEqual(base[0], 'index')
+
+    def test_lifts_without_a_trace(self):
+        m = self.mini()
+        text = m.lift(proto([(1, 1, 42, 0), (36, 1, 0, 0), (35, 1, 0, 0), (2, 1, 0, 0)]))
+        self.assertEqual(m.errors, [])
+        self.assertEqual(text.strip(), 'return 42')
+
+    def test_a_handler_local_of_the_same_name_is_not_the_list(self):
+        m = Mini("""elseif op == 35 then
+local lists = R[A[pc]]
+for _, list in lists do
+for _, cell in list do
+if cell[2] == R and cell[1] >= A[pc] then
+cell[1] = 1
+end
+end
+end
+""")
+        self.assertEqual(pe.PE(m.model, None).cell_lists, set())
 
 
 # ---------------------------------------------------------------- the public corpus, when it is there
