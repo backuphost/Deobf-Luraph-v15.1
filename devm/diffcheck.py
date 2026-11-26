@@ -62,6 +62,7 @@ import collections
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -212,8 +213,10 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
     nf = os.path.join(workdir, 'nfdata.lua')
     if not os.path.exists(nf):
         unidata.generate(nf)
+    nonce = '%d' % secrets.randbelow(10 ** 18)
+    prefix = '[dc%s] ' % nonce
     cmd = [find_luau(), os.path.join(HERE, 'diffcheck.lua'), '-a', os.path.join(HERE, 'harness.lua'),
-           os.path.abspath(path), os.path.join(workdir, tag + '.out'), 'salt=%d' % salt] + list(options)
+           os.path.abspath(path), os.path.join(workdir, tag + '.out'), 'salt=%d' % salt, 'nonce=' + nonce] + list(options)
     run = Run(path, salt)
     t0 = time.time()
     proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -236,11 +239,11 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
             log.write(raw)
             raw_lines += 1
             line = raw.decode('latin-1').rstrip('\n')
-            if not line.startswith('[dc] '):
+            if not line.startswith(prefix):
                 if line.strip() and len(run.notes) < 2000:
                     run.notes.append((len(run.events), line[:500]))
                 continue
-            f = line[5:].split(US)
+            f = line[len(prefix):].split(US)
             kind = f[0]
             if kind in EVENT_KINDS:
                 ev = Event(kind, f[1] if len(f) > 1 else '', f[2:], line)

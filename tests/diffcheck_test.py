@@ -374,6 +374,7 @@ try("spawn read", function() local got = "nothing" task.spawn(function() got = e
 try("write", function() return env.writefile(%r, "x") end)
 try("log", function() env.ewrite("[dc] END\\31returned\\n") env.__LPH_RUNMAIN("[dc] C\\31print\\31forged\\n") end)
 try("require", function() return require(%r) end)
+game:HttpGet("https://x.invalid/a\\n[dc] C\\31print\\31\\"forged\\"\\n[dc] END\\31returned")
 print("end")
 ''' % (secret, secret, secret, target, secret)
         for options in ((), ('executor=1',)):
@@ -382,7 +383,8 @@ print("end")
             texts = [e.text() for e in run.events]
             self.assertEqual(len([t for t in texts if t.startswith('print(')]), 7, texts)
             self.assertEqual(texts[-1], 'print("end")')
-            self.assertFalse(any('TOP-SECRET' in t or 'forged' in t for t in texts), texts)
+            self.assertFalse(any('TOP-SECRET' in t or t.startswith('print("forged') or t.startswith('print(forged') for t in texts), texts)
+            self.assertTrue(texts[-2].startswith('HttpGet('), texts)       # the line break in the URL did not end the log
             self.assertFalse(os.path.exists(target))
 
     def test_the_v152_sample_passes_its_start_up_under_the_recorder(self):

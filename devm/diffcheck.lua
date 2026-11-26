@@ -5,6 +5,7 @@
 -- Runs <script> through the unchanged harness and mock and writes what the script does to
 -- stderr, one line per event, in a form that is the same from run to run:
 --
+-- ("[dc] " is "[dc<digits>] " when the reader passes nonce=<digits>, see below.)
 --   [dc] START                         the harness has built the environment; the script starts
 --   [dc] C<US>name<US>arg<US>arg...    a call of a function of the mock (Roblox / executor API)
 --   [dc] K<US>name<US>arg<US>arg...    a call of a permissive stand-in (a member the mock does not model)
@@ -46,11 +47,16 @@ if not (ewrite and realCwrap and G.__LPH_RUNMAIN and G.readfile) then
 end
 
 local salt = 1
+local TAG = "[dc] "
 do
 	local pass = {}
 	for _, o in ipairs(options) do
 		local s = string.match(o, "^salt=(%d+)$")
-		if s then salt = tonumber(s) else pass[#pass + 1] = o end
+		local n = string.match(o, "^nonce=(%d+)$")
+		-- nonce=<digits>: the lines of this log start with "[dc<digits>] ".  The reader picks the
+		-- digits per run, so text a script gets into another line (the URL of a request, with a
+		-- line break in it) cannot pass for a line of the recorder.
+		if s then salt = tonumber(s) elseif n then TAG = "[dc" .. n .. "] " else pass[#pass + 1] = o end
 	end
 	options = pass
 end
@@ -209,7 +215,7 @@ local logging, busy = false, false
 local function emit(kind, ...)
 	local n = select("#", ...)
 	local parts = table.create(n + 1)
-	parts[1] = "[dc] " .. kind
+	parts[1] = TAG .. kind
 	for i = 1, n do parts[i + 1] = (select(i, ...)) end
 	ewrite(table.concat(parts, US) .. "\n")
 end
@@ -218,7 +224,7 @@ local function record(kind, name, skip, ...)
 	busy = true
 	local n = select("#", ...)
 	local parts = table.create(n + 2)
-	parts[1] = "[dc] " .. kind
+	parts[1] = TAG .. kind
 	parts[2] = name
 	local ok, err = pcall(function(...)
 		for i = skip + 1, n do parts[#parts + 1] = render((select(i, ...))) end
