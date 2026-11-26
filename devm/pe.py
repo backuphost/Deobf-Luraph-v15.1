@@ -2348,7 +2348,10 @@ class PE:
             # (an opaque test in front of the assignment: its arm must be dead)
             if not (junk[0] == 'if' and len(junk[1]) == 1 and not junk[2] and repr(a) not in repr(junk[1][0][0])):
                 return False
-            jv = self.eval1(junk[1][0][0], scope)
+            try:
+                jv = self.eval1(junk[1][0][0], scope)
+            except PEError:
+                return False
             if isinstance(jv, (Sym, LinSym, tuple)) or jv is FSTATE or truthy(jv):
                 return False
         self.setvar(scope, a[1], LinSym('va', -1))
@@ -2374,7 +2377,10 @@ class PE:
                             if not ok(b):
                                 return False
                             continue
-                        v = self.eval1(c, scope)
+                        try:
+                            v = self.eval1(c, scope)
+                        except PEError:
+                            return False
                         if isinstance(v, (Sym, LinSym, tuple)) or v is FSTATE:
                             return False
                         if truthy(v):
