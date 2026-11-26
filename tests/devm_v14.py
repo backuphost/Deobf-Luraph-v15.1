@@ -376,6 +376,29 @@ class Containers(unittest.TestCase):
                 self.assertIn('pcall(loadstring,s,"Luraph",nil)', f.read())
 
 
+@unittest.skipUnless(HAVE_LUAU, 'bin/luau is not built')
+class RunErrors(unittest.TestCase):
+    def test_error_message_of_the_first_program(self):
+        bad = vm_text().replace('{1,2,3}', '{1,2,4}').replace('elseif o==2 then pc=pc+1;', 'elseif o==2 then pc=pc+1;elseif o==4 then error("boom "..pc);')
+        m = vmmodel.Model(normalize.reflow(normalize.normalise_heads(bad)[0]), oneline=True)
+        with tempfile.TemporaryDirectory() as work:
+            data, notes = vmmodel.run_dump_script(m, work, 'vm', ['executor=1'])
+        self.assertIsNone(data)
+        self.assertIn('[error] sample:1: boom 3', notes)
+
+    def test_last_calls(self):
+        # the first program calls a mocked function and then spins: the diagnosis run names the call
+        spin = vm_text().replace('{1,2,3}', '{5,2,4}').replace(
+            'elseif o==2 then pc=pc+1;', 'elseif o==2 then pc=pc+1;elseif o==5 then game:GetService("Players");pc=pc+1;elseif o==4 then pc=2;')
+        m = vmmodel.Model(normalize.reflow(normalize.normalise_heads(spin)[0]), oneline=True)
+        with tempfile.TemporaryDirectory() as work:
+            data, notes = vmmodel.run_dump_script(m, work, 'vm', ['executor=1'], budget=5000, timeout=60, calls=True)
+        self.assertIsNone(data)
+        line = [n for n in notes if n.startswith('[calls] ')]
+        self.assertEqual(len(line), 1, notes)
+        self.assertIn('GetService', line[0])
+
+
 def smallest(version, pred, limit=40):
     """The smallest file of a corpus directory that satisfies pred(text); None when there is none."""
     d = os.path.join(CORPUS, version)

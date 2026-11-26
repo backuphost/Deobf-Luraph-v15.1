@@ -1158,10 +1158,17 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
             '; '.join(c[:90] for c in made[-6:]) or 'none'))
     if not os.path.exists(outjson):
         # how the run ended: the error message the harness printed in front of its `[end] error` line
+        # (message, then `stacktrace:` with one line per frame and an empty line)
         lines = stderr.strip().split('\n')
         for i, l in enumerate(lines):
-            if l.startswith('[end] error') and i and not lines[i - 1].startswith(keep):
-                notes.insert(max(0, len(notes) - 1), '[error] ' + lines[i - 1][:300])
+            if not l.startswith('[end] error'):
+                continue
+            j = i - 1
+            while j > 0 and lines[j] != 'stacktrace:':
+                j -= 1
+            msg = lines[j - 1] if j > 0 else next((x for x in reversed(lines[:i]) if x.strip()), '')
+            if msg.strip() and not msg.startswith(keep):
+                notes.insert(max(0, len(notes) - 1), '[error] ' + msg[:300])
         if not notes:
             notes = ['[stderr] ' + l for l in lines[-3:] if l]
         return None, notes
