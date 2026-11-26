@@ -11,6 +11,7 @@
   structurer    deobf's structurer against random control-flow graphs (research/structure_fuzz.py)
   frontend      deob.py picks the right engine and reports truthfully (tests/allinone_test.py)
   codecs        the static container decoder and the Zstandard decoders (tests/codecs_test.py)
+  diffcheck     devm.diffcheck tells same from different on scripts changed on purpose (tests/diffcheck_test.py)
 
 Everything needs the interpreter (./setup.sh).  Exit status 0 when every check passes.
 """
@@ -33,6 +34,7 @@ def checks(full):
         ("structurer", [PY, "-B", "deobf/research/structure_fuzz.py", "0", "3000" if full else "500"], {}, 1800),
         ("frontend", [PY, "-B", "tests/allinone_test.py"], {"ALLINONE_FULL": "1"} if full else {}, 3600),
         ("codecs", [PY, "-B", "tests/codecs_test.py"], {}, 1800),
+        ("diffcheck", [PY, "-B", "tests/diffcheck_test.py"], {}, 900),
     ]
     if full:
         out.insert(3, ("devm-full", [PY, "-B", "tests/devm_v152.py", "V152Full", "Layer3Full"],
