@@ -446,6 +446,15 @@ class Verify(unittest.TestCase):
         self.assertEqual(self.check("2")[0], "not-comparable")
         self.assertEqual(self.check("hang", timeout=2)[0], "timeout")
 
+    def test_a_complete_result_that_was_not_compared_says_so(self):
+        self.hand_over("same")              # (sets the stand-in engine)
+        lines = []
+        allinone.say = lambda msg="": lines.append(msg)
+        rc = allinone.hand_over(self.inp, self.out, ("devm",))
+        self.assertEqual(rc, allinone.OK)
+        self.assertEqual(lines[-1], "result: complete (devm)")
+        self.assertIn("was not compared with the protected file", lines[-2])
+
     def test_tree_without_the_checker_says_so(self):
         allinone.DIFFCHECK = os.path.join(self.tmp.name, "nope.py")
         self.assertEqual(allinone.check_result(self.inp, self.out)[0], "unavailable")
@@ -474,6 +483,7 @@ class Verify(unittest.TestCase):
             rc, lines = self.hand_over(how)
             self.assertEqual(rc, allinone.OK, (how, lines))
             self.assertEqual(lines[-1], "result: complete (devm)")
+            self.assertFalse(any("was not compared" in l for l in lines), lines)
             want = "/ verified:" if how == "same" else "not verified (%s): line of the checker" % how
             self.assertTrue(any(want in l for l in lines), lines)
 

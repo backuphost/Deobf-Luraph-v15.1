@@ -664,6 +664,11 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None, ve
     # the last line is the front end's own verdict, in the engines' `result:` form
     if res["complete"]:
         say("[✓] devirtualized → %s" % out)
+        if not verify:
+            # "complete" is the engine's statement that nothing is missing, checked here for
+            # syntax only: say so (a lift can be whole and still wrong in a place)
+            say("    (引擎报告没有缺失；结果的行为没有和原文件对比：--verify / the engine reports nothing missing; "
+                "what the result does was not compared with the protected file: --verify)")
         say("result: complete (%s)" % res["engine"])
         return OK
     if res.get("kind") == "trace":
