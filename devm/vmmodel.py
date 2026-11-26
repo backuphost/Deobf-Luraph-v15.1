@@ -1069,10 +1069,13 @@ def run_oracle(model, workdir, tag, options=()):
     return dump, out, note
 
 
-def run_dump_script(model, workdir, tag, options=(), budget=40000000, timeout=150):
+def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=150):
     """Proto-table layout, route A: let the VM run its own first program (Luraph's init) under the
     harness and dump the state when the proto that program returned is entered, i.e. when the
     script's main function starts (patched_source(newproto=True), harness dumpnew=1).
+
+    budget: VM instructions the run may execute before the harness stops it.  Inits seen hand over
+    after 6 thousand to 0.9 million instructions; a failed check ends in Luraph's endless loop.
 
     Returns (dump or None, notes): notes are the harness's lines about the run ([handover],
     [dumpnew], [budget], [http], ...) plus one line of ours when the run had to be stopped."""

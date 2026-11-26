@@ -118,7 +118,7 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def _dump_script(self, options=(), budget=40000000, timeout=150):
+def _dump_script(self, options=(), budget=None, timeout=150):
     """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
     proto of the script.  The harness lets the VM run that init and dumps the state when the
     returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
@@ -134,6 +134,11 @@ def _dump_script(self, options=(), budget=40000000, timeout=150):
     rm = getattr(self, 'run_model', None) or m
     self.log('[%s] interpreter at line %d, %d dispatch loop(s) in %d interpreter(s), proto-table%s' % (
         self.tag, m.interp.line, len(m.loops), len(m.interps), ', one table per instruction' if m.insn_tables else ''))
+    if not budget:
+        # Instructions the init may run.  Inits seen take up to 2 instructions per byte of the file
+        # where the init deserializes the script itself (v14.0 - v14.2: 2.36 million for 2.2 MB) and
+        # about 11 per byte of data where it decrypts it (v14.8); a failed check never ends.
+        budget = max(12000000, 40 * len(rm.src))
     text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
     self.run_notes = notes
     for n in notes:
@@ -149,7 +154,7 @@ def _dump_script(self, options=(), budget=40000000, timeout=150):
 Stage.dump_script = _dump_script
 
 
-def _run_script(self, options=(), budget=40000000, timeout=150):
+def _run_script(self, options=(), budget=None, timeout=150):
     """dump_script, then a plain lift of the script's program (no key-function search, no
     opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
     import re
