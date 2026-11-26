@@ -288,6 +288,19 @@ class Tool(unittest.TestCase):
         self.assertLess(sent.index("getgenv().key"), sent.index("return(function"))
 
 
+class Formatter(unittest.TestCase):
+    def test_hex_float_is_one_token(self):
+        import deobf_plus
+        for lit in ("0x1.c8P5", "0X1.f4P6", "0x.8p-1", "0x1p+4"):
+            toks = [v for _k, v in deobf_plus.tokenize("x = %s + 1" % lit)]
+            self.assertEqual(toks, ["x", "=", lit, "+", "1"], lit)
+            self.assertEqual(deobf_plus.norm_num(lit), lit)         # no decimal spelling is made up
+        # Luau text reads as before
+        self.assertEqual([v for _k, v in deobf_plus.tokenize("a=0x10..s")], ["a", "=", "0x10", "..", "s"])
+        self.assertEqual([v for _k, v in deobf_plus.tokenize("0xE+1")], ["0xE", "+", "1"])
+        self.assertEqual([v for _k, v in deobf_plus.tokenize("t[0x1].x")], ["t", "[", "0x1", "]", ".", "x"])
+
+
 class Judging(unittest.TestCase):
     """allinone: an engine's result is judged before it is reported."""
 

@@ -44,6 +44,11 @@ for _p in (str(_LIBS), str(_LIBS.parent)):
 # digit and underscore that follows.  So `0x10`, `1e+5`, `1_000` and the integer literals of
 # newer Luau (`5i`, `0x10i`) are one token each, exactly as Luau reads them; whether the
 # token is a VALID number is Luau's business, not the formatter's.
+# One exception, for text that is not Luau at all: a hexadecimal float of Lua 5.2+ / LuaJIT
+# (`0x1.c8P5`, `0x.8p-1`, `0x1p+4`) is ONE token.  Luau would cut it into `0x1` `.` `c8P5`,
+# and the formatter then printed `1 .c8P5`: another program for the Lua the file was written
+# for (and a syntax error in Luau either way, so no Luau text reads differently for it: a
+# number literal cannot be indexed, and `0x1..s` keeps its `..`).
 _TOKEN_RE = re.compile(r'''
   (?P<ws>[ \t\r\n\f\v]+)
  |(?P<c>--(?:\[(?P<ceq>=*)\[[\s\S]*?(?:\](?P=ceq)\]|\Z)|[^\n]*))
@@ -51,7 +56,9 @@ _TOKEN_RE = re.compile(r'''
        |"(?:[^"\\\n]|\\z[ \t\r\n\f\v]*|\\\r\n|\\[\s\S])*(?:"|(?=\n)|\Z)
        |'(?:[^'\\\n]|\\z[ \t\r\n\f\v]*|\\\r\n|\\[\s\S])*(?:'|(?=\n)|\Z)
        |`(?:[^`\\]|\\[\s\S])*(?:`|\Z))
- |(?P<n>(?:[0-9]|\.(?=[0-9]))[0-9._]*(?:[eE][+-]?)?[A-Za-z0-9_]*)
+ |(?P<n>0[xX][0-9a-fA-F_]*\.(?!\.)[0-9a-fA-F_]*(?:[pP][+-]?[0-9_]+)?[A-Za-z0-9_]*
+       |0[xX][0-9a-fA-F_]+[pP][+-][0-9_]+[A-Za-z0-9_]*
+       |(?:[0-9]|\.(?=[0-9]))[0-9._]*(?:[eE][+-]?)?[A-Za-z0-9_]*)
  |(?P<w>[A-Za-z_][A-Za-z0-9_]*)
  |(?P<o>\.\.\.|\.\.=|//=|==|~=|<=|>=|\.\.|::|->|//|\+=|-=|\*=|/=|%=|\^=|[\s\S])
 ''', re.X)
