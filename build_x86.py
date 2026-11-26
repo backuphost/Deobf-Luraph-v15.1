@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_x86.py —— 自动为 x86_64 平台构建 luau / luau-ast
+build_x86.py —— 在 Alpine（aarch64）上为 x86_64 **交叉编译** luau / luau-ast
+
+For a normal build on the machine you are sitting at, use  ./setup.sh  (python3
+build_luau.py): it builds the patched Luau 0.739 that every engine of this repository needs.
+This script is the old cross-compile route (clang --target=x86_64-alpine-linux-musl on an
+Alpine/aarch64 host, runtime packages fetched from an Alpine mirror with `apk` and `curl`);
+it builds whatever Luau checkout it finds, WITHOUT the repository's patches, so its output is
+enough for deob.py but not for devm / deobf.  It therefore only runs when asked with --cross.
 
 运行时会打印当前阶段，缺什么依赖就自动下载什么，不静默卡住。
 
 用法:
-    python build_x86.py                # 构建并放到 bin/
-    python build_x86.py --check        # 只检查现有二进制架构
+    python build_x86.py --check                # 只检查现有二进制架构
+    python build_x86.py --cross                # 交叉编译并放到 bin/（需要 Alpine + 网络）
+    python build_x86.py --cross --work DIR     # 指定工作目录（sysroot 缓存、构建目录）
+                                               # 默认每次新建临时目录，不与别的运行共用
 
 原理:
     用 clang 的 --target=x86_64-alpine-linux-musl 交叉编译，
@@ -21,7 +30,10 @@ import shutil
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SYSROOT = Path("/tmp/lv151_x86_sysroot")
+# set in main(): a fresh temporary directory per run, or --work DIR.  (These used to be fixed
+# names under /tmp, shared by every run and every user of the machine.)
+WORK = None
+SYSROOT = None
 MIRROR = "https://mirrors.aliyun.com/alpine/v3.21"
 ARCH = "x86_64"
 
@@ -117,8 +129,8 @@ def ensure_toolchain():
 
 def write_wrappers():
     """写编译器包装脚本，把 target/sysroot/lld 固化进去"""
-    cc = Path("/tmp/lv151_x86cc")
-    cxx = Path("/tmp/lv151_x86cxx")
+    cc = WORK / "x86cc"
+    cxx = WORK / "x86cxx"
     base = (f'--target={ARCH}-alpine-linux-musl --sysroot={SYSROOT} '
             f'-fuse-ld=lld')
     cc.write_text(f'#!/bin/sh\nexec clang {base} "$@"\n')
@@ -130,12 +142,12 @@ def write_wrappers():
 
 
 def build(luau_src: Path, cc: Path, cxx: Path):
-    build_dir = Path("/tmp/lv151_x86_build")
+    build_dir = WORK / "build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True)
 
-    tc = Path("/tmp/lv151_x86_toolchain.cmake")
+    tc = WORK / "toolchain.cmake"
     tc.write_text(f'''set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_C_COMPILER {cc})
@@ -187,19 +199,41 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 
 
 def main():
+    global WORK, SYSROOT
     if "--check" in sys.argv:
+        found = 0
         for name in ("luau", "luau-ast"):
-            for cand in (HERE / "bin" / name, HERE / "libs" / name):
-                if cand.exists():
-                    ok, arch = check_arch(cand)
-                    print(f"{cand}  →  {arch}")
+            for d in (HERE / "bin", HERE / "libs"):
+                for cand in sorted(d.glob(name + "*")) if d.is_dir() else []:
+                    if cand.name == name or cand.name.startswith(name + "."):
+                        ok, arch = check_arch(cand)
+                        print(f"{cand}  →  {arch}")
+                        found += 1
+        if not found:
+            print("bin/ 里没有 luau / luau-ast；本机构建： ./setup.sh")
         return 0
 
-    say("平台", f"当前架构 {platform.machine()}")
+    if "--cross" not in sys.argv:
+        print(__doc__)
+        print("本机构建请用  ./setup.sh ；确实要在 Alpine 上交叉编译 x86_64，请加 --cross。")
+        return 1
+
+    if not shutil.which("apk"):
+        say("错误", "这条路线依赖 Alpine 的 apk；当前系统没有。本机构建请用 ./setup.sh")
+        return 1
+    import tempfile
+    work = None
+    for i, a in enumerate(sys.argv):
+        if a == "--work" and i + 1 < len(sys.argv):
+            work = sys.argv[i + 1]
+    WORK = Path(work).resolve() if work else Path(tempfile.mkdtemp(prefix="lv151_x86_"))
+    WORK.mkdir(parents=True, exist_ok=True)
+    SYSROOT = WORK / "sysroot"
+    say("平台", f"当前架构 {platform.machine()}，工作目录 {WORK}")
 
     luau_src = HERE / "luau"
     if not luau_src.exists():
-        for cand in (HERE.parent / "luau", Path("/var/minis/workspace/luau")):
+        for cand in (HERE.parent / "luau",):
             if (cand / "CMakeLists.txt").exists():
                 luau_src = cand
                 break

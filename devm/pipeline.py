@@ -68,7 +68,7 @@ def _run_traced(self):
     self.lifter.end_state = True
     # Two-interpreter builds: the first program is Luraph's bootstrap (environment checks, key
     # derivation, decryption); the script itself is the first proto of the other interpreter.
-    root = self.lifter.root_key
+    root = first_root = self.lifter.root_key
     boot = self.lifter.records[root - 1][0]
     payload = [i + 1 for i, (idx, _) in enumerate(self.lifter.records) if idx != boot]
     # --root overrides: in some builds the other interpreter only runs a helper of the build (a
@@ -97,6 +97,17 @@ def _run_traced(self):
         self.tag, len(protos), nodes, sum(len(p.oracle_used) for p in protos.values()), len(errs), ran))
     self.errors = errs
     self.conflicts = [(k, c) for k, p in protos.items() for c in p.conflicts]
+    self.hints = []
+    if payload and not forced:
+        # The proto taken for the script is the first one on the second interpreter.  Where that
+        # interpreter only runs a helper, next to nothing is lifted while the run shows the first
+        # program doing all the work: say so (the choice itself is left alone, --root decides).
+        ran_first = sum(1 for k in oracle if isinstance(k[0], int) and 0 < k[0] <= len(self.lifter.records)
+                        and self.lifter.records[k[0] - 1][0] == boot)
+        if nodes < 50 and ran_first > 1000:
+            self.hints.append('[hint] the function taken for the script (proto %d, on the second interpreter) has only %d '
+                              'instructions, while the first program executed %d: the script is probably the first '
+                              'program; run again with --root %d' % (root, nodes, ran_first, first_root))
     d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
     self.text = d.run()
     self.stats = d.stats

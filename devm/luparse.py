@@ -22,7 +22,8 @@ import re
 
 
 class Func:
-    __slots__ = ('params', 'vararg', 'body', 'line', 'body_pos', 'end_line', 'id', 'kw_pos', 'end_pos', 'name_stmt', 'fid')
+    __slots__ = ('params', 'vararg', 'body', 'line', 'body_pos', 'end_line', 'id', 'kw_pos', 'end_pos', 'name_stmt', 'fid',
+                 'stmt_name')
     _n = 0
 
     def __init__(self, params, vararg, body, line, body_pos, end_line):
@@ -33,6 +34,7 @@ class Func:
         self.body_pos = body_pos
         self.end_line = end_line
         self.name_stmt = None     # NAME when declared as `local function NAME`
+        self.stmt_name = None     # `a.b.c` when declared by the statement `function a.b.c()` / `function a.b:c()`
         Func._n += 1
         self.id = Func._n
 
@@ -346,17 +348,23 @@ class Parser:
             if k == 'function':
                 self.next()
                 target = ('name', self.expect('name')[1])
+                path = [target[1]]
                 while True:
                     if self.accept('op', '.'):
                         target = ('index', target, ('str', self.expect('name')[1]))
+                        path.append(target[2][1])
                     elif self.accept('op', ':'):
                         target = ('index', target, ('str', self.expect('name')[1]))
+                        path.append(target[2][1])
                         f = self.funcbody(t[2])
                         f.params.insert(0, 'self')
+                        f.stmt_name = '.'.join(path)
                         return ('funcstmt', target, f)
                     else:
                         break
-                return ('funcstmt', target, self.funcbody(t[2]))
+                f = self.funcbody(t[2])
+                f.stmt_name = '.'.join(path)
+                return ('funcstmt', target, f)
             if k == 'break':
                 self.next()
                 return ('break',)

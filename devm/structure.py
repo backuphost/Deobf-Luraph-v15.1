@@ -675,9 +675,11 @@ class Structurer:
             elif t == 'error':
                 out.append(['comment', 'LIFT ERROR: ' + st[1]])
             elif t == 'trap':
-                out.append(['comment', 'tamper response (never taken in the traced run)'])
+                out.append(['comment', TRAP_CALL_NOTE if len(st) > 2 and st[2] == 'call'
+                            else 'tamper response (never taken in the traced run)'])
             elif t == 'cold':
-                pass
+                if MARK_COLD and not (out and out[-1] == ['comment', COLD_NOTE]):
+                    out.append(['comment', COLD_NOTE])
             elif t == 'setlist':
                 out.append(['setlist', st[1], st[2], st[3], st[4]])
             elif t in ('numforprep', 'genforprep'):
@@ -1006,15 +1008,52 @@ def unflag(root):
             elif t == 'do':
                 level_jumps(st[1], flags, acc)
             elif t in ('while', 'repeat', 'fornum', 'forin'):
-                acc[2] += sum(_mentions(st, f) for f in flags)
+                acc[2] += _mentions_any(st, flags)
             i += 1
 
+    def _mentions_any(node, flags):
+        """uses of any of the flags under node (one walk for all of them)"""
+        n = 0
+        stack = [node]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, tuple) and len(x) == 2 and x[0] == 'r' and not isinstance(x[1], (list, tuple)):
+                if x[1] in flags:
+                    n += 1
+            elif isinstance(x, (list, tuple)):
+                stack.extend(x)
+        return n
+
+    # Uses of every register name in the whole function, counted in one pass and kept until the
+    # tree changes: asking again for each flag made this pass quadratic (a flattened function of
+    # some thousand blocks, as Luraph v15.2's main function is, did not finish).
+    counts = {}
+
+    def dirty():
+        counts.clear()
+        return True
+
     def _mentions(node, flagname):
-        if node == ('r', flagname):
-            return 1
-        if isinstance(node, (list, tuple)):
-            return sum(_mentions(x, flagname) for x in node)
-        return 0
+        if node is root:
+            if not counts:
+                counts[None] = 0
+                stack = [root]
+                while stack:
+                    x = stack.pop()
+                    if isinstance(x, tuple) and len(x) == 2 and x[0] == 'r' and not isinstance(x[1], (list, tuple)):
+                        counts[x[1]] = counts.get(x[1], 0) + 1
+                    elif isinstance(x, (list, tuple)):
+                        stack.extend(x)
+            return counts.get(flagname, 0)
+        n = 0
+        stack = [node]
+        while stack:
+            x = stack.pop()
+            if x == ('r', flagname):
+                n += 1
+            elif isinstance(x, (list, tuple)):
+                stack.extend(x)
+        return n
 
     def walk(lst):
         changed = False
@@ -1049,7 +1088,7 @@ def unflag(root):
                         x[2].pop()
                         rest = body[k + 1:]
                         body[k + 1:] = [['if', ('un', 'not', v), rest, None]] if rest else []
-                        changed = True
+                        changed = dirty()
                         break
                 # `if c then break end` / `if c then ...; break end` among the block's own
                 # statements: the rest of the block is the other side of that test
@@ -1068,7 +1107,7 @@ def unflag(root):
                             body[k:] = [['if', x[1], then, None]]
                         else:
                             body[k:] = [['if', x[1], [], None]] if _has_call_expr(x[1]) else []
-                        changed = True
+                        changed = dirty()
                         if rest:
                             body = body[k][3] if then else body[k][2]
                             k = 0
@@ -1077,7 +1116,7 @@ def unflag(root):
                     k += 1
                 if not has_break(st[1]) and not has_continue(st[1]):
                     lst[i:i + 1] = st[1]
-                    changed = True
+                    changed = dirty()
                     continue
             # `if c then x() else exit1 = true end  if exit1 then break end`: the jump goes where
             # the flag is set, when nothing runs in between
@@ -1104,7 +1143,7 @@ def unflag(root):
                     for blk in tails:
                         blk[-1] = list(nx[2][0])
                     del lst[i + 1]
-                    changed = True
+                    changed = dirty()
                     continue
             # the flags that are checked right after the block
             flags = []
@@ -1133,7 +1172,7 @@ def unflag(root):
                                 if kinds[f] == 'continue':
                                     blk[n] = ['continue']
                     lst[i:j] = st[1]
-                    changed = True
+                    changed = dirty()
                     continue
             i += 1
         return changed
@@ -1509,6 +1548,121 @@ def section_scopes(stmts, limit=150):
     return True
 
 
+FIT_SCOPES = False      # set by run.py for builds whose main function is one unflattened state machine
+# Say where the traced run stopped following the code: the arm of a branch it never took.  What
+# comes after such a line was lifted without the run to check it against (and, in builds that
+# decrypt block by block with rolling keys, possibly with the wrong key).  Off by default: the
+# comments also keep small arms from folding into `and`/`or` expressions (run.py --mark-untaken).
+MARK_COLD = False
+COLD_NOTE = 'not reached in the traced run'
+
+
+def _decl_names(st):
+    return st[1] if st[0] == 'local' else [st[1]] if st[0] == 'localfunction' else ()
+
+
+def _bodies(st):
+    """(statement list, locals the statement itself adds for it) per nested block of a statement"""
+    t = st[0]
+    if t == 'if':
+        return [(st[2], 0)] + ([(st[3], 0)] if st[3] else [])
+    if t == 'while':
+        return [(st[2], 0)]
+    if t == 'do' or t == 'repeat':
+        return [(st[1], 0)]
+    if t == 'fornum':
+        return [(st[3], 4)]
+    if t == 'forin':
+        return [(st[3], 3 + len(st[1]))]
+    return []
+
+
+def fit_scopes(stmts, base, limit, live_after=()):
+    """Bring a function under Luau's limit of 200 locals with as few `do` blocks as it takes.
+
+    The statements are scanned in order; `base` locals are in scope when the list starts.  Where
+    a statement would exceed the limit, the statements of this list in front of it become one
+    `do ... end` section (cut where the fewest of its locals are still needed; those are declared
+    in front of the section and assigned inside).  A statement that still does not fit is entered
+    and its blocks are treated the same way.  Unlike tighten_scopes, which wraps every short-lived
+    local it can, this leaves a function that fits alone and puts sections side by side."""
+    def decls(a, b):
+        return sum(len(_decl_names(s)) for s in stmts[a:b])
+
+    def need(st):
+        own = len(_decl_names(st))
+        for body, extra in _bodies(st):
+            own = max(own, max_locals(body, extra))
+        return own
+
+    sec = 0
+    i = 0
+    guard = 0
+    while i < len(stmts):
+        st = stmts[i]
+        cnt = base + decls(0, i)
+        if cnt + need(st) <= limit or guard > 4 * len(stmts) + 50:
+            i += 1
+            continue
+        guard += 1
+        # the best cut in (sec, i]: most locals of the section that end before it
+        declared = []                   # (name, index of its statement) for stmts[sec:i]
+        for k in range(sec, i):
+            for nm in _decl_names(stmts[k]):
+                declared.append((nm, k))
+        best = None
+        if declared:
+            uses_after = [None] * (i + 1)
+            acc = set(live_after)       # (the condition of `repeat ... until` sees the body's locals)
+            for nm in stmt_vars(st):
+                acc.add(nm)
+            for s2 in stmts[i + 1:]:
+                acc.update(stmt_vars(s2))
+            # uses_after[p] = names used in stmts[p:]
+            for p in range(i, sec, -1):
+                if p < i:
+                    acc.update(stmt_vars(stmts[p]))
+                uses_after[p] = set(acc)
+            for p in range(i, sec, -1):
+                ua = uses_after[p]
+                inside = [(nm, k) for nm, k in declared if k < p]
+                if not inside:
+                    break
+                # a statement declares all of its names or none: partners of a crossing name cross too
+                cross_st = {k for nm, k in inside if nm in ua}
+                crossing = [nm for nm, k in inside if k in cross_st]
+                gain = len(inside) - len(crossing)
+                if gain > 0 and (best is None or gain > best[0]):
+                    best = (gain, p, crossing, cross_st)
+        if best is not None and (best[0] >= 8 or cnt + need(st) - best[0] <= limit):
+            gain, p, crossing, cross_st = best
+            section = []
+            for k in range(sec, p):
+                s2 = stmts[k]
+                if k in cross_st:
+                    if s2[0] == 'local':
+                        if s2[2]:
+                            section.append(['assign', [('r', x) for x in s2[1]], list(s2[2])])
+                    else:
+                        section.append(['assign', [('r', s2[1])], [s2[2]]])
+                else:
+                    section.append(s2)
+            fwd = []
+            for j in range(0, len(crossing), 10):
+                fwd.append(['local', list(crossing[j:j + 10]), []])
+            stmts[sec:p] = fwd + [['do', section]]
+            sec = sec + len(fwd) + 1
+            i = sec
+            continue
+        # nothing to gain in front of it: make the statement's own blocks fit
+        for body, extra in _bodies(st):
+            after = ()
+            if st[0] == 'repeat':
+                after = [x[1] for x in walk_expr(st[2], []) if x[0] == 'r']
+            fit_scopes(body, cnt + extra, limit, after)
+        i += 1
+
+
 def max_locals(stmts, base=0):
     """Upper bound of simultaneously declared locals."""
     cur = base
@@ -1606,6 +1760,12 @@ def lua_string_pretty(s):
             out.append(ch)
     out.append('"')
     return ''.join(out)
+
+
+# Items of a multi-line table constructor that span lines themselves (function literals, nested
+# tables) are indented with the table.  Off by default: the committed v15.1 results (compared text
+# for text by tests/regress.py) were written without it; run.py switches it on for v15.2.
+NEST_ITEMS = False
 
 
 def lua_number(v):
@@ -1760,7 +1920,10 @@ class Printer:
         if len(one) <= 100 and '\n' not in one:
             return one
         ind = '\t' * (self.level + 1)
-        return '{\n' + ''.join(ind + it.replace('\n', '\n') + ',\n' for it in items) + '\t' * self.level + '}'
+        # (an item that spans lines, a function or a nested table, was laid out for this level:
+        # inside the braces it sits one level deeper.  String literals never hold a raw newline.)
+        nl = '\n\t' if NEST_ITEMS else '\n'
+        return '{\n' + ''.join(ind + it.replace('\n', nl) + ',\n' for it in items) + '\t' * self.level + '}'
 
     level = 0
 
@@ -1868,6 +2031,30 @@ class Printer:
 
 FLAT_FALLBACK = True
 
+# Luraph's tamper response is a function that loads the instruction arrays of its own VM function
+# into registers and hands them to a routine that overwrites them (called wherever a check of the
+# protection fails).  No program of the script does that, so such a function is labelled in the
+# output.  Off by default (the committed v15.1 results were written without the label); run.py
+# switches it on for v15.2.
+NOTE_TRAPS = False
+# (behind a call of that function, where ircfg.ProtoCFG._cut_after_traps ended the block)
+TRAP_CALL_NOTE = 'tamper response, never taken in the traced run (the stray jump Luraph leaves behind the call is not followed)'
+TRAP_NOTE = "Luraph's tamper response: loads this function's own VM instruction arrays for a routine that scrambles them (the protection calls it where one of its checks fails)"
+
+
+def loads_own_code(pir):
+    """True when a lifted function reads the operand arrays of a VM function as values (the
+    dump names them `__LPH_PROTOS[n]["vars"][...]`)."""
+    def walk(x):
+        if isinstance(x, tuple):
+            if len(x) == 2 and x[0] == 'outer' and isinstance(x[1], str):
+                return x[1].startswith('__LPH_PROTOS[') and '["vars"]' in x[1]
+            return any(walk(y) for y in x)
+        if isinstance(x, list):
+            return any(walk(y) for y in x)
+        return False
+    return any(walk(n.tree) for n in pir.nodes.values() if n.tree is not None)
+
 
 def flat_ast(st, why, params=()):
     """Fallback for a function the structurer gives up on: a state machine with one `if` per basic
@@ -1951,6 +2138,13 @@ class Decompiler:
             n0 = max_locals(ast) + len(params)
             if n0 <= 180:
                 break
+            if FIT_SCOPES:
+                # sections side by side, only where the limit asks for them
+                fit_scopes(ast, len(params), 190)
+                if max_locals(ast) + len(params) <= 195:
+                    if os.environ.get('DEVM_TRACE_LOCALS'):
+                        print('locals', key, 'coalesce' if coalesce else 'plain', n0, '-> sections', max_locals(ast) + len(params))
+                    break
             # too many locals for one Luau function: first try do-blocks around the short-lived
             # ones (every variable keeps its own name); sharing variables is the last resort
             if not (ircfg_mod.DROP_OPAQUE and section_scopes(ast) and max_locals(ast) + len(params) <= 195):
@@ -1961,6 +2155,8 @@ class Decompiler:
                 break
         self.stats['protos'] += 1
         self.stats['warnings'].extend(cfg.warnings)
+        if NOTE_TRAPS and loads_own_code(pir):
+            ast.insert(0, ['comment', TRAP_NOTE])
         return params, cfg.vararg, ast
 
     def closure_text(self, e, printer, name=None):
@@ -2002,6 +2198,7 @@ class Decompiler:
         return head + '\n' + '\n'.join(p.lines) + '\n' + '\t' * printer.level + 'end'
 
     def run(self):
+        ircfg_mod.TRAP_PROTOS = {k for k, p in self.protos.items() if loads_own_code(p)} if NOTE_TRAPS else set()
         if ircfg_mod.DROP_OPAQUE:
             ircfg_prepass(self.protos)
         params, vararg, ast = self.proto_ast(self.root_key)

@@ -12,12 +12,14 @@ dynlift.py —— 动态截获 Luraph 的 Luau 字节码，再反编译回源码
     抓到字节码后交给 Tovek（lift.py）反编译，得到接近原始的可读源码。
 
 安全边界：
-    · 只在本地桩环境跑，不联网（game:HttpGet 被桩掉）
+    · 样本在 luasandbox.py 的环境表里运行：只有 Luau 自带的库，没有文件读写 / require，
+      也没有 Roblox 对象（game 是 nil，所以不可能联网）
     · 有超时
     · 不执行反编译产物，只做文本输出
 """
 import re
 import sys
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -26,12 +28,9 @@ HERE = Path(__file__).resolve().parent
 
 
 def find_luau():
-    for cand in (HERE / "bin" / "luau.aarch64", HERE / "bin" / "luau.x86_64",
-                 HERE / "bin" / "luau"):
-        if cand.is_file():
-            return cand
-    import shutil
-    return shutil.which("luau")
+    sys.path.insert(0, str(HERE))
+    import luaubin
+    return luaubin.find_luau()
 
 
 LOADER_SIGNS = [
@@ -92,7 +91,7 @@ HOOK = (
 
 def extract_bc(html_or_lua_path, workdir=None):
     """核心：从样本里截出字节码，返回 bytes 或 None"""
-    raw = Path(html_or_lua_path).read_text(encoding="utf-8", errors="ignore")
+    raw = Path(html_or_lua_path).read_text(encoding="utf-8", errors="ignore").lstrip("\ufeff")
 
     # 如果是 HTML，抽出 Luraph 代码那一行
     if "<html" in raw[:500].lower() or "<!doctype" in raw[:200].lower():
@@ -115,7 +114,7 @@ def extract_bc(html_or_lua_path, workdir=None):
 
     luau = find_luau()
     if not luau:
-        print("     ✗ 找不到 luau 运行时（先跑 python fetch_bin.py）")
+        print("     ✗ 找不到 luau 运行时（先跑 ./setup.sh）")
         return None
 
     for ci, cand in enumerate(candidates):
@@ -125,22 +124,31 @@ def extract_bc(html_or_lua_path, workdir=None):
         hooked = cand[:pos] + HOOK + cand[pos:]
         td = Path(tempfile.mkdtemp(prefix="dynlift_"))
         f = td / "hook.lua"
-        f.write_text(hooked, encoding="utf-8")
-        print(f"     注入点 @{pos:,}，运行桩环境…（第 {ci+1}/{len(candidates)} 个候选）")
+        # the sample runs in the sandbox table (luasandbox.py): Luau's libraries only, no
+        # readfile / writefile / require of the patched interpreter
+        import luasandbox
+        body = ('if not __CHUNK then print("load failed: " .. tostring(__LOADERR)) else\n'
+                '  local ok, err = pcall(__CHUNK)\n'
+                '  if not ok then print("run failed: " .. tostring(err)) end\nend\n')
+        text = luasandbox.launcher(body, hooked.encode("utf-8").decode("latin-1"), chunk_name="=sample")
+        f.write_bytes(text.encode("latin-1"))
+        print(f"     注入点 @{pos:,}，在沙箱环境里运行…（第 {ci+1}/{len(candidates)} 个候选）")
         try:
             r = subprocess.run([str(luau), str(f)],
                                capture_output=True, text=True, timeout=180)
         except subprocess.TimeoutExpired:
             print("     ✗ 超时（可能有死循环防护）")
             continue
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
         out = (r.stdout or "") + "\n" + (r.stderr or "")
-        m = re.search(r"@@BC@@(\d+)", out)
+        m = re.search(r"^@@BC@@(\d+)", out, re.M)
         if not m:
             tail = (r.stderr or r.stdout or "").strip().split("\n")[0][:100]
             print(f"     ✗ 没抓到字节码：{tail}")
             continue
         declared = int(m.group(1))
-        hexes = "".join(re.findall(r"@@H@@([0-9a-f]+)", out))
+        hexes = "".join(re.findall(r"^@@H@@([0-9a-f]+)", out, re.M))
         if len(hexes) < declared * 2:
             print(f"     ✗ 字节码不完整（{len(hexes)//2:,}/{declared:,}）")
             continue
@@ -155,7 +163,18 @@ def main():
         print(__doc__)
         return 1
     src = sys.argv[1]
+    if not Path(src).is_file():
+        print(f"[✗] 文件不存在：{src}")
+        return 1
     out = sys.argv[2] if len(sys.argv) > 2 else str(Path(src).with_suffix(".luau"))
+    ok, why = probe_loader(Path(src).read_text(encoding="utf-8", errors="ignore"))
+    if not ok:
+        print("[✗] 这个样本不适用动态截获（形态 B 专用）：")
+        print("        " + why)
+        print("    先用 python3 deob.py " + src + " 判断形态：")
+        print("      · 表里留有明文业务函数（形态 A）→ deob.py 直接提取")
+        print("      · 脚本被整体虚拟化 → deob.py 会指向去虚拟化器 python3 -m devm.run")
+        return 2
 
     print(f"[1] 截获字节码：{src}")
     bc = extract_bc(src)
@@ -163,11 +182,18 @@ def main():
         print("[✗] 截获失败")
         return 1
 
-    tmpbc = Path(tempfile.mkdtemp(prefix="bc_")) / "payload.bin"
+    tmpd = Path(tempfile.mkdtemp(prefix="bc_"))
+    tmpbc = tmpd / "payload.bin"
     tmpbc.write_bytes(bc)
     print(f"[2] 反编译 → {out}")
-    r = subprocess.run([sys.executable, str(HERE / "lift.py"),
-                        str(tmpbc), out], capture_output=True, text=True)
+    try:
+        r = subprocess.run([sys.executable, str(HERE / "lift.py"),
+                            str(tmpbc), out], capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        print("[✗] 反编译超时")
+        return 1
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
     print((r.stdout or "").strip()[-500:])
     if r.returncode != 0:
         print((r.stderr or "").strip()[-500:])

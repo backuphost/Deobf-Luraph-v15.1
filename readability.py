@@ -21,21 +21,23 @@ def load(p):
 
 
 def has_lua_syntax_ok(p):
-    """用 luau 跑一次，能过解析就算语法 OK"""
-    import subprocess
-    for cand in ("/var/minis/workspace/pkg_en/bin/luau.aarch64",
-                 "/var/minis/workspace/pkg_en/bin/luau"):
-        if Path(cand).is_file():
-            try:
-                r = subprocess.run([cand, str(p)], capture_output=True,
-                                   text=True, timeout=120)
-                err = (r.stderr or "") + (r.stdout or "")
-                if "Expected" in err and "when parsing" in err:
-                    return False, err.strip().split("\n")[0][:80]
-                return True, "解析通过"
-            except Exception as e:
-                return None, str(e)[:60]
-    return None, "无 luau"
+    """只编译不执行：把文件内容作为字符串交给 luau 的 loadstring，只看能不能编译，
+    编译出来的函数不调用（luasandbox.compile_only）。
+    （旧做法是包进 `if false then ... end` 再运行：文件里只要有 `end ... if false then`，
+    中间那段就会被执行。）
+    返回 (True/False/None, 说明)；None = 没有 luau，无法判断。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import luaubin
+    import luasandbox
+    luau = luaubin.find_luau()
+    if not luau:
+        return None, "无 luau"
+    try:
+        ok, msg = luasandbox.compile_only(luasandbox.strip_bom(Path(p).read_bytes()), luau, timeout=120,
+                                          chunk_name=Path(p).name.replace('"', "'")[:60] or "file")
+    except Exception as e:
+        return None, str(e)[:60]
+    return (True, "解析通过") if ok else (False, msg[:80])
 
 
 def analyze(path):

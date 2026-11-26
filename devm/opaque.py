@@ -563,6 +563,17 @@ def _fold_const_ifs(text):
 
         def ded(blk):
             return [x[1:] if x.startswith('\t') else x for x in blk]
+
+        def leaves(blk):
+            """The arm ends in return/break/continue while statements follow the `if`: without
+            the `if` around it the block would go on after its last statement (`return` followed
+            by a call even parses, as one statement that means something else)."""
+            own = [x for x in blk if x.startswith(ind + '\t') and not x.startswith(ind + '\t\t')
+                   and not re.match(r'\t*(?:[\]})]|end\b|until\b)', x)]
+            if not own or not re.match(r'\t*(?:return\b|break$|continue$)', own[-1]):
+                return False
+            rest = next((x for x in lines[end + 1:] if x.strip()), None)
+            return rest is not None and rest.startswith(ind)
         nxt = marks[0] if marks else end
         if g.group(2) == 'while':
             if truth:
@@ -570,10 +581,14 @@ def _fold_const_ifs(text):
             lines[i:end + 1] = []
         elif g.group(2) == 'if':
             if truth:
+                if leaves(lines[i + 1:nxt]):
+                    continue
                 lines[i:end + 1] = ded(lines[i + 1:nxt])
             elif not marks:
                 lines[i:end + 1] = []
             elif lines[nxt] == ind + 'else':
+                if leaves(lines[nxt + 1:end]):
+                    continue
                 lines[i:end + 1] = ded(lines[nxt + 1:end])
             else:
                 lines[i:nxt + 1] = [ind + 'if ' + lines[nxt][len(ind) + 7:]]

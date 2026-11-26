@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_bin.py —— 按需下载 luau / luau-ast 二进制
+fetch_bin.py —— 检查 luau / luau-ast 二进制；需要时从你指定的地址下载
 
-二进制不进 Git 仓库（体积大、和版本无关），改为首次运行时从
-GitHub Release 拉取，之后缓存在 bin/ 里。这样仓库只有 ~100 KB。
+二进制不进 Git 仓库。本仓库的做法是**本地构建**：
 
-用法:
-    python fetch_bin.py             # 下载当前架构所需二进制
-    python fetch_bin.py --check     # 只看现在有什么、缺什么
-    python fetch_bin.py --force     # 强制重新下载
-    python fetch_bin.py --url URL   # 用自定义源（镜像 / 自建服务器）
+    ./setup.sh              （或 python3 build_luau.py）
+
+构建出来的是打过补丁的 Luau 0.739（devm / deobf 两个引擎都依赖这些补丁），
+普通的官方 luau 不能代替它。
+
+This script does NOT touch the network unless you ask it to:
+
+    python fetch_bin.py                 # 检查 bin/ 里有什么；齐了就结束，缺了就告诉你怎么构建
+    python fetch_bin.py --check         # 同上，只是不给构建提示以外的任何输出
+    python fetch_bin.py --url URL       # 从 URL/<名字>.<架构> 下载缺失的二进制（你自己的镜像）
+    python fetch_bin.py --download      # 从默认的 GitHub Release 下载（见下）
+    python fetch_bin.py --force ...     # 配合 --url / --download：已有也重新下载
+    python fetch_bin.py --lifter-only   # 只下载形态 B 用的反编译器（Tovek luau-lifter，仅 aarch64）
 
 环境变量:
-    LUAU_BIN_URL     覆盖下载源前缀，默认 GitHub Release
-    LUAU_BIN_MIRROR  镜像前缀（内地用，如 https://ghproxy.net/）
+    LUAU_BIN_URL     等同 --url
+    LUAU_BIN_MIRROR  给默认 Release 地址加镜像前缀（如 https://ghproxy.net/）
 
-被 deob.py 自动调用，一般不用手动跑。
+About --download: the default address is the release v1.5.0 of sikon789/Deobf-Luraph-v15.1.
+That release does not exist for every copy of this repository (a fork has no releases), and
+what it held was a stock Luau without the patches, so this is no longer done automatically.
+Downloads use short timeouts and never hang: a failure prints how to build instead.
 """
 import os
 import sys
@@ -113,12 +123,22 @@ def try_system(name):
     return Path(found) if ok else None
 
 
+BUILD_HINT = ("本地构建：  ./setup.sh   （或 python3 build_luau.py；需要 git、cmake 和 C++ 编译器，几分钟）")
+
+
 def download(url, dest):
-    cmd = ["curl", "-fsSL", "--max-time", "300", "--retry", "2",
+    cmd = ["curl", "-fsSL", "--connect-timeout", "15", "--max-time", "120",
            "-o", str(dest), url]
     if not shutil.which("curl"):
-        cmd = ["wget", "-q", "-T", "300", "-O", str(dest), url]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+        if not shutil.which("wget"):
+            say("失败", "没有 curl 也没有 wget，无法下载")
+            return False
+        cmd = ["wget", "-q", "-T", "30", "-t", "1", "-O", str(dest), url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        say("失败", f"{url[:60]}…  超时")
+        return False
     if r.returncode != 0 or not dest.exists() or dest.stat().st_size < 1000:
         err = (r.stderr or r.stdout or "").strip().split("\n")[-1]
         say("失败", f"{url[:60]}…  {err[:80]}")
@@ -174,19 +194,7 @@ def fetch(name, force=False, custom_url=None):
         return str(sysb)
 
     say("失败", f"{name} 下载不到，本地也没有可用的")
-    print(f"""
-三个办法任选一个：
-
-  1) 换镜像手动下载
-     curl -L --max-time 300 -o bin/{name}.{suf} \\
-       https://ghproxy.net/https://github.com/{REPO}/releases/download/{TAG}/{asset}
-
-  2) 装官方包（有 apt / apk / brew 的环境）
-     astro add luau   （或从 https://github.com/luau-lang/luau/releases 取）
-
-  3) 自己编译（需要 clang + cmake）
-     python build_x86.py
-""", flush=True)
+    print("  " + BUILD_HINT, flush=True)
     return None
 
 
@@ -205,6 +213,9 @@ def ensure_lifter(force=False, custom_url=None):
         say("缓存", f"反编译器已就绪 → tools/luau-lifter（{lifter.stat().st_size:,} 字节）")
         return True
 
+    if arch_suffix() != "aarch64":
+        say("跳过", f"反编译器 luau-lifter 只有 aarch64 版本，当前是 {arch_suffix()}，不下载")
+        return False
     if not shutil.which("curl"):
         say("警告", "没有 curl，跳过反编译器获取")
         return False
@@ -224,9 +235,13 @@ def ensure_lifter(force=False, custom_url=None):
                      [t.format(repo=REPO, tag=TAG, name=asset) for t in DEFAULT_MIRRORS])
         for url in cands:
             say("下载", f"{asset}…")
-            r = subprocess.run(["curl", "-fsSL", "--max-time", "600",
-                                "--retry", "2", "-o", str(target), url],
-                               capture_output=True, text=True)
+            try:
+                r = subprocess.run(["curl", "-fsSL", "--connect-timeout", "15",
+                                    "--max-time", "300", "-o", str(target), url],
+                                   capture_output=True, text=True, timeout=330)
+            except subprocess.TimeoutExpired:
+                say("失败", "超时")
+                continue
             if r.returncode == 0 and target.exists() and target.stat().st_size > 50000:
                 got = True
                 break
@@ -262,36 +277,45 @@ def main():
     name_arg = [a for a in sys.argv[1:] if not a.startswith("-")]
     force = "--force" in sys.argv
     custom = None
+    skip = set()
     for i, a in enumerate(sys.argv):
         if a == "--url" and i + 1 < len(sys.argv):
             custom = sys.argv[i + 1]
+            skip.add(custom)
+    name_arg = [a for a in name_arg if a not in skip]
 
+    say("平台", f"{platform.machine()} → {arch_suffix()}")
     if "--lifter-only" in sys.argv:
-        say("平台", f"{platform.machine()} → {arch_suffix()}")
-        return 0 if ensure_lifter(force="--force" in sys.argv) else 1
+        return 0 if ensure_lifter(force=force, custom_url=custom) else 1
 
     targets = [name_arg[0]] if name_arg and name_arg[0] in ARTIFACTS else ARTIFACTS
 
-    if "--check" in sys.argv:
-        say("平台", f"{platform.machine()} → {arch_suffix()}")
-        missing = 0
-        for n in ARTIFACTS:
-            got = resolve(n)
-            if got:
-                ok, arch = check(got)
-                say("已有", f"{n}: {got}  {got.stat().st_size:,} 字节  {arch}")
-            else:
-                say("缺失", f"{n}: 需要 {n}.{arch_suffix()}")
-                missing += 1
-        return 0 if not missing else 1
-
-    say("平台", f"{platform.machine()} → {arch_suffix()}")
-    ok_all = True
+    # 先看本地：齐了就不碰网络
+    missing = []
     for n in targets:
+        got = resolve(n) or try_system(n)
+        if got and not force:
+            ok, arch = check(got)
+            say("已有", f"{n}: {got}  {Path(got).stat().st_size:,} 字节  {arch}")
+        else:
+            missing.append(n)
+            if not got:
+                say("缺失", f"{n}: bin/{n} 或 bin/{n}.{arch_suffix()} 不存在")
+    if not missing:
+        return 0
+
+    want_download = bool(custom or os.environ.get("LUAU_BIN_URL") or "--download" in sys.argv)
+    if "--check" in sys.argv or not want_download:
+        print("  " + BUILD_HINT, flush=True)
+        if "--check" not in sys.argv:
+            print("  （要从自己的镜像下载：python fetch_bin.py --url URL；"
+                  "默认 Release 地址见本文件开头的说明：--download）", flush=True)
+        return 1
+
+    ok_all = True
+    for n in missing:
         if not fetch(n, force=force, custom_url=custom):
             ok_all = False
-    if "--no-lifter" not in sys.argv:
-        ensure_lifter(force=force, custom_url=custom)
     return 0 if ok_all else 1
 
 

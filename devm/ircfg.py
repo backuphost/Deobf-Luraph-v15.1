@@ -9,11 +9,28 @@ import os
 import pickle
 CELLS = (1, 3)        # upvalue cell layout of the VM being lifted (set by the lifter)
 DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
+DEBUG_FOR = bool(os.environ.get('DEVM_DEBUG_FOR'))     # why a table-state loop was not turned into `for`
 
 
 # Undo state-machine control flow (see ProtoCFG._unflatten).  Scripts protected from source have
 # none in their payload, and there the pass only splits loops on the script's own boolean flags.
 UNFLATTEN = True
+# Keep the lifter's marks on branch arms the traced run never took (see structure.MARK_COLD).
+KEEP_COLD = False
+# Refinements that came with Luraph v15.2 support.  Off for v15.1 inputs, whose committed results
+# were made without them (tests/regress.py compares text for text); run.py switches them on.
+#  * table-state `for` loops as v15.2 writes them (ProtoCFG._recover_for_loops): the state table
+#    goes through a scratch register, a bound may be a call, the loop may be left by a jump inside
+#    an enclosing loop;
+#  * key checks are cut until none is left: cutting one often leaves the next test of the same
+#    flag alone in its block's only predecessor (ProtoCFG.__init__);
+#  * nothing follows a call of the tamper response (ProtoCFG._cut_after_traps).
+V152 = False
+# Functions that are Luraph's tamper response (set by structure.Decompiler, see
+# structure.loads_own_code), and per function the registers / upvalues that hold one (prepass).
+TRAP_PROTOS = set()
+TRAP_REFS = {}
+_TRAP_SCAN = {}
 
 
 class Block:
@@ -329,6 +346,8 @@ def prepass(protos):
     OPAQUE_UPS.clear()
     FUNCTION_UPS.clear()
     DROP_UPS.clear()
+    _TRAP_SCAN.clear()
+    TRAP_REFS.clear()
     PREPASS = True
     try:
         for key, pir in protos.items():
@@ -353,6 +372,33 @@ def prepass(protos):
                     used.add((k, j))
                     changed = True
     USED_UPS = (used, unknown, set(_UP_PLAIN))
+    if V152 and TRAP_PROTOS:
+        TRAP_REFS.update(_trap_refs())
+
+
+def _trap_refs():
+    """{function key: {('r', n) | ('up', i)}}: where each function keeps the tamper response.
+    A register counts when a closure of a tamper-response function is all it is ever assigned;
+    from there the value is followed into the upvalues of the functions that capture it.  If any
+    function assigns to such an upvalue the variable is not a constant, and nothing is claimed."""
+    refs = {k: {('r', n) for n in regs} for k, (regs, _, _) in _TRAP_SCAN.items()}
+    changed = True
+    while changed:
+        changed = False
+        for k, (_, closures, _) in _TRAP_SCAN.items():
+            have = refs.get(k)
+            if not have:
+                continue
+            for child, caps in closures:
+                for i, c in enumerate(caps):
+                    src = ('r', c[1]) if c[0] in ('ref', 'val') else ('up', c[1]) if c[0] == 'up' else None
+                    if src in have and ('up', i) not in refs.setdefault(child, set()):
+                        refs[child].add(('up', i))
+                        changed = True
+    for k, (_, _, upwrites) in _TRAP_SCAN.items():
+        if any(('up', i) in refs.get(k, ()) for i in upwrites):
+            return {}
+    return {k: v for k, v in refs.items() if v}
 
 
 def _up_used(child, n):
@@ -443,8 +489,18 @@ class ProtoCFG:
         self._detect_params()
         if PREPASS:
             self._scan_up_usage()
+            if V152 and TRAP_PROTOS:
+                self._scan_traps()
             return
-        self._cut_cold_magic()
+        if V152 and self._cut_after_traps():
+            self._thread()
+        if self._cut_cold_magic() and V152:
+            # `flag = key ~= 437829938; if flag then <tamper> end; x = ...; if flag then <tamper> end`:
+            # with the first test gone the second sits in the same block as the comparison
+            for _ in range(8):
+                self._thread()
+                if not self._cut_cold_magic():
+                    break
         if DROP_OPAQUE and self._cut_loop_entries():
             self._thread()
         if DROP_OPAQUE:
@@ -471,7 +527,7 @@ class ProtoCFG:
                 self._merge_tables()
             self._merge_conds()
             self._fold_regs()
-        if self._collapse_bool_diamonds():
+        if self._collapse_bool_diamonds() or V152:
             self._thread()
             self._dead_stores()
             self._fold_regs()
@@ -1545,8 +1601,9 @@ class ProtoCFG:
             if not (e[0] == 'bin' and e[1] in ('==', '~=')):
                 continue
             consts = [x[1] for x in (e[2], e[3]) if _isnum(x)]
-            if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != round(consts[0]):
-                continue
+            if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != consts[0] or abs(consts[0]) == float('inf') \
+                    or consts[0] != round(consts[0]):
+                continue        # (math.huge and nan are no opaque keys, and round() raises on them)
             other = e[3] if _isnum(e[2]) else e[2]
             n = pos        # (where the comparison is made: its operands may be reassigned after)
             proven = opaque(b, n, other)
@@ -1588,6 +1645,84 @@ class ProtoCFG:
                 if lose is None:
                     continue
             b.term = ('goto', arms[1] if lose == arms[0] else arms[0])
+            cut += 1
+        if cut:
+            self._prune()
+            self.compute_preds()
+        return cut
+
+    def _scan_traps(self):
+        """Facts for _trap_refs: the registers that only ever receive a closure of a tamper-response
+        function, the closures this function creates (with what they capture), and the upvalues
+        it assigns to."""
+        defs, closures, upwrites = {}, [], set()
+        self.compute_preds()
+        params = set(self.param_regs or ())
+        for b in self.blocks.values():
+            # (a function starts by copying registers nobody has written yet -- nil -- into the
+            # ones it is going to use: `R145 = R13`)
+            fresh = b.id == self.entry and not b.preds
+            written = set()
+            for st in b.stmts + [b.term]:
+                reads, writes = stmt_exprs(st)
+                for w in writes:
+                    if w[0] == 'r':
+                        d = st[2] if st[0] == 'set' else None
+                        if d is not None and d[0] == 'r' and fresh and d[1] not in written and d[1] not in params:
+                            d = ('k', None)
+                        defs.setdefault(w[1], []).append(d)
+                        written.add(w[1])
+                    elif w[0] in ('up', 'upcell'):
+                        upwrites.add(w[1])
+                for e in reads:
+                    for x in walk_expr(e, []) or ():
+                        if x[0] == 'closure':
+                            closures.append((x[1], x[2]))
+
+        def trap(d):
+            return d is not None and d[0] == 'closure' and d[1] in TRAP_PROTOS
+
+        def inert(d):       # (a value that cannot be called)
+            return d is not None and d[0] == 'k' and (d[1] is None or isinstance(d[1], (bool, int, float, str)))
+        regs = {n for n, ds in defs.items() if any(trap(d) for d in ds) and all(trap(d) or inert(d) for d in ds)}
+        _TRAP_SCAN[self.pir.key] = (regs, closures, upwrites)
+
+    def _cut_after_traps(self):
+        """Nothing follows a call of Luraph's tamper response: it overwrites the code of the VM
+        and does not come back, and what the instruction stream holds behind the call is a jump
+        to some unrelated place (into the body of a loop, back to the start of a block).  Read as
+        control flow those jumps tie the function into knots.  The plain shape
+        `if not ok then tamper() end` is left as it is; anywhere else the block ends at the call."""
+        refs = TRAP_REFS.get(self.pir.key)
+        if not refs:
+            return 0
+        blocks = self.blocks
+        self.compute_preds()
+        cut = 0
+        for b in list(blocks.values()):
+            hit = None
+            copies = {}         # register -> the upvalue it was loaded from, in this block
+            for i, st in enumerate(b.stmts):
+                if st[0] == 'callstmt' and st[1][0] == 'call' and not st[1][2] and st[1][3] is None:
+                    f = st[1][1]
+                    if f[0] == 'r' and f[1] in copies:
+                        f = copies[f[1]]
+                    if f in refs:
+                        hit = i
+                        break
+                for r in _writes_of(st):
+                    copies.pop(r, None)
+                if st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'up':
+                    copies[st[1][1]] = st[2]
+            if hit is None:
+                continue
+            if b.term[0] == 'goto' and len(b.preds) == 1 and hit == len(b.stmts) - 1:
+                pred = blocks[next(iter(b.preds))]
+                if pred.term[0] == 'br' and b.term[1] in pred.succs():
+                    continue
+            succs = b.succs()
+            b.stmts = b.stmts[:hit + 1] + [('trap', succs[0] if succs else None, 'call')]
+            b.term = ('ret', [], None)
             cut += 1
         if cut:
             self._prune()
@@ -1928,7 +2063,7 @@ class ProtoCFG:
                 continue
             if reg in keyregs:
                 equal = keyregs[reg] == c
-            elif c != round(c) and abs(c - round(c)) < 1e-6:
+            elif c == c and abs(c) != float('inf') and c != round(c) and abs(c - round(c)) < 1e-6:
                 equal = False
             else:
                 continue
@@ -1992,7 +2127,9 @@ class ProtoCFG:
 
         for c in cold:
             only = len(c.stmts) == 1 and c.term[0] == 'goto' and len(c.preds) == 1
-            c.stmts = [st for st in c.stmts if st[0] != 'cold']
+            # (KEEP_COLD: an arm that stays keeps its mark, for a comment in the output; an arm
+            # that is nothing but a jump -- an edge back to shared code -- has nothing to mark)
+            c.stmts = [st for st in c.stmts if st[0] != 'cold' or (KEEP_COLD and not only and len(c.preds) == 1)]
             if not only:
                 continue
             pred = blocks[next(iter(c.preds))]
@@ -2221,6 +2358,10 @@ class ProtoCFG:
         blocks = self.blocks
         self.compute_preds()
         done = 0
+
+        def why(hid, msg):
+            if DEBUG_FOR:
+                print('forloop', self.pir.key, hid, msg)
         for hid in sorted(blocks, key=repr):
             head = blocks.get(hid)
             if head is None or head.term[0] != 'br' or len(head.preds) < 2:
@@ -2242,6 +2383,8 @@ class ProtoCFG:
                     break
             if not ok or store is None:
                 continue
+            if DEBUG_FOR:
+                why(hid, 'candidate: store %r' % (store,))
             cond = sub(head.term[1])
             body, exit_ = head.term[2], head.term[3]
             while cond[0] == 'un' and cond[1] == 'not':
@@ -2254,20 +2397,25 @@ class ProtoCFG:
             if ival[2] != ('index', S, key) or step[0] != 'index' or step[1] != S or step[2][0] != 'k':
                 continue
             if not (cond[0] == 'or' and cond[1][0] == 'and' and cond[2][0] == 'and'):
+                why(hid, 'condition is not (a and b) or (c and d): %r' % (cond,))
                 continue
             A, G = cond[1][1], cond[1][2]
             nA, L = cond[2][1], cond[2][2]
             if A != ('bin', '<=', step, ('k', 0)) or nA != ('un', 'not', A):
+                why(hid, 'step test %r / %r' % (A, nA))
                 continue
             if not (G[0] == 'bin' and G[1] == '>=' and G[2] == ival and L == ('bin', '<=', ival, G[3])):
+                why(hid, 'limit tests %r / %r' % (G, L))
                 continue
             lim = G[3]
             if lim[0] != 'index' or lim[1] != S or lim[2][0] != 'k':
+                why(hid, 'limit %r' % (lim,))
                 continue
             s = S[1]
             ki, ks, kl = key[1], step[2][1], lim[2][1]
             ivars = [r for r, v in env.items() if v == ival]
             if not ivars or body == hid or exit_ == hid:
+                why(hid, 'no loop variable / degenerate')
                 continue
             # loop body: everything that reaches the head again
             inside = set()
@@ -2278,18 +2426,28 @@ class ProtoCFG:
                     continue
                 inside.add(x)
                 stack.extend(blocks[x].succs())
-            latches = {p for p in head.preds if p in inside}
-            entries = [p for p in head.preds if p not in inside]
-            if not latches or not entries or hid in entries:
-                continue
-            # registers the head computes besides the loop variable must be dead afterwards
+            S_ = ('r', s)
             live_in, _ = self.liveness()
-            others = set(env) - set(ivars)
-            if others & (set(live_in.get(body, ())) | set(live_in.get(exit_, ()))):
-                continue
-            # the state table: built at the end of every entry block
-            pushes = {}
-            for p in entries:
+
+            def first_value(start, step0):
+                if _isnum(start) and _isnum(step0):
+                    return ('k', start[1] + step0[1])
+                if start == ('k', 0):
+                    return step0
+                if V152 and start[0] == 'bin' and start[1] == '-' and start[3] == step0 and _isnum(step0):
+                    return start[2]         # the table holds `first - step`
+                return ('bin', '+', start, step0)
+
+            def plain_limit(limit):
+                if limit[0] == 'bin' and limit[1] == '+' and limit[3] == ('k', 0):
+                    return limit[2]
+                return limit
+
+            def push_at(p):
+                """The state table built at the end of block p, or None: (index of the statement
+                that defines S, items, the three bounds, indexes of the statements to delete,
+                statements to put in the table's place, whether the first bound already is the
+                loop's first value rather than `first - step`)."""
                 pb = blocks[p]
                 idx = None
                 for i in range(len(pb.stmts) - 1, -1, -1):
@@ -2297,10 +2455,30 @@ class ProtoCFG:
                         idx = i
                         break
                 if idx is None:
-                    break
+                    return None
                 st = pb.stmts[idx]
+                defidx, tmp, drop = idx, None, [idx]
+                if V152 and st[0] == 'set' and st[2][0] == 'r' and st[2][1] != s:
+                    # v15.2: `T = { ... }; <other set-up>; S = T` with a scratch register T
+                    tmp = st[2][1]
+                    j = None
+                    for i in range(idx - 1, -1, -1):
+                        if tmp in _writes_of(pb.stmts[i]):
+                            j = i
+                            break
+                    if j is None or tmp in live_in.get(hid, ()):
+                        why(hid, 'entry %r: scratch register %r is used by the loop' % (p, tmp))
+                        return None
+                    rest = pb.stmts[j + 1:idx] + pb.stmts[idx + 1:] + [pb.term]
+                    if any(tmp in [r for r, _ in _reads_of(x)] or tmp in _writes_of(x) for x in rest) \
+                            or any(s in _writes_of(x) for x in pb.stmts[j + 1:idx]):
+                        why(hid, 'entry %r: scratch register %r is used between table and loop' % (p, tmp))
+                        return None
+                    idx = j
+                    st = pb.stmts[idx]
+                    drop = [idx, defidx]
                 if not (st[0] == 'set' and st[2][0] == 'table' and not st[2][2]):
-                    break
+                    return None
                 items = {}
                 n = 0
                 for k, v in st[2][1]:
@@ -2310,28 +2488,73 @@ class ProtoCFG:
                     elif k[0] == 'k':
                         items[k[1]] = v
                 need = [items.get(ki, ('k', None)), items.get(kl, ('k', None)), items.get(ks, ('k', None))]
-                reads = set()
-                for e in need:
-                    reads |= expr_reads(e)[0]
-                    if expr_reads(e)[2]:
-                        reads = None
-                        break
-                if reads is None:
-                    break
-                later = pb.stmts[idx + 1:]
-                if any(set(_writes_of(x)) & reads for x in later) or pb.term[0] not in ('goto', 'br'):
-                    break
-                if any(expr_reads(e)[1] for e in need) and any(stmt_effects(x)[1] for x in later):
-                    break
-                pushes[p] = (idx, items, need)
+                later = [x for i, x in enumerate(pb.stmts) if i > idx and i != defidx]
+                if pb.term[0] not in ('goto', 'br'):
+                    return None
+                if not V152:
+                    reads = set()
+                    for e in need:
+                        reads |= expr_reads(e)[0]
+                        if expr_reads(e)[2]:
+                            return None
+                    if any(set(_writes_of(x)) & reads for x in later):
+                        return None
+                    if any(expr_reads(e)[1] for e in need) and any(stmt_effects(x)[1] for x in later):
+                        return None
+                    return defidx, items, need, drop, [], False
+                # v15.2: a bound can be a call (`for i = 1, f(x) do`), as long as moving it behind
+                # the other two cannot change what they read; and a bound whose registers the
+                # set-up statements after the table reuse is kept in a register of its own
+                heap = [any(x[0] in ('index', 'up', 'global', 'method', 'call') for x in walk_expr(e, [])) for e in need]
+                calls = [n for n, e in enumerate(need) if expr_reads(e)[2]]
+                if len(calls) > 1 or (calls and any(h for n, h in enumerate(heap) if n != calls[0])):
+                    why(hid, 'entry %r: bounds with calls that cannot be reordered: %r' % (p, need))
+                    return None
+                if any(expr_reads(v)[2] for k, v in items.items() if k not in (ki, kl, ks)):
+                    why(hid, 'entry %r: a call among the other slots' % (p,))
+                    return None
+                # (from here on the first of the three is the loop's first value, not `first - step`)
+                need = [first_value(need[0], need[2]), plain_limit(need[1]), need[2]]
+                held = [n for n, e in enumerate(need) if any(blocks_move(expr_reads(e), x) for x in later)]
+                keep = []
+                if held:
+                    # (evaluated where the table was built, each into a register of its own)
+                    if calls and calls[0] not in held:
+                        why(hid, 'entry %r: bounds %r cannot move behind the set-up that follows' % (p, held))
+                        return None
+                    need = list(need)
+                    for n in held:
+                        keep.append(('set', ('r', ('for', hid, p, n)), need[n]))
+                        need[n] = ('r', ('for', hid, p, n))
+                return defidx, items, need, drop, keep, True
+
+            found = {p: push_at(p) for p in head.preds}
+            if V152:
+                # (a loop left by a jump inside an enclosing loop: its set-up block is reached
+                # from its own body, so "comes from outside" does not tell entries from latches)
+                entries = [p for p in head.preds if p not in inside or found[p]]
+            else:
+                entries = [p for p in head.preds if p not in inside]
+            latches = {p for p in head.preds if p in inside and p not in entries}
+            if not latches or not entries or hid in entries:
+                why(hid, 'latches %r entries %r' % (latches, entries))
+                continue
+            # registers the head computes besides the loop variable must be dead afterwards
+            others = set(env) - set(ivars)
+            if others & (set(live_in.get(body, ())) | set(live_in.get(exit_, ()))):
+                why(hid, 'head registers live afterwards: %r' % (
+                    others & (set(live_in.get(body, ())) | set(live_in.get(exit_, ()))),))
+                continue
+            # the state table: built at the end of every entry block
+            pushes = {p: found[p] for p in entries if found[p]}
             if len(pushes) != len(entries):
+                why(hid, 'no state table at the end of entry %r' % ([p for p in entries if p not in pushes],))
                 continue
             # every other use of the table must read a slot of it (the pop `S = S[link]`, or the next
             # push taking over the link) or be the push of a nested loop, which stores S as its link
             order, IN = self._reaching()
-            mine = {(p, idx) for p, (idx, _, _) in pushes.items()}
+            mine = {(p, x[0]) for p, x in pushes.items()}
             first = next(iter(pushes.values()))[1]
-            S_ = ('r', s)
 
             def slot_reads(st):
                 """slots read as S[k] by a statement, or None if S is used in any other way."""
@@ -2357,6 +2580,7 @@ class ProtoCFG:
                     if s in reads and bid != hid and cur & mine:
                         slots = slot_reads(st)
                         if not cur <= mine:
+                            why(hid, 'block %r reads the state of this loop or of %r: %r' % (bid, sorted(cur - mine, key=repr), st))
                             bad = True
                         elif slots is not None and st[0] != 'setindex':
                             pops.append((bid, i, slots))
@@ -2364,7 +2588,13 @@ class ProtoCFG:
                                 and sum(1 for x in walk_expr(st[2], []) if x == S_) == 1 \
                                 and any(v == S_ for _, v in st[2][1]):
                             pass
+                        elif V152 and st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'table' \
+                                and sum(1 for x in walk_expr(st[2], []) if x == S_) == 1 \
+                                and any(v == S_ for _, v in st[2][1]) \
+                                and any(x == ('set', S_, st[1]) for x in b.stmts[i + 1:]):
+                            pass        # (the same push through a scratch register)
                         else:
+                            why(hid, 'state table used otherwise in block %r: %r' % (bid, st))
                             bad = True
                     if s in _writes_of(st):
                         cur = frozenset([(bid, i)])
@@ -2376,12 +2606,14 @@ class ProtoCFG:
             link = {}
             for _, _, slots in pops:
                 for k in slots:
-                    vals = {repr(items.get(k, ('k', None))) for _, items, _ in pushes.values()}
+                    vals = {repr(x[1].get(k, ('k', None))) for x in pushes.values()}
                     v = first.get(k, ('k', None))
                     if len(vals) != 1 or not (v[0] == 'k' or v == S_ or (v[0] == 'index' and v[1] == S_ and v[2][0] == 'k')):
                         bad = True
                     link[k] = v
             if bad:
+                why(hid, 'slots read after the loop differ between entries or are not simple: %r; pushes %r' % (
+                    pops, [(p, x[1]) for p, x in pushes.items()]))
                 continue
             # ---- rewrite
             for bid, i, slots in pops:
@@ -2394,18 +2626,17 @@ class ProtoCFG:
                 else:
                     blocks[bid].stmts[i] = map_stmt(blocks[bid].stmts[i], fix)
             ivar = ivars[0]
-            for n, (p, (idx, items, need)) in enumerate(sorted(pushes.items(), key=repr)):
+            for n, (p, (_, items, need, drop, keep, ready)) in enumerate(sorted(pushes.items(), key=repr)):
                 pb = blocks[p]
-                del pb.stmts[idx]
+                if keep:
+                    names = {st[1][1]: self._fresh_reg() for st in keep}
+                    keep = [('set', ('r', names[st[1][1]]), st[2]) for st in keep]
+                    need = [('r', names[e[1]]) if e[0] == 'r' and e[1] in names else e for e in need]
+                pb.stmts = [x for i, x in enumerate(pb.stmts) if i not in drop[1:]]
+                pb.stmts[drop[0]:drop[0] + 1] = keep
                 start, limit, step0 = need
-                if _isnum(start) and _isnum(step0):
-                    init = ('k', start[1] + step0[1])
-                elif start == ('k', 0):
-                    init = step0
-                else:
-                    init = ('bin', '+', start, step0)
-                if limit[0] == 'bin' and limit[1] == '+' and limit[3] == ('k', 0):
-                    limit = limit[2]
+                init = start if ready else first_value(start, step0)
+                limit = plain_limit(limit)
                 pre = Block((hid, 'for', n))
                 pre.stmts = [('numforprep', [init, limit, step0])]
                 pre.term = ('goto', hid)
@@ -2424,6 +2655,29 @@ class ProtoCFG:
             self.compute_preds()
             done += 1
         return done
+
+    def _fresh_reg(self):
+        """A register number no instruction of this function uses."""
+        n = getattr(self, '_next_reg', None)
+        if n is None:
+            n = 0
+
+            def scan(x):
+                nonlocal n
+                if isinstance(x, tuple) and len(x) == 2 and x[0] in ('r', 'ref', 'val') and isinstance(x[1], int) \
+                        and not isinstance(x[1], bool):
+                    n = max(n, x[1])
+                elif isinstance(x, (tuple, list)):
+                    for y in x:
+                        scan(y)
+            for b in self.blocks.values():
+                scan(b.stmts)
+                scan(b.term)
+                if b.term[0] == 'forbr':
+                    n = max([n] + [v for v in b.term[2] if isinstance(v, int)])
+            n = max([n] + [r for r in (self.param_regs or ()) if isinstance(r, int)]) + 1
+        self._next_reg = n + 1
+        return n
 
     def _open_upcells(self):
         """cell[1][cell[3]] (an upvalue cell opened by generic table instructions) -> the upvalue."""

@@ -90,16 +90,20 @@ class SrcPrinter:
         self.level -= 1
 
     def stmt(self, st):
+        def semi(text):
+            # a statement that starts with a parenthesis would continue the line before it
+            # (`f()` newline `(g or h)()` is one call chain to the parser)
+            return ';' + text if text.startswith('(') else text
         t = st[0]
         E = self.expr
         if t == 'local':
             self.emit('local ' + ', '.join(st[1]) + (' = ' + ', '.join(E(e) for e in st[2]) if st[2] else ''))
         elif t == 'assign':
-            self.emit(', '.join(E(e) for e in st[1]) + ' = ' + ', '.join(E(e) for e in st[2]))
+            self.emit(semi(', '.join(E(e) for e in st[1]) + ' = ' + ', '.join(E(e) for e in st[2])))
         elif t == 'opassign':
-            self.emit('%s %s= %s' % (E(st[2]), st[1], E(st[3])))
+            self.emit(semi('%s %s= %s' % (E(st[2]), st[1], E(st[3]))))
         elif t == 'callstmt':
-            self.emit(E(st[1]))
+            self.emit(semi(E(st[1])))
         elif t == 'do':
             self.emit('do'); self.block(st[1]); self.emit('end')
         elif t == 'while':
@@ -162,6 +166,11 @@ def native_shape(func, underscore_is_name=False):
 def native_closure_text(func, upnames, level, cells=(1, 3), base=0):
     """Source of the inner function with upvalue-cell accesses replaced by the captured names."""
     shape = native_shape(func)
+    if shape is None and not func.params and len(func.body) == 1 and func.body[0][0] == 'return' \
+            and len(func.body[0][1]) == 1 and func.body[0][1][0][0] == 'func':
+        # a wrapper without parameters, `function() return function(...) ... end end`: a function
+        # that captures nothing (examples/layer3.lua keeps its first plain-Lua function this way)
+        shape = (None, {}, func.body[0][1][0][1])
     if shape is None:
         return None
     up, alias, inner = shape

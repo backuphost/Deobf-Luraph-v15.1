@@ -1,7 +1,34 @@
 #!/usr/bin/env python3
-"""Lua/Luau 语义重命名：单遍作用域解析（支持同名重复声明）+ 按初始化表达式推导名字。"""
+"""Lua/Luau 语义重命名：按初始化表达式推导名字（derive）。
+
+Two parts live here:
+
+  derive / sanitize / BAD_BASE   the ORIGINAL naming rules ("what to call a local, given the
+                                 first tokens of the expression it is initialised with").
+                                 libs/luascope.py (what deob.py renames with) still uses
+                                 sanitize and BAD_BASE, and derive for function expressions
+                                 only: derive names a value after the FIRST name chain of the
+                                 expression (`game:GetService("X"):JSONDecode(s)` -> GetService),
+                                 so every other kind of value is now named from its syntax
+                                 tree by libs/luanames.py.
+  rename(toks)                   the ORIGINAL renamer: it guesses scopes from the token stream
+                                 in one pass.  The guess is wrong for `for` loops (the loop
+                                 scope is never closed), for `a, b = ...` (b is not renamed)
+                                 and for `function name()` statements, so a renamed use can
+                                 end up bound to another variable or to a global.  It is kept
+                                 only for callers of the old name; nothing in the tool uses it.
+
+    python libs/readable3.py in.lua out.lua      # renames with luascope (exact scopes, checked)
+"""
 import sys
-from beautify2 import tokenize, build_tokens
+from pathlib import Path
+
+_LIBS = Path(__file__).resolve().parent
+for _p in (str(_LIBS), str(_LIBS.parent)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from beautify2 import tokenize, build_tokens     # noqa: E402
 
 RESERVED = {
     'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function',
@@ -481,9 +508,32 @@ def v_name(toks, idx):
 
 
 if __name__ == '__main__':
-    src = open(sys.argv[1]).read()
-    toks = tokenize(src)
-    new = rename(toks)
-    txt = build_tokens(new)
-    open(sys.argv[2], 'w').write(txt + '\n')
-    print('tokens', len(toks), 'out', len(txt))
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+    import deobf_plus as dp
+    import luascope
+    import luaubin
+    src = dp.read_lua(sys.argv[1])
+    ast_bin = luaubin.find_luau_ast()
+    if not ast_bin:
+        print('luau-ast not found: ' + luaubin.MISSING_HINT)
+        sys.exit(3)
+    root, errors = luascope.parse(src, ast_bin)
+    if errors:
+        print('syntax error in the input, nothing written: ' + errors[0])
+        sys.exit(2)
+    ptoks = dp.tokenize_pos(src)
+    ren = luascope.Renamer(luascope.Analysis(root, luascope.LineIndex(src), ptoks))
+    lay = {}
+    txt, ok = dp.format_checked(ren.apply(ptoks), info=lay)
+    if lay.get('fallback'):
+        print('note: the indented layout failed its token check (%s); plain layout used'
+              % str(lay.get('reason'))[:120])
+    root2, errors2 = luascope.parse(txt, ast_bin)
+    same, why = (False, errors2[0]) if errors2 else luascope.alpha_equal(root, root2)
+    if not (ok and same):
+        print('rename failed its check, nothing written: ' + why)
+        sys.exit(3)
+    Path(sys.argv[2]).write_bytes((txt + '\n').encode('utf-8', errors='surrogateescape'))
+    print('tokens', len(ptoks), 'locals renamed', ren.renamed, 'out', len(txt), 'bytes; binding check ok')

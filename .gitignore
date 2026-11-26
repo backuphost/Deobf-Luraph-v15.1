@@ -25,3 +25,13 @@ output.lua
 # 系统
 .DS_Store
 Thumbs.db
+
+# deobf engine (imported from luraph-v15.2-deobf)
+deobf/bin/luau
+deobf/bin/luau-ast
+deobf/bin/*.exe
+.build/
+output/
+*.harness.luau
+_*_harness.luau
+.devm/

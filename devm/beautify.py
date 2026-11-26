@@ -158,6 +158,113 @@ def and_or(block):
         i += 1
 
 
+# Two more rewrites, written for Luraph v15.2 output (register set-up that both arms of an `if`
+# repeat, and the `x = c or E` diamond).  Off by default: the committed v15.1 results are compared
+# text for text by tests/regress.py; run.py switches them on for the v15.2 generation.
+MERGE_ARMS = False
+
+
+def _mentions(node, name):
+    """Does the variable occur anywhere in the fragment: read, written, captured, loop variable?
+    (A string constant that happens to spell the name counts too: the answer errs towards yes.)"""
+    if isinstance(node, str):
+        return node == name
+    if isinstance(node, (list, tuple)):
+        return any(_mentions(x, name) for x in node)
+    return False
+
+
+def _escapes(block):
+    """break / continue / return anywhere inside: what follows the block is then not always reached"""
+    for st in block:
+        if st[0] in ('break', 'continue', 'return', 'goto'):
+            return True
+        for x in st[1:]:
+            if isinstance(x, list) and x and isinstance(x[0], list) and _escapes(x):
+                return True
+    return False
+
+
+def _plain_cond(c):
+    return c[0] in ('r', 'k') or c[0] == 'un' and c[1] == 'not' and c[2][0] in ('r', 'k')
+
+
+def sink_common(block, caps):
+    """`if c then x = K; A else x = K; B end`  ->  `if c then A else B end; x = K`
+
+    for a variable that neither arm uses otherwise and a value that neither arm changes (a constant
+    or another variable): set-up both paths share, moved next to the statement that uses it.
+    `caps`: variables some closure captured (a call in an arm could read or write those)."""
+    for st in block:
+        for b in sub_blocks(st):
+            sink_common(b, caps)
+    i = 0
+    while i < len(block):
+        st = block[i]
+        i += 1
+        if st[0] != 'if' or not st[2] or not st[3] or _escapes(st[2]) or _escapes(st[3]):
+            continue
+        moved = []
+        for s in list(st[2]):
+            if not (s[0] == 'assign' and len(s) == 3 and len(s[1]) == 1 and s[1][0][0] == 'r'
+                    and len(s[2]) == 1 and s[2][0][0] in ('k', 'r')):
+                continue
+            x, v = s[1][0][1], s[2][0]
+            if caps.get(x) or v[0] == 'r' and (v[1] == x or caps.get(v[1])):
+                continue
+            if sum(1 for o in st[2] if o == s) != 1 or sum(1 for o in st[3] if o == s) != 1:
+                continue
+            rest = [o for o in st[2] if o != s] + [o for o in st[3] if o != s]
+            if _mentions(rest, x):
+                continue
+            if v[0] == 'r' and v in _targets(rest, set()):
+                continue
+            if len(st[2]) == 1 and len(st[3]) == 1 and not _plain_cond(st[1]):
+                continue        # (the test would be left with nothing to guard: keep it as it is)
+            st[2] = [o for o in st[2] if o != s]
+            st[3] = [o for o in st[3] if o != s]
+            moved.append(s)
+        if not moved:
+            continue
+        at = i          # (the statement after the `if`)
+        if not st[2] and not st[3]:
+            del block[i - 1]
+            at = i - 1
+        elif not st[2]:
+            c = st[1]
+            st[1] = c[2] if c[0] == 'un' and c[1] == 'not' else ('un', 'not', c)
+            st[2], st[3] = st[3], None
+        elif not st[3]:
+            st[3] = None
+        block[at:at] = moved
+        i = at + len(moved)
+
+
+def copy_diamonds(block):
+    """`if c then x = c else x = E end` -> `x = c or E`;  `if c then x = E else x = c end` ->
+    `x = c and E`  (c a plain variable; with `not c` the arms change places).  Exact: the variable
+    is read once more at most, which nothing can observe."""
+    for st in block:
+        for b in sub_blocks(st):
+            copy_diamonds(b)
+    for i, st in enumerate(block):
+        if st[0] != 'if' or not st[3] or len(st[2]) != 1 or len(st[3]) != 1:
+            continue
+        c, T, F = st[1], st[2][0], st[3][0]
+        if c[0] == 'un' and c[1] == 'not':
+            c, T, F = c[2], F, T
+        if c[0] != 'r' or not (T[0] == 'assign' and len(T) == 3 and len(T[1]) == 1 and T[1][0][0] == 'r' and len(T[2]) == 1):
+            continue
+        x = T[1][0]
+        if not (is_assign_to(F, x[1]) and len(F) == 3):
+            continue
+        a, b = T[2][0], F[2][0]
+        if a == c and b[0] not in ('closure', 'mvall'):
+            block[i] = ['assign', [x], [('or', c, b)]]
+        elif b == c and a[0] not in ('closure', 'mvall'):
+            block[i] = ['assign', [x], [('and', c, a)]]
+
+
 def flip_negated(block):
     for st in block:
         for b in sub_blocks(st):
@@ -498,6 +605,9 @@ def beautify(ast):
     fold_packs(ast)
     strip_tail_returns(ast)
     nil_vars(ast)
+    if MERGE_ARMS:
+        sink_common(ast, Counts(ast).caps)
+        copy_diamonds(ast)
     and_or(ast)
     inline_single_use(ast)
     and_or(ast)

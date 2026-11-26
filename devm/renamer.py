@@ -296,7 +296,8 @@ def _pass(text):
             if item is None:
                 m2 = re.search(r'(?:^|\.)(%s)$' % ID, src)
                 if m2 and not re.fullmatch(GEN, m2.group(1)):
-                    item = singular(camel(m2.group(1)))
+                    base = camel(m2.group(1))       # (None for a name that is not usable as one)
+                    item = singular(base) if base else None
             if item is None and kind == 'ipairs':
                 item = 'item'
             if re.fullmatch(r'value\d*', v) or re.fullmatch(GEN, v):

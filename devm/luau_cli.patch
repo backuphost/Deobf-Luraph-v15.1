@@ -1,8 +1,8 @@
 diff --git a/CLI/src/Repl.cpp b/CLI/src/Repl.cpp
-index cd877d1..b5d17e2 100644
+index cd877d1..7ffb70a 100644
 --- a/CLI/src/Repl.cpp
 +++ b/CLI/src/Repl.cpp
-@@ -117,6 +117,157 @@ static int lua_loadstring(lua_State* L)
+@@ -117,6 +117,215 @@ static int lua_loadstring(lua_State* L)
      return 2;          // return nil plus error message
  }
  
@@ -157,10 +157,68 @@ index cd877d1..b5d17e2 100644
 +    return 1;
 +}
 +
++// devm: natives behind the executor API that harness.lua offers to scripts in executor mode
++// (getrawmetatable / setrawmetatable look behind __metatable, setreadonly / isreadonly reach the
++// table flag that table.freeze sets).  Handed out as the table __LPH_NATIVE, not as globals.
++static int lua_getrawmetatable_(lua_State* L)
++{
++    luaL_checkany(L, 1);
++    if (!lua_getmetatable(L, 1))
++        lua_pushnil(L);
++    return 1;
++}
++
++static int lua_setrawmetatable_(lua_State* L)
++{
++    luaL_checkany(L, 1);
++    int t = lua_type(L, 2);
++    luaL_argexpected(L, t == LUA_TNIL || t == LUA_TTABLE, 2, "nil or table");
++    lua_settop(L, 2);
++    if (lua_istable(L, 1) && lua_getreadonly(L, 1))
++    {
++        lua_setreadonly(L, 1, false);
++        lua_setmetatable(L, 1);
++        lua_setreadonly(L, 1, true);
++    }
++    else
++        lua_setmetatable(L, 1);
++    lua_settop(L, 1);
++    return 1;
++}
++
++static int lua_setreadonly_(lua_State* L)
++{
++    luaL_checktype(L, 1, LUA_TTABLE);
++    luaL_checktype(L, 2, LUA_TBOOLEAN);
++    lua_setreadonly(L, 1, lua_toboolean(L, 2));
++    return 0;
++}
++
++static int lua_isreadonly_(lua_State* L)
++{
++    luaL_checktype(L, 1, LUA_TTABLE);
++    lua_pushboolean(L, lua_getreadonly(L, 1));
++    return 1;
++}
++
++// devm: clonefunction for a Lua closure: a new closure of the same prototype with the same upvalues
++// (not equal to the original, same behaviour, same debug.info).  nil for a C function.
++static int lua_clonefunction_(lua_State* L)
++{
++    luaL_checktype(L, 1, LUA_TFUNCTION);
++    if (lua_iscfunction(L, 1))
++    {
++        lua_pushnil(L);
++        return 1;
++    }
++    lua_clonefunction(L, 1);
++    return 1;
++}
++
  static int lua_collectgarbage(lua_State* L)
  {
      const char* option = luaL_optstring(L, 1, "collect");
-@@ -215,6 +366,13 @@ void setupState(lua_State* L)
+@@ -215,6 +424,13 @@ void setupState(lua_State* L)
      static const luaL_Reg funcs[] = {
          {"loadstring", lua_loadstring},
          {"collectgarbage", lua_collectgarbage},
@@ -174,7 +232,26 @@ index cd877d1..b5d17e2 100644
  #ifdef CALLGRIND
          {"callgrind", lua_callgrind},
  #endif
-@@ -630,6 +788,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
+@@ -225,6 +441,18 @@ void setupState(lua_State* L)
+     luaL_register(L, NULL, funcs);
+     lua_pop(L, 1);
+ 
++    static const luaL_Reg natives[] = {
++        {"getrawmetatable", lua_getrawmetatable_},
++        {"setrawmetatable", lua_setrawmetatable_},
++        {"setreadonly", lua_setreadonly_},
++        {"isreadonly", lua_isreadonly_},
++        {"clonefunction", lua_clonefunction_},
++        {NULL, NULL},
++    };
++    lua_newtable(L);
++    luaL_register(L, NULL, natives);
++    lua_setglobal(L, "__LPH_NATIVE");
++
+     luaopen_require(L, requireConfigInit, createCliRequireContext(L));
+ 
+     luaL_sandbox(L);
+@@ -630,6 +858,47 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
  
          setupArguments(L, program_argc, program_argv);
          status = lua_resume(L, NULL, program_argc);
