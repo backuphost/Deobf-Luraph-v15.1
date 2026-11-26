@@ -111,7 +111,8 @@ def solve(target, outdir, arg_files=(), call_result=True, timeout=300, say=print
     """Run the target and write what it loads / decodes into outdir.
 
     Returns a dict:
-      'chunks'   [{'n', 'path', 'size', 'name' (None: none given), 'args': [{'k', 'kind', 'path', 'size'}]}]
+      'chunks'   [{'n', 'path', 'size', 'name' (None: none given), 'args': [{'k', 'kind', 'path', 'size'}],
+                   'compiles' (False: Luau refused the text; it was recorded all the same)}]
       'blobs'    [{'i', 'path', 'size', 'kind', 'layer': path or None}]
       'error'    first line of the run-time error that ended the run, or None
       'prelude'  None, or {'bytes': n, 'ok': bool} for text in front of the Luraph header
@@ -127,7 +128,7 @@ def solve(target, outdir, arg_files=(), call_result=True, timeout=300, say=print
     if m:
         res['prelude'] = {'bytes': int(m.group(1)), 'ok': m.group(2) == 'true',
                           'error': m.group(3)}
-        say('    前导代码 %s 字节（Luraph 头注释之前）：%s' % (
+        say('    前导代码 %s 字节（受保护的程序之前）：%s' % (
             m.group(1), '已执行' if m.group(2) == 'true' else '执行失败，已跳过：' + (m.group(3) or '')[:90]))
     m = re.search(r'^\[RUNERR\] (.+)', txt, re.M)
     if m:
@@ -143,6 +144,8 @@ def solve(target, outdir, arg_files=(), call_result=True, timeout=300, say=print
         args.setdefault(int(n), {})[int(k)] = kind
     arghex = {(int(n), int(k)): h
               for n, k, h in re.findall(r'^\[ARGHEX (\d+)\.(\d+)\] ([0-9a-f]*)', txt, re.M)}
+    # chunks Luau refused to compile (a build for another Lua): recorded all the same
+    loadfail = {int(n) for n in re.findall(r'^\[LOADFAIL (\d+)\] ', txt, re.M)}
     for n, hexs in re.findall(r'^\[LOADHEX (\d+)\] ([0-9a-f]*)', txt, re.M):
         n = int(n)
         data = bytes.fromhex(hexs)
@@ -153,7 +156,8 @@ def solve(target, outdir, arg_files=(), call_result=True, timeout=300, say=print
         if name is not None:
             with open(os.path.join(outdir, f'chunk{n}.name.txt'), 'wb') as fh:
                 fh.write(name.encode('latin-1'))
-        entry = {'n': n, 'path': path, 'size': len(data), 'name': name, 'args': []}
+        entry = {'n': n, 'path': path, 'size': len(data), 'name': name, 'args': [],
+                 'compiles': n not in loadfail}
         for k, kind in sorted(args.get(n, {}).items()):
             a = {'k': k, 'kind': kind, 'path': None, 'size': 0}
             if (n, k) in arghex:

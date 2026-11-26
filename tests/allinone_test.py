@@ -39,8 +39,9 @@ def deob(*args, timeout=600):
 
 
 def parses(path):
-    out = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors="replace").stdout
-    return "Parse errors" not in out[:4000]
+    # luau-ast reports a syntax error on stderr and by its exit status, not on stdout
+    r = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors="replace")
+    return r.returncode == 0 and "Parse errors" not in (r.stderr[:4000] + r.stdout[:4000])
 
 
 class FakeScan:

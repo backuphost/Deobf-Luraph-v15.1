@@ -32,7 +32,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 LUAU_AST = os.path.join(ROOT, "bin", "luau-ast")
 
-RC_NAMES = {0: "complete", 6: "partial", 4: "vm, no result", 3: "syntax check failed", 2: "not recognised",
+RC_NAMES = {0: "complete", 6: "partial", 4: "vm, no result", 3: "syntax check failed", 2: "not Luraph / not recognised",
+            8: "Luraph, cannot be processed (damaged / other Lua)",
             1: "error", 5: "wrong binary", 7: "form C harness", None: "timeout"}
 
 
@@ -67,7 +68,8 @@ def parses(path):
         r = subprocess.run([LUAU_AST, path], capture_output=True, text=True, errors="replace", timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return "Parse errors" not in r.stdout[:4000]
+    # luau-ast reports a syntax error on stderr and by its exit status, not on stdout
+    return r.returncode == 0 and "Parse errors" not in (r.stderr[:4000] + r.stdout[:4000])
 
 
 def one(path, engine, timeout, keep):
