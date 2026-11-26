@@ -1,41 +1,61 @@
 """Does a recovered script do what the protected file does?
 
-    python3 -m devm.diffcheck ORIGINAL RESULT [--work DIR] [--timeout S] [--json]
+    python3 -m devm.diffcheck ORIGINAL RESULT [--work DIR] [--timeout S] [--max-events N] [--no-executor] [--json]
 
 Runs the protected file and the recovered script in the same mock environment (harness.lua and
-rbxmock.lua, through the recording front end diffcheck.lua; nothing is sent anywhere, a request
-gets an empty reply) and compares what each one does there: the ordered calls into the
+rbxmock.lua, unchanged, through the recording front end diffcheck.lua; nothing is sent anywhere,
+a request gets an empty reply) and compares what each one does there: the ordered calls into the
 environment with their arguments, property writes on mock objects, the globals each leaves
 behind and how each run ends.
 
 Exit status: 0 same, 1 different (the first divergence is printed with context), 2 not
 comparable (the reason is printed).  "Same" is a statement about ONE run in ONE mock environment:
 code the run did not reach is not compared, and neither is anything a server's reply would
-trigger.  The report says how far the comparison went.
+trigger.  The report says how far the comparison went ("the same N calls, both return", "same
+for the first N calls; both runs were still going at their limit", ...).
+
+What is recorded.  Every call of a function the mock gives a script (Roblox API, executor
+functions, print / warn, loadstring, task.*), calls of members the mock does not model, and
+property writes.  Arguments: strings and numbers by value, tables by content (three levels),
+functions, instances and other objects by kind and order of first appearance, never by address.
+Not compared: calls of getfenv / setfenv / type / typeof, which Luraph's interpreter makes on its
+own while the script runs.
 
 How the two logs are lined up.  A protected file runs Luraph's own start-up code first, which
-probes the environment (getfenv, type, task.*, Instance.new, a GUI layout, ...); the recovered
-script has none of that.  The result's log must equal one contiguous stretch of the original's
-log, and when both runs ended, the stretch must reach the original's end.  The calls of the
-original in front of it are the start-up; they are only accepted as such when every one of them
-is of a kind Luraph's start-up makes (PROBE_CALLS).  A print, a request or a call of anything
-else in front of the result's first call is reported as a difference.  This is a rule of thumb
-with one known hole: a result that lacks its script's first calls is not noticed when those
-calls are themselves of the probe kinds (say a leading `task.wait()`).  The report names how
-many calls were skipped and of which kinds.
+probes the environment; the recovered script has none of that.  The result's log must equal one
+contiguous stretch of the original's log, and when both runs ended, the stretch must reach the
+original's end.  The calls of the original in front of it are accepted as start-up only when
+every one of them is of a kind the start-up makes (_is_probe): it computes with values, makes
+objects of its own and works on those, uses the scheduler and loadstring, calls methods without
+their object to see the error, and asks one of three services a question.  A print, a request,
+an executor call, a write to an object that was there before, game:GetService("Players") in
+front of the result's first call is reported as a difference.  This is a rule of thumb with one
+known hole: a result that lacks its script's first calls is not noticed when those calls are
+themselves of the start-up kinds (say a leading `task.wait()`).  The report names how many
+calls were skipped and of which kinds.
 
-Time and chance.  The front end replaces the clock by a counter and seeds math.random; both
-depend on a "salt".  When the first comparison (salt 1) finds a difference, both files are run
-again with salt 2: an argument that differs between the two runs of the same file depends on
-time or chance and is not compared.
+Time and chance.  The front end replaces the clock by a counter (a wait advances it) and seeds
+math.random; both depend on a "salt".  When the first comparison (salt 1) finds a difference,
+both files are run again with salt 2: an argument that differs between the two runs of the same
+file depends on time or chance and is not compared.
 
 Error positions.  `sample:61:` in front of a message names chunk and line; they differ between a
 VM and plain code and are left out of the comparison, in the error a run stops with and inside
 string arguments (a script that prints an error it caught).
 
+Method calls on nothing.  For `obj:Method(args)` Luau evaluates the arguments and then looks the
+method up; Luraph's interpreter (Lua 5.1 order) looks it up first.  When obj is nil the same
+source therefore makes the argument calls only in the result.  That is accepted when the result
+stops on the line of that call with the same error and the extra calls only make values.
+
 Partial results (LIFT ERROR markers, __LPH_ENV, ARG_n / REG_n / UPVAL_n placeholders) usually
-stop early.  They are compared as far as they run; "same up to call N, then the result stops"
-is reported as not comparable beyond that point (exit 2), never as same.
+stop early.  They are compared as far as they run; "same up to call N of M, then the result
+ends / reads the placeholder REG_3" is reported as not comparable beyond that point (exit 2),
+never as same.  A call that differs before that point is a difference (exit 1).
+
+Limits.  Both runs get the same time limit (45 % of --timeout per round) and a cap on the number
+of calls (--max-events for the result, four times that for the original, whose start-up comes
+first); there is no instruction count for a file that runs as it is.
 """
 import argparse
 import collections
