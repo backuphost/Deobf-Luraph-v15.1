@@ -456,7 +456,7 @@ def lua_unpack(fmt, data):
     out = []
     pos = 0
     i = 0
-    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 8, 'J': 8, 'T': 8}
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 4, 'J': 4, 'T': 4}     # (Luau: j, J and T are 4 bytes)
     while i < len(fmt):
         c = fmt[i]
         i += 1
@@ -496,7 +496,7 @@ def lua_unpack(fmt, data):
 
 def lua_packsize(fmt):
     """string.packsize for the fixed-size formats lua_unpack reads; None when not supported."""
-    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 8, 'J': 8, 'T': 8, 'f': 4, 'd': 8, 'n': 8, 'x': 1}
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 4, 'J': 4, 'T': 4, 'f': 4, 'd': 8, 'n': 8, 'x': 1}
     total = 0
     i = 0
     while i < len(fmt):
@@ -1983,18 +1983,30 @@ class PE:
         return []
 
     def unpack_order(self, func, args, nums):
-        """(start, stop) for the VM's unpack-like helper, from `p = p or 1` in its body."""
-        start_param = None
-        for st in func.body:
-            if st[0] == 'assign' and st[1][0][0] == 'name' and _unparen(st[2][0])[0] == 'bin' and _unparen(st[2][0])[1] == 'or' \
-                    and _unparen(st[2][0])[3] == ('num', 1):
-                start_param = st[1][0][1]
-        if start_param in func.params:
-            i = func.params.index(start_param)
-            if i < len(args) and args[i] is not REGS:
-                a = args[i]
-                b = [x for j, x in enumerate(args) if j != i and x is not REGS][0]
-                return a, b
+        """(start, stop) for the VM's unpack-like helper, from `p = p or 1` (the start) or
+        `p = p or #t` (the stop) in its body, wherever in the body that default is set (v14.0.x
+        flattens the helper into a state machine)."""
+        found = {}
+
+        def scan(block):
+            for st in block:
+                if st[0] == 'assign' and len(st[1]) == 1 and len(st[2]) == 1 and st[1][0][0] == 'name':
+                    e = _unparen(st[2][0])
+                    if e[0] == 'bin' and e[1] == 'or' and _unparen(e[2]) == st[1][0]:
+                        d = _unparen(e[3])
+                        if d == ('num', 1):
+                            found.setdefault('start', st[1][0][1])
+                        elif d[0] == 'un' and d[1] == '#':
+                            found.setdefault('stop', st[1][0][1])
+                for b in subblocks(st):
+                    scan(b)
+        scan(func.body)
+        for which in ('start', 'stop'):
+            if found.get(which) in func.params:
+                i = func.params.index(found[which])
+                if i < len(args) and args[i] is not REGS:
+                    other = [x for j, x in enumerate(args) if j != i and x is not REGS][0]
+                    return (args[i], other) if which == 'start' else (other, args[i])
         if isinstance(nums[0], LinSym):
             return nums[1], nums[0]
         return nums[0], nums[1]

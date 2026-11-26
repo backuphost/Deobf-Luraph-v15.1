@@ -788,6 +788,38 @@ R[A[pc]] = R[B[pc]] < R[C[pc]]
         self.assertIsNone(f('string.rep', ['a', 3]))
 
 
+class UnpackHelper(unittest.TestCase):
+    """The loader's own unpack(regs, from, to) with its parameters in another order: which number
+    is the start is read from the defaults the helper sets."""
+
+    def order(self, body):
+        m = Mini(loader='local function up(z, e, b)\n%s\nend' % body)
+        f = [f for f in m.model.funcs if f.params == ['z', 'e', 'b']][0]
+        return pe.PE(m.model, None).unpack_order(f, [18, pe.REGS, 16], [18, 16])
+
+    def test_start_default(self):
+        self.assertEqual(self.order('b = b or 1\nreturn unpack(e, b, z)'), (16, 18))
+
+    def test_stop_default(self):
+        self.assertEqual(self.order('z = (z or #e)\nreturn unpack(e, b, z)'), (16, 18))
+
+    def test_defaults_inside_a_state_machine(self):
+        self.assertEqual(self.order("""local l = 22
+repeat
+if not (l < 125) then
+if l > 22 then
+z = (z or #e)
+break
+end
+else
+l = 125
+b = b or 1
+continue
+end
+until false
+return unpack(e, b, z)"""), (16, 18))
+
+
 class CaptureLists(unittest.TestCase):
     """v14.0.x: the closure maker keeps a list of the capture lists its closure made; functions
     that return walk it and detach the cells that still point into their registers."""
