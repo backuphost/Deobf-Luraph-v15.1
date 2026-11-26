@@ -313,6 +313,10 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                 'the inlined copy is executed' % (tag, len(keep), len(stage.model.funcs_by_id)))
     first = stage.run_model.first_program_call()
     handover = None
+    # The second-stage route recovers the key of script data that the init decrypts in place.  Data
+    # that can be rewritten in place is a buffer (Luraph v14.7 and later); a VM that reads its data
+    # from a string has no such stage, and lifting its init to look for one is time spent for nothing.
+    in_place = re.search(r'\bbuffer\b', stage.model.src) is not None
     if first and root is None and route in ('auto', 'a'):
         # Route A.  The loader runs a first program and wraps what it returns: that program is
         # Luraph's own init, the returned proto is the script.  Let the VM run its init in the
@@ -321,7 +325,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ()))
         if data is not None:
             text = lift_program(stage, data, tag, log, oneline, 'script')
-            if route == 'a' or not stage.errors:
+            if route == 'a' or not stage.errors or not in_place:
                 return text
             # The lift has errors.  Builds whose init decrypts the script data with a key it
             # derives (Luraph v14.8) patch their own operands with values of key functions; the
@@ -352,7 +356,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             return text
         handover = '; '.join(n for n in stage.run_notes if not n.startswith('[http]'))[-600:] or 'the run ended without entering the script'
         log('[%s] the VM\'s init did not hand over to the script (%s)' % (tag, handover))
-        if route == 'a':
+        if route == 'a' or route == 'auto' and not in_place:
             raise DevmError('init did not hand over', handover)
         log('[%s] trying the second-stage route: lift the init, run it natively, recover the key' % tag)
     try:
