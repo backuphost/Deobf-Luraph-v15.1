@@ -1,4 +1,4 @@
-# Luraph deobfuscator, all in one (v15.1 and v15.2)
+# Luraph deobfuscator, all in one (Luraph v14.x and v15.x)
 
 One command for a Luraph-protected Roblox script:
 
@@ -7,11 +7,15 @@ One command for a Luraph-protected Roblox script:
 python3 deob.py protected.lua -o out.lua    # looks at the file, picks the engine, writes the result
 ```
 
-`deob.py` unwraps Luraph's compressed container, decides what kind of script is inside, and hands it
-to the engine that can recover it:
+`deob.py` recognises the file (header, owner-added lines around it, the shape of its main `return`
+statement), opens Luraph's compressed container without running it (`devm/container_static.py`:
+LZMA and Zstandard payloads, v14 and v15 containers), decides what kind of script is inside, and
+hands it to the engine that can recover it:
 
 | What the file is | Engine | What you get |
 |---|---|---|
+| Luraph **v14.0 - v14.9** (the whole script runs on Luraph's VM) | `devm` (devirtualizer) | the VM runs Luraph's own start-up program in the mock environment until it hands the script's program over; that program is lifted to Luau. The script itself is not run. |
+| Luraph **v15.0** | `deobf` first (dynamic engine), then `devm` | the script as Luau, lifted from a traced run |
 | Luraph script whose code runs on the VM (v15.1, **v15.2**) | `devm` (devirtualizer) | the script as Luau: control flow, strings, calls, closures. Local names are re-derived from use (protection discards them). Ends with a report of what, if anything, is left unrecovered. |
 | Luraph script that kept its code as plain Lua inside the VM object ("form A") | static extraction (`deob.py` itself) | those functions cut out, formatted and renamed. Every step is checked: formatting must keep the token stream, renaming must keep the syntax tree up to local names. |
 | IronBrew1, or anything else | `deobf` (dynamic engine) | IronBrew1: devirtualized Luau. Unknown obfuscators: a behaviour trace on request (`--engine trace`). |
@@ -47,10 +51,13 @@ python3 deob.py INPUT --engine devm         # force the devirtualizer
 python3 deob.py INPUT --engine deobf        # force the dynamic engine (its Luraph v15 lifter, IronBrew1)
 python3 deob.py INPUT --engine trace        # behaviour trace only (what the script did in the mock)
 python3 deob.py INPUT --list                # what is inside (functions, VM dispatchers), no output
+python3 deob.py INPUT --classify            # one JSON line: version, container, VM layout, verdict; runs nothing
+python3 deob.py INPUT --verify              # also compare what the result does with what the protected file does
 ```
 
 Other options: `--work DIR` keeps intermediate files (the unwrapped VM chunk and its data buffer,
-the engines' dumps), `--timeout S`, `--engine-args "..."` passes options through to the engine
+the engines' dumps), `--timeout S` (per engine, default 3600; on timeout, Ctrl-C or SIGTERM the
+engine and everything it started is stopped), `--engine-args "..."` passes options through to the engine
 (for example `--engine-args "--http-map replies.txt"` for `devm`, see below), `--no-run` forbids
 every step that executes the input (the container then stays closed and no engine is started).
 `python3 deob.py -h` lists the options of the static path.
@@ -62,16 +69,43 @@ Exit status:
 
 | Code | Meaning |
 |---|---|
-| 0 | complete result written |
-| 6 | result written, but **partial**: the report that was printed says what is missing |
-| 4 | a VM-only script and no engine produced a result (or `--engine static` on such a script) |
+| 0 | complete result written: the engine reports nothing missing (see "Limits" for what that does and does not mean) |
+| 6 | result written, but **partial**: the report that was printed says what is missing (unlifted code, a run that stopped early, only a behaviour trace, a result that does not parse) |
+| 4 | a VM-only script and no engine produced a result (or `--engine static` on such a script); the last lines are the engines' own reasons |
+| 8 | Luraph, but it cannot be processed as given: cut-off or edited text, a payload that does not decode, a build for Lua 5.3/5.4 or LuaJIT, a VM chunk without its data; the last line says what and where |
 | 3 | static result written, but it failed its own syntax check |
-| 2 | nothing recognised (not a Luraph product, no extractable function); nothing was run |
+| 2 | not Luraph (another obfuscator behind a Luraph header, an imitation, an empty file), or nothing recognised; the reason is the last line; nothing was run |
 | 1 | error (file or interpreter missing, engine crashed without a result) |
 | 5 | the interpreter binary in `bin/` is for another CPU: run `./setup.sh` |
 | 7 | "form C" capture harness written (old static path, see `docs/static-tool.zh-CN.md`) |
 
 Each engine can also be run on its own: `python3 -m devm.run`, `python3 deobf/deob.py`.
+
+## Luraph v14
+
+All v14 builds are one VM family in three spellings (details: `devm/README.md`):
+
+| Versions | Main statement | VM |
+|---|---|---|
+| v14.0.2 - v14.2 | `return(function(P1..Pn) ... end)(A1..An)(...)` | one table per instruction |
+| v14.3 | same | parallel operand arrays |
+| v14.4 - v14.9 | the loader is split into methods of one table | parallel operand arrays |
+
+Most files are wrapped in a compressed container (base85 text, LZMA; v14.7 also Zstandard through
+Roblox's `EncodingService:DecompressBuffer`), opened statically. The VM's first program is not the
+script: it is Luraph's own start-up code (environment probes, lazily decoded constants), which ends
+by handing the script's program to the VM. `devm` normalises every spelling of the dispatch loop,
+lets the VM run that start-up code inside the mock environment, stops when the program it returned
+is entered, and lifts that program. Luraph's start-up code is never written out as the script.
+
+From v14.6 on the start-up code probes Roblox (a GUI tree whose `AbsolutePosition`/`AbsoluteSize`
+must match numbers carried in the file, `Path2D`, enum items, instance members and their errors).
+The mock answers these the way Roblox does (`devm/rbxmock.lua`, built from Roblox's API table in
+`deobf/roblox_api.luau`); a wrong answer would make the VM scramble itself, so a file whose probes
+are not passed ends with `devm: init did not hand over: ...` instead of a result.
+
+v14.9 builds have a single root program (no hand-over); `devm` lifts what it can and reports it as
+partial.
 
 ## Luraph v15.2
 
@@ -142,7 +176,17 @@ the repository; `tests/regress.py DIR` re-runs them if you have the inputs).
 - **Only what a run reached is known to be right.** Code that never ran is lifted statically; where
   it needs a key the run never produced it is marked (`LIFT ERROR`, a count in the report).
 - **Remote code and key systems**: see above.
-- **Names, comments, formatting** do not survive protection. Names are re-derived from use.
+- **Names, comments, formatting** do not survive protection and cannot be recovered by any tool.
+  Names are re-derived from use (`starterGui`, `getService`), the rest are numbered (`v12`).
+- **"complete" is the engine's own judgement**: no unlifted instruction, no missing constant, all
+  control flow structured, nothing left that it knows to be Luraph's. It is not a proof that the
+  result behaves like the protected file; `--verify` compares the two in the mock environment
+  (`python3 -m devm.diffcheck ORIGINAL RESULT`).
+- **Leftovers that are not the script** can remain in a result that is otherwise right: dead
+  arithmetic Luraph inserts between statements (`local v2 = bit32.lrotate(-83, 7) - 4294933093 +
+  -23700`, never used) is not yet removed in every case.
+- **Damaged files** (cut off, edited, recompressed by a third party) and builds for Lua 5.3/5.4 or
+  LuaJIT are reported as such (exit 8), not processed.
 - **A behaviour trace is not source.** It shows the branches one run took in a mock environment.
 - The v15.1 results in `deobfuscated/` could not be re-run here (no inputs), so changes to shared
   code paths were kept behind checks on the layout; `tests/regress.py` is the way to confirm on
@@ -153,7 +197,13 @@ the repository; `tests/regress.py DIR` re-runs them if you have the inputs).
 ```bash
 python3 tests/run_all.py            # quick checks (a few minutes)
 python3 tests/run_all.py --full     # also the slow ones: full devirtualization of the v15.2 sample
+LURAPH_CORPUS=/path/to/obfuscator-samples/Luraph python3 tests/run_all.py   # also checks on a sample corpus
 ```
+
+The checks need no samples. With `LURAPH_CORPUS` pointing at a directory that holds one directory
+per Luraph version (as in the public `obfuscator-samples` collection), some checks also pick a few
+files of it at run time; nothing of the corpus is stored in this repository. `tests/corpus.py DIR`
+runs `deob.py` over a directory and tabulates the outcomes (`--classify` for recognition only).
 
 ## Where the code came from
 
