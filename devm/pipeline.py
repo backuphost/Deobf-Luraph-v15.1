@@ -134,15 +134,21 @@ def _dump_script(self, options=(), budget=None, timeout=None):
     rm = getattr(self, 'run_model', None) or m
     self.log('[%s] interpreter at line %d, %d dispatch loop(s) in %d interpreter(s), proto-table%s' % (
         self.tag, m.interp.line, len(m.loops), len(m.interps), ', one table per instruction' if m.insn_tables else ''))
+    # what the init works through: the VM text (it holds the script data of a plain file) and, for
+    # a container, the data the container hands to the chunk
+    size = len(rm.src)
+    arg = getattr(getattr(self, 'carrier', None), 'chunk_arg', None)
+    if arg and os.path.exists(arg):
+        size += os.path.getsize(arg)
     if not budget:
         # Instructions the init may run.  Inits seen take up to 2 instructions per byte of the file
         # where the init deserializes the script itself (v14.0 - v14.2: 2.36 million for 2.2 MB) and
         # about 11 per byte of data where it decrypts it (v14.8); a failed check never ends.
-        budget = max(12000000, 40 * len(rm.src))
+        budget = max(12000000, 40 * size)
     if not timeout:
-        # (the dump decodes every lazy constant of the script: about 25 s per megabyte of VM text
-        # on a busy machine)
-        timeout = max(150, 30 * len(rm.src) // 1000000)
+        # (the dump decodes every lazy constant of the script: about 25 s per megabyte on a busy
+        # machine)
+        timeout = max(150, 30 * size // 1000000)
     text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
     self.run_notes = notes
     for n in notes:
