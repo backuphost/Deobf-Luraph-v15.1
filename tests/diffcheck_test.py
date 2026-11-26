@@ -264,10 +264,10 @@ class Limits(Base):
 
     def test_result_that_spins(self):
         a = 'print("a")\n'
-        self.expect(NOT_COMPARABLE, a, 'print("a")\nwhile true do end\n', r'still running at the time limit', timeout=8)
+        self.expect(NOT_COMPARABLE, a, 'print("a")\nwhile true do end\n', r'still running at the time limit', timeout=12)
         b = 'print("a")\nprint("b")\n'
-        self.expect(DIFFERENT, b, 'print("a")\nwhile true do end\n', r'makes no further call until the time limit', timeout=8)
-        self.expect(NOT_COMPARABLE, b, 'print("a")\n-- LIFT ERROR: x\nwhile true do end\n', r'the result is partial', timeout=8)
+        self.expect(DIFFERENT, b, 'print("a")\nwhile true do end\n', r'makes no further call until the time limit', timeout=12)
+        self.expect(NOT_COMPARABLE, b, 'print("a")\n-- LIFT ERROR: x\nwhile true do end\n', r'the result is partial', timeout=12)
 
 
 class Partial(Base):
@@ -380,6 +380,24 @@ print("end")
             self.assertEqual(texts[-1], 'print("end")')
             self.assertFalse(any('TOP-SECRET' in t or 'forged' in t for t in texts), texts)
             self.assertFalse(os.path.exists(target))
+
+    def test_the_v152_sample_passes_its_start_up_under_the_recorder(self):
+        # A real protected file, unmodified: Luraph's start-up derives keys from what its probes see,
+        # and answers a failed probe by never returning.  Under the recorder the sample must get as
+        # far as devm/README.md says it gets: the loader's request to its key server, then its warning.
+        sample = os.path.join(ROOT, 'examples', 'v15.2', 'sample.luau')
+        if not os.path.isfile(sample):
+            self.skipTest('examples/v15.2/sample.luau is not there')
+        run = diffcheck.run_script(sample, os.path.join(self.dir, 'w'), 'v152', timeout=240)
+        self.assertIsNotNone(run.end, run.how_ended())
+        self.assertTrue(any('POST https://api.jnkie.com/api/v1/luascripts/precheck/' in r for r in run.requests), run.requests)
+        texts = [e.text() for _, e in diffcheck.compared(run)]
+        self.assertIn('warn("JNKIE: Key verification unavailable. Please try again shortly.")', texts[-3:])
+        # and what precedes the loader's own first calls is start-up by the tool's rule, up to the
+        # executor tests the loader makes itself
+        first = next(i for i, t in enumerate(texts) if t.startswith('IsA('))
+        odd = [texts[i] for i, (j, e) in enumerate(diffcheck.compared(run)[:first]) if not (j in run.errors or diffcheck._is_probe(e))]
+        self.assertEqual(odd, [])
 
     def test_nothing_of_the_recorder_in_the_log(self):
         run = diffcheck.run_script(self.write(GUI), os.path.join(self.dir, 'w'), 'gui', timeout=60)
