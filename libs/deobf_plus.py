@@ -182,13 +182,15 @@ def parse_num(lit):
     t = lit.replace('_', '')
     try:
         if t[:2].lower() == '0x':
+            if '.' in t or 'p' in t.lower():
+                return float.fromhex(t)     # a hexadecimal float of Lua 5.2+ / LuaJIT: 0x1.c8P5 = 57.0
             return int(t, 16)
         if t[:2].lower() == '0b':
             return int(t, 2)
         if re.fullmatch(r'[+-]?\d+', t):
             return int(t)
         return float(t)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 

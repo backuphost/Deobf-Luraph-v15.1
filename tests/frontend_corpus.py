@@ -268,6 +268,21 @@ class Tool(unittest.TestCase):
         self.assertFalse(os.path.exists(out_path))
         self.assertNotIn("[9]", log)
 
+    def test_engines_for_a_v14_vm(self):
+        """A real engine start on a miniature table VM (it holds no interpreter, so devm ends
+        at once): automatic mode and `--engine devm` both mean devm alone, the run ends with
+        exit 4, the engine's own reason is the last line, no traceback is passed through."""
+        out_path = os.path.join(self.tmp.name, "n.lua")
+        src = self.write("named.lua", HEADER + TABLE)
+        for extra in ((), ("--engine", "devm")):
+            rc, log = self.run_tool(src, "-o", out_path, "--timeout", "120", *extra)
+            self.assertEqual(rc, 4, log[-800:])
+            self.assertIn("[devm]", log)
+            self.assertNotIn("[deobf]", log)
+            self.assertNotIn("Traceback", log)
+            self.assertTrue(log.strip().splitlines()[-1].strip().startswith("devm:"), log[-400:])
+            self.assertFalse(os.path.exists(out_path))
+
     def test_owner_statements_stay_guard_goes(self):
         text = ("-- This file is licensed with Luarmor.\n"
                 "if not is_from_loader then warn('Use the loadstring') return end;\n"
@@ -425,10 +440,13 @@ class StaticDecoderHandOver(unittest.TestCase):
 class Formatter(unittest.TestCase):
     def test_hex_float_is_one_token(self):
         import deobf_plus
-        for lit in ("0x1.c8P5", "0X1.f4P6", "0x.8p-1", "0x1p+4"):
+        for lit, value in (("0x1.c8P5", 57.0), ("0X1.f4P6", 125.0), ("0x.8p-1", 0.25), ("0x1p+4", 16.0)):
             toks = [v for _k, v in deobf_plus.tokenize("x = %s + 1" % lit)]
             self.assertEqual(toks, ["x", "=", lit, "+", "1"], lit)
-            self.assertEqual(deobf_plus.norm_num(lit), lit)         # no decimal spelling is made up
+            # its value is the one Lua 5.3 gives it, and the decimal spelling is exact
+            self.assertEqual(deobf_plus.num_value(lit), value, lit)
+            self.assertEqual(float(deobf_plus.norm_num(lit)), value, lit)
+        self.assertEqual(deobf_plus.norm_num("0xFFp"), "0xFFp")     # not a number: left as it stands
         # Luau text reads as before
         self.assertEqual([v for _k, v in deobf_plus.tokenize("a=0x10..s")], ["a", "=", "0x10", "..", "s"])
         self.assertEqual([v for _k, v in deobf_plus.tokenize("0xE+1")], ["0xE", "+", "1"])

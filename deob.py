@@ -2125,6 +2125,7 @@ def main():
         # build for another Lua is said to be that instead of being fed to the engine.
         scan = Scan(inp, say=lambda *a, **k: None, allow_run=False)
         tmp_in = None
+        engine = args.engine
         try:
             scan.load()
             scan.binaries()
@@ -2133,11 +2134,16 @@ def main():
                 if scan.front["verdict"] in ("damaged", "unsupported-target"):
                     print_front(scan)
                     return front_exit(scan)
+                if engine == "devm" and scan.front_decisive() and scan.front["verdict"] == "luraph" \
+                        and allinone.engine_order(scan) == ("devm",):
+                    # a v14 VM: the second engine has no lifter for it (it would hand back a trace
+                    # of Luraph's own start-up code), so "devm" means devm alone here
+                    engine = ("devm",)
             src_path, tmp_in = engine_input(scan, inp)
         finally:
             scan.cleanup(keep_work=False)
         try:
-            return allinone.hand_over(src_path, str(out_path), args.engine, work=engine_work,
+            return allinone.hand_over(src_path, str(out_path), engine, work=engine_work,
                                       timeout=args.timeout, extra=engine_extra)
         finally:
             if tmp_in:
