@@ -803,6 +803,10 @@ class UnpackHelper(unittest.TestCase):
     def test_stop_default(self):
         self.assertEqual(self.order('z = (z or #e)\nreturn unpack(e, b, z)'), (16, 18))
 
+    def test_defaults_set_by_if(self):
+        self.assertEqual(self.order('if not b then\nb = (1)\nend\nif not z then\nz = (#e)\nend\nreturn unpack(e, b, z)'), (16, 18))
+        self.assertEqual(self.order('if not z then\nz = #e\nend\nreturn unpack(e, b, z)'), (16, 18))
+
     def test_defaults_inside_a_state_machine(self):
         self.assertEqual(self.order("""local l = 22
 repeat

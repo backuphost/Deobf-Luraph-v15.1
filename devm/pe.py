@@ -1988,16 +1988,25 @@ class PE:
         flattens the helper into a state machine)."""
         found = {}
 
+        def default(name, d):
+            d = _unparen(d)
+            if d == ('num', 1):
+                found.setdefault('start', name)
+            elif d[0] == 'un' and d[1] == '#':
+                found.setdefault('stop', name)
+
         def scan(block):
             for st in block:
                 if st[0] == 'assign' and len(st[1]) == 1 and len(st[2]) == 1 and st[1][0][0] == 'name':
                     e = _unparen(st[2][0])
                     if e[0] == 'bin' and e[1] == 'or' and _unparen(e[2]) == st[1][0]:
-                        d = _unparen(e[3])
-                        if d == ('num', 1):
-                            found.setdefault('start', st[1][0][1])
-                        elif d[0] == 'un' and d[1] == '#':
-                            found.setdefault('stop', st[1][0][1])
+                        default(st[1][0][1], e[3])
+                if st[0] == 'if' and len(st[1]) == 1 and not st[2] and len(st[1][0][1]) == 1:
+                    # `if not p then p = 1 end`
+                    c, arm = _unparen(st[1][0][0]), st[1][0][1][0]
+                    if c[0] == 'un' and c[1] == 'not' and _unparen(c[2])[0] == 'name' and arm[0] == 'assign' \
+                            and len(arm[1]) == 1 and len(arm[2]) == 1 and arm[1][0] == _unparen(c[2]):
+                        default(arm[1][0][1], arm[2][0])
                 for b in subblocks(st):
                     scan(b)
         scan(func.body)
