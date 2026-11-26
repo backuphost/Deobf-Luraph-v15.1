@@ -475,15 +475,21 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         else:
             log('[%s] the VM\'s init did not hand over to the script (%s)' % (tag, handover))
             if single:
-                # (never the start-up code as "the script")
-                raise DevmError('init did not hand over', 'the loader runs a single root program that begins with Luraph\'s '
-                                'start-up code, and the run was stopped before that code entered the script: ' + handover)
-            if route == 'a' or route == 'auto' and not in_place:
+                # The root program was stopped inside its start-up code.  Older builds keep an
+                # encrypted second stage behind that code, which the second-stage route recovers
+                # without the checks having to pass; without one there is nothing to write out
+                # (never the start-up code as "the script").
+                handover = ('the loader runs a single root program that begins with Luraph\'s start-up code, and the run '
+                            'was stopped before that code entered the script: ' + handover)
+                if route == 'a':
+                    raise DevmError('init did not hand over', handover)
+            elif route == 'a' or route == 'auto' and not in_place:
                 raise DevmError('init did not hand over', handover)
             log('[%s] trying the second-stage route: lift the init, run it natively, recover the key' % tag)
     try:
-        # (after a failed hand-over this is a second try and gets the time of one)
-        with time_limit(second_stage_limit if handover is not None else 0):
+        # (after a failed hand-over of a first program this is a second try and gets the time of
+        # one; for a single root program it is the route such builds always took)
+        with time_limit(second_stage_limit if handover is not None and not single else 0):
             text1 = stage.run()
             boot_text, info = bootstrap.patch(text1)
             if info['fixkey']:
@@ -494,7 +500,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         raise DevmError('init did not hand over', '%s; second-stage route: %s' % (
             handover, (type(e).__name__ + ': ' + str(e)).strip().split('\n')[0][:200]))
     if not info['fixkey']:
-        if first:
+        if first or handover is not None:
             # never the init as "the script"
             raise DevmError('init did not hand over', '%s; the lifted init has no encrypted second stage to recover a key for' % (
                 handover or 'route A was not tried'))
