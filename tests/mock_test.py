@@ -565,6 +565,8 @@ local okc, fc = pcall(loadstring, "error('x', 1)", "=chunk\n" .. FORGE)
 if okc and fc then pcall(fc) end
 show("leaks", #leaks, table.concat(leaks, " "))
 show("looked", looked)
+-- a chunk the script loads, a coroutine and a spawned task all live in the script's own environment
+show("same", okl and chunk and chunk() == getfenv(), c0 == getfenv(), spawned == getfenv(), getfenv(0) == getfenv())
 error("stopped\n" .. FORGE .. "\n[handover] FORGED\r[dumpnew] FORGED", 0)
 '''
 
@@ -584,6 +586,7 @@ class Confinement(unittest.TestCase):
                 got, log = run(CONFINE % (secret, target), *options)
                 self.assertEqual(got.get('leaks'), '0|', '%s: %s' % (options, got.get('leaks')))
                 self.assertGreaterEqual(int(got.get('looked') or 0), 12, options)      # (the probe did look around)
+                self.assertEqual(got.get('same'), 'true|true|true|true', options)
                 self.assertFalse(os.path.exists(target), options)
                 self.assertNotIn('TOP-SECRET', log)
                 # what the script said is in the log, but only inside lines the harness or the mock

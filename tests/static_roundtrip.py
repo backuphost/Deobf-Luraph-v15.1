@@ -70,6 +70,17 @@ def compiles(luau, text):
     return luasandbox.compile_only(text, luau, timeout=300)
 
 
+# A static result was written: exit 0, or exit 6 for form A in a file with VM dispatch loops
+# (the main flow runs on the VM; the last line says what the output lacks)
+FORM_A_LINE = ('result: PARTIAL: only the functions kept as plain Lua; the virtualized main flow is not in the '
+               'output (static)')
+
+
+def written(rc, log):
+    last = log.strip().split('\n')[-1] if log.strip() else ''
+    return rc == 0 or (rc == 6 and last == FORM_A_LINE)
+
+
 def run_deob(inp, out, work, extra):
     cmd = [sys.executable, '-B', os.path.join(ROOT, 'deob.py'), '--engine', 'static', inp, '-o', out, '--work', work] + extra
     t = time.time()
@@ -130,9 +141,9 @@ def check_input(inp, luau, ast, report):
             extra = ['--force']
             rc, log, dt = run_deob(inp, out1, tmp, ['--no-rename'] + extra)
             report(name + ': virtualized, checked with --force', True)
-        report('%s: deob.py --no-rename exits 0 (%.0fs)' % (name, dt), rc == 0,
+        report('%s: deob.py --no-rename exits 0, or 6 with the form-A PARTIAL line (%.0fs)' % (name, dt), written(rc, log),
                log.strip().splitlines()[-1] if log.strip() else '')
-        if rc != 0 or not os.path.exists(out1):
+        if not written(rc, log) or not os.path.exists(out1):
             return
         src = source_of(inp, tmp)
         text1 = read(out1)
@@ -259,9 +270,9 @@ def check_input(inp, luau, ast, report):
         # ---------------------------------------------------------------- default (rename)
         out2 = os.path.join(tmp, 'renamed.lua')
         rc, log, dt = run_deob(inp, out2, tmp, extra)
-        report('%s: deob.py (rename) exits 0 (%.0fs)' % (name, dt), rc == 0,
+        report('%s: deob.py (rename) exits 0, or 6 with the form-A PARTIAL line (%.0fs)' % (name, dt), written(rc, log),
                log.strip().splitlines()[-1] if log.strip() else '')
-        if rc != 0 or not os.path.exists(out2):
+        if not written(rc, log) or not os.path.exists(out2):
             return
         text2 = read(out2)
         ok, msg = compiles(luau, text2)
