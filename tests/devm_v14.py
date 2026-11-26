@@ -15,7 +15,9 @@ Without a corpus (hand-written text only):
 * the harness runs that VM, sees its first program return a proto and dumps when that proto is
   entered (`[handover]`, `[dumpnew]`); a first program that never returns ends by the instruction
   budget with a `[budget]` line and no dump; key functions the init installed (closures of the VM
-  that return a fixed number) are in the dump with their values;
+  that return a fixed number) are in the dump with their values; a loader with a single root
+  program is dumped when that program enters a program it built at run time, and not at all when
+  it enters none;
 * `normalize.foreign_dialect` names builds for Lua 5.3/5.4 and LuaJIT and passes Luau text (type
   annotations, strings, truncated text); `run.main` ends with one line `devm: unsupported target:`
   or `devm: damaged input:` for them, without a traceback;
@@ -219,6 +221,41 @@ class KeyFunctions(unittest.TestCase):
         self.assertIn('[keyfn] 1=41 2=97', notes)
         self.assertIn('{"cfn":41,"k":1}', data)
         self.assertIn('{"cfn":97,"k":2}', data)
+
+
+# a loader that runs a single root program (Luraph v14.9): the root program enters one of its own
+# nested protos (opcode 8), which builds a proto at run time and enters that (opcode 7)
+SINGLE_VM = ('return(function(E,S,U)local W;W=function(p,u)local c,a=p[1],p[2];local f;f=function(...)local pc=1;'
+             'local r=S("#",...);while true do local o=c[pc];if o==1 then pc=pc+1;elseif o==7 then '
+             'return W({{1,1,3},{0,0,0},{{9},{0}}},u)(...);elseif o==8 then return W(p[4],u)(...);else return p[3];end;end;end;'
+             'return f;end;local P={{1,8,3},{0,0,0},{{9,8,7},{0,0,0}},{{1,7},{0,0}}};'
+             'return W(P,U);end)(getfenv,select,{})(...)')
+
+
+@unittest.skipUnless(HAVE_LUAU, 'bin/luau is not built')
+class SingleRoot(unittest.TestCase):
+    def dump(self, text, **kw):
+        m = vmmodel.Model(normalize.reflow(normalize.normalise_heads(text)[0]), oneline=True)
+        self.assertIsNone(m.first_program_call())
+        self.assertIn('if __LPH_T[p]==nil then local __r = __LPH_ENTER(p,', m.patched_source(newproto=True, count=True))
+        with tempfile.TemporaryDirectory() as work:
+            return vmmodel.run_dump_script(m, work, 'vm', ['executor=1'], **kw)
+
+    def test_program_built_at_run_time(self):
+        data, notes = self.dump(SINGLE_VM)
+        self.assertIsNotNone(data, notes)
+        self.assertTrue(notes[0].startswith('[root] the VM\'s root program starts'), notes)
+        self.assertTrue(any(n.startswith('[handover] the root program entered a program that did not exist when it started, after 4 instructions')
+                            for n in notes), notes)
+        rep = run.run_report(notes)
+        self.assertTrue(rep and rep[0].startswith('the VM\'s root program began with Luraph\'s start-up code'), rep)
+
+    def test_root_program_alone(self):
+        # no program is built at run time: the root program returns, nothing is dumped
+        data, notes = self.dump(SINGLE_VM.replace('{{1,7},{0,0}}', '{{1,3},{0,0}}'))
+        self.assertIsNone(data)
+        self.assertTrue(any(n.startswith('[root]') for n in notes), notes)
+        self.assertFalse(any(n.startswith(('[handover]', '[budget]')) for n in notes), notes)
 
 
 class Dialect(unittest.TestCase):

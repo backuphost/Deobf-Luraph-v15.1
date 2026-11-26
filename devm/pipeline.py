@@ -118,7 +118,7 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def _dump_script(self, options=(), budget=None, timeout=150):
+def _dump_script(self, options=(), budget=None, timeout=None):
     """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
     proto of the script.  The harness lets the VM run that init and dumps the state when the
     returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
@@ -139,6 +139,10 @@ def _dump_script(self, options=(), budget=None, timeout=150):
         # where the init deserializes the script itself (v14.0 - v14.2: 2.36 million for 2.2 MB) and
         # about 11 per byte of data where it decrypts it (v14.8); a failed check never ends.
         budget = max(12000000, 40 * len(rm.src))
+    if not timeout:
+        # (the dump decodes every lazy constant of the script: about 25 s per megabyte of VM text
+        # on a busy machine)
+        timeout = max(150, 30 * len(rm.src) // 1000000)
     text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
     self.run_notes = notes
     for n in notes:
@@ -154,7 +158,25 @@ def _dump_script(self, options=(), budget=None, timeout=150):
 Stage.dump_script = _dump_script
 
 
-def _run_script(self, options=(), budget=None, timeout=150):
+def _last_calls(self, options=(), budget=12000000, timeout=120):
+    """After a hand-over that did not happen: the same run once more with call logging, to say
+    which mocked calls the init made last (the probe it failed is usually among them).
+    Returns one line, or None when that run told nothing."""
+    rm = getattr(self, 'run_model', None) or self.model
+    try:
+        _text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag + '.calls', options, budget=budget, timeout=timeout, calls=True)
+    except Exception:
+        return None
+    for n in notes:
+        if n.startswith('[calls] '):
+            return n[len('[calls] '):]
+    return None
+
+
+Stage.last_calls = _last_calls
+
+
+def _run_script(self, options=(), budget=None, timeout=None):
     """dump_script, then a plain lift of the script's program (no key-function search, no
     opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
     import re

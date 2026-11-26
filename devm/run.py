@@ -187,7 +187,7 @@ class DevmError(Exception):
         self.reason = reason
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -368,15 +368,21 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     # that can be rewritten in place is a buffer (Luraph v14.7 and later); a VM that reads its data
     # from a string has no such stage, and lifting its init to look for one is time spent for nothing.
     in_place = re.search(r'\bbuffer\b', stage.model.src) is not None
-    if first and root is None and route in ('auto', 'a'):
+    single = not first
+    if root is None and route in ('auto', 'a'):
         # Route A.  The loader runs a first program and wraps what it returns: that program is
         # Luraph's own init, the returned proto is the script.  Let the VM run its init in the
         # harness and lift from the state at the moment the script's proto is entered.
+        # A loader that runs a single root program (Luraph v14.9) has the same start-up code in
+        # that program; it builds the script's program and calls it itself.  There the dump is
+        # taken when a program is entered that did not exist when the root program started.
+        if single:
+            log('[%s] the loader runs a single root program: looking for the program it builds and enters' % tag)
         data = stage.dump_script(common, **{k: v for k, v in (('budget', budget), ('timeout', run_timeout)) if v})
         LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ()))
         if data is not None:
             text = lift_program(stage, data, tag, log, oneline, 'script')
-            if route == 'a' or not stage.errors or not in_place:
+            if route == 'a' or not stage.errors or not in_place or single:
                 return text
             # The lift has errors.  Builds whose init decrypts the script data with a key it
             # derives (Luraph v14.8) patch their own operands with values of key functions; the
@@ -405,11 +411,32 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                 log('[%s] second-stage route not usable (%s): result from the state at the hand-over kept' % (
                     tag, (type(e).__name__ + ' ' + str(e)).strip().split('\n')[0][:160]))
             return text
+        if any(n.startswith('[dumpnew]') for n in stage.run_notes):
+            # the init did hand over; what did not get done is the dump of the state (every lazy
+            # constant of the script is decoded for it: millions in a script of several megabytes)
+            raise DevmError('run failed', 'the VM\'s init handed over to the script, but the dump of the state at that moment '
+                            'was not finished (%s)' % '; '.join(n for n in stage.run_notes if n.startswith(('[dump]', '[timeout]', '[end]', '[error]')))[-300:])
         handover = '; '.join(n for n in stage.run_notes if not n.startswith('[http]'))[-600:] or 'the run ended without entering the script'
-        log('[%s] the VM\'s init did not hand over to the script (%s)' % (tag, handover))
-        if route == 'a' or route == 'auto' and not in_place:
-            raise DevmError('init did not hand over', handover)
-        log('[%s] trying the second-stage route: lift the init, run it natively, recover the key' % tag)
+        if diagnose and not any(n.startswith('[handover]') for n in stage.run_notes):
+            # which probe did the init fail?  One more run with call logging names its last calls.
+            calls = stage.last_calls(common, timeout=min(run_timeout or 120, 120))
+            if calls:
+                handover += '; in a second run with call logging: ' + calls
+        stopped = any(n.startswith(('[budget]', '[timeout]', '[end]', '[error]', '[stderr]', 'COMPILE ERROR')) for n in stage.run_notes)
+        if single and not stopped:
+            # the root program ran to its end and entered nothing else: it is all there is
+            log('[%s] the root program returned without entering another program: it is the script itself' % tag)
+            handover = None
+            LAST_RUN['notes'] = []
+        else:
+            log('[%s] the VM\'s init did not hand over to the script (%s)' % (tag, handover))
+            if single:
+                # (never the start-up code as "the script")
+                raise DevmError('init did not hand over', 'the loader runs a single root program that begins with Luraph\'s '
+                                'start-up code, and the run was stopped before that code entered the script: ' + handover)
+            if route == 'a' or route == 'auto' and not in_place:
+                raise DevmError('init did not hand over', handover)
+            log('[%s] trying the second-stage route: lift the init, run it natively, recover the key' % tag)
     try:
         # (after a failed hand-over this is a second try and gets the time of one)
         with time_limit(second_stage_limit if handover is not None else 0):
@@ -539,6 +566,9 @@ def main(argv=None):
                          'auto = a, then b when the init does not hand over')
     ap.add_argument('--budget', type=int, default=None, help='route a: VM instructions the init may run before it is stopped')
     ap.add_argument('--run-timeout', type=int, default=None, help='route a: seconds the run may take')
+    ap.add_argument('--no-diagnosis', action='store_true',
+                    help='route a: when the init does not hand over, do not run it a second time with call logging '
+                         '(the run that names the last mocked calls in the failure message)')
     a = ap.parse_args(argv)
     work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.input)), '.devm')
     out = a.output or os.path.splitext(a.input)[0] + '.deobf.lua'
@@ -555,7 +585,7 @@ def main(argv=None):
 
     stop_on_signals()
     try:
-        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result)
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis)
     except Terminated as e:
         if vmmodel.SERVER is not None:
             vmmodel.SERVER.close()
@@ -614,9 +644,14 @@ def run_report(notes):
         if m:
             out.append('traced run: the script %s (%s VM instructions)' % (
                 'returned' if m.group(1) == 'returned' else 'stopped with "%s"' % m.group(1)[len('stopped: '):], m.group(2)))
+    single = any(n.startswith('[root]') for n in notes)
     for n in notes:
         m = re.match(r'\[dumpnew\] the script starts at interpreter entry (\d+) \((\d+) VM instructions', n)
-        if m:
+        if m and single:
+            out.append('the VM\'s root program began with Luraph\'s start-up code, which ran (%s VM instructions) and then '
+                       'entered a program it had built: the script.  This result is a static lift of that program from the '
+                       'state at that moment: the script itself did not run' % m.group(2))
+        elif m:
             out.append('the VM ran its own init (%s VM instructions) and handed over to the script; this result is a static '
                        'lift of the script\'s program from the state at that moment: the script itself did not run' % m.group(2))
         elif n.startswith('[single-root]'):

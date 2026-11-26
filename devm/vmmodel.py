@@ -762,7 +762,9 @@ class Model:
         newproto: proto-table layout, route A: the loader's first-program call goes through
                 __LPH_MARK, which learns the proto that program returns; the entry hook of every
                 interpreter calls __LPH_RUN when exactly that proto is entered (a comparison, no
-                call: the init measures its own call stack).
+                call: the init measures its own call stack).  A loader without such a call runs a
+                single root program: the hook then calls __LPH_ENTER for protos that are not
+                marked as part of the root program.
         count:  every dispatch loop counts its instructions in __LPH_N.s and calls __LPH_OVER once
                 the budget __LPH_N.b is used up (inlined; used with newproto).
         """
@@ -864,8 +866,15 @@ class Model:
                             captured.add(id(wrap))
                             edits.append((wrap.body_pos, 'local __lph_p=%s;' % pp))
                         pp = '__lph_p'
-                    edits.append((it.func.body_pos, 'if %s==__LPH_N.w then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
-                        pp, lst, len(names), ','.join(names))))
+                    if mark:
+                        edits.append((it.func.body_pos, 'if %s==__LPH_N.w then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
+                            pp, lst, len(names), ','.join(names))))
+                    else:
+                        # a single root program (no first-program call): the hook fires for every
+                        # proto the harness has not marked as part of the root program (a table
+                        # read, no call), see __LPH_ENTER in harness.lua
+                        edits.append((it.func.body_pos, 'if __LPH_T[%s]==nil then local __r = __LPH_ENTER(%s,%s,%d,%s) if __r then return __r(...) end end;' % (
+                            pp, pp, lst, len(names), ','.join(names))))
                 else:
                     edits.append((it.func.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         for f in self.meta_closures():
@@ -1090,13 +1099,18 @@ def run_oracle(model, workdir, tag, options=()):
     return dump, out, note
 
 
-def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=150):
+def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=150, calls=False):
     """Proto-table layout, route A: let the VM run its own first program (Luraph's init) under the
     harness and dump the state when the proto that program returned is entered, i.e. when the
     script's main function starts (patched_source(newproto=True), harness dumpnew=1).
 
     budget: VM instructions the run may execute before the harness stops it.  Inits seen hand over
     after 6 thousand to 0.9 million instructions; a failed check ends in Luraph's endless loop.
+
+    calls: diagnosis run with the harness's call logging (calls=1).  The notes then get one line
+    `[calls] ...` with the last mocked Roblox / executor calls the run made.  Call logging puts one
+    more closure around every mock function, which a script can notice: not for the run a result
+    is taken from.
 
     Returns (dump or None, notes): notes are the harness's lines about the run ([handover],
     [dumpnew], [budget], [http], ...) plus one line of ours when the run had to be stopped."""
@@ -1116,6 +1130,8 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
     # the interpreters' function ids: the harness evaluates the init's key functions, which are
     # closures of the VM on this route (harness.lua findConstFns)
     cmd += ['interp=%d' % it.func.fid for it in model.interps if getattr(it.func, 'fid', None) is not None]
+    if calls:
+        cmd.append('calls=1')
     cmd += list(options) + list(getattr(model, 'run_options', ()))
     errpath = os.path.join(workdir, tag + '.newproto.err')
     notes = []
@@ -1132,8 +1148,14 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
             raise
     with open(errpath, errors='replace') as f:
         stderr = f.read()
-    keep = ('[handover]', '[dumpnew]', '[dump]', '[keyfn]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
+    keep = ('[root]', '[handover]', '[dumpnew]', '[dump]', '[keyfn]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
     notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
+    if calls:
+        made = [l[len('[call] '):] for l in stderr.split('\n') if l.startswith('[call] ')]
+        # (the harness logs the first 20000 calls only)
+        notes.append('[calls] %d mocked calls%s; the last ones: %s' % (
+            len(made), ' logged (there were more)' if len(made) >= 20000 else '',
+            '; '.join(c[:90] for c in made[-6:]) or 'none'))
     if not os.path.exists(outjson):
         # how the run ended: the error message the harness printed in front of its `[end] error` line
         lines = stderr.strip().split('\n')
