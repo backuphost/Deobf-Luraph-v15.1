@@ -1070,8 +1070,13 @@ def run_dump_script(model, workdir, tag, options=(), budget=40000000, timeout=60
     keep = ('[handover]', '[dumpnew]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
     notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
     if not os.path.exists(outjson):
+        # how the run ended: the error message the harness printed in front of its `[end] error` line
+        lines = stderr.strip().split('\n')
+        for i, l in enumerate(lines):
+            if l.startswith('[end] error') and i and not lines[i - 1].startswith(keep):
+                notes.insert(max(0, len(notes) - 1), '[error] ' + lines[i - 1][:300])
         if not notes:
-            notes = ['[stderr] ' + l for l in stderr.strip().split('\n')[-3:] if l]
+            notes = ['[stderr] ' + l for l in lines[-3:] if l]
         return None, notes
     with open(outjson) as f:
         return f.read(), notes
