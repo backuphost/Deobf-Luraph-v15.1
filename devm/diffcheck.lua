@@ -7,6 +7,8 @@
 --
 --   [dc] START                         the harness has built the environment; the script starts
 --   [dc] C<US>name<US>arg<US>arg...    a call of a function of the mock (Roblox / executor API)
+--   [dc] K<US>name<US>arg<US>arg...    a call of a permissive stand-in (a member the mock does not model)
+--   [dc] X<US>name<US>arg<US>arg...    a call of an executor function the harness keeps as a Lua stand-in
 --   [dc] S<US>object<US>key<US>value   a property write on a mock object
 --   [dc] E<US>name<US>message          that call raised (information; follows its C line)
 --   [dc] G<US>name<US>value            a global the script left behind (at the end, sorted)
@@ -88,6 +90,7 @@ local serial = 0
 local ids = setmetatable({}, { __mode = "k" })       -- object -> serial number (weak: nothing is kept alive)
 local known = {}                                     -- function -> name of the global it is
 local mockTypeof = nil                               -- the mock's typeof implementation (not the wrapped one)
+local created = setmetatable({}, { __mode = "k" })   -- instances the script made itself (Instance.new, Clone)
 local rawTypeof = typeof
 
 local function idOf(v)
@@ -190,7 +193,7 @@ function render(v, depth, path)
 		local ok, class = pcall(function() return v.ClassName end)
 		local ok2, text = pcall(tostring, v)
 		return "Instance<" .. clean(ok and type(class) == "string" and class or "?") .. " " ..
-			quote(ok2 and type(text) == "string" and text or "?") .. ">" .. idOf(v)
+			quote(ok2 and type(text) == "string" and text or "?") .. (created[v] and " new>" or ">") .. idOf(v)
 	end
 	local ok, text = pcall(tostring, v)
 	text = ok and type(text) == "string" and clean(text) or "?"
@@ -240,6 +243,7 @@ G.cwrap = function(name, impl, ...)
 	local skip = yielder and 1 or 0
 	local rec = { name = name }
 	local isWait = name == "wait"
+	local makes = name == "new" or name == "Clone" or name == "clone" or name == "fromExisting"
 	local function wrapped(...)
 		if isWait then
 			local t = select(skip + 1, ...)
@@ -252,7 +256,7 @@ G.cwrap = function(name, impl, ...)
 			elseif name == "__call" then
 				-- a permissive stand-in of the mock, called: its own text is the name of what was called
 				local okn, text = pcall(tostring, (...))
-				record("C", okn and type(text) == "string" and clean(text) or "?", 1, ...)
+				record("K", okn and type(text) == "string" and clean(text) or "?", 1, ...)
 			else
 				record("C", rec.full or name, skip, ...)
 			end
@@ -263,6 +267,7 @@ G.cwrap = function(name, impl, ...)
 		local r = table.pack(coroutine.resume(co, ...))
 		if r[1] then
 			if coroutine.status(co) ~= "dead" then error("attempt to yield across metamethod/C-call boundary", 0) end
+			if makes and logging and type(r[2]) == "userdata" and mockTypeof and mockTypeof(r[2]) == "Instance" then created[r[2]] = true end
 			return unpack(r, 2, r.n)
 		end
 		if live and logging and type(r[2]) == "string" and string.sub(r[2], 1, 6) ~= "__LPH_" then
@@ -276,6 +281,18 @@ G.cwrap = function(name, impl, ...)
 end
 
 -- ---------------------------------------------------------------- run the harness
+-- The mock has to know the script's main thread: a wait in any other thread of the script
+-- suspends that thread, as in Roblox, and Luraph's start-up tests exactly that.  devm's
+-- instrumented copies tell the harness from their own hooks; a file that runs as it is cannot, so
+-- its text gets `__LPH_MAIN();` in front of its first line (line numbers stay as they are).
+do
+	local realRead = G.readfile
+	G.readfile = function(path, ...)
+		local data = realRead(path, ...)
+		if path == samplePath and type(data) == "string" then return "__LPH_MAIN(); " .. data end
+		return data
+	end
+end
 local text = G.readfile(harnessPath)
 local harness, cerr = loadstring(text, "=" .. harnessPath)
 if not harness then
@@ -288,8 +305,46 @@ if not ok or type(main) ~= "function" then
 	return
 end
 
--- names: every function reachable as a global or as a field of a global table of the script
 local env = getfenv(main)
+local envMt = getmetatable(env)
+local globals = type(envMt) == "table" and rawget(envMt, "__index")
+
+-- Executor functions the harness gives the script as plain Lua stand-ins (setclipboard, writefile,
+-- hookfunction, queue_on_teleport, ...) are not made by cwrap.  They are replaced by a recording
+-- Lua function (a Lua function stays a Lua function: iscclosure and the like answer as before).
+if type(globals) == "table" then
+	local PURE = { getgenv = true, getrenv = true }
+	local names = {}
+	for k, f in next, globals do
+		if type(k) == "string" and type(f) == "function" and not recOf[f] and not PURE[k] and
+			string.sub(k, 1, 6) ~= "__LPH_" and debug.info(f, "s") ~= "[C]" then
+			names[#names + 1] = k
+		end
+	end
+	local made = {}
+	for _, k in ipairs(names) do
+		local f = rawget(globals, k)
+		local w = made[f]
+		if not w then
+			w = function(...)
+				if logging and not busy then record("X", k, 0, ...) end
+				local r = table.pack(pcall(f, ...))
+				if r[1] then return unpack(r, 2, r.n) end
+				local msg = r[2]
+				-- raised with error(msg, 2) (no position yet): the position of the script's call goes in front
+				if type(msg) == "string" and string.sub(msg, 1, 6) ~= "__LPH_" and not string.find(msg, "^[^\n]-%.lua:%d+: ")
+					and not string.find(msg, "^rbxmock:%d+: ") then
+					error(msg, 2)
+				end
+				error(msg, 0)
+			end
+			made[f] = w
+		end
+		rawset(globals, k, w)
+	end
+end
+
+-- names: every function reachable as a global or as a field of a global table of the script
 local base = {}
 do
 	local function walk(t, prefix, depth)
@@ -306,8 +361,6 @@ do
 			end
 		end
 	end
-	local mt = getmetatable(env)
-	local globals = type(mt) == "table" and rawget(mt, "__index")
 	if type(globals) == "table" then walk(globals, "", 0) end
 	if type(env) == "table" then
 		walk(env, "", 0)

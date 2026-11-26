@@ -47,6 +47,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 US = '\x1f'
+EVENT_KINDS = ('C', 'K', 'X', 'S')     # mock call, stand-in call, executor stand-in call, property write
 ID_RE = re.compile('\x01(\\d+)\x02')
 
 SAME, DIFFERENT, NOT_COMPARABLE = 0, 1, 2
@@ -56,32 +57,58 @@ VERDICT_WORD = {SAME: 'same', DIFFERENT: 'different', NOT_COMPARABLE: 'not compa
 # makes them on its own while the script runs (the result, being plain code, does not).
 NOISE_CALLS = frozenset(['getfenv', 'setfenv', 'type', 'typeof'])
 
-# Kinds of call Luraph's start-up code makes before the script starts.  Calls of the original in
-# front of the result's first call are accepted as start-up only when all of them are in this set.
-PROBE_CALLS = frozenset([
-    # the loader: the container compiles its chunk, the VM tests loadstring
-    'loadstring',
-    # scheduler and instance probes of the v14.6+ / v15 start-up
-    'task.spawn', 'task.defer', 'task.delay', 'task.wait', 'task.cancel', 'task.synchronize', 'task.desynchronize',
-    'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime', 'os.clock', 'os.time', 'os.date',
-    'Instance.new', 'Instance.fromExisting', 'Destroy', 'Clone', 'IsA', 'GetService', 'FindFirstChild',
-    'FindFirstChildOfClass', 'FindFirstChildWhichIsA', 'GetChildren', 'GetDescendants', 'GetFullName',
-    'IsDescendantOf', 'IsAncestorOf', 'GetAttribute', 'SetAttribute', 'GetAttributes', 'AddTag', 'RemoveTag',
-    'HasTag', 'GetTags', 'GetTagged', 'GetPropertyChangedSignal', 'Connect', 'Once', 'Disconnect', 'Wait',
-    'GetEnumItems', 'GetEnums', 'FromName', 'FromValue',
-    # datatype constructors and their methods (GUI layout, Path2D geometry)
-    'Vector2.new', 'Vector3.new', 'UDim.new', 'UDim2.new', 'UDim2.fromScale', 'UDim2.fromOffset', 'Color3.new',
-    'Color3.fromRGB', 'Color3.fromHSV', 'Color3.fromHex', 'Color3.toHSV', 'CFrame.new', 'CFrame.Angles',
-    'Random.new', 'NextInteger', 'NextNumber', 'NextUnitVector', 'Shuffle', 'Path2DControlPoint.new',
-    'SetControlPoints', 'GetControlPoints', 'GetPositionOnCurve', 'GetPositionOnCurveArcLength',
-    'GetTangentOnCurve', 'GetTangentOnCurveArcLength', 'GetBoundingRect', 'GetLength', 'GetMaxControlPoints',
-    'GetControlPoint', 'InsertControlPoint', 'RemoveControlPoint', 'UpdateControlPoint', 'GetSegmentCount',
-    'Lerp', 'Dot', 'Cross', 'FuzzyEq', 'ToWorldSpace', 'ToObjectSpace', 'GetComponents', 'Inverse',
-    # executor probes
-    'identifyexecutor', 'iscclosure', 'islclosure', 'isreadonly', 'getrawmetatable', 'require',
-    'debug.profilebegin', 'debug.profileend', 'debug.getmemorycategory', 'debug.setmemorycategory',
-    'debug.resetmemorycategory', 'DecompressBuffer', 'CompressBuffer',
+# What Luraph's start-up code does before the script starts, by kind.  A start-up probe computes
+# with values, makes objects of its own and works on those, queries the environment read-only and
+# uses the scheduler.  It does not print, request, call executor functions that act on the outside,
+# or write to objects that were there before it.  Calls of the original in front of the result's
+# first call are accepted as start-up only when every one of them is of these kinds (_is_probe).
+PROBE_LIBS = frozenset([
+    'Instance', 'task', 'debug', 'os', 'Enum', 'buffer', 'utf8',
+    'Vector2', 'Vector3', 'CFrame', 'UDim', 'UDim2', 'Color3', 'Random', 'Rect', 'Path2DControlPoint', 'NumberRange',
+    'NumberSequence', 'ColorSequence', 'NumberSequenceKeypoint', 'ColorSequenceKeypoint', 'TweenInfo', 'BrickColor',
+    'Ray', 'Region3', 'Font', 'DateTime', 'Axes', 'Faces', 'Vector3int16', 'Vector2int16', 'PhysicalProperties',
+    'OverlapParams', 'RaycastParams', 'SharedTable',
 ])
+PROBE_GLOBALS = frozenset([
+    'loadstring', 'require', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime', 'settings', 'UserSettings',
+    'identifyexecutor', 'iscclosure', 'islclosure', 'isreadonly', 'getrawmetatable', 'newproxy',
+])
+# methods a probe calls on objects that were there before it (game, a service): queries only
+QUERY_METHODS = frozenset([
+    'GetService', 'FindService', 'FindFirstChild', 'FindFirstChildOfClass', 'FindFirstChildWhichIsA', 'FindFirstAncestor',
+    'FindFirstAncestorOfClass', 'FindFirstAncestorWhichIsA', 'FindFirstDescendant', 'WaitForChild', 'GetChildren',
+    'GetDescendants', 'GetFullName', 'GetDebugId', 'IsA', 'IsDescendantOf', 'IsAncestorOf', 'GetAttribute', 'GetAttributes',
+    'GetAttributeChangedSignal', 'GetPropertyChangedSignal', 'HasTag', 'GetTags', 'GetTagged', 'GetAllTags',
+    'IsPropertyModified', 'IsLoaded', 'IsStudio', 'IsClient', 'IsServer', 'IsRunning', 'IsRunMode', 'IsEdit',
+    'GetEnumItems', 'GetEnums', 'FromName', 'FromValue', 'CompressBuffer', 'DecompressBuffer', 'GetGuiInset',
+    'GenerateGUID', 'JSONEncode', 'JSONDecode', 'UrlEncode',
+])
+_NEW_INSTANCE = re.compile(r'Instance<.* new>\x01\d+\x02\Z', re.S)
+_INSTANCE = re.compile(r'Instance<.*>\x01\d+\x02\Z', re.S)
+_VALUE = re.compile(r'<\w+ ')
+
+
+def _is_probe(e):
+    """Is this event of a kind Luraph's start-up makes?  (see PROBE_LIBS)"""
+    a = e.args[0] if e.args else ''
+    if e.kind == 'S':
+        # a property of an object the start-up made itself, and not a link into what was there before
+        if not _NEW_INSTANCE.match(a):
+            return False
+        v = e.args[2] if len(e.args) > 2 else ''
+        return not (_INSTANCE.match(v) and not _NEW_INSTANCE.match(v))
+    if e.kind == 'K':
+        return bool(_NEW_INSTANCE.match(a))
+    if e.kind != 'C':
+        return False                 # an executor function kept as a Lua stand-in
+    if '.' in e.name:
+        return e.name.split('.')[0] in PROBE_LIBS
+    if _NEW_INSTANCE.match(a) or (_VALUE.match(a) and not a.startswith('Instance<')):
+        return True                  # a method of its own object, or of a value (vector math, a signal, a Random)
+    if _INSTANCE.match(a):
+        return e.name in QUERY_METHODS
+    return e.name in PROBE_GLOBALS
+
 
 PLACEHOLDER_RE = re.compile(r'LIFT ERROR|__LPH_\w+|\b(?:ARG|REG|UPVAL)_\d+\b|\bLuraphVM\b|nil --\[\[|\bUNSTRUCTURED\b')
 
@@ -187,7 +214,7 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
                 continue
             f = line[5:].split(US)
             kind = f[0]
-            if kind in ('C', 'S'):
+            if kind in EVENT_KINDS:
                 ev = Event(kind, f[1] if len(f) > 1 else '', f[2:], line)
                 run.events.append(ev)
                 if not (kind == 'C' and ev.name in noise):
@@ -389,10 +416,6 @@ def _kinds(events):
     return ', '.join('%s x%d' % kv for kv in c.most_common(12)) + (', ...' if len(c) > 12 else '')
 
 
-def _is_probe(e):
-    return e.kind == 'C' and e.name in PROBE_CALLS
-
-
 def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS):
     """Compare two runs.  Returns a Verdict."""
     for run, who in ((orig, 'original'), (res, 'result')):
@@ -432,7 +455,8 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
         return v
 
     # 1. calls in front of the result's first call must be Luraph's
-    odd = [(i, e) for i, e in prefix if not _is_probe(e)]
+    # (a call that raised did nothing: the start-up calls methods without their object to see the error)
+    odd = [(i, e) for i, e in prefix if not (i in orig.errors or _is_probe(e))]
     if odd and m == n_r and n_r <= n_o:
         # (when the result's own calls do not line up at all, that is the divergence to report)
         v = finish(DIFFERENT, 'the original makes %d call(s) in front of the result\'s first call that Luraph\'s start-up does not make' % len(odd))
