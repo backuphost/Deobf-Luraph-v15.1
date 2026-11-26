@@ -410,15 +410,7 @@ return function(G, fnames, libnames, opts)
 				if v ~= nil then return v end
 				if kind == "method" then return unmodelled(k) end
 			end
-			if kind == nil then
-				-- (a member hides a child of the same name; anything else can be a child)
-				for _, c in ipairs(d.children) do
-					if data[c].props.Name == k then return c end
-				end
-				if class == "DataModel" and type(k) == "string" and services[k] then return services[k] end
-			end
-			if type(k) ~= "string" then return nil end
-			if kind == "prop" then
+			if kind == "prop" and type(k) == "string" then
 				local f = computed[k]
 				if f then
 					v = f(u, d)
@@ -433,6 +425,15 @@ return function(G, fnames, libnames, opts)
 					end
 				end
 			end
+			if kind == nil or kind == "prop" then
+				-- a child of that name (a method or an event hides it; so does a property the mock
+				-- has a value for, while one it has none for gives way: `game.Workspace`)
+				for _, c in ipairs(d.children) do
+					if data[c].props.Name == k then return c end
+				end
+				if class == "DataModel" and type(k) == "string" and services[k] then return services[k] end
+			end
+			if type(k) ~= "string" then return nil end
 			if known and kind == nil and d.created then
 				-- the script made this instance itself: what it has is known, and this is not part of it
 				error(k .. " is not a valid member of " .. class .. " \"" .. fullName(u) .. "\"", 2)
@@ -771,6 +772,7 @@ return function(G, fnames, libnames, opts)
 	local workspace = newInstance("Workspace", "Workspace")
 	services.Workspace = workspace
 	setParent(workspace, game)
+	data[game].props.workspace = workspace      -- (the property; `game.Workspace` finds the child)
 	data[game].props.PlaceId = 1
 	data[game].props.GameId = 1
 	data[game].props.JobId = "5c3a1a7e-0b1f-4c2d-9e57-3f6a8d2b4c10"    -- (empty only in Studio; scripts derive keys from it)
