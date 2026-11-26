@@ -109,7 +109,10 @@ def _run_traced(self):
         # program doing all the work: say so (the choice itself is left alone, --root decides).
         ran_first = sum(1 for k in oracle if isinstance(k[0], int) and 0 < k[0] <= len(self.lifter.records)
                         and self.lifter.records[k[0] - 1][0] == boot)
-        if nodes < 50 and ran_first > 1000:
+        # (A small script is small too -- a test script is a handful of instructions next to the
+        # 20,000 of Luraph's start-up code -- so size alone says nothing.  A helper of the build
+        # is arithmetic: the hint is for a function that calls nothing but pure library functions.)
+        if nodes < 50 and ran_first > 1000 and not _calls_out(protos):
             self.hints.append('[hint] the function taken for the script (proto %d, on the second interpreter) has only %d '
                               'instructions, while the first program executed %d: the script is probably the first '
                               'program; run again with --root %d' % (root, nodes, ran_first, first_root))
@@ -121,6 +124,25 @@ def _run_traced(self):
 
 
 Stage.run_traced = _run_traced
+
+_PURE_LIBS = ('bit32.', 'math.', 'string.', 'buffer.', 'table.', 'utf8.')
+
+
+def _calls_out(protos):
+    """True when a lifted instruction calls anything other than a pure library function."""
+    for p in protos.values():
+        for node in p.nodes.values():
+            stack = [node.tree] if node.tree else []
+            while stack:
+                stmts, term = stack.pop()
+                for st in stmts:
+                    if st[0] == 'call' and not (isinstance(st[2], tuple) and st[2][0] == 'kfn' and str(st[2][1]).startswith(_PURE_LIBS)):
+                        return True
+                if term[0] == 'br':
+                    stack += [term[2], term[3]]
+                elif term[0] == 'forbr':
+                    stack += [term[3], term[4]]
+    return False
 
 
 def _poke_list(self):

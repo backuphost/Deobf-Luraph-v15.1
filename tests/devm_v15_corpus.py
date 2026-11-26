@@ -11,7 +11,8 @@ wrapper keys: one interpreter, the main function behind jump-register hubs and b
   old test;
 * `lifter.hub_line`: the instructions without effect in front of a jump through a register belong to
   that jump (one copy per jump target), and nothing else does;
-* a traced run that created no VM function ends in `run failed: the VM never started: ...`.
+* a traced run that created no VM function ends in `run failed: the VM never started: ...`;
+* the `--root` hint is given for a helper function (arithmetic only), not for every small script.
 
     LURAPH_CORPUS=/path/to/obfuscator-samples/Luraph DEVM_V15_CORPUS_FULL=1 python3 tests/devm_v15_corpus.py Corpus
 
@@ -204,6 +205,28 @@ class HubLine(unittest.TestCase):
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 57)))
         self.nodes[(2, 59)] = node((2, 59), (2, 60), error='register 11850 out of range')
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 57)))
+
+
+class RootHint(unittest.TestCase):
+    """The hint `the script is probably the first program; run again with --root N` is for a function
+    on the second interpreter that is a helper of the build (arithmetic), not for a small script."""
+
+    def protos(self, *stmts):
+        from devm import pipeline
+        pir = lifter.ProtoIR(34)
+        n = lifter.Node((0, 1))
+        n.tree = ([], ('br', ('t', 'c'), (list(stmts), ('goto', (0, 2), {})), ([], ('ret', [], None))))
+        pir.nodes[(0, 1)] = n
+        return pipeline._calls_out({34: pir})
+
+    def test_small_script_calls_out(self):
+        self.assertTrue(self.protos(('call', 'c1', ('t', 'P1_1'), [('k', 'hii')], None, 0)))
+        self.assertTrue(self.protos(('call', 'c1', ('kfn', 'print'), [('k', 'hii')], None, 0)))
+
+    def test_helper_is_arithmetic(self):
+        self.assertFalse(self.protos(('call', 'c1', ('kfn', 'bit32.bxor'), [('r', 1), ('k', 5)], None, 1),
+                                     ('set', ('r', 2), ('mv', 'c1', 1))))
+        self.assertFalse(self.protos())
 
 
 LAYER3 = os.path.join(ROOT, 'examples', 'layer3.lua')
