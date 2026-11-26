@@ -196,7 +196,7 @@ IR module as parameter `D`. `backend.lower`: `structure.build_cfg` ->
   given to a local whose scope overlaps another one with that name, so no
   shadowing; `local f = function` counts from its statement start since
   localfuncs turns it into `local function f`; numbered in declaration
-  order; globals are never reused) names from use: `x or default` after `x`,
+  order; globals are never reused: `game_`, then `game2`) names from use: `x or default` after `x`,
   `f("RouterClient")` after the string, `require(x:WaitForChild("M"))` ->
   `M`, `t[k](...)` -> `handlers`. `localfuncs.py`: `local f = function` ->
   `local function f`.
@@ -342,9 +342,7 @@ hold for every change to the shared runtime:
   runs: while a register is open (captured, not yet closed by the VM's close
   op), assignments to it must not be inlined away or copy-propagated
   (`codegen.open_registers`, forward dataflow).
-- Inlining a call into a later statement must keep evaluation order inside
-  that statement too (`call_before`) and must not cross a redefinition of a
-  register the call reads.
+- Inlining a call into a later statement must keep evaluation order inside that statement too (`call_before`) and must not cross a redefinition of a register the call reads. `simplify_block` sweeps strictly first: a call does not cross the definition of another operand of its use statement (else `f(a(), g())` became `local g2 = g; f(a(), g2())`); the relaxed sweep only runs when the strict ones change nothing. A sweep from the last definition backwards is wrong: it moves `r1 / 2`, `#r1` away before their operand.
 - A call or `...` used as a single value in the last position of an argument
   list / return / table constructor must be parenthesized (`g((f()))`).
 - `for` header expressions are evaluated once, at the loop prep (`ForPrep`
@@ -373,7 +371,7 @@ hold for every change to the shared runtime:
 - Luau's 200-active-locals limit: `variables.limit_locals` -> `fit_locals`:
   small closed `do ... end` segments (`wrap_segments`) when their estimate
   (`dry=True`) fits, else `split_block` (one closed prefix, e.g. a loader and
-  the script it runs, with the locals crossing the cut declared in front).
+  the script it runs, with the locals crossing the cut declared in front, in declaration order: never iterate a `set` of names into the output, its order differs per process).
   `backend.lower` retries with smaller budgets while `peak_locals` is over
   the limit (a full top level leaves nested blocks no room). Call temps kept
   as `local tN = table.pack(call)` count as locals there (`declared_here`,
@@ -396,13 +394,11 @@ hold for every change to the shared runtime:
   a loop to another exit -> `exitTo = k break` + dispatch after the loop
   (`unify_exits`); a block reached again -> its region (up to the fork's join)
   copied per extra pred (`split_node`). Last resort: a `state` dispatch loop.
-- A register table (`t = {}` + stores) folds into a constructor across pure
-  moves; integer keys 1..n become positional items. `fold_tables` repeats
+- A register table (`t = {}` + stores) folds into a constructor across pure moves; integer keys 1..n become positional items; the fixed items in front of a multret SETLIST join it (`merge_setlist_items`: `{a, b, f()}`). An empty table moves down to its first store only when that is an array item and no closure holds the register (never for `M.name = v`: `local M = {}` stays where it is). A function that names its table (`M.f = function() M.g() end`) keeps all of M's functions out of the constructor (`table_self_ref`, idioms `self_named`). `fold_tables` repeats
   with copy propagation/simplify until nothing changes: an inner constructor
   sits in a temp register until simplify inlines it into the outer store
   (nested `{ {"PUSH", 7}, ... }`, webhook `embeds = { { ... } }`).
-- Nested constructors whose items contain calls can come out split
-  (`local t5 = {...}; ... t[1] = t5`): moving an item past a call isn't safe.
+- An array constructor whose LAST item is a single-valued call stays `local a, b = f(), g(); t = { a, b }`: `truncated_use` keeps `(g())` out and no earlier call may pass it.
 
 ## Checks
 

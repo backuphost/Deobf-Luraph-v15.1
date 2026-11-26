@@ -4938,7 +4938,9 @@ class FunctionLifter:
             memo[ckey] = (lines, params)
         self.lifted.discard(id(proto))
         f = CG.FuncE(["function(%s)" % ", ".join(params)] + ["\t" + l for l in lines] + ["end"])
-        f.captures = set(upnames.values())
+        # (a list in upvalue order, not a set: variables.declare lists the names
+        # in this order, and a set's order differs from process to process)
+        f.captures = list(dict.fromkeys(upnames.values()))
         return f
 
 

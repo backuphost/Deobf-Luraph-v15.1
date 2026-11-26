@@ -261,6 +261,180 @@ def check_run_once_forin():
     assert not any(isinstance(s, D.CallStmt) and isinstance(s.fn, Pseudo) for s in blocks[1].stmts)
 
 
+def _block(stmts, values=None):
+    import structure
+    b = structure.Block(1)
+    b.stmts = list(stmts)
+    b.kind = "ret"
+    b.values = values
+    return b
+
+
+def check_operand_order():
+    """`f(a(), K.g())` with the multret call already in place: `a()` does not move across the load
+    of `K.g` (which then could not follow it and stayed a local in front of the statement)."""
+    import codegen as CG
+    from luasym import Const, Reg, Global, Index, TempVal, TempTail, Multi
+
+    def call(fn, *args, tail=None):
+        return CG.CallE(fn, Multi(list(args), tail))
+
+    b = _block([CG.AssignS([Reg(1)], Multi([Global("f")])),
+                CG.AssignS([Reg(2)], Multi([Global("a")])),
+                CG.TempDef("T1", call(Reg(2))),
+                CG.AssignS([Reg(2)], Multi([TempVal("T1", 1)])),
+                CG.AssignS([Reg(3)], Multi([Index(Global("K"), Const(b"g"))])),
+                CG.TempDef("T2", call(Reg(3), Const(1))),
+                CG.TempDef("T3", call(Reg(1), Reg(2), tail=TempTail("T2", 1)))],
+               Multi([], TempTail("T3", 1)))
+    blocks = {1: b}
+    for _ in range(3):
+        CG.simplify_block(b, set(), CG.count_temp_uses(blocks))
+    assert b.stmts == [], [type(s).__name__ for s in b.stmts]
+    outer = b.values.tail.call
+    assert isinstance(outer.fn, Global) and outer.fn.name == "f", outer.fn
+    first, inner = outer.args.items[0], outer.args.tail.call
+    assert isinstance(first, CG.CallE) and first.fn.name == "a"
+    assert isinstance(inner.fn, Index) and inner.fn.key.v == b"g", inner.fn      # not a register
+
+
+def check_table_constructors():
+    """Array items with calls fold into the constructor: the fixed items of a multret SETLIST,
+    an empty table that moves down to its first array store; a table that one of its functions
+    names keeps its functions outside."""
+    import codegen as CG
+    from luasym import Const, Reg, Global, Index, TempVal, TempTail, Multi, ClosureExpr
+
+    def call(fn, *args, tail=None):
+        return CG.CallE(fn, Multi(list(args), tail))
+
+    def new():
+        return CG.AssignS([Reg(1)], Multi([CG.NewTableE([])]))
+
+    def store(key, value):
+        return CG.AssignS([Index(Reg(1), Const(key))], Multi([value]))
+
+    # {f(), g(1)}: Luraph stores the fixed item, then moves the results of the last call
+    b = _block([new(),
+                CG.TempDef("T1", call(Global("f"))),
+                CG.AssignS([Reg(2)], Multi([TempVal("T1", 1)])),
+                CG.AssignS([Reg(3)], Multi([Global("g")])),
+                CG.TempDef("T2", call(Reg(3), Const(1))),
+                store(1, Reg(2)),
+                CG.SetListS(Reg(1), 2, Multi([], TempTail("T2", 1)))],
+               Multi([Reg(1)]))
+    CG.merge_setlist_items(b)
+    assert isinstance(b.stmts[-1], CG.SetListS) and b.stmts[-1].start == 1 and len(b.stmts[-1].values.items) == 1
+    blocks = {1: b}
+    for _ in range(3):
+        CG.simplify_block(b, set(), CG.count_temp_uses(blocks))
+        CG.fold_tables(b)
+    tbl = b.values.items[0] if not b.stmts else b.stmts[-1].values.items[0]
+    assert isinstance(tbl, CG.NewTableE) and len(tbl.items) == 1 and isinstance(tbl.tail, CG.InlineTail), \
+        [type(s).__name__ for s in b.stmts]
+    assert isinstance(tbl.items[0][1], CG.CallE) and tbl.tail.call.fn.name == "g"
+    assert not any(isinstance(s, CG.SetListS) for s in b.stmts)
+    # {a, b} whose items stay registers (used again): the empty table moves down to the stores
+    use = CG.CallS(call(Global("use"), Reg(2), Reg(3)))
+    b = _block([new(), CG.AssignS([Reg(2)], Multi([call(Global("f"))])), CG.AssignS([Reg(3)], Multi([call(Global("f"))])),
+                store(1, Reg(2)), store(2, Reg(3)), use], Multi([Reg(1)]))
+    assert CG.fold_tables(b) is True
+    kinds = [type(s.values.items[0]).__name__ if isinstance(s, CG.AssignS) else "use" for s in b.stmts]
+    assert kinds == ["CallE", "CallE", "NewTableE", "use"], kinds
+    assert len(b.stmts[2].values.items[0].items) == 2
+    # ... but `local M = {}`, other statements, `M.name = v` stays as written
+    b = _block([new(), CG.CallS(call(Global("f"))), store(b"name", Reg(2))], Multi([Reg(1)]))
+    assert CG.fold_tables(b) is False and len(b.stmts) == 3
+    # ... and not while a closure made earlier holds the register (it could read the table)
+    b = _block([new(), CG.CallS(call(Global("f"))), store(1, Reg(2))], Multi([Reg(1)]))
+    assert CG.fold_tables(b, frozenset([1])) is False
+    # a function that names its table: no function is folded in, plain fields are
+    plain, named = ClosureExpr(object(), []), ClosureExpr(object(), [Reg(1)])
+    b = _block([new(), store(b"x", Const(1)), store(b"f", plain), store(b"g", named)], Multi([Reg(1)]))
+    assert CG.fold_tables(b) is True
+    assert len(b.stmts) == 3 and [k.v for k, _ in b.stmts[0].values.items[0].items] == [b"x"], len(b.stmts)
+    b = _block([new(), store(b"x", Const(1)), store(b"f", plain)], Multi([Reg(1)]))
+    assert CG.fold_tables(b) is True and len(b.stmts) == 1
+
+
+def check_declarations():
+    """Locals that live across `do ... end` segments are declared in front only where a segment
+    closes over them (no `local x` directly followed by `x = v`), in declaration order whatever
+    the hash seed is; a local named like a global is numbered `v2`, not `v_2`."""
+    import codegen as CG
+    import variables as V
+    from luasym import Const, Multi
+
+    def local(names, value):
+        st = CG.AssignS([CG.LocalName(n) for n in names], Multi([value]))
+        st.is_local = True
+        return st
+
+    def use(*names):
+        return CG.CallS(CG.CallE(CG.LocalName("print"), Multi([CG.LocalName(n) for n in names])))
+
+    # closed groups of statements with a long-lived local between them: the long-lived ones are
+    # hoisted so that the groups can close, but a lone `a = v` between two groups closes nothing
+    stmts = []
+    for i in range(40):
+        stmts += [local(["b%d" % i], Const(i)), local(["c%d" % i], CG.LocalName("b%d" % i)), use("c%d" % i),
+                  local(["a%d" % i], Const(i))]
+    stmts.append(use(*["a%d" % i for i in range(40)]))
+    out = V.wrap_segments(stmts, 30)
+
+    def pairs(lst):
+        n = 0
+        for x, y in zip(lst, lst[1:]):
+            if isinstance(x, CG.LocalS) and x.values is None and isinstance(y, CG.AssignS) \
+                    and not getattr(y, "is_local", False) \
+                    and any(isinstance(t, CG.LocalName) and t.name in x.names for t in y.targets):
+                n += 1
+        for x in lst:
+            if isinstance(x, V.DoBlock):
+                n += pairs(x.body)
+        return n
+    assert any(isinstance(x, V.DoBlock) for x in out), "no segment was closed"
+    assert pairs(out) == 0, pairs(out)
+    # every name is still declared exactly once
+    seen = []
+
+    def decls(lst):
+        for x in lst:
+            seen.extend(V.declared_here(x))
+            if isinstance(x, V.DoBlock):
+                decls(x.body)
+    decls(out)
+    assert sorted(seen) == sorted(["a%d" % i for i in range(40)] + ["b%d" % i for i in range(40)]
+                                  + ["c%d" % i for i in range(40)]), len(seen)
+    # the order of hoisted names of one statement does not depend on the hash seed
+    prog = ("import sys; sys.path.insert(0, %r)\n"
+            "import codegen as CG, variables as V\n"
+            "from luasym import Const, Multi\n"
+            "def local(names, v):\n"
+            "    st = CG.AssignS([CG.LocalName(n) for n in names], Multi([v])); st.is_local = True; return st\n"
+            "def use(*names):\n"
+            "    return CG.CallS(CG.CallE(CG.LocalName('print'), Multi([CG.LocalName(n) for n in names])))\n"
+            "names = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta']\n"
+            "stmts = [local(names, Const(1))]\n"
+            "for i in range(12):\n"
+            "    stmts += [local(['t%%d' %% i], Const(i)), use('t%%d' %% i)]\n"
+            "stmts.append(use(*names))\n"
+            "out = V.split_block(stmts, 8)\n"
+            "print(','.join(n for x in (out or []) if isinstance(x, CG.LocalS) and x.values is None for n in x.names))\n"
+            % DEOBF)
+    got = set()
+    for seed in ("1", "2", "3", "4"):
+        r = subprocess.run([PY, "-B", "-c", prog], capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, PYTHONHASHSEED=seed))
+        assert r.returncode == 0, r.stderr[-400:]
+        got.add(r.stdout.strip())
+    assert got == {"alpha,beta,gamma,delta,epsilon,zeta"}, got
+    # names
+    import names
+    text = names.rename_text("local r1 = foo()\nlocal r2 = foo()\nlocal r3 = foo()\nprint(v, r1, r2, r3)\n")
+    assert "v_2" not in text and "v_3" not in text and "print(v, v_, v2, v3)" in text, text
+
+
 # --------------------------------------------------------------------------
 # with the corpus (files picked by directory and property)
 
@@ -322,6 +496,9 @@ CHECKS = [
     ("pack-site", check_pack_site),
     ("chunk-params", check_chunk_params),
     ("run-once-forin", check_run_once_forin),
+    ("operand-order", check_operand_order),
+    ("table-constructors", check_table_constructors),
+    ("declarations", check_declarations),
     ("result-line", check_result_line_trace),
     ("failure-line", check_failure_line),
     ("time-limit-lift", check_time_limit_lift),

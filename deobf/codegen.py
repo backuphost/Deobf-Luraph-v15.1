@@ -495,7 +495,13 @@ def simplify_block(b, live_out, temp_uses_total, open_in=frozenset()):
         i += 1
     b.stmts = out
     # --- registers: inline single-use definitions (one forward sweep per
-    # round; per-statement uses/defs memoized: this is the lifter's hot loop)
+    # round; per-statement uses/defs memoized: this is the lifter's hot loop).
+    # Strict sweeps first: a call does not move across the definition of
+    # another operand of the same statement (`f(a(), g())` with the multret
+    # `g()` already in place: moving `a()` across the load of `g` left that
+    # load in front for good, `local g2 = g; f(a(), g2())`). The operand goes
+    # first in the same sweep and the call follows in the next one. A relaxed
+    # sweep (the call moves anyway) only when the strict ones are done.
     memo = {}
 
     def ud(x):
@@ -506,23 +512,28 @@ def simplify_block(b, live_out, temp_uses_total, open_in=frozenset()):
         return m[1], m[2]
     ud.memo = memo
 
-    changed = True
-    while changed:
+    def sweep(strict):
         changed = False
         st = b.stmts
         opened = set(open_in)       # open registers before st[i]
         i = 0
         while i < len(st):
             s = st[i]
-            if inline_def(b, st, i, live_out, opened, ud):
+            if inline_def(b, st, i, live_out, opened, ud, strict):
                 changed = True
                 continue
             open_step(s, b, opened)
             i += 1
+        return changed
+
+    while sweep(True) or sweep(False):
+        pass
 
 
-def inline_def(b, st, i, live_out, opened, ud):
-    """Inline `r = val` (st[i]) into its single use if that is safe; True if done."""
+def inline_def(b, st, i, live_out, opened, ud, strict=False):
+    """Inline `r = val` (st[i]) into its single use if that is safe; True if done.
+    strict: a value with a call does not move across the definition of a
+    register its use statement reads too (see simplify_block)."""
     s = st[i]
     if not (isinstance(s, AssignS) and len(s.targets) == 1 and isinstance(s.targets[0], Reg)
             and len(s.values.items) == 1 and s.values.tail is None):
@@ -583,11 +594,20 @@ def inline_def(b, st, i, live_out, opened, ud):
     stop = len(st) if use_at == "term" else use_at
     deps = set(regs_read(val))
     mov = movable(val)
+    others = None       # strict: the registers the use statement reads, if val has a call
     for k in range(i + 1, stop):
-        if deps & set(ud(st[k])[1]):
+        dk = ud(st[k])[1]
+        if deps & set(dk):
             return False
         if not mov and not pure_stmt(st[k]):
             return False
+        if strict and not mov and dk:
+            if others is None:
+                others = set()
+                if any(isinstance(x, (CallE, ClosureExpr)) for x in walk(val)):
+                    others = set(term_uses(b)[0] if use_at == "term" else ud(st[use_at])[0])
+            if others & set(dk):
+                return False
     if use_at != "term" and not prefix_ok(val) and r in target_regs(st[use_at]):
         return False
     if expands(val) and truncated_use(st[use_at] if use_at != "term" else None, b, r):
@@ -1226,6 +1246,7 @@ def term_exprs(b):
 def simplify_blocks(blocks, D):
     for b in blocks.values():
         b.stmts = convert_stmts(b.stmts, D)
+        merge_setlist_items(b)
         if b.cond is not None:
             b.cond = conv(b.cond, D)
         if b.kind == "ret" and b.values is not None:
@@ -1251,10 +1272,11 @@ def simplify_blocks(blocks, D):
     # table constructors: r = {} followed by r[k] = v / setlist. Nested
     # tables need several rounds: an inner constructor is built in a temp
     # register and only inlined into the outer store by simplify_block.
+    opened = open_registers(blocks)
     for _ in range(8):
         changed = False
         for b in blocks.values():
-            changed |= fold_tables(b)
+            changed |= fold_tables(b, opened[b.id])
         live_out = liveness(blocks)
         opened = open_registers(blocks)
         for b in blocks.values():
@@ -1339,11 +1361,66 @@ def drop_redundant_stores(blocks):
         b.stmts = keep
 
 
-def fold_tables(b):
+def merge_setlist_items(b):
+    """`t[1] = a; t[2] = b; setlist(t, 3, <all results of a call>)` -> one
+    setlist from 1. Luau's SETLIST for `{a, b, f()}` is one instruction;
+    Luraph's handler stores the fixed items one by one and moves the rest.
+    As one statement it folds into the constructor (fold_tables)."""
+    st = b.stmts
+    i = 0
+    while i < len(st):
+        s = st[i]
+        if isinstance(s, SetListS) and s.values.tail is not None and isinstance(s.tbl, Reg):
+            r = s.tbl.n
+            items = []
+            j = i
+            while j > 0:
+                p = st[j - 1]
+                if not (isinstance(p, AssignS) and len(p.targets) == 1 and isinstance(p.targets[0], Index)
+                        and isinstance(p.targets[0].obj, Reg) and p.targets[0].obj.n == r
+                        and isinstance(p.targets[0].key, Const)
+                        and isinstance(p.targets[0].key.v, (int, float)) and not isinstance(p.targets[0].key.v, bool)
+                        and p.targets[0].key.v == s.start - len(items) - 1
+                        and len(p.values.items) == 1 and p.values.tail is None
+                        and isinstance(p.values.items[0], (Reg, Const))
+                        and not (isinstance(p.values.items[0], Reg) and p.values.items[0].n == r)):
+                    break
+                items.insert(0, p.values.items[0])
+                j -= 1
+            if items:
+                st[j:i + 1] = [SetListS(s.tbl, s.start - len(items), Multi(items + list(s.values.items), s.values.tail))]
+                i = j
+        i += 1
+
+
+def table_self_ref(st, start, r, b):
+    """Is a closure that captures register r (a table) stored into that table
+    by one of the statements from `start` on, while r keeps its value?"""
+    for k in range(start, len(st)):
+        n = st[k]
+        if isinstance(n, AssignS) and len(n.targets) == 1 and isinstance(n.targets[0], Index) \
+                and isinstance(n.targets[0].obj, Reg) and n.targets[0].obj.n == r:
+            order = stmt_eval_order(n, b)
+            if r in ref_captures(order):
+                return True
+            if any(isinstance(x, ClosureExpr) and r in [c.n for c in children(x) if isinstance(c, Reg)] for x in order):
+                return True
+        if r in stmt_defs(n):
+            break
+    return False
+
+
+def fold_tables(b, open_in=frozenset()):
     """`t = {}` followed by `t[k] = v` / setlist -> one table constructor.
     Pure register moves may sit in between (Luraph loads the item functions
     into registers there) as long as they don't touch the table or what the
-    items read: the constructor then takes the place of the last store."""
+    items read: the constructor then takes the place of the last store.
+    An empty table whose first store is an array item also moves down to
+    that store, across any statement that does not mention it: Luau creates
+    the table of `{f(), g()}` first, evaluates the items into registers and
+    stores them last (SETLIST), and nothing can see a table that no closure
+    holds and no statement names. (Not for `t.name = v` as first store:
+    that is `local M = {}` and, much later, `M.f = f`.)"""
     st = b.stmts
     changed = False
     i = 0
@@ -1357,12 +1434,27 @@ def fold_tables(b):
             consumed = []
             item_reads = set()
             pending = []            # intermediate statements (kept, before the constructor)
+            # may the (still empty) table be created later than written?
+            sinks = not tbl.items and tbl.tail is None and r not in open_before(b, i, open_in)
+            sunk = False            # ... and it would be (statements with calls passed)
+            self_ref = None         # does a function stored into the table use the table?
             while j < len(st):
                 n = st[j]
                 if isinstance(n, AssignS) and len(n.targets) == 1 and isinstance(n.targets[0], Index) and                         isinstance(n.targets[0].obj, Reg) and n.targets[0].obj.n == r and                         len(n.values.items) == 1 and n.values.tail is None and                         r not in regs_read(n.values.items[0]) and r not in regs_read(n.targets[0].key):
                     key = n.targets[0].key
+                    if any(isinstance(x, (ClosureExpr, FuncE)) for x in walk(n.values.items[0])):
+                        # `local M = {}` + `function M.f() ... M.g() ... end`: a
+                        # function that names the table cannot have been written
+                        # inside its constructor. Then none of the functions is
+                        # folded in (not `local M; M = { f = function() M.g() end }`).
+                        if self_ref is None:
+                            self_ref = table_self_ref(st, i + 1, r, b)
+                        if self_ref:
+                            break
                     if isinstance(key, Const) and key.v == count_array(tbl) + 1 and not isinstance(key.v, bool)                             and not any(isinstance(k, Const) and k.v == key.v for k, _ in tbl.items):
                         key = None      # next array slot: positional item
+                    if sunk and not consumed and key is not None:
+                        break
                     tbl.items.append((key, n.values.items[0]))
                     item_reads |= set(regs_read(n.values.items[0])) | set(regs_read(n.targets[0].key))
                     consumed.append(j)
@@ -1382,6 +1474,13 @@ def fold_tables(b):
                     continue
                 if pure_stmt(n) and isinstance(n, AssignS) and r not in stmt_regs(n)                         and r not in stmt_defs(n) and not (set(stmt_defs(n)) & item_reads):
                     pending.append(n)
+                    j += 1
+                    continue
+                if sinks and not consumed and isinstance(n, (AssignS, CallS, TempDef)) \
+                        and r not in stmt_regs(n) and r not in stmt_defs(n) \
+                        and r not in ref_captures(stmt_eval_order(n, b)):
+                    pending.append(n)
+                    sunk = True
                     j += 1
                     continue
                 break
@@ -1680,8 +1779,16 @@ class Renderer:
             if st.values.tail is None:
                 tg = ", ".join("%s[%d]" % (self.prefix(st.tbl), st.start + k) for k in range(len(st.values.items)))
                 return [ind + "%s = %s" % (tg, self.multi(st.values, trunc=False))] if tg else []
-            return [ind + "do", ind + "\tlocal values = table.pack(%s)" % self.multi(st.values),
-                    ind + "\ttable.move(values, 1, values.n, %d, %s)" % (st.start, self.expr(st.tbl)), ind + "end"]
+            # (a table that did not fold into a constructor: the fixed items
+            # as plain stores, as Luraph's handler does, then the call's results)
+            k = len(st.values.items)
+            head = []
+            if k:
+                tg = ", ".join("%s[%d]" % (self.prefix(st.tbl), st.start + q) for q in range(k))
+                head = [ind + "%s = %s" % (tg, self.multi(Multi(list(st.values.items)), trunc=False))]
+            return head + [ind + "do", ind + "\tlocal values = table.pack(%s)" % self.multi(Multi([], st.values.tail)),
+                           ind + "\ttable.move(values, 1, values.n, %d, %s)" % (st.start + k, self.expr(st.tbl)),
+                           ind + "end"]
         if isinstance(st, LocalS):
             if st.values is None:
                 return [ind + "local " + ", ".join(st.names)]
