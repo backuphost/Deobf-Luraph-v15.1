@@ -77,7 +77,8 @@ def maybe_reexec_pypy(args):
         return
     print("[*] big script: running under PyPy (%s; --no-pypy to turn off)" % pypy, file=sys.stderr)
     sys.stderr.flush()
-    sys.exit(subprocess.call([pypy, os.path.abspath(__file__)] + sys.argv[1:]))
+    # (limits.spawn: the PyPy run ends with this process, also when it is killed)
+    sys.exit(limits.spawn([pypy, os.path.abspath(__file__)] + sys.argv[1:]).wait())
 
 
 def parser():

@@ -305,6 +305,7 @@ def run(job):
     chunks = {}
     raw_chunks = {}     # key -> original source of a loadstring'd VM chunk (for devirt)
     body = None
+    prev = None         # the trace of the run before (kept when a rerun runs into the time limit)
     trapped = None      # (body, raw output) of the run that hit the last trap
     cfg = None
     for attempt in range(1, args.max_runs + 1):
@@ -333,12 +334,18 @@ def run(job):
             chunks = {k: patch_spin(v) for k, v in chunks.items()}
             cfg["spin"] = SPIN_CHECKS
             body, err = runner.run(patched, cfg, chunks)
+        if body is None and prev is not None and limits.expired():
+            # (the lift is cut short by the same limit; the trace stays a result)
+            print("[!] %s: keeping the trace of run %d" % (err, attempt - 1), file=sys.stderr)
+            body = prev
+            break
         if body is None:
             harness.save_raw(args.raw)
             runner.finish()
             sys.exit("[!] " + err)
         body = harness.take_p2d(body, cache_path, bridge is not None)
         found, body = harness.take_chunks(body)
+        prev = body
         added = 0
         nested = "nested" in shapes
         for key, src in found:
