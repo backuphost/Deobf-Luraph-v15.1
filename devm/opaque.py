@@ -89,7 +89,7 @@ def strip(text):
             if nxt == new:
                 break
             new = nxt
-        for fn in (_drop_dead_copies, _inline_fn_alias, _fold_call_keys, _iife_params, _fold_fn_truth, _drop_empty_ifs, _drop_dead_opaque_stores, _drop_callback_opaque):
+        for fn in (_drop_dead_copies, _inline_fn_alias, _fold_type_tests, _drop_blind_key_arith, _fold_call_keys, _iife_params, _fold_fn_truth, _drop_empty_ifs, _drop_dead_opaque_stores, _drop_callback_opaque):
             for _ in range(500):
                 nxt = fn(new)
                 if nxt == new:
@@ -1267,6 +1267,81 @@ def _decide_key_tests(text, keyvars):
         if n == 1:
             lines = [ln for ln in lines if not re.fullmatch(r'\t*(?:local )?%s = %d' % (name, value), ln)]
     return '\n'.join(lines)
+
+
+_TYPE_TEST = re.compile(r'\btype\((\d+(?:\.\d+)?)\) ([=~]=) "(\w+)"')
+_BLIND_TOK = re.compile(r'\s*(?:(?P<nil>nil(?: --\[\[\w+\]\])?)|(?P<num>\d+\.?\d*(?:[eE][-+]?\d+)?)|(?P<var>v\d+)|bit32\.\w+|//|[-+*/%^(),])')
+
+
+def _fold_type_tests(text):
+    """`if type(0) == "buffer" then`: the type of a number literal is known (an opaque test in
+    front of a junk arm; _fold_const_ifs removes the arm)."""
+    def fold(m):
+        return 'true' if (m.group(3) == 'number') == (m.group(2) == '==') else 'false'
+    return '\n'.join(_TYPE_TEST.sub(fold, ln) if re.match(r'\t*(?:if|elseif|while) ', ln) and 'type(' in ln else ln
+                     for ln in text.split('\n'))
+
+
+def _drop_blind_key_arith(text):
+    """Key arithmetic on an interpreter local the lifter has no value for:
+
+        local v36 = nil --[[OPENUPS]] % 4294967296
+        local v37 = bit32.bxor(v36 - v36 % 1, 283475159)
+
+    The interpreter of these builds mixes a key it keeps in one of its locals into values nothing
+    reads.  Where the lifter knows the key the result is a constant and _fold_consts removes it;
+    where it does not, the unknown is printed as nil.  A chain of locals made of numbers, bit32,
+    arithmetic and such an unknown, with a large literal in it and no reader outside the chain,
+    is that arithmetic and is removed."""
+    lines = text.split('\n')
+    cand = {}       # variable -> (line, variables its value is made of, has an unknown and a large literal)
+    for i, ln in enumerate(lines):
+        m = re.fullmatch(r'\t*local (v\d+) = (.+)', ln)
+        if not m or m.group(1) in cand:
+            continue
+        pos, rhs, refs, unknown, big = 0, m.group(2), set(), False, False
+        while pos < len(rhs):
+            t = _BLIND_TOK.match(rhs, pos)
+            if not t:
+                break
+            if t.group('var'):
+                refs.add(t.group('var'))
+            elif t.group('nil'):
+                unknown = True
+            elif t.group('num') and float(t.group('num')) >= 2 ** 24:
+                big = True
+            pos = t.end()
+        if pos == len(rhs):
+            cand[m.group(1)] = (i, refs, unknown and big)
+    if not any(c[2] for c in cand.values()):
+        return text
+    own = {c[0]: nm for nm, c in cand.items()}
+    readers = {}
+    for i, ln in enumerate(lines):
+        for nm in set(re.findall(r'\bv\d+\b', ln)):
+            if nm in cand and own.get(i) != nm:
+                readers.setdefault(nm, set()).add(own.get(i))
+    # the chains: made of chain members only, read by chain members only, started by an unknown
+    chain = set(cand)
+    shrunk = True
+    while shrunk:
+        shrunk = False
+        for nm in list(chain):
+            if not cand[nm][1] <= chain or any(r is None or r not in chain for r in readers.get(nm, ())):
+                chain.discard(nm)
+                shrunk = True
+    live = {nm for nm in chain if cand[nm][2]}
+    grew = True
+    while grew:
+        grew = False
+        for nm in chain - live:
+            if cand[nm][1] & live:
+                live.add(nm)
+                grew = True
+    if not live:
+        return text
+    drop = {cand[nm][0] for nm in live}
+    return '\n'.join(ln for i, ln in enumerate(lines) if i not in drop)
 
 
 def _drop_dead_copies(text):

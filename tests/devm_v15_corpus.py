@@ -19,6 +19,8 @@ computes every test into a local first.
 * `opaque._fold_call_keys`: Luraph's per-call key (a parameter that only comes back xor-ed as an extra
   first result) is removed where every caller is in view, and `run.report` does not say `complete`
   where it is left;
+* `opaque._drop_blind_key_arith`, `_fold_type_tests`: key arithmetic on an unknown interpreter local
+  that nothing reads, and the junk arm behind `type(0) == "buffer"`, are removed;
 * `run.method_wrap_layout`: the v15.0 layout is recognised (devm refuses it at once).
 
     LURAPH_CORPUS=/path/to/obfuscator-samples/Luraph python3 tests/devm_v15_corpus.py Corpus
@@ -358,6 +360,29 @@ class CallKeys(unittest.TestCase):
         self.assertTrue(any('went to the script\'s end' in ln for ln in got), got)
         head = '-- x.lua, %s.  How the run went and what this file lacks:\n--   traced run: the script returned (5 VM instructions)\n--   result: PARTIAL\n' % run.HEAD_MARK
         self.assertEqual(run.report(head + text), got)
+
+
+class BlindKeyArithmetic(unittest.TestCase):
+    """What the interpreter that runs the script leaves in a v15.1 result: key arithmetic on an
+    interpreter local the lifter has no value for, and junk arms behind `type(<number>) == "buffer"`."""
+    TEXT = ('local v1 = f()\n'
+            'local v2 = (121107783 + nil) % 4294967296\nlocal v3 = v2 - v2 % 1\nlocal v4 = bit32.bxor(v3, 55)\nprint(v4)\n'   # read by the script
+            'local v5 = nil --[[X]] % 4294967296\nlocal v6 = v5 + v1\n'             # mixed with a real value
+            'local v7 = (nil + 5) % 7\n'                                             # no large literal: not key arithmetic
+            'local v8 = nil --[[OPENUPS]] % 4294967296\nlocal v9 = bit32.bxor(v8 - v8 % 1, 283475159)\n'
+            'if type(0) == "buffer" then\n\tlocal v10 = (121107783 + nil) % 4294967296\n\tprint(v10)\nend\n'
+            'if type(0) ~= "number" then\n\tprint(1)\nelseif type(5) == "number" then\n\tprint(2)\nend\n'
+            'if type(x) == "number" then\n\tprint(3)\nend')
+
+    def test_chain_nothing_reads(self):
+        from devm import opaque
+        self.assertEqual(opaque.strip(self.TEXT), (
+            'local v1 = f()\n'
+            'local v2 = (121107783 + nil) % 4294967296\nlocal v3 = v2 - v2 % 1\nlocal v4 = bit32.bxor(v3, 55)\nprint(v4)\n'
+            'local v5 = nil --[[X]] % 4294967296\nlocal v6 = v5 + v1\n'
+            'local v7 = (nil + 5) % 7\n'
+            'print(2)\n'
+            'if type(x) == "number" then\n\tprint(3)\nend'))
 
 
 # The v15.0 shape: the function that makes a VM closure is a method of the VM object and a state machine.
