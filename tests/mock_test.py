@@ -214,6 +214,37 @@ show("info", debug.info(task.spawn, "s"), debug.info(task.spawn, "n"), debug.inf
         self.assertEqual(got.get('ok'), 'thread|thread|thread')
         self.assertEqual(got.get('info'), '[C]|spawn|delay')
 
+    def test_a_spawned_thread_that_waits_is_suspended(self):
+        # The run of an unmodified file knows the script's main thread too (harness.lua, where the
+        # sample is loaded): only then does task.wait suspend a spawned thread until the main thread
+        # waits, as Roblox's scheduler does.  Luraph v15.x start-up code checks it.
+        got, log = run('''
+local order = {}
+local co = task.spawn(function()
+	order[#order + 1] = "a"
+	task.wait()
+	order[#order + 1] = "c"
+end)
+order[#order + 1] = "b"
+show("spawned", coroutine.status(co), table.concat(order))
+task.wait()
+order[#order + 1] = "d"
+show("resumed", coroutine.status(co), table.concat(order))
+local co2 = task.defer(function() order[#order + 1] = "e" end)
+show("deferred", coroutine.status(co2), table.concat(order))
+task.wait()
+show("ran", coroutine.status(co2), table.concat(order))
+local co3 = task.spawn(function() game:GetService("RunService").Heartbeat:Wait(); order[#order + 1] = "never" end)
+show("signal", coroutine.status(co3))
+show("below", debug.info(2, "l"))
+''')
+        self.assertEqual(got.get('spawned'), 'suspended|ab', log)
+        self.assertEqual(got.get('resumed'), 'dead|abcd')
+        self.assertEqual(got.get('deferred'), 'suspended|abcd')
+        self.assertEqual(got.get('ran'), 'dead|abcde')
+        self.assertEqual(got.get('signal'), 'suspended')
+        self.assertEqual(got.get('below'), '')          # the chunk is the bottom of the stack, as in Roblox
+
     def test_script_output_is_logged(self):
         _, log = run('print("hello", 1, nil)\nwarn("careful")\nprint("hello", 1, nil)')
         self.assertIn('[script] print: hello 1 nil  (x2)', log)

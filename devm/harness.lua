@@ -1900,7 +1900,14 @@ function _G.__LPH_CRASH()
 end
 
 local src = readfile(samplePath)
-local fn, err = loadstring(src, "=sample")
+-- The mock has to know the script's main thread: task.wait / signal:Wait() suspend every other
+-- thread of the script (rbxmock.lua), and Luraph's start-up code (v15.x) checks that a spawned
+-- thread that waits is suspended.  An instrumented copy says so at its first proto (__LPH_PROTO);
+-- a file without any hook is given a call of __LPH_MAIN in front of its first token: same line,
+-- no frame left on the stack, and the answers are the same in both kinds of run.
+local fn, err
+if not string.find(src, "__LPH_", 1, true) then fn = loadstring("__LPH_MAIN();" .. src, "=sample") end
+if not fn then fn, err = loadstring(src, "=sample") end
 if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
 	error("compile")
