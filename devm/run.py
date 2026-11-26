@@ -410,12 +410,15 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ()))
         if data is not None:
             text = lift_program(stage, data, tag, log, oneline, 'script', replayed=False)
-            if route == 'a' or not stage.errors or not in_place or single:
+            if route == 'a' or not stage.errors or not in_place or single or not unknown_keyfns(data):
                 return text
-            # The lift has errors.  Builds whose init decrypts the script data with a key it
-            # derives (Luraph v14.8) patch their own operands with values of key functions; the
-            # second-stage route recovers those from a native replay of the lifted init.  Try it
+            # The lift has errors, and the dump holds key functions the harness could not
+            # evaluate.  Builds whose init decrypts the script data with a key it derives (Luraph
+            # v14.8) patch their own operands with values of those functions; the second-stage
+            # route searches the values after a native replay of the lifted init.  Try it
             # (time-boxed) and keep whichever result has fewer unlifted instructions.
+            # (Lift errors with every key function known, or with none in the dump, have other
+            # causes; the second stage lifts with the same lifter and would not remove them.)
             a_errs, a_nodes = len(stage.errors), sum(len(p.nodes) for p in stage.protos.values())
             if preliminary:
                 preliminary(text)       # (the result so far is on disk should the second try be cut short)
