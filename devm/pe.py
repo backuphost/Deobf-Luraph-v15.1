@@ -2195,6 +2195,7 @@ class PE:
                 raise PEError('symbolic numeric for %r %r %r' % (a, b, c))
             i = a
             n = 0
+            ir0 = len(self.ir) if self.ir is not None else 0
             while (c > 0 and i <= b) or (c < 0 and i >= b):
                 sc = Scope(scope)
                 sc.vars[st[1]] = i
@@ -2212,6 +2213,16 @@ class PE:
                 n += 1
                 if n > 2000000:
                     raise PEError('runaway for')
+            if c == 1 and self.ir is not None and len(self.ir) > ir0:
+                # `for i = 1, nparams do R[i] = args[i] end`: the loop copied the function's fixed
+                # parameters and nothing else.  As one statement it says how many there are, which
+                # single register writes cannot (a first vararg fetched into the next register
+                # looks like one more parameter).
+                new = self.ir[ir0:]
+                base = new[0][1][1] if new[0][0] == 'set' and new[0][1][0] == 'r' else None
+                if isinstance(base, int) and all(x == ('set', ('r', base + k), ('arg', k + 1)) for k, x in enumerate(new)):
+                    del self.ir[ir0:]
+                    self.emit(('params', base, len(new)))
             return None
         if t == 'forin':
             if len(st[2]) == 3 and st[2][2] == ('nil',) and st[2][0][0] == 'name' and st[2][1][0] == 'name':

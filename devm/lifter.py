@@ -781,7 +781,7 @@ class Lifter:
             raise PEError('interpreter returned before reaching dispatch loop')
         # parameters the interpreter copies into registers before its dispatch loop
         # (`for i = 1, nparams do R[i] = args[i] end`, v14.0.2 - v14.2): see the end of this method
-        entry_params = [st for st in ir0 if st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'arg']
+        entry_params = [st for st in ir0 if st[0] == 'params' or (st[0] == 'set' and st[1][0] == 'r' and st[2][0] == 'arg')]
         entry, snap = end[1], end[2]
         if key in self.entry_override:
             entry, ovars = self.entry_override[key]
@@ -1270,7 +1270,8 @@ class Lifter:
         pir.children = self.queue[nq0:]
         if entry_params and pir.entry in pir.nodes:
             # A loop statement of the prologue is not executed again when single instructions are
-            # lifted (PE.exec_seek), so what it wrote exists only in the entry run: it becomes a
+            # lifted (PE.exec_seek), so what it wrote (a `params` block, see PE.exec_core, or single
+            # `R[n] = argument n` statements) exists only in the entry run: it becomes a
             # block of its own in front of the first instruction, which may be a jump target.
             # (A plain statement of the prologue is executed for every instruction; what the
             # first instruction's own tree already holds is not repeated.)

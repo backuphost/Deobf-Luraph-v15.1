@@ -514,6 +514,21 @@ end
         self.assertNotIn('ARG_', text)
 
 
+    def test_first_vararg_right_after_the_parameters(self):
+        # function(a, ...) local b = ...: the fetch into the next register is not a second parameter
+        for where in ('handler', 'prologue'):
+            copy = 'for i = 1, NP do R[i] = args[i] end'
+            m = Mini("""elseif op == 20 then
+%s
+elseif op == 34 then
+R[A[pc]] = args[firstva]
+""" % (copy if where == 'handler' else ''), prologue='local firstva = NP + 1\n' + (copy if where == 'prologue' else ''),
+                     outer=PACKER)
+            code = ([(20, 0, 0, 0)] if where == 'handler' else []) + [(34, 2, 0, 0), (4, 3, 1, 2), (2, 3, 0, 0)]
+            text = m.lift(proto([(8, 1, proto(code, nparams=1), 0), (2, 1, 0, 0)]))
+            self.assertEqual(m.errors, [], where)
+            self.assertRegex(text, r'function\((\w+), \.\.\.\)\s*return \1 \+ \(?select\(1, \.\.\.\)\)?\s*end', where)
+
     def test_argument_beyond_the_parameters_is_a_vararg(self):
         # the interpreter keeps the position of the first vararg in a local and reads the
         # argument table there
