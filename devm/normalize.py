@@ -486,6 +486,17 @@ def inline_protected_raw_info(src):
 #
 # Junk constants move in front of the loop (they are never assigned; opaque tests in the dispatch
 # tree compare with them).
+#
+# A third form is known to the model but NOT to this normaliser: the v15.1 interpreter that runs
+# the script outlines its first opcode test into a local,
+#
+#     while true do local OP=CODE[PC];local T=OP>=10;if T then ...             outlined first test
+#
+# vmmodel.is_dispatch_loop (_outlined_test) and LOOP_HEAD_RE accept exactly this spelling, and
+# container.has_dispatch_loop finds it through LOOP_HEAD_RE.  match_head() does not: such a head is
+# not counted by count_heads(), and a spelling of it other than the canonical one (the fetch in
+# parentheses, `repeat ... until false`, a truthy literal for `true`) is neither normalised nor
+# modelled.  The builds seen write the canonical spelling.
 
 class Head:
     """One dispatch-loop head found in a token list."""
