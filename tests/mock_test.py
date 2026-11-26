@@ -296,6 +296,24 @@ show("now", math.abs(DateTime.now().UnixTimestamp - os.time()) <= 2, DateTime.no
                          ['[script] print: hello 1 nil', '[script] warn: careful', '[script] said 2 times: print: hello 1 nil'])
 
 
+class Report(unittest.TestCase):
+    def test_the_report_shows_what_the_script_said(self):
+        # devm.run's final report: the script's own output and the mock's stand-ins are part of it
+        from devm import run as devm_run
+        out = devm_run.run_report([
+            '[oracle] script returned after 10 instructions',
+            '[script] print: hello',
+            '[script] undefined globals read (nil, as in Roblox): SCRIPT_KEY',
+            '[stub] permissive stand-ins handed out where the mock has no Roblox answer: Path2D:GetBoundingRect()',
+            '[stub] tamper response 3 suppressed (entry 1, step 2)'])
+        self.assertIn('  script: print: hello', out)
+        self.assertIn('  script: undefined globals read (nil, as in Roblox): SCRIPT_KEY', out)
+        self.assertIn('  mock: permissive stand-ins handed out where the mock has no Roblox answer: Path2D:GetBoundingRect()', out)
+        self.assertFalse(any('tamper response' in line for line in out))
+        many = devm_run.run_report(['[script] print: %d' % i for i in range(40)])
+        self.assertEqual(len([line for line in many if line.startswith('  script: ')]), 13)       # 12 and a count
+
+
 @unittest.skipUnless(LUAU, 'needs bin/luau')
 class Path2D(unittest.TestCase):
     def test_without_a_parent(self):
