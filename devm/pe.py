@@ -1441,14 +1441,18 @@ class PE:
                 if isinstance(val, LuaTable) and val.fresh:
                     self.parked = val
                 return
-            if self.slot_policy and not obj.fresh and obj.path and isinstance(val, Sym) and not self.seeking \
-                    and self.inject is not None and not self.lazy_depth and id(obj) not in self.program_ids \
-                    and obj.path not in self.volatile:
-                # a run-time value of the program kept in a table of the loader (`shared[k] = R[a]`):
-                # the slot is a variable from here on, not what the dump holds
-                self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
+            if self.slot_policy and not obj.fresh and obj.path and not self.seeking and self.inject is not None \
+                    and not self.lazy_depth and id(obj) not in self.program_ids and obj.path not in self.volatile \
+                    and not isinstance(val, (LinSym, MultiTail)):
+                # an instruction storing into a table of the loader (`shared[k] = R[a]`)
                 self.slot_writes.add((obj.path, key))
-                return
+                if isinstance(val, Sym) or (obj.path, key) in self.unstable or (obj.path, None) in self.unstable:
+                    # a run-time value, or a slot known to be read as a variable: the store happens
+                    # at run time, and the slot is not what the dump holds
+                    self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
+                    return
+                # (a constant: it stays a write of the model; if an instruction reads the slot
+                # from the dump, the lifter starts over with the slot as a variable)
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
                 raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key) + (' <%r was %r>' % (val, obj.h.get(key)) if os.environ.get('DEVM_PEDBG') else ''))
             if obj.path and not obj.fresh and not self.seeking and self.inject is not None \

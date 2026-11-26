@@ -533,6 +533,8 @@ S[3] = S[3] + 1
 if S[3] == 4 then
 R[A[pc]] = B[pc]
 end
+elseif op == 29 then
+shared[B[pc]] = C[pc]
 """
 
     def mini(self):
@@ -570,6 +572,20 @@ end
         self.assertNotIn('from the dump', text)
         self.assertEqual(text.count('__LPH_ENV["shared"][5]'), 3)
         self.assertIn('__LPH_ENV["shared"][5] = f', text)
+
+    def test_a_constant_parked_in_a_loader_table(self):
+        # the store is later in the program than the read (a loop): the read is not the dump's value
+        m = self.mini()
+        text = m.lift(proto([(25, 1, 5, 0), (29, 0, 5, 7), (7, 1, 0, 0), (2, 1, 0, 0)]))
+        self.assertEqual(m.errors, [])
+        self.assertNotIn('from the dump', text)
+        self.assertIn('__LPH_ENV["shared"][5] = 7', text)
+        # ... and a constant nobody reads back stays out of the way
+        m = self.mini()
+        text = m.lift(proto([(29, 0, 6, 7), (25, 1, 5, 0), (2, 1, 0, 0)]))
+        self.assertEqual(m.errors, [])
+        self.assertIn('"from the dump"', text)
+        self.assertEqual(m.lifter.slot_rounds, 0)
 
     def test_store_into_program_data_is_still_an_error(self):
         m = Mini("""elseif op == 27 then
