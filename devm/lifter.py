@@ -1445,6 +1445,28 @@ class TableProtoLifter(Lifter):
                             self.pe.volatile.add(sub.path)
         self.root_key = self.base.vars[self.proto_param].id
         self.proto_objs[self.root_key] = self.base.vars[self.proto_param]
+        self.pe.slot_policy = True
+        self.pe.program_ids = frozenset(program)
+        self.slot_rounds = 0
+
+    def lift_all(self, root_key):
+        """Lift every proto; again from the state of the dump when a loader-state slot that was
+        answered from the dump turned out to be written by code that runs (see PE.slot_policy).
+        Slots are only ever added to the run-time set, so this ends; the bound is a safeguard."""
+        protos = Lifter.lift_all(self, root_key)
+        for rnd in range(1, 7):
+            if not self.pe.slot_conflicts():
+                break
+            unstable = self.pe.unstable | self.pe.slot_writes
+            keep = (self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server)
+            self.__init__(self.model, P.Dump(self.dump.data, self.model), self.log)
+            self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server = keep
+            self.pe.unstable = unstable
+            self.slot_rounds = rnd
+            if root_key not in self.proto_objs:
+                self.register(root_key)
+            protos = Lifter.lift_all(self, root_key)
+        return protos
 
     def register(self, key):
         self.proto_objs[key] = self.dump.tables[key]

@@ -764,6 +764,18 @@ class PE:
         from . import luprint
         self.native_ids = {id(f) for f in model.funcs if luprint.native_shape(f)}
         self.volatile = set()       # paths of loader-state tables whose scalar fields change at run time
+        # Per-slot policy (proto-table layouts, set by TableProtoLifter).  The interpreters of
+        # v14 builds test loader-state slots against each other in front of junk arms (opaque
+        # tests), and keep run-time values of the program in loader tables.  A slot is answered
+        # from the dump as long as no code the evaluator executes writes it; a slot such code
+        # does write is a run-time variable.  Which is which is only known after everything has
+        # been lifted, so the lifter repeats the lift when a slot it answered from the dump
+        # turned out to be written (TableProtoLifter.lift_all).
+        self.slot_policy = False
+        self.program_ids = frozenset()  # ids of the tables that are program data (protos, code arrays)
+        self.unstable = set()       # (table path, key) written by code that runs; (path, None): with a run-time key
+        self.stable_reads = set()   # (table path, key) answered from the dump in this lift
+        self.slot_writes = set()    # (table path, key) written in this lift
         for l in model.loops:
             self.pcvars[id(l)] = l[2][0][2][0][2][1]
 
@@ -941,6 +953,11 @@ class PE:
         for l in loops:
             walk(l[2], [])
         return fvars, fstack, openups
+
+    def slot_conflicts(self):
+        """Loader-state slots this lift answered from the dump although code that runs writes them."""
+        tabs = {p for p, k in self.slot_writes if k is None}
+        return {s for s in self.stable_reads if s in self.slot_writes or s[0] in tabs}
 
     # -- emission
     def newt(self):
@@ -1262,6 +1279,14 @@ class PE:
                     return vals[0] if vals else None
                 if isinstance(h, LuaTable):
                     return self.index(h, key, keyast)
+            if self.slot_policy and obj.path and not obj.fresh and not self.seeking and self.inject is not None \
+                    and id(obj) not in self.program_ids:
+                if (obj.path, key) in self.unstable or (obj.path, None) in self.unstable:
+                    if self.trace is not None:
+                        self.trace.append('   run-time slot read %s[%r]' % (obj.path, key))
+                    return self.emit_expr(('index', ('outer', obj.path), self.atom(key)))
+                self.stable_reads.add((obj.path, key))
+                return v
             if obj.path in self.volatile and (v is None or is_num(v) or isinstance(v, bool)) and not self.seeking \
                     and self.inject is not None:
                 # loader state that changes while the program runs (e.g. the stream position)
@@ -1350,6 +1375,8 @@ class PE:
         if isinstance(obj, LuaTable):
             if isinstance(key, (Sym, LinSym)):
                 if obj.path and not obj.fresh:
+                    if self.slot_policy and id(obj) not in self.program_ids:
+                        self.slot_writes.add((obj.path, None))
                     self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
                     return
                 raise PEError('symbolic key store into concrete table')
@@ -1367,6 +1394,14 @@ class PE:
                 if isinstance(val, LuaTable) and val.fresh:
                     self.parked = val
                 return
+            if self.slot_policy and not obj.fresh and obj.path and isinstance(val, Sym) and not self.seeking \
+                    and self.inject is not None and not self.lazy_depth and id(obj) not in self.program_ids \
+                    and obj.path not in self.volatile:
+                # a run-time value of the program kept in a table of the loader (`shared[k] = R[a]`):
+                # the slot is a variable from here on, not what the dump holds
+                self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
+                self.slot_writes.add((obj.path, key))
+                return
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
                 raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key) + (' <%r was %r>' % (val, obj.h.get(key)) if os.environ.get('DEVM_PEDBG') else ''))
             if obj.path and not obj.fresh and not self.seeking and self.inject is not None \
@@ -1375,8 +1410,12 @@ class PE:
                 # this must happen at run time, not inside the evaluator's model
                 self.emit(('setindex', ('outer', obj.path), self.atom(key), self.atom(val)))
                 self.state_writes.add((obj.path, key))
+                self.slot_writes.add((obj.path, key))
                 return
             if not obj.fresh:
+                if self.slot_policy and obj.path in self.volatile:
+                    # (written while an interpreter or a closure maker starts: at run time all the same)
+                    self.slot_writes.add((obj.path, key))
                 self.model_writes += 1
                 if self.write_log is not None and obj.path and obj.h.get(key) != val:
                     self.write_log.append((id(obj), key))
@@ -2170,32 +2209,55 @@ class PE:
             neg = not neg
         if neg:
             body, other = other, body
-        if other or len(body) != 1:
-            return False
-        s = body[0]
-        if not (s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and s[1][0] == ('name', a[1])):
-            return False
-        v = _unparen(s[2][0])
-        if not ((v[0] == 'num' and v[1] == -1) or (v[0] == 'un' and v[1] == '-' and _unparen(v[2]) == ('num', 1))):
+        if other or not body:
             return False
         sc = scope.lookup(a[1])
         cur = sc.vars[a[1]] if sc is not None else None
         if not (isinstance(cur, LinSym) and cur.id == 'args'):
             return False
+        s = body[-1]
+        if not (s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and s[1][0] == ('name', a[1])):
+            return False
+        v = _unparen(s[2][0])
+        if not ((v[0] == 'num' and v[1] == -1) or (v[0] == 'un' and v[1] == '-' and _unparen(v[2]) == ('num', 1))):
+            return False
+        for junk in body[:-1]:
+            # (an opaque test in front of the assignment: its arm must be dead)
+            if not (junk[0] == 'if' and len(junk[1]) == 1 and not junk[2] and repr(a) not in repr(junk[1][0][0])):
+                return False
+            jv = self.eval1(junk[1][0][0], scope)
+            if isinstance(jv, (Sym, LinSym, tuple)) or jv is FSTATE or truthy(jv):
+                return False
         self.setvar(scope, a[1], LinSym('va', -1))
         return True
 
     def clears_regs(self, st, scope):
         """`for k in REGS do if k > top then REGS[k] = nil end end`: the interpreter dropping the
         registers above the top of the stack (after a call, a return of several values).  The
-        lifted code has no counterpart: registers are variables there."""
+        lifted code has no counterpart: registers are variables there.
+
+        Builds with opaque tests put them into the loop as well (`if S[15] == S[17] then <junk>
+        elseif k > top then REGS[k] = nil end`): a test that does not look at the loop variables
+        is evaluated, and only the arm it selects has to be a clearing arm."""
+        names = [repr(('name', n)) for n in st[1]]
         kname = st[1][0]
 
         def ok(block):
             for s in block:
                 if s[0] == 'if':
-                    if not all(ok(b) for _, b in s[1]) or (s[2] and not ok(s[2])):
-                        return False
+                    for c, b in list(s[1]) + ([(None, s[2])] if s[2] else []):
+                        if c is None or any(n in repr(c) for n in names):
+                            # the test on the register number (or the else arm after it)
+                            if not ok(b):
+                                return False
+                            continue
+                        v = self.eval1(c, scope)
+                        if isinstance(v, (Sym, LinSym, tuple)) or v is FSTATE:
+                            return False
+                        if truthy(v):
+                            if not ok(b):
+                                return False
+                            break
                 elif s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and _unparen(s[2][0]) == ('nil',):
                     tg = s[1][0]
                     if not (tg[0] == 'index' and _unparen(tg[2]) == ('name', kname) and _unparen(tg[1])[0] == 'name'
@@ -2207,19 +2269,31 @@ class PE:
         return ok(st[3])
 
     def close_base(self, st, scope):
-        """for k, v in openups do if k >= X then ... -> X"""
-        body = st[3]
-        kname = st[1][0]
-        if body and body[0][0] == 'if':
-            c = body[0][1][0][0]
-            while c[0] == 'paren' or (c[0] == 'un' and c[1] == 'not'):
-                c = c[-1]
-            if c[0] == 'bin':
-                if c[2] == ('name', kname):
-                    return self.eval1(c[3], scope)
-                if c[3] == ('name', kname):
-                    return self.eval1(c[2], scope)
-        raise PEError('unrecognised close-upvalues loop')
+        """for k, v in openups do if k >= X then ... -> X  (the test need not be the first
+        statement or the first arm: opaque tests on loader state stand in front of it)"""
+        kname = ('name', st[1][0])
+
+        def find(block):
+            for s in block:
+                if s[0] != 'if':
+                    continue
+                for c, _ in s[1]:
+                    while c[0] == 'paren' or (c[0] == 'un' and c[1] == 'not'):
+                        c = c[-1]
+                    if c[0] == 'bin' and c[1] in CMP:
+                        if _unparen(c[2]) == kname:
+                            return c[3]
+                        if _unparen(c[3]) == kname:
+                            return c[2]
+                for b in subblocks(s):
+                    r = find(b)
+                    if r is not None:
+                        return r
+            return None
+        e = find(st[3])
+        if e is None:
+            raise PEError('unrecognised close-upvalues loop')
+        return self.eval1(e, scope)
 
     def exec_seek(self, st, scope):
         """Prologue / fast-forward execution towards the dispatch loop to resume."""
