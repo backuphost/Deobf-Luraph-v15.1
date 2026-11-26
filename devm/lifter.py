@@ -810,36 +810,8 @@ class Lifter:
             info = snaps.get(str(key))
             env = self.records[key - 1][1] if hasattr(self, 'records') and isinstance(key, int) else {}
             # the loader's shared tables (harness sharedBase)
-            shared = []
-            own = {id(v) for v in env.values() if isinstance(v, LuaTable)}
-            below = None
-            for ent in snaps.get('shared') or ():
-                if not ent['base']:
-                    continue
-                if 'tid' in ent:
-                    # The entry names its table (its id in the dump).  Name and key only say where
-                    # the harness first met it: another interpreter's protos hold the same table
-                    # under another name, and every proto can have a table of its own under this one.
-                    if below is None:
-                        below = {t.id: t for h in env.values() if isinstance(h, LuaTable)
-                                 for t in h.h.values() if isinstance(t, LuaTable) and id(t) not in own}
-                    obj = below.get(ent['tid'])
-                    if obj is not None:
-                        shared_ids.add(id(obj))
-                        shared.append((obj, ent['base']))
-                    continue
-                holder = env.get(ent['name'])
-                obj = holder.h.get(ent['key']) if isinstance(holder, LuaTable) else None
-                if not isinstance(obj, LuaTable) or id(obj) in own:
-                    # (not one of this proto's own code arrays seen through a lazy view of it,
-                    # `P = setmetatable({[0] = K}, decode)`: followed per proto, under its own name)
-                    continue
-                # (a run recorded without table ids.  Two interpreters can each have a table under
-                # the same name: the entry belongs to this one only if its keys are this table's keys)
-                if isinstance(obj, LuaTable) and ent['base'] and \
-                        sum(1 for k in ent['base'] if P.is_num(obj.h.get(int(k)))) >= 0.95 * len(ent['base']):
-                    shared_ids.add(id(obj))
-                    shared.append((obj, ent['base']))
+            shared = shared_snapshot_tables(env, snaps.get('shared') or ())
+            shared_ids.update(id(obj) for obj, _ in shared)
             if info and env:
                 writes = []
                 for obj, base in shared:
@@ -981,35 +953,6 @@ class Lifter:
             self.pe.live_table_patches = live_patches
             if root_cell is not None:
                 work[0] = work[0][:5] + (root_cell,)
-
-        def hub_register(k):
-            """The register a trampoline jumps through, when instruction k leads to that jump in a
-            straight line of instructions without effect (builds whose trampolines land a few
-            instructions in front of the hub: block decryptors that ran once and are no-ops since).
-            The whole line is then kept once per jump target, like the hub itself."""
-            line, x = [], k
-            while len(line) < 64:
-                nd = pir.nodes.get(x)
-                if nd is None or nd.error or not nd.tree or nd.tree[0] or nd.tree[1][0] != 'goto':
-                    return None
-                r = indirect.get(x)
-                if r is None and len(nd.kreads) == 1:
-                    r = next(iter(nd.kreads))
-                    if not P.is_num(node_in[x].get(r)):
-                        return None
-                if r is not None:
-                    if not line:
-                        return None     # (the jump itself: the caller's own case)
-                    indirect[x] = r
-                    for y in line:
-                        indirect[y] = r
-                    return r
-                x2 = nd.tree[1][1]
-                if nd.kreads or len(x2) != 2 or x2 == x or x2 in line:
-                    return None
-                line.append(x)
-                x = x2
-            return None
         while work or deferred:
             if not work:
                 # nothing else to follow: the instructions still waiting are lifted in the code
@@ -1031,7 +974,7 @@ class Lifter:
                     else:
                         r = None
                 if r is None:
-                    r = hub_register(key2)
+                    r = hub_line(pir.nodes, node_in, indirect, key2)
                 if r is not None and P.is_num(known.get(r)) and not same_const(known[r], node_in[key2].get(r)):
                     key2 = key2 + (known[r],)
                     if pred is not None:
@@ -1383,6 +1326,71 @@ class Lifter:
             done.add(k)
             self.protos[k] = self.lift_proto(k)
         return self.protos
+
+
+def shared_snapshot_tables(env, entries):
+    """[(table, base values)]: the `shared` entries of a traced run's snapshots (harness.lua
+    sharedBase: tables of numbers one level below a proto variable, as they were when the first
+    proto started) that belong to the proto whose variables are `env`."""
+    out = []
+    own = {id(v) for v in env.values() if isinstance(v, LuaTable)}
+    below = None
+    for ent in entries:
+        if not ent['base']:
+            continue
+        if 'tid' in ent:
+            # The entry names its table (its id in the dump).  Name and key only say where the
+            # harness first met it: another interpreter's protos hold the same table under another
+            # name, and every proto can have a table of its own under this one.
+            if below is None:
+                below = {t.id: t for h in env.values() if isinstance(h, LuaTable)
+                         for t in h.h.values() if isinstance(t, LuaTable) and id(t) not in own}
+            obj = below.get(ent['tid'])
+            if obj is not None:
+                out.append((obj, ent['base']))
+            continue
+        holder = env.get(ent['name'])
+        obj = holder.h.get(ent['key']) if isinstance(holder, LuaTable) else None
+        if not isinstance(obj, LuaTable) or id(obj) in own:
+            # (not one of this proto's own code arrays seen through a lazy view of it,
+            # `P = setmetatable({[0] = K}, decode)`: followed per proto, under its own name)
+            continue
+        # (a run recorded without table ids.  Two interpreters can each have a table under the same
+        # name: the entry belongs to this one only if its keys are this table's keys)
+        if sum(1 for k in ent['base'] if P.is_num(obj.h.get(int(k)))) >= 0.95 * len(ent['base']):
+            out.append((obj, ent['base']))
+    return out
+
+
+def hub_line(nodes, node_in, indirect, k):
+    """The register a trampoline jumps through, when instruction k leads to that jump in a
+    straight line of instructions without effect (builds whose trampolines land a few
+    instructions in front of the hub: block decryptors that ran once and are no-ops since).
+    The whole line is then kept once per jump target, like the hub itself: it is entered in
+    `indirect` ((loop, pc) -> register).  None when k is the jump itself or leads elsewhere."""
+    line, x = [], k
+    while len(line) < 64:
+        nd = nodes.get(x)
+        if nd is None or nd.error or not nd.tree or nd.tree[0] or nd.tree[1][0] != 'goto':
+            return None
+        r = indirect.get(x)
+        if r is None and len(nd.kreads) == 1:
+            r = next(iter(nd.kreads))
+            if not P.is_num(node_in[x].get(r)):
+                return None
+        if r is not None:
+            if not line:
+                return None     # (the jump itself: the caller's own case)
+            indirect[x] = r
+            for y in line:
+                indirect[y] = r
+            return r
+        x2 = nd.tree[1][1]
+        if nd.kreads or len(x2) != 2 or x2 == x or x2 in line:
+            return None
+        line.append(x)
+        x = x2
+    return None
 
 
 def program_entries(model, oracle):
