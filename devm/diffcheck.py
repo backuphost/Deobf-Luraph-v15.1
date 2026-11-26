@@ -69,6 +69,8 @@ PROBE_LIBS = frozenset([
     'Ray', 'Region3', 'Font', 'DateTime', 'Axes', 'Faces', 'Vector3int16', 'Vector2int16', 'PhysicalProperties',
     'OverlapParams', 'RaycastParams', 'SharedTable',
 ])
+# libraries whose functions only make or combine values
+VALUE_LIBS = PROBE_LIBS - frozenset(['Instance', 'task', 'debug', 'os', 'buffer', 'utf8'])
 PROBE_GLOBALS = frozenset([
     'loadstring', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime', 'iscclosure', 'islclosure',
 ])
@@ -522,10 +524,17 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
     # 3. the result's log is used up, the original goes on
     if m == n_r and n_o > n_r:
         why = stops_at()
+        if res.cut == 'event limit' and not hole:
+            return finish(SAME, 'same for the first %s; the result\'s run was cut at the event limit there, the original goes on' % _n(m))
         if res.cut and not hole:
-            if m == 0:
-                return finish(NOT_COMPARABLE, 'the result made no call before its %s' % res.cut)
-            return finish(SAME, 'same for the first %s; the result\'s run was cut at the %s there, the original goes on' % (_n(m), res.cut))
+            # the result sits somewhere without a call until its time is up; the original did not
+            v = finish(NOT_COMPARABLE if partial else DIFFERENT,
+                       'after %s the result makes no further call until the time limit, the original goes on (%d more)%s' % (
+                           _n(m, 'equal call'), n_o - n_r, '; the result is partial' if partial else ''))
+            v.add('next calls of the original:')
+            for line in _context(eo, p + m, 2, 2):
+                v.add(line)
+            return v
         if why:
             v = finish(NOT_COMPARABLE, 'same up to call %d of %s, then the result %s' % (m, '%d or more (run cut at the %s)' % (n_o, orig.cut) if orig.cut else n_o, why))
         else:
@@ -542,8 +551,23 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
             if m == 0:
                 return finish(NOT_COMPARABLE, 'the original made no call of the script before its %s' % orig.cut)
             return finish(SAME, 'same for the first %s; the original\'s run was cut at the %s there, the result goes on' % (_n(m), orig.cut))
+        extra = [e for _, e in er[m:]]
+        late_lookup = (orig.end == 'error' and res.end == 'error' and not hole
+                       and _strip_position(orig.end_message) == _strip_position(res.end_message)
+                       and re.match(r"attempt to (index nil with '|call a nil value|call missing method)", _strip_position(orig.end_message)))
+        if late_lookup and all(e.kind == 'C' and '.' in e.name and e.name.split('.')[0] in VALUE_LIBS for e in extra):
+            # obj:Method(args) with a missing obj or method: Luau evaluates the arguments first and then
+            # looks the method up, Luraph's VM (Lua 5.1 order) looks it up first.  The same source text
+            # therefore makes the argument calls only in the result; value constructors have no effect.
+            v = finish(SAME, 'the same %s, then both stop with the same error (%s); before it the result makes %s of value constructors that the original does not' % (
+                _n(m), _strip_position(orig.end_message)[:100], _n(len(extra))))
+            v.add('those calls (%s) are arguments of the failing method call: Luau evaluates them before it looks the method up, Luraph\'s interpreter after' % _kinds(er[m:]))
+            return v
         v = finish(DIFFERENT, 'after %s the original %s, the result goes on (%d more)' % (
             _n(m, 'equal call'), 'returns' if orig.end == 'returned' else 'stops', n_r - n_o))
+        if late_lookup:
+            v.add('both stop with the same error (%s).  Luau evaluates the arguments of obj:Method(...) before it looks the method up, '
+                  'Luraph\'s interpreter after: if the calls below are such arguments, the source is the same' % _strip_position(orig.end_message)[:100])
         v.add('next calls of the result:')
         for line in _context(er, m, 2, 2):
             v.add(line)
@@ -629,7 +653,7 @@ def check(original, result, workdir=None, timeout=120.0, max_events=20000, optio
         log('original: %d events in %.1fs, %s' % (len(orig.events), orig.seconds, orig.how_ended()))
         log('result:   %d events in %.1fs, %s' % (len(res.events), res.seconds, res.how_ended()))
         v = compare(orig, res, result_text)
-        if v.code == SAME or orig.fatal or res.fatal:
+        if v.code != DIFFERENT:
             return v
         left = t_end - time.time() - 1.0
         if left < 2.0:

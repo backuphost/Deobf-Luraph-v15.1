@@ -178,6 +178,17 @@ class Plain(Base):
         self.expect(DIFFERENT, a, 'print("a")\n', r'the original stopped with an error.*the result returned')
         self.expect(DIFFERENT, 'print("a")\n', a)
 
+    def test_method_lookup_after_the_arguments(self):
+        # Luraph's VM looks a method up before it evaluates the arguments (Lua 5.1), Luau after.
+        # "original": the 5.1 order written out; "result": the source as a lift gives it back.
+        original = 'print("a")\nlocal lib = nil\nlocal m = lib.CreateWindow\nm(lib, { Size = UDim2.fromOffset(500, 400) })\n'
+        result = 'print("a")\nlocal lib = nil\nlib:CreateWindow({ Size = UDim2.fromOffset(500, 400) })\n'
+        self.expect(SAME, original, result, r'Luau evaluates them before it looks the method up')
+        # an argument with an effect is not waved through
+        result2 = 'print("a")\nlocal lib = nil\nlib:CreateWindow({ Parent = game:GetService("CoreGui") })\n'
+        self.expect(DIFFERENT, original, result2, r'if the calls below are such arguments')
+        self.expect(DIFFERENT, original, mutate(result, 'lib:CreateWindow', 'lib:CreateWindows'))
+
     def test_which_object(self):
         a = 'local x, y = Instance.new("Part"), Instance.new("Part")\nx.Name = "n"\ny:Destroy()\n'
         self.expect(SAME, a, a)
@@ -245,6 +256,9 @@ class Limits(Base):
     def test_result_that_spins(self):
         a = 'print("a")\n'
         self.expect(NOT_COMPARABLE, a, 'print("a")\nwhile true do end\n', r'still running at the time limit', timeout=8)
+        b = 'print("a")\nprint("b")\n'
+        self.expect(DIFFERENT, b, 'print("a")\nwhile true do end\n', r'makes no further call until the time limit', timeout=8)
+        self.expect(NOT_COMPARABLE, b, 'print("a")\n-- LIFT ERROR: x\nwhile true do end\n', r'the result is partial', timeout=8)
 
 
 class Partial(Base):
