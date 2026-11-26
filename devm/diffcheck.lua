@@ -34,7 +34,8 @@
 -- messages a script sees are the ones it sees without recording.
 --
 -- Time and random numbers are made reproducible: os.clock / os.time / tick() read a counter that
--- starts at a value derived from salt= and advances with every reading and every wait, and
+-- starts at a value derived from salt= (and, for os.time, from epoch=, the present time as the
+-- reader saw it once for all its runs) and advances with every reading and every wait, and
 -- math.random is seeded from the salt.  Two runs with the same salt see the same values; values
 -- that differ between two salts are the ones that depend on time or chance (diffcheck.py masks
 -- them).
@@ -53,6 +54,7 @@ end
 local salt = 1
 local TAG = "[dc] "
 local callbacksMax = 0        -- callbacks=<n>: after the run, call up to n functions the script handed over
+local epoch = 1795000000      -- epoch=<seconds>: what os.time() starts from (scripts compare dates: it has to be "now")
 do
 	local pass = {}
 	for _, o in ipairs(options) do
@@ -62,17 +64,18 @@ do
 		-- digits per run, so text a script gets into another line (the URL of a request, with a
 		-- line break in it) cannot pass for a line of the recorder.
 		local c = string.match(o, "^callbacks=(%d+)$")
+		local e = string.match(o, "^epoch=(%d+)$")
 		if s then salt = tonumber(s) elseif n then TAG = "[dc" .. n .. "] " elseif c then callbacksMax = tonumber(c)
-		else pass[#pass + 1] = o end
+		elseif e then epoch = tonumber(e) else pass[#pass + 1] = o end
 	end
 	options = pass
 end
 
 -- ---------------------------------------------------------------- reproducible time and chance
 local realOs = os
-local now = 4096 * salt
+local now = salt / 4                              -- os.clock(): seconds of processor time, small at the start
 local TICK = 1 / 64
-local EPOCH = 1700000000 + 1000003 * salt
+local EPOCH = epoch + 977 * (salt - 1)            -- os.time(): the reader passes the present time (epoch=<seconds>)
 do
 	math.randomseed(7919 * salt + 13)
 	local fake = {}

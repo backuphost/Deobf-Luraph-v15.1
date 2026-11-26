@@ -34,8 +34,9 @@ known hole: a result that lacks its script's first calls is not noticed when tho
 themselves of the start-up kinds (say a leading `task.wait()`).  The report names how many
 calls were skipped and of which kinds.
 
-Time and chance.  The front end replaces the clock by a counter (a wait advances it) and seeds
-math.random; both depend on a "salt".  When the first comparison (salt 1) finds a difference,
+Time and chance.  The front end replaces the clock by a counter (a wait advances it; os.time
+starts at the moment the check began, the same in every run of it) and seeds math.random; both
+depend on a "salt".  When the first comparison (salt 1) finds a difference,
 both files are run again with salt 2: an argument that differs between the two runs of the same
 file depends on time or chance and is not compared.
 
@@ -218,10 +219,11 @@ class Run:
         return 'ended without a report (exit status %s)' % self.returncode
 
 
-def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, options=('executor=1',), noise=NOISE_CALLS):
+def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, options=('executor=1',), noise=NOISE_CALLS, epoch=None):
     """Run one file through diffcheck.lua / harness.lua and read its event log.
 
-    max_events counts compared events (not NOISE_CALLS); the run is stopped when it is reached."""
+    max_events counts compared events (not NOISE_CALLS); the run is stopped when it is reached.
+    epoch: what os.time() is in the run (default: now).  Runs that are compared get the same."""
     from . import unidata
     os.makedirs(workdir, exist_ok=True)
     nf = os.path.join(workdir, 'nfdata.lua')
@@ -230,7 +232,8 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
     nonce = '%d' % secrets.randbelow(10 ** 18)
     prefix = '[dc%s] ' % nonce
     cmd = [find_luau(), os.path.join(HERE, 'diffcheck.lua'), '-a', os.path.join(HERE, 'harness.lua'),
-           os.path.abspath(path), os.path.join(workdir, tag + '.out'), 'salt=%d' % salt, 'nonce=' + nonce] + list(options)
+           os.path.abspath(path), os.path.join(workdir, tag + '.out'), 'salt=%d' % salt, 'nonce=' + nonce,
+           'epoch=%d' % (int(time.time()) if epoch is None else epoch)] + list(options)
     run = Run(path, salt)
     t0 = time.time()
     proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -796,6 +799,7 @@ def check(original, result, workdir=None, timeout=120.0, max_events=20000, optio
     """Run both files and compare.  Returns a Verdict (code, headline, lines, data)."""
     log = log or (lambda s: None)
     t_end = time.time() + timeout
+    epoch = int(time.time())          # the same "now" for every run of this check
     own = None
     if workdir is None:
         own = tempfile.TemporaryDirectory(prefix='diffcheck-')
@@ -815,7 +819,7 @@ def check(original, result, workdir=None, timeout=120.0, max_events=20000, optio
             out = {}
 
             def one(key, path, cap):
-                out[key] = run_script(path, workdir, '%s.salt%d' % (key, salt), salt, budget, cap, options)
+                out[key] = run_script(path, workdir, '%s.salt%d' % (key, salt), salt, budget, cap, options, epoch=epoch)
             # the original gets room for its start-up calls in front of the script's
             ts = [threading.Thread(target=one, args=('original', original, 4 * max_events)),
                   threading.Thread(target=one, args=('result', result, max_events))]
