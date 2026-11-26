@@ -33,7 +33,8 @@ automatically, and the run ends with a report of what, if anything, is left unre
 | proto-table, Luraph's own one-line output, encrypted second stage | message_1 | complete, 0 lift errors, reproduced by `tests/regress.py` |
 | factory (`factory(...)(upvalues)`), decompiled bytecode | Net, TeleportGuard | complete up to a few constants in branches no run reached |
 | factory, one-line output, self-decrypting code and lazily decoded constants | 25ms_get | partial: all modules, but unlifted instructions and unstructured exits remain |
-| v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,500 lines); code that never ran keeps about 25 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
+| v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,300 lines); code that never ran keeps about 25 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
+| v15.1 chunk cut out of its container, script mostly plain Lua kept in the VM object | examples/layer3.lua + examples/blob4.bin (`--chunk-arg`) | the script runs to its end; about 38,600 lines, 1 unlifted instruction in code that did not run |
 
 There is no key that opens every Luraph v15.1 script.  Every protected file carries its own virtual
 machine: opcode numbers, operand layout and handlers are generated per script, the decryption keys
@@ -51,6 +52,27 @@ What no tool can recover from the file alone:
 
 `python tests/regress.py DIR` re-runs the pipeline on the protected inputs in `DIR` and compares
 with the committed results (the inputs themselves are not in the repository).
+
+### The report
+
+`python -m devm.run` ends with a report, and writes the same lines as comments at the head of the
+result, so that a file read later still says what it is: how the traced run ended (returned, or
+the error it stopped with, after how many VM instructions), the requests the script made (nothing
+is sent; a request gets an empty reply), and `result: complete` or `result: PARTIAL` with one
+line per kind of thing that is missing:
+
+| Line | Meaning |
+|---|---|
+| `LIFT ERROR markers` | an instruction that could not be lifted; the code after it is missing |
+| `lines index or call nil` | `(nil)[k]`, `t[nil]`: usually a constant of code that never ran |
+| `constants shown as __LPH_PROTOS[...]` | a value of the VM state the dump could not describe |
+| `uses of LuraphVM` | the table that holds Luraph's interpreter; protected code keeps helper functions and values in its fields. The table itself is not in the result |
+| `exit flags`, `state machines` | control flow that was not fully structured |
+| `lines use UPVAL_n` | a captured variable of a function whose creation was not lifted |
+| `values printed as nil --[[...]]` | a loop variable, argument or operand without a known source |
+| `for loops without their loop statement`, `functions printed as a stub` | what the words say |
+
+`run.report(text)` gives the second part for any result file (it skips a head written earlier).
 
 ### Factory layout: traced end-state lifting
 
@@ -184,10 +206,24 @@ Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
   the same call shape.  Without its buffer such a chunk stops at its first read.  This pair is
   a v15.1 build whose script is mostly plain Lua kept inside the VM object: the functions the
   payload creates from it (`native(nil, nil, upvalues, nil)`, a wrapper with four parameters)
-  are printed with their own text.  Result: about 34,000 lines, 110 functions on the VM, 2
-  unlifted instructions in code that did not run; the traced run stops in the script's GUI code
-  on a gap of the mock (`attempt to index nil with 'X'`), after two requests for a file on
-  raw.githubusercontent.com that get no reply offline.
+  are printed with their own text, also the one kept in a wrapper without parameters (4,650
+  lines of GUI library that used to be a stub).  Result: about 38,600 lines, 110 functions on
+  the VM, 1 unlifted instruction in code that did not run.  The traced run goes to the script's
+  `return` (2.4 million VM instructions); its three requests (a file on
+  raw.githubusercontent.com, a POST to the script's own server) get no reply offline.  Three
+  things this pair needed besides the container stand-in: `GuiService:GetGuiInset()` returns two
+  values (`rbxmock.lua`; the script stopped on `nil.X` before); the wrapper of this build's VM
+  closures is `function(m, m, m)`, so the upvalue list is the one table among the arguments
+  (`pe.call`, 92 of 113 closures had no captured variables before: 330 `UPVAL_n` lines); and
+  the for-loop state, see next point.
+* **For loops.**  The interpreter that runs the script (both in this v15.1 build and in v15.2)
+  keeps the state of `for` loops in interpreter locals and saves them on a stack when a loop
+  starts: `tmp = stack; stack, a = {[9]=limit, [6]=tmp, ...}, operand[pc]`.  The stack goes
+  through a scratch variable, which `PE._classify_state_vars` did not expect, so the loop
+  instructions were lifted as ordinary code and every generic `for` came out as a `while` over
+  `nil --[[forval]]` placeholders (123 of them in the layer3 result, 24 in the v15.2 sample,
+  where `for k, v in <the VM table>` had lost what it iterates).  With the scratch form
+  recognised they are `for` loops again.
 * **Model.**  The v15.2 chunk has four interpreters with 4 + 6 + 3 + 4 dispatch loops; a loop head
   can be `while true do OP = CODE[PC]` with the opcode variable declared outside
   (`vmmodel.is_dispatch_loop(assigned=True)`).  The wrapper between factory and interpreter takes
@@ -222,18 +258,29 @@ Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
   instruction that ran is only lifted where the replayed code equals a version the run recorded
   for it, otherwise in the recorded state of its first execution, and with the keys the run
   recorded on entry.  The 39 MB / 78,000 lines the first v15.2 support produced became about
-  3,500 lines (the same sample, the same run).
+  3,300 lines (the same sample, the same run).
 * **Closures** get their captured variables from the list the instruction builds; that list is
   parked in the instruction's argument template only for the duration of the call (`PE.parked`).
 * **More than 200 locals.**  The unflattened function has about 500.  `structure.fit_scopes`
   cuts it into `do ... end` sections side by side, only where the limit asks for one
   (`tighten_scopes`, used for v15.1, nests one block per short-lived local).
+* **Rewrites that are on for v15.2 only** (`run.py` sets `beautify.MERGE_ARMS` and
+  `structure.NEST_ITEMS` when the model has keyed wrappers; the committed v15.1 results were
+  written without them and `tests/regress.py` compares text for text):
+  `if c then x = c else x = E end` becomes `x = c or E` (and the `and` twin), register set-up
+  that both arms of an `if` repeat moves behind the `if`, and a function or table inside a
+  multi-line table constructor is indented with it.  Together with the inliner that was already
+  there, `local v = getgenv().SCRIPT_KEY or SCRIPT_KEY` is one line instead of nine.
+* **A constant test is kept where removing it would change the meaning.**  A function that
+  captured the constant `false` starts with `if not false then return end`; folding that to a
+  bare `return` in front of the rest of the body would make Luau read `return` and the next
+  call as one statement (it parses).  `opaque._fold_const_ifs` now leaves such a test alone.
 * **What is not recovered, and why.**  All remaining `LIFT ERROR` markers are in code that did
   not run: there a key was computed from a value that only exists at run time, so the block or
   constant behind it cannot be decrypted.  Branches the run did not take can therefore end in a
   marker or, where a wrong key still produced valid operands, in nonsense statements; nothing in
   them is confirmed by the run.  `--mark-untaken` writes `-- not reached in the traced run`
-  where such an arm starts (188 places in the sample; off by default because the comments
+  where such an arm starts (about 190 places in the sample; off by default because the comments
   keep small arms from folding into `and`/`or` expressions).
 * **What the sample is.**  A JNKIE (jnkie.com) key-system loader.  After Luraph's start-up probes
   it tests the executor (`PC-E01..E03`: raw metatable access, `clonefunction`; a `request` call

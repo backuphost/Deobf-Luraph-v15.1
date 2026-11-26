@@ -13,7 +13,13 @@
 * the v15.2-only rewrites (`beautify.copy_diamonds`, `sink_common`, nested table layout) do what
   they say, leave alone what they must, and are off unless run.py switches them on;
 * the report: the VM table gets a name, a marker's own text is not counted twice, and the report
-  that main() writes at the head of a result is not taken for part of it.
+  that main() writes at the head of a result is not taken for part of it; the tamper response
+  function is labelled and its calls are counted;
+* the model's roles of the wrapper parameters (keys, upvalue list) for all four interpreters of
+  the v15.2 chunk, against how the interpreter bodies use them;
+* `ircfg.ProtoCFG._recover_for_loops` on the v15.2 forms of table-state `for` loops (state table
+  through a scratch register, bounds reused by the set-up, a bound that is a call, a loop left by
+  a jump inside an enclosing loop), and that none of it happens without `ircfg.V152`.
 
     DEVM_V152_FULL=1 python3 tests/devm_v152.py V152Full Layer3Full     (about 2 minutes each)
 
@@ -88,6 +94,39 @@ class V152(unittest.TestCase):
         self.assertEqual(sorted(m.wrapper_numbers(last)), [2, 3])
         self.assertTrue(m.keyed_wrappers)      # switches the v15.2 passes on (lifter, run.py)
 
+    def test_wrapper_roles(self):
+        """Wrapper parameters of all four interpreters: which carry per-closure key numbers and
+        which is the upvalue list.  Checked against the interpreter bodies: a key is copied into a
+        local that the code rotates and xors (`bxor(K, band(rshift(K, 29), 7))`), the upvalue
+        list is indexed with an operand (`U[F[pc]]`).  Only the last interpreter is exercised by
+        the sample's run; the others are read off the text."""
+        import re
+        from devm import lifter
+        m = self.model
+        stub = type('L', (), {'model': m})()
+        want = [([0, 1], 2), ([0, 2, 3], 1), ([1], 0), ([2, 3], 4)]
+        for it, (nums, up) in zip(m.interps, want):
+            mid = it.chain[-2]
+            got = m.wrapper_numbers(it)
+            self.assertEqual(sorted(got), nums, 'interpreter %d' % it.index)
+            self.assertEqual(lifter.FactoryLifter.upvalue_param(stub, mid), up, 'interpreter %d' % it.index)
+            body = m.src[it.func.body_pos:it.func.end_pos]
+            # every key local is used as the seed of the keyed decoders: f(K, g(h(K, 29), 7))
+            keyed = [n for names in got.values() for n in names
+                     if re.search(r'\w+\(%s,\s*\(?\w+\(\w+\(%s,\s*29\),\s*7\)' % (re.escape(n), re.escape(n)), body)]
+            self.assertTrue(keyed, 'interpreter %d: no key local feeds a decoder' % it.index)
+
+    def test_for_state(self):
+        """The interpreter that runs keeps for-loop state in locals and saves them on a stack that
+        goes through a scratch variable (`Xh = l; l, h = {[6]=Xh, [9]=A, ...}, X[W]`): the stack and
+        the saved locals are for-loop state, the scratch variable is not."""
+        from devm import pe
+        P = pe.PE.__new__(pe.PE)
+        fvars, fstack, _ = pe.PE._classify_state_vars(P, self.model.interps[-1].loops)
+        self.assertEqual(len(fstack), 1)
+        self.assertEqual(len(fvars), 5)
+        self.assertTrue(fstack <= fvars)
+
     @unittest.skipUnless(os.path.exists(LUAU_AST), 'needs bin/luau-ast')
     def test_instrumented_chunk_parses(self):
         path = os.path.join(self.tmp.name, 'step.lua')
@@ -104,6 +143,17 @@ class Layer3(unittest.TestCase):
         self.assertEqual([len(it.loops) for it in m.interps], [4, 4])
         self.assertEqual([m.wrapper_numbers(it) for it in m.interps], [{}, {}])
         self.assertFalse(m.keyed_wrappers)     # v15.1: the v15.2 passes stay off
+        # for-loop state of the interpreter the script's functions run on (same form as v15.2)
+        from devm import luprint, pe
+        fvars, fstack, _ = pe.PE._classify_state_vars(pe.PE.__new__(pe.PE), m.interps[0].loops)
+        self.assertEqual((len(fstack), len(fvars)), (1, 5))
+        # the script's first plain-Lua function sits in a wrapper without parameters
+        # (`function() return function() ... end end`): it is printed, not replaced by a stub
+        first = [f for f in m.funcs if not f.params and luprint.native_shape(f) is None
+                 and len(f.body) == 1 and f.body[0][0] == 'return' and len(f.body[0][1]) == 1 and f.body[0][1][0][0] == 'func']
+        self.assertTrue(first)
+        text = luprint.native_closure_text(first[0], [], 0, m.cells, m.up_base)
+        self.assertTrue(text and text.startswith('function('))
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'step.lua')
             with open(path, 'w', encoding='latin-1') as f:
@@ -261,6 +311,40 @@ class MergeArms(unittest.TestCase):
         self.assertEqual(repr(ast), before)
 
 
+class ConstIfs(unittest.TestCase):
+    def fold(self, text):
+        from devm import opaque
+        while True:
+            new = opaque._fold_const_ifs(text)
+            if new == text:
+                return text
+            text = new
+
+    def test_arm_that_leaves(self):
+        """`if not false then return end` in front of more statements stays as it is: without the
+        `if`, `return` would swallow the next statement (`return print(...)` parses)."""
+        a = 'local f = function(...)\n\tif not false then\n\t\treturn\n\tend\n\tprint(1)\nend\n'
+        self.assertEqual(self.fold(a), a)
+        b = 'local f = function(...)\n\tif not false then\n\t\treturn\n\tend\nend\n'
+        self.assertEqual(self.fold(b), 'local f = function(...)\n\treturn\nend\n')
+        c = 'if false then\n\ta()\nelse\n\tb()\nend\nc()\n'
+        self.assertEqual(self.fold(c), 'b()\nc()\n')
+
+
+def misplaced_terminators(text):
+    """Lines where return/break/continue is followed by another statement of the same block."""
+    import re
+    lines = text.split('\n')
+    bad = []
+    for i in range(len(lines) - 1):
+        m = re.match(r'^(\t*)(return\b.*|break|continue)\s*$', lines[i])
+        nxt = lines[i + 1]
+        if m and nxt.strip() and len(nxt) - len(nxt.lstrip('\t')) >= len(m.group(1)) \
+                and not lines[i].rstrip().endswith(('{', '(', ',')) and not re.search(r'function\([^)]*\)$', lines[i]):
+            bad.append(i + 1)
+    return bad
+
+
 class TableLayout(unittest.TestCase):
     def test_nested_items(self):
         """An item of a multi-line table that spans lines itself sits one level inside the braces."""
@@ -297,6 +381,25 @@ class Report(unittest.TestCase):
         self.assertNotIn('__LPH_PROTOS', rep)       # (the marker's own text is not a second finding)
         self.assertEqual(run.name_vm_object('local a = 1\n'), 'local a = 1\n')
 
+    def test_tamper_response(self):
+        """A function that reads the operand arrays of a VM function is Luraph's tamper response:
+        labelled (when structure.NOTE_TRAPS is on) and its calls counted by the report."""
+        from devm import run
+        node = type('N', (), {})
+        trap, plain = type('P', (), {})(), type('P', (), {})()
+        a, b = node(), node()
+        a.tree = ([('set', ('r', 6), ('outer', '__LPH_PROTOS[6]["vars"]["R"][-2]'))], ('ret', [], None))
+        b.tree = ([('set', ('r', 6), ('outer', '__LPH_PROTOS[1]["self"]["F"]'))], ('ret', [], None))
+        trap.nodes, plain.nodes = {1: a}, {1: b}
+        self.assertTrue(structure.loads_own_code(trap))
+        self.assertFalse(structure.loads_own_code(plain))
+        self.assertFalse(structure.NOTE_TRAPS)
+        text = ('local v60 = function()\n\t-- %s\n\t-- LIFT ERROR: call of None\nend\n'
+                'if not ok then\n\tv60()\nend\nv60()\nlocal x = v60\n' % structure.TRAP_NOTE)
+        rep = run.report(text)
+        self.assertIn("note: 2 calls of v60, Luraph's tamper response", '\n'.join(rep))
+        self.assertNotIn('note:', '\n'.join(run.report('local v60 = function()\nend\nv60()\n')))
+
     def test_head_is_not_counted(self):
         """A file written by main() starts with the report of its run: reading it again gives the
         same findings, and a marker in the first line of a result is never taken for a head."""
@@ -307,6 +410,135 @@ class Report(unittest.TestCase):
         head = '-- x.lua, %s.  How the run went and what this file lacks:\n' % run.HEAD_MARK + ''.join('--   %s\n' % ln for ln in first)
         self.assertEqual(run.report(head + body), first)
         self.assertIn('result: complete', run.report(head + 'local a = 1\n')[0])
+
+
+def for_cfg(entry_stmts, slots, body, after=(), outer=False):
+    """A hand-made CFG with one table-state loop: entry block E, loop head H (state table in
+    register 21; `slots` = (index slot, step slot, limit slot)), body B, exit X (pops the table
+    through slot 4).  outer=True puts the loop inside another loop that the body can jump to."""
+    from devm import ircfg
+    ki, ks, kl = slots
+    S = ('r', 21)
+
+    def at(k):
+        return ('index', S, ('k', k))
+    cfg = ircfg.ProtoCFG.__new__(ircfg.ProtoCFG)
+    cfg.pir = type('P', (), {'key': 0})()
+    cfg.param_regs = None
+    cfg.blocks = {}
+
+    def block(name, stmts, term):
+        b = ircfg.Block(name)
+        b.stmts, b.term = list(stmts), term
+        cfg.blocks[name] = b
+    block('E', entry_stmts, ('goto', 'H'))
+    block('H', [
+        ('set', ('r', 10), at(ks)),
+        ('set', ('r', 11), at(kl)),
+        ('set', ('r', 5), ('bin', '+', at(ki), ('r', 10))),
+        ('set', ('r', 10), ('bin', '<=', ('r', 10), ('k', 0))),
+        ('set', ('r', 14), ('bin', '>=', ('r', 5), ('r', 11))),
+        ('set', ('r', 11), ('bin', '<=', ('r', 5), ('r', 11))),
+        ('set', ('r', 14), ('or', ('and', ('r', 10), ('r', 14)), ('and', ('un', 'not', ('r', 10)), ('r', 11)))),
+        ('setindex', S, ('k', ki), ('r', 5)),
+    ], ('br', ('r', 14), 'B', 'X'))
+    pop = ('set', S, at(4))
+    if outer:
+        block('B', body, ('br', ('r', 30), 'X2', 'L'))
+        block('L', [], ('goto', 'H'))
+        block('X2', [pop], ('goto', 'O'))
+        block('X', [pop] + list(after), ('goto', 'O'))
+        block('O', [], ('br', ('r', 31), 'E', 'R'))
+        block('R', [], ('ret', [('r', 6)], None))
+    else:
+        block('B', body, ('goto', 'H'))
+        block('X', [pop] + list(after), ('ret', [('r', 6)], None))
+    cfg.entry = 'E'
+    cfg.compute_preds()
+    return cfg
+
+
+class ForState(unittest.TestCase):
+    """Numeric `for` loops whose state Luraph keeps in a table, in the forms v15.2 writes
+    (ircfg.ProtoCFG._recover_for_loops with ircfg.V152)."""
+
+    def setUp(self):
+        from devm import ircfg
+        self.ircfg = ircfg
+        ircfg.V152 = True
+
+    def tearDown(self):
+        self.ircfg.V152 = False
+
+    BODY = [('set', ('r', 6), ('bin', '+', ('bin', '*', ('r', 6), ('k', 10)), ('r', 5)))]
+
+    def scratch_entry(self):
+        # T = {link .. first - step}; n = 0; S = T; b = c     (the bounds read n and b)
+        return [
+            ('set', ('r', 17), ('table', [(None, ('r', 37)), (None, ('k', 1)),
+                                          (None, ('bin', '+', ('bin', '-', ('r', 23), ('k', 1)), ('k', 0))),
+                                          (None, ('r', 21)),
+                                          (None, ('bin', '-', ('bin', '+', ('r', 6), ('k', 1)), ('k', 1)))], None)),
+            ('set', ('r', 6), ('k', 0)),
+            ('set', ('r', 21), ('r', 17)),
+            ('set', ('r', 23), ('r', 5)),
+        ]
+
+    def test_scratch_register_and_reused_bounds(self):
+        cfg = for_cfg(self.scratch_entry(), (5, 2, 3), self.BODY)
+        self.assertEqual(cfg._recover_for_loops(), 1)
+        self.assertEqual(cfg.blocks['H'].term[:3], ('forbr', 'num', (5,)))
+        entry = cfg.blocks['E'].stmts
+        # both bounds are evaluated where the table was built, before `n = 0` and `b = c`
+        self.assertEqual([st[2] for st in entry[:2]],
+                         [('bin', '+', ('r', 6), ('k', 1)), ('bin', '-', ('r', 23), ('k', 1))])
+        self.assertEqual(entry[2:], [('set', ('r', 6), ('k', 0)), ('set', ('r', 23), ('r', 5))])
+        fresh = [st[1] for st in entry[:2]]
+        self.assertTrue(all(r[1] > 37 for r in fresh) and fresh[0] != fresh[1])
+        prep = [b for b in cfg.blocks.values() if b.stmts and b.stmts[0][0] == 'numforprep']
+        self.assertEqual(len(prep), 1)
+        self.assertEqual(prep[0].stmts[0][1], [fresh[0], fresh[1], ('k', 1)])
+        # the pop of the state table is gone with the table
+        self.assertEqual(cfg.blocks['X'].stmts, [('set', ('r', 21), ('r', 21))])
+
+    def test_v151_form_only_without_the_flag(self):
+        self.ircfg.V152 = False
+        cfg = for_cfg(self.scratch_entry(), (5, 2, 3), self.BODY)
+        before = repr(sorted((k, b.stmts, b.term) for k, b in cfg.blocks.items()))
+        self.assertEqual(cfg._recover_for_loops(), 0)
+        self.assertEqual(repr(sorted((k, b.stmts, b.term) for k, b in cfg.blocks.items())), before)
+        # ... while the direct form (S = {...} as the last thing before the loop) is recovered
+        direct = [('set', ('r', 21), ('table', [(None, ('k', None)), (None, ('k', 1)), (None, ('r', 23)),
+                                                (None, ('r', 21)), (None, ('k', 0))], None))]
+        cfg = for_cfg(direct, (5, 2, 3), self.BODY)
+        self.assertEqual(cfg._recover_for_loops(), 1)
+        prep = [b for b in cfg.blocks.values() if b.stmts and b.stmts[0][0] == 'numforprep']
+        self.assertEqual(prep[0].stmts[0][1], [('k', 1), ('r', 23), ('k', 1)])
+
+    def test_bound_is_a_call(self):
+        call = ('call', ('r', 77), [('r', 15)], None)
+        limit = ('bin', '+', ('bin', '+', ('r', 13), ('bin', '-', call, ('k', 9))), ('k', 0))
+        entry = [('set', ('r', 21), ('table', [(None, ('r', 0)), (None, ('k', 1)), (None, limit), (None, ('r', 21)),
+                                               (None, ('bin', '-', ('r', 86), ('k', 1)))], None))]
+        cfg = for_cfg(entry, (5, 2, 3), self.BODY)
+        self.assertEqual(cfg._recover_for_loops(), 1)
+        prep = [b for b in cfg.blocks.values() if b.stmts and b.stmts[0][0] == 'numforprep']
+        self.assertEqual(prep[0].stmts[0][1], [('r', 86), limit[2], ('k', 1)])
+        # two calls among the bounds would be reordered: left alone
+        entry = [('set', ('r', 21), ('table', [(None, ('r', 0)), (None, ('k', 1)), (None, limit), (None, ('r', 21)),
+                                               (None, ('bin', '-', call, ('k', 1)))], None))]
+        cfg = for_cfg(entry, (5, 2, 3), self.BODY)
+        self.assertEqual(cfg._recover_for_loops(), 0)
+
+    def test_loop_left_by_a_jump_inside_an_outer_loop(self):
+        entry = [('set', ('r', 21), ('table', [(None, ('k', 1)), (None, ('k', 1)), (None, ('k', 3)), (None, ('r', 21)),
+                                               (None, ('k', 0))], None))]
+        cfg = for_cfg(entry, (5, 2, 3), self.BODY, outer=True)
+        self.assertEqual(cfg._recover_for_loops(), 1)
+        self.assertEqual(cfg.blocks['H'].term[:3], ('forbr', 'num', (5,)))
+        self.ircfg.V152 = False
+        cfg = for_cfg(entry, (5, 2, 3), self.BODY, outer=True)
+        self.assertEqual(cfg._recover_for_loops(), 0)
 
 
 @unittest.skipUnless(os.environ.get('DEVM_V152_FULL') and have_luau() and os.path.exists(SAMPLE), 'set DEVM_V152_FULL=1 (about 2 minutes)')
@@ -338,6 +570,25 @@ class V152Full(unittest.TestCase):
         self.assertLess(max(len(ln) - len(ln.lstrip('\t')) for ln in lines), 30)
         self.assertNotIn('not structured', text)
         self.assertLess(text.count('UPVAL_'), 100)      # (closures get their captured variables: about 40 uses are left, inside native functions; several hundred before)
+        # generic for loops come out as loops (the walk over the VM table among them), the
+        # v15.2 rewrites are on, and no block goes on after its return
+        self.assertNotIn('forval', text)
+        self.assertRegex(text, r'for \w+, \w+ in LuraphVM do')
+        self.assertIn('getgenv().SCRIPT_KEY or SCRIPT_KEY', text)
+        self.assertEqual(misplaced_terminators(text), [])
+        # numeric for loops that v15.2 keeps in a state table are loops again (at most the few
+        # in code that never ran are left as `x = t[i] + t[s]` arithmetic), and no state
+        # comparison is left over a boolean (`true <= 4`: the junk side of a key check)
+        import re
+        self.assertGreaterEqual(len(re.findall(r'(?m)^\s*for \w+ = ', text)), 20)
+        self.assertLessEqual(len(re.findall(r'(?m)^.* = \w+ and \w+ or not \w+ and \w+$', text)), 6)
+        self.assertIsNone(re.search(r'\b(?:true|false) <= \d', text))
+        self.assertIn(structure.TRAP_NOTE, text)
+        rep = '\n'.join(run.report(text))
+        self.assertIn('result: PARTIAL', rep)
+        self.assertIn('LIFT ERROR markers', rep)
+        self.assertIn("Luraph's tamper response", rep)
+        self.assertNotIn('__LPH_PROTOS', rep)
 
 
 @unittest.skipUnless(os.environ.get('DEVM_V152_FULL') and have_luau() and os.path.exists(LAYER3), 'set DEVM_V152_FULL=1 (about 2 minutes)')
@@ -360,6 +611,14 @@ class Layer3Full(unittest.TestCase):
         self.assertGreater(text.count('\n'), 10000)
         self.assertIn('game:GetService("CoreGui")', text)
         self.assertLess(text.count('LIFT ERROR'), 10)
+        # the script runs to its end (GuiService:GetGuiInset() gives two values); functions on the
+        # VM get their captured variables and their for loops; no stub for the first plain function
+        self.assertTrue(any('script returned' in ln for ln in logs), logs[-12:])
+        self.assertLess(text.count('UPVAL_'), 20)
+        self.assertNotIn('forval', text)
+        self.assertNotIn('native function L', text)
+        self.assertIn('for _, ', text)
+        self.assertEqual(misplaced_terminators(text), [])
 
 
 if __name__ == '__main__':

@@ -33,7 +33,7 @@ def has_lua_syntax_ok(p):
     if not luau:
         return None, "无 luau"
     try:
-        ok, msg = luasandbox.compile_only(Path(p).read_bytes(), luau, timeout=120,
+        ok, msg = luasandbox.compile_only(luasandbox.strip_bom(Path(p).read_bytes()), luau, timeout=120,
                                           chunk_name=Path(p).name.replace('"', "'")[:60] or "file")
     except Exception as e:
         return None, str(e)[:60]

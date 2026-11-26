@@ -262,6 +262,62 @@ def main():
                                    '--max-round', '6'])
         verdict('autostub.py', log, want_probe=False)
 
+        # ---- autostub.py: what it calls a universal stub must be one.  A missing global is
+        # stubbed and then read two and three levels deep, called, used in arithmetic, in a
+        # concatenation and in loops; the script runs through and its last line is reached
+        # (the stub file it saves is run again here to see that line).
+        asrc = os.path.join(tmp, 'deep.lua')
+        with open(asrc, 'w', encoding='utf-8') as fh:
+            fh.write('local a = Foo.Bar.Baz\nlocal b = Foo.Bar(1).x.y()\n'
+                     'local n = #Foo.list + Foo.n + 1 - Foo.m * 2\nlocal s = Foo.s .. "x" .. tostring(a)\n'
+                     'for i, v in ipairs(Foo.items) do error("ipairs ran") end\n'
+                     'for k, v in Foo.map do error("iteration ran") end\n'
+                     'local e = Enum.KeyCode.E\nlocal c = Color3.new(1, 2, 3).R\n'
+                     'local d = Qux:Method().field.deep()\nZed.config.x = 5\n'
+                     'assert(Foo.Bar == Foo.Bar and Zed.config.x == 5 and n == 1)\n'
+                     # numeric indices: read to any depth; the same index gives the same
+                     # object; a loop that counts indices itself comes to an end
+                     'local k = Qux:Method(1, 2).deep.er[3]["k"]\n'
+                     'local who = game:GetService("Players"):GetPlayers()[1].Name\n'
+                     'local key = Enum.KeyCode.E[1].x\n'
+                     'assert(Foo.items[2] == Foo.items[2] and Foo.items[2] ~= Foo.items[3])\n'
+                     'local i = 1\nwhile Foo.items[i] do i += 1 end\n'
+                     'assert(i == 257, "counting loop ended at " .. i)\n'
+                     'assert(Foo.items[0/0] == nil and #Foo.items == 0)\n'
+                     'print("DEEP_DONE")\n')
+        stub_out = os.path.join(tmp, 'deep.stub.lua')
+        rc, log = run('autostub deep', [py, '-B', os.path.join(ROOT, 'autostub.py'), asrc, '--timeout', '30',
+                                        '--save', stub_out])
+        check('autostub.py: a stub can be read at any depth (fields and numeric indices), called and computed '
+              'with (three globals stubbed, run completes)',
+              rc == 0 and '跑通' in log and '共补了 3 个全局：Foo, Qux, Zed' in log and '非缺失类错误' not in log
+              and '补不了' not in log, log[-500:])
+        if os.path.isfile(stub_out):
+            again = os.path.join(tmp, 'deep.again.lua')
+            with open(again, 'w', encoding='utf-8') as fh:
+                fh.write('local env = (function() ' + open(stub_out, encoding='utf-8').read() + ' end)()\n'
+                         'local f = loadstring(' + luasandbox.lua_string_expr(open(asrc, encoding='utf-8').read())
+                         + ', "=deep")\nsetfenv(f, env)\nf()\n')
+            r2 = subprocess.run([luau, again], capture_output=True, text=True, timeout=60)
+            check('autostub.py: the saved stub file runs the script to its last line',
+                  r2.returncode == 0 and 'DEEP_DONE' in r2.stdout, (r2.stdout + r2.stderr)[-300:])
+        else:
+            check('autostub.py: --save wrote the stub file', False, log[-300:])
+
+        # ---- a UTF-8 byte order mark in front of the input: the runners drop it (no Luau
+        # compiles a text that starts with one)
+        bsrc = os.path.join(tmp, 'bom.lua')
+        with open(bsrc, 'wb') as fh:
+            fh.write(b'\xef\xbb\xbflocal f = loadstring("return 41 + 1", "BOMCHUNK")\nprint(f())\n')
+        bout = os.path.join(tmp, 'bom_fs')
+        rc, log = run('fastsolve bom', [py, '-B', os.path.join(ROOT, 'fastsolve.py'), bsrc, bout])
+        cap = os.path.join(bout, 'chunk1.lua')
+        check('fastsolve.py: an input with a byte order mark runs, and what it loads is captured',
+              '运行时中断' not in log and os.path.isfile(cap) and open(cap, 'rb').read() == b'return 41 + 1',
+              log[-400:])
+        rc, log = run('autostub bom', [py, '-B', os.path.join(ROOT, 'autostub.py'), bsrc, '--timeout', '30'])
+        check('autostub.py: an input with a byte order mark runs', rc == 0 and '第 1 轮跑通' in log, log[-300:])
+
         # ---- trace_vm.py
         tsrc = os.path.join(tmp, 'evil_trace.lua')
         with open(tsrc, 'w', encoding='utf-8') as fh:

@@ -374,6 +374,16 @@ hold for every change to the shared runtime:
   small closed `do ... end` segments (`wrap_segments`) when their estimate
   (`dry=True`) fits, else `split_block` (one closed prefix, e.g. a loader and
   the script it runs, with the locals crossing the cut declared in front).
+  `backend.lower` retries with smaller budgets while `peak_locals` is over
+  the limit (a full top level leaves nested blocks no room). Call temps kept
+  as `local tN = table.pack(call)` count as locals there (`declared_here`,
+  `names_anywhere`): a segment must not close before a temp's last read, and
+  `TailCount` (the number of a call's values) is a read of its temp too.
+- `structure.GUARD_TAILS` (off; a front end switches it on, Luraph v15.2 does):
+  a branch whose one side is a join that runs straight into a return/error
+  becomes a guard clause with a copy of that tail, and without a join the
+  clearly smaller side is tried first as the guard. Fuzz it with
+  `DEVIRT_GUARD_TAILS=1 python research/structure_fuzz.py 0 3000` too.
 - Structuring heuristics (before any goto rewrite): `break` paths to another
   exit via tail duplication / return-only regions / "same statements as the
   exit"; endless loops join at the first block both branches reach (RPO);

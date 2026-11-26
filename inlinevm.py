@@ -156,7 +156,7 @@ def detect(src_text):
 def dissect(sample: Path, verbose=True):
     """把内联 VM 的语义层全部还原。
     返回 dict（槽位表 / handler 表 / 主循环 / 字符串表结构）。"""
-    src = sample.read_text(encoding='utf-8', errors='ignore')
+    src = sample.read_text(encoding='utf-8', errors='ignore').lstrip('\ufeff')
     ast = _ast(sample)
 
     # 定位 handler 表：setmetatable( {第一参数}, ... )
@@ -662,7 +662,7 @@ print('<<<CAPTURE_END>>>')
 
 def make_harness(sample: Path, info: dict, out: Path = None):
     """生成自跑捕获脚本"""
-    src = sample.read_text(encoding='utf-8', errors='ignore')
+    src = sample.read_text(encoding='utf-8', errors='ignore').lstrip('\ufeff')
     prims = info.get('prims', {})
     handlers = info.get('handlers', {})
     strings = info.get('strings', {})

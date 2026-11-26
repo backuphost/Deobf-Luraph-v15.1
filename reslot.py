@@ -28,6 +28,16 @@ assigned again.  By default the name is added as a COMMENT, so the code is untou
 
     tbl[60 --[[RunService]]].Heartbeat:Connect(...)
 
+A comment must be true as well: it says "the only assignment to this slot that the visible
+code makes is `tbl[60] = RunService`".  So a table gets slot names only when the visible code
+has no second way to write it (luascope.slot_table_problem): it is declared `local tbl = {}`
+and never assigned again, there is no write with a computed index (`tbl[i] = ...`), and the
+table itself is not copied or passed on (`local alias = tbl`, `x.t = tbl`, `f(tbl)`,
+`table.insert(tbl, v)`, `return tbl` all take the names away).  The one hand-over that is let
+through is Luraph's own: `obj:method(1, 2, {[1] = tbl, ...})` with `obj` a parameter that is
+never assigned (the VM object creating a closure and giving it the captured variables).
+What such a closure writes is outside the visible code; the output's header says so.
+
 `--inline` substitutes the name instead (the old look) where the visible code proves the read
 can only see that value: the table is a `local tbl = {}` used only as `tbl[number]`, the
 assignment runs once, the read comes after it in the same block, and the name is not shadowed
@@ -174,7 +184,8 @@ def main():
         print(f"[✗] 文件不存在：{src}")
         return 1
     dst = Path(args[1]) if len(args) > 1 else src.with_suffix('.reslot.luau')
-    text = src.read_bytes().decode('utf-8', errors='surrogateescape')
+    from deobf_plus import read_lua
+    text = read_lua(src)
     try:
         out, stats = process_text(text, inline=inline)
     except RuntimeError as e:

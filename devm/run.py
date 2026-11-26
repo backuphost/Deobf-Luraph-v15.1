@@ -174,6 +174,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # (layout and and/or rewrites that came with v15.2 support; the committed v15.1 results
         # were written without them and tests/regress.py compares text for text)
         structure.NEST_ITEMS = beautify.MERGE_ARMS = stage.model.keyed_wrappers
+        # (v15.2 forms of table-state `for` loops and of repeated key checks, see ircfg.V152)
+        ircfg.V152 = structure.NOTE_TRAPS = stage.model.keyed_wrappers
         structure.MARK_COLD = ircfg.KEEP_COLD = bool(mark_untaken)
         try:
             text = stage.run_traced()
@@ -182,6 +184,7 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             ircfg.DROP_OPAQUE = False
             structure.FIT_SCOPES = False
             structure.NEST_ITEMS = beautify.MERGE_ARMS = False
+            ircfg.V152 = structure.NOTE_TRAPS = False
             structure.MARK_COLD = ircfg.KEEP_COLD = False
         LAST_RUN['notes'] = list(getattr(stage, 'run_notes', ())) + list(getattr(stage, 'hints', ()))
         # Paths that never ran keep encrypted instructions and constants.  With the traced run
@@ -352,7 +355,8 @@ def report(text):
             del lines[0]
         text = '\n'.join(lines)
     errs = text.count('LIFT ERROR')
-    blank = len(re.findall(r'(?m)^.*(?:\[nil\]|\(nil\)|= nil \.\.).*$', text))
+    # (`(nil)[k]`, `(nil)(...)`, `t[nil]`, `nil .. x`; a call that passes nil, `f(nil)`, is ordinary code)
+    blank = len(re.findall(r'(?m)^.*(?:\[nil\]|(?<![\w\)\]])\(nil\)[\[.(:]|= nil \.\.).*$', text))
     # (comment lines are not code: a LIFT ERROR marker can name the VM table it could not write
     # to, and the note of name_vm_object names the table it explains)
     code = '\n'.join(ln for ln in lines if not ln.lstrip().startswith('--'))
@@ -360,11 +364,24 @@ def report(text):
     vm = len(re.findall(r'\b%s\w*' % VM_NAME, code))
     flat = text.count('not structured')
     flags = len(re.findall(r'exit\d+ = true', text))
+    # placeholders the printer writes where it has no value or text to show
+    ups = sum(1 for ln in lines if re.search(r'\bUPVAL_\d', ln))
+    holes = len(re.findall(r'nil --\[\[', code))
+    stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
+    preps = sum(1 for ln in lines if '-- for-loop setup:' in ln)
+    # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
+    # protection's own checks, which a reader should not take for the script's
+    traps = []
+    for m in re.finditer(r'(?m)^[ \t]*(?:local )?(?:function )?([A-Za-z_]\w*)(?: = function)?\(\)\n[ \t]*-- %s'
+                         % re.escape(structure.TRAP_NOTE), text):
+        calls = len(re.findall(r'(?m)^[ \t]*%s\(\)$' % re.escape(m.group(1)), code))
+        traps.append('  note: %d calls of %s, Luraph\'s tamper response: the tests in front of them are checks of the '
+                     'protection, not of the script' % (calls, m.group(1)))
     lines = max(1, text.count('\n'))
     out = []
-    if not (errs or blank or refs or flat or flags or vm):
+    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
-        return out
+        return out + traps
     out.append('result: PARTIAL')
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
@@ -378,6 +395,16 @@ def report(text):
                    'uses as storage; the table itself is not in the result' % (vm, VM_NAME))
     if flat or flags:
         out.append('  control flow not fully structured: %d state machines, %d exit flags' % (flat, flags))
+    if ups:
+        out.append('  %d lines use UPVAL_n: a variable a function captured; which one was not recovered '
+                   '(usually the code that creates the function never ran)' % ups)
+    if holes:
+        out.append('  %d values printed as nil --[[...]]: a loop variable, argument or operand the lifter '
+                   'could not connect to its source' % holes)
+    if preps:
+        out.append('  %d for loops without their loop statement (only the set-up of the bounds was found)' % preps)
+    if stubs:
+        out.append('  %d functions printed as a stub (their body was not recovered)' % stubs)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '
@@ -386,7 +413,7 @@ def report(text):
         out.append('  most of the script did not run.  Usual causes: it waits for a server reply (see the [http] '
                    'lines above; --http-map), a key system, or an environment check that failed '
                    '(try --no-executor / --executor)')
-    return out
+    return out + traps
 
 
 if __name__ == '__main__':

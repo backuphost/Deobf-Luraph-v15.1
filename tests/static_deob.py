@@ -12,6 +12,13 @@ No sample file is needed.  The inputs have Luraph's SHAPES (nothing is copied fr
               -> every plain function is exported (big, API-dense, closure-factory shape,
                  reads a global), script code first; the dispatcher and the VM method are
                  not, and the log accounts for every API mention that is not exported;
+  no UI code  the same object, but its big plain function is a script without a single UI
+              name (HttpGet, loadstring, table reads by key, numeric comparisons, loops that
+              begin with a table read) -> still form A and exported: what a VM dispatcher is
+              is decided by structure (interpreter dispatch loops make up most of the
+              function), not by which names a function mentions; only the interpreter's
+              loops are counted as dispatch loops; a UTF-8 byte order mark in front of the
+              file changes nothing; --keep-dispatchers exports the dispatcher too, labelled;
   container   key line + header comment + code that hands a VM-only chunk to loadstring and
               calls it with a buffer -> chunk and buffer are saved byte for byte, the tool says
               "Luraph v15.2 virtual machine, use python3 -m devm.run" and exits 4; with --force
@@ -55,8 +62,8 @@ def business_function(lines):
     return ''.join(out)
 
 
-def dispatcher(cases):
-    out = ['function(F,b)local r,a={};while true do local D=F[b];if D<1 then return r end;']
+def dispatcher(cases, head='if D<1 then'):
+    out = ['function(F,b)local r,a={};while true do local D=F[b];%s return r end;' % head]
     for i in range(cases):
         out.append('if D<%d then a=F[b];r[%d]=a;b=b+1;end;' % (i + 2, i + 1))
     out.append('b=b+1;end end')
@@ -79,6 +86,51 @@ FACTORY_SCRIPT = ('function(W,W,W)return function(W,W)return function()'
 FACTORY_PURE = ('function(W,Z)return function(Z,Z,v)local p=v[1];local q=v[2];return function()'
                 'local s=1;while true do if s<=0 then return;else p[6][p[5]]=q[6][q[5]];s=0;end;end;end;end;end')
 READS_GLOBAL = 'function(a,b)local s=game:GetService("StarterGui");return s,a+b end'
+
+
+def plain_no_ui(lines, state_machine=False):
+    """A big plain function of a script that has no UI code at all: a download, loadstring,
+    many table reads by key, numeric comparisons, and loops that begin with a table read.
+    `state_machine`: it also holds a small loop of the interpreter's shape (opcode fetched
+    from an array and compared with four numbers), next to all the other code."""
+    out = ['function(...)local T={};local q={10,20,30};local h=1;local n=0;'
+           'local data=game:HttpGet("https://example.invalid/data");']
+    for i in range(lines):
+        out.append('do local k=q[h];if n<%d then n=n+1;end;local v=T[n];if v==nil then T[n]=k;end;end;'
+                   % (i % 7 + 2))
+    # loops of a script that begin with a table read: `x = t[i]; if ...` like a dispatch
+    # loop head, but they branch on nil / on two numbers, not on an opcode
+    out.append('while true do local it=q[h];if it==nil then break;end;if it>25 then n=n+100;end;'
+               'if it<15 then n=n+1000;end;h=h+1;end;')
+    out.append('while true do local w=T[1];local z=tostring(w);if #z>0 then break;end;end;')
+    if state_machine:
+        out.append('h=1;while true do local op=q[h];if op==10 then n=n+1;elseif op==20 then n=n+2;'
+                   'elseif op==30 then n=n+3;elseif op==40 then n=n+4;else break;end;h=h+1;end;')
+    out.append('task.wait(n);return type(loadstring(data)),n end')
+    return ''.join(out)
+
+
+def old_heuristic_calls_it_a_dispatcher(body):
+    """The text rule deob.py used before (`is_dispatcher_text`): few UI names, many
+    `x = t[k]`, dense comparisons with numbers.  Kept here only to show that the test input
+    is of the kind that rule misjudged."""
+    jump_like = len(re.findall(r'\w+\s*=\s*\w+\[\s*\w+\s*\]', body))
+    cmp_like = len(re.findall(r'if\s+\w+\s*[<>~=]=?\s*\d+', body))
+    api = len(re.findall(r'GetService|Instance\s*\.\s*new|UDim2|Color3', body))
+    return (api < 5 and jump_like > 80
+            and (1000.0 * cmp_like / len(body) > 8 or 1000.0 * jump_like / len(body) > 4))
+
+
+# a method of the VM object that is big, reads no global and is no interpreter (a decoder)
+def pure_big(lines):
+    return ('function(z,a,b)local s=0;' + ''.join(
+        'do local c=z[%d];if c then s=s+a*%d-b;end;end;' % (i, i) for i in range(lines))
+        + 'return s end')
+
+
+def no_ui_object(state_machine=False):
+    return ('return setmetatable({[1]=%s,[2]=%s,[4]=%s,[5]=string.byte,k=function(z)return z end},{}):rk(...);'
+            % (plain_no_ui(70, state_machine), dispatcher(160), HELPER))
 
 
 def vm_object(entry='rk'):
@@ -121,7 +173,9 @@ local log = {}
 local function obj(kind) return setmetatable({}, {__newindex = function(t, k, v)
   log[#log + 1] = kind .. "." .. tostring(k) .. "=" .. tostring(v); rawset(t, k, v) end,
   __tostring = function() return kind end}) end
-game = {GetService = function(_, n) return obj("svc:" .. n) end}
+game = {GetService = function(_, n) return obj("svc:" .. n) end,
+        HttpGet = function(_, url) log[#log + 1] = "HttpGet " .. url; return "return 1" end}
+task = {wait = function(n) log[#log + 1] = "wait " .. tostring(n) end}
 Instance = {new = function(c) return obj(c) end}
 UDim2 = {new = function(...) return "UDim2(" .. table.concat({...}, ",") .. ")" end}
 Color3 = {fromRGB = function(...) return "Color3(" .. table.concat({...}, ",") .. ")" end}
@@ -391,6 +445,110 @@ def main():
         check('object with header: version read, still form A',
               info['luraph_version'] == '15.1' and info['form'] == 'A' and info['vm']['object'], str(info))
 
+        # ------------------------------------------------------------- script without UI code
+        nsrc = no_ui_object()
+        fn_text = plain_no_ui(70)
+        a0 = nsrc.index(fn_text)
+        d0 = nsrc.index(dispatcher(160))
+        check('no-UI object: the test input is what the old text heuristic called a dispatcher',
+              old_heuristic_calls_it_a_dispatcher(fn_text) and not API.search(fn_text), '')
+        nin = os.path.join(tmp, 'noui.lua')
+        with open(nin, 'w', encoding='utf-8') as fh:
+            fh.write(nsrc)
+        nout = os.path.join(tmp, 'noui.out.lua')
+        rc, log = deob([nin, '-o', nout, '--min-size', '3000'], tmp)
+        check('no-UI object: exit 0 (form A without a single UI name)', rc == 0, log[-600:])
+        ntext = ''
+        if rc == 0:
+            ntext = open(nout, encoding='utf-8').read()
+            found = parts('no-UI object', nsrc, ntext, rename=True)
+            check('no-UI object: the plain function is the output, the dispatcher is not',
+                  [(a, b) for a, b, _k in found] == [(a0, a0 + len(fn_text))], str(found))
+            check('no-UI object: labelled by the globals it reads',
+                  len(found) == 1 and found[0][2].startswith('读全局 ') and 'game' in found[0][2], str(found))
+            check('no-UI object: the log drops one dispatcher, by structure',
+                  '剔除 VM 分派器 1 个' in log and '综合得分 = 0' in log and '依据是结构' in log, log[-900:])
+            head = ntext.split('\n', 6)[:6]
+            check('no-UI object: header counts a script function, not a VM-only output',
+                  any('共导出 1 个函数：读全局、未见业务 API 名的脚本函数 1 个' in ln
+                      and '另有 VM 分派器 1 个未导出' in ln for ln in head), str(head))
+            check('no-UI object: output compiles', compiles(ntext))
+            seg = ntext[ntext.index('local __part1 = ') + len('local __part1 = '):ntext.rindex('\nreturn {')]
+            want, have = run_function(fn_text), run_function(seg)
+            check('no-UI object: the exported function runs like the input', want[0] == 0 and have == want,
+                  'input %r\n output %r' % (want[1][:200], have[1][:200]))
+        info = deob_mod.probe(nin, work_dir=os.path.join(tmp, 'probe_noui'), min_size=3000)
+        check('no-UI object probe: form A; only the interpreter loop is a dispatch loop',
+              info['form'] == 'A' and info['engine'] == 'static' and info['score'] == 0
+              and info['vm']['dispatch_loops'] == 1
+              and info['big_functions'] == [(a0, a0 + len(fn_text), len(fn_text))]
+              and info['dispatchers'] == [(d0, d0 + len(dispatcher(160)), len(dispatcher(160)))], str(info))
+        # a UTF-8 byte order mark in front of the file: not part of the script
+        bin_path = os.path.join(tmp, 'noui_bom.lua')
+        with open(bin_path, 'wb') as fh:
+            fh.write(b'\xef\xbb\xbf' + nsrc.encode())
+        bout = os.path.join(tmp, 'noui_bom.out.lua')
+        rc, log = deob([bin_path, '-o', bout, '--min-size', '3000'], tmp)
+        check('BOM + VM object: exit 0 and the log says the mark was dropped', rc == 0 and 'BOM 已去掉' in log,
+              log[-400:])
+        if rc == 0 and ntext:
+            btext = open(bout, encoding='utf-8').read()
+            check('BOM + VM object: same output as without the mark (file-name line aside)',
+                  btext.split('\n')[2:] == ntext.split('\n')[2:] and not btext.startswith('\ufeff'), '')
+        # the function also holds a small loop of the interpreter's shape: counted as a loop,
+        # but the function is not a dispatcher (the loop is a small part of it)
+        ssrc = no_ui_object(state_machine=True)
+        sfn = plain_no_ui(70, state_machine=True)
+        sin_ = os.path.join(tmp, 'noui_sm.lua')
+        with open(sin_, 'w', encoding='utf-8') as fh:
+            fh.write(ssrc)
+        info = deob_mod.probe(sin_, work_dir=os.path.join(tmp, 'probe_noui_sm'), min_size=3000)
+        check('no-UI object with a small state machine: two loops counted, function still form A',
+              info['form'] == 'A' and info['vm']['dispatch_loops'] == 2
+              and [x[2] for x in info['big_functions']] == [len(sfn)] and len(info['dispatchers']) == 1, str(info))
+        rc, log = deob([sin_, '-o', os.path.join(tmp, 'noui_sm.out.lua'), '--min-size', '3000', '--keep-dispatchers'], tmp)
+        check('no-UI object --keep-dispatchers: exit 0', rc == 0, log[-500:])
+        if rc == 0:
+            text = open(os.path.join(tmp, 'noui_sm.out.lua'), encoding='utf-8').read()
+            found = parts('no-UI object --keep-dispatchers', ssrc, text, rename=True)
+            check('no-UI object --keep-dispatchers: script function first, the dispatcher last and labelled',
+                  len(found) == 2 and found[0][2].startswith('读全局 ') and '另含 1 个分派循环形态的循环' in found[0][2]
+                  and re.match(r'VM 分派器（1 个分派循环，占函数 \d+%）', found[1][2]) is not None, str(found))
+            head = text.split('\n', 6)[:6]
+            check('no-UI object --keep-dispatchers: header counts the dispatcher as exported',
+                  any('共导出 2 个函数' in ln and 'VM 分派器 1 个（解释器骨架' in ln and '未导出' not in ln
+                      for ln in head), str(head))
+            check('no-UI object --keep-dispatchers: output compiles', compiles(text))
+
+        # a VM chunk with a big function that is neither an interpreter nor script code: the
+        # VM block must not call it a dispatcher, and --force must say what it writes
+        pb = pure_big(140)
+        chunk3 = ('return setmetatable({[1]=%s,[2]=%s,[5]=%s,[9]=UDim2.new,[11]=%s},{}):yQ(...);'
+                  % (dispatcher(170), dispatcher(180), pb, FACTORY_SCRIPT))
+        c3 = os.path.join(tmp, 'vm3.lua')
+        with open(c3, 'w', encoding='utf-8') as fh:
+            fh.write(chunk3)
+        rc, log = deob([c3, '-o', os.path.join(tmp, 'vm3.out.lua'), '--min-size', '3000'], tmp)
+        check('VM chunk with a big non-interpreter method: exit 4; two of three big functions are dispatchers',
+              rc == 4 and '3 个大函数里 2 个是 VM 分派器' in log and '其余 1 个不是分派器' in log
+              and '全是 VM 分派器' not in log and '有 1 个没被虚拟化的小函数' in log, log[-1200:])
+        rc, log = deob([c3, '-o', os.path.join(tmp, 'vm3.out.lua'), '--min-size', '3000', '--force'], tmp)
+        check('VM chunk with a big non-interpreter method --force: exit 0', rc == 0, log[-500:])
+        if rc == 0:
+            text = open(os.path.join(tmp, 'vm3.out.lua'), encoding='utf-8').read()
+            found = parts('vm3 --force', chunk3, text, rename=True)
+            said = re.search(r'--force 已指定：导出 (\d+) 个函数（1 个没被虚拟化的小函数，1 个 ≥ 3,000 字节、不是分派器的函数', log)
+            check('VM chunk with a big non-interpreter method --force: the log announces what is written',
+                  bool(said) and int(said.group(1)) == len(found) == 2, log[-600:] + str(found))
+            fs, pbs = chunk3.index(FACTORY_SCRIPT), chunk3.index(pb)
+            check('VM chunk with a big non-interpreter method --force: script function first, then the method',
+                  [(a, b) for a, b, _k in found] == [(fs, fs + len(FACTORY_SCRIPT)), (pbs, pbs + len(pb))]
+                  and found[1][2].startswith('未见业务 API，不读全局'), str(found))
+            head = text.split('\n', 6)[:6]
+            check('VM chunk with a big non-interpreter method --force: header does not call the parts small',
+                  any('这里只有没被虚拟化的函数。' in ln for ln in head)
+                  and not any('小函数' in ln for ln in head), str(head))
+
         # ------------------------------------------------------------- container (VM only)
         chunk = vm_only_chunk()
         cin = os.path.join(tmp, 'packed.luau')
@@ -426,6 +584,24 @@ def main():
               and info['sandbox_run'] is False and info['error'] is None, str(info))
         check('saved chunk as input: the log says it is the VM itself and was not executed',
               'VM 对象本身' in log and '没有执行它' in log and '剥壳失败' not in log, log[:900])
+        # the same kind of chunk, written so that a pattern on the text does not see its loop
+        # heads (`if(1>D)then`): it is still the VM itself by its syntax tree, and not run
+        odd = ('return setmetatable({[1]=%s,[2]=%s,[3]=%s},{}):yQ(...);'
+               % (dispatcher(170, 'if(1>D)then'), dispatcher(180, 'if not(D>=1)then'), HELPER))
+        op_ = os.path.join(tmp, 'odd.chunk.lua')
+        with open(op_, 'w', encoding='utf-8') as fh:
+            fh.write(odd)
+        info = deob_mod.probe(op_, work_dir=os.path.join(tmp, 'probe_odd'), min_size=3000)
+        check('VM chunk whose loop heads a text pattern misses: recognised on the tree, not run',
+              deob_mod.vm_features(odd)['dispatch_loops'] == 0 and info['vm']['dispatch_loops'] == 2
+              and info['sandbox_run'] is False and info['bare_chunk'] is True and info['form'] == 'vm'
+              and len(info['dispatchers']) == 2 and info['error'] is None, str(info))
+        # with the default threshold none of its functions is "big": only the loops on the
+        # tree say that this is the VM and not a container to be run
+        info = deob_mod.probe(op_, work_dir=os.path.join(tmp, 'probe_odd_def'))
+        check('the same chunk, default threshold: still not run',
+              info['vm']['dispatch_loops'] == 2 and info['sandbox_run'] is False and info['bare_chunk'] is True
+              and info['form'] == 'vm' and info['error'] is None, str(info))
         # no -o, no --work: what was unwrapped is not kept, and nothing stays in the temp dir
         tdir = os.path.join(tmp, 'tmpdir')
         os.mkdir(tdir)

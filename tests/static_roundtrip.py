@@ -29,6 +29,11 @@ or mentions the business API five times must be among the parts (dispatch loops 
 function that is left out must read no global at all (counted here on the luau-ast tree, not
 taken from the tool's log), and every `HttpGet` of the input must be in the output.
 
+The labels are checked too: a part called a VM dispatcher must be mostly dispatch loop, the
+number of globals / API mentions a label gives is counted again here, and the number of
+dispatch loops the tool reports must be the number of loop heads in the text (the loops of
+the script's own functions are not interpreter loops).
+
 --corpus formats every .lua / .luau file under the repository with the formatter alone and
 checks that the result lexes back to the same tokens (comments included) and that luau still
 compiles it when it compiled the original; every file that compiles is also renamed and must
@@ -103,6 +108,9 @@ def global_names(node):
 
 
 FACTORY_TEXT = re.compile(r'function\s*\([^()]*\)\s*return\s+function\s*\(')
+# head of an interpreter dispatch loop, as text (the tool counts them on the syntax tree):
+# opcode fetched from an array by a program counter, then compared with a number
+LOOP_HEAD = re.compile(r'\bwhile true do (?:local )?(\w+)(?:,\w+)*=[A-Za-z_]\w*\[[A-Za-z_]\w*\];if \1(?:[<>]=?|==|~=)\d')
 
 
 def source_of(inp, work):
@@ -155,19 +163,35 @@ def check_input(inp, luau, ast, report):
             napi = len(re.findall(r'GetService|Instance\s*[.:]\s*new|UDim2|Color3|TweenService', frag))
             lab = label.group(1) if label else ''
             globs = global_names(node_at[(s, e)]) if (s, e) in node_at else None
-            named = re.match(r'读全局 (.*?)(?: 等 \d+ 个)?（未见业务 API 名）$', lab)
+            # loops of the interpreter's shape in this part, found here on the text
+            heads = list(LOOP_HEAD.finditer(frag))
+            extra_loop = re.search(r'；另含 (\d+) 个分派循环形态的循环（占函数 \d+%）$', lab)
+            core = lab[:extra_loop.start()] if extra_loop else lab
+            both = re.match(r'业务 API (\d+) 处，读全局 (\d+) 个$', core)
+            named = re.match(r'读全局 (.*?)(?: 等 (\d+) 个)?（未见业务 API 名）$', core)
+            api_only = re.match(r'业务 API 名 (\d+) 处，不读全局（', core)
+            disp = re.match(r'VM 分派器（(\d+) 个分派循环，占函数 (\d+)%），不是业务源码$', core)
             good = bool(label) and globs is not None and (
-                (lab.startswith('业务 API') and lab == '业务 API %d 处' % napi and napi > 0)
+                (bool(both) and int(both.group(1)) == napi > 0 and int(both.group(2)) == len(globs) > 0)
                 or (bool(named) and napi == 0 and bool(globs)
-                    and set(named.group(1).split(', ')) <= globs)
-                or (lab.startswith('闭包工厂形态，不读全局') and napi == 0 and not globs
+                    and set(named.group(1).split(', ')) <= globs
+                    and (named.group(2) is None or int(named.group(2)) == len(globs)))
+                or (bool(api_only) and int(api_only.group(1)) == napi > 0 and not globs)
+                or (core.startswith('闭包工厂形态，不读全局') and napi == 0 and not globs
                     and bool(FACTORY_TEXT.match(frag)))
-                or (lab.startswith('未见业务 API，不读全局') and napi == 0 and not globs)
-                or lab.startswith('VM 分派器'))
-            report('%s: part %d label %r matches its content (%d API mentions, %d globals)'
-                   % (name, num, lab, napi, len(globs or ())), good)
+                or (core.startswith('未见业务 API，不读全局') and napi == 0 and not globs)
+                or (bool(disp) and int(disp.group(1)) == len(heads) > 0 and int(disp.group(2)) > 50))
+            # what the label says about dispatch loops is what the text shows
+            good = good and (bool(disp) or (int(extra_loop.group(1)) if extra_loop else 0) == len(heads))
+            report('%s: part %d label %r matches its content (%d API mentions, %d globals, %d loop heads)'
+                   % (name, num, lab, napi, len(globs or ()), len(heads)), good)
         report('%s: %d tokens compared, %d literals respelled, 0 changed in value'
                % (name, total, spelled), True)
+        said_loops = re.search(r'(\d+) 个解释器分派循环', log)
+        if said_loops:
+            report('%s: the VM block says %s dispatch loops; the text has %d loop heads'
+                   % (name, said_loops.group(1), len(LOOP_HEAD.findall(src))),
+                   int(said_loops.group(1)) == len(LOOP_HEAD.findall(src)))
         if not extra:
             # nothing with business API calls is left out silently: every mention of the API
             # names in the source is inside an exported part or counted in the log
@@ -190,6 +214,27 @@ def check_input(inp, luau, ast, report):
             exported = {(s, e) for _n, s, e, _b in parts}
             dropped = {tuple(int(x) for x in mm) for mm in
                        re.findall(r'^\s+(\d+) - (\d+)\s+[\d,]+ 字节  （查表跳转', log, re.M)}
+            # what was dropped as a VM dispatcher is one by its text: from its first dispatch
+            # loop head (found here with a regular expression) to its end is most of the
+            # function; no exported part has such a head at all
+            def loop_share(a, b):
+                hs = [m.start() for m in LOOP_HEAD.finditer(src, a, b)]
+                return (len(hs), (b - hs[0]) / float(b - a)) if hs else (0, 0.0)
+            report('%s: each of the %d functions dropped as dispatchers is mostly dispatch loop'
+                   % (name, len(dropped)), all(loop_share(a, b)[1] > 0.5 for a, b in dropped),
+                   str([(sp, loop_share(*sp)) for sp in dropped]))
+            report('%s: no exported part has a dispatch loop head' % name,
+                   all(loop_share(a, b)[0] == 0 for a, b in exported),
+                   str([(sp, loop_share(*sp)) for sp in exported if loop_share(*sp)[0]]))
+            # the loop count the tool reports (deob.probe) is the number of those heads: the
+            # loops of the script's own functions are not interpreter loops
+            import deob as deob_mod
+            info = deob_mod.probe(inp, work_dir=os.path.join(tmp, 'probe'))
+            heads_all = len(LOOP_HEAD.findall(src))
+            in_dropped = sum(loop_share(a, b)[0] for a, b in dropped)
+            report('%s: probe() reports %d dispatch loops; the text has %d loop heads, %d of them in the '
+                   'dropped dispatchers' % (name, info['vm']['dispatch_loops'], heads_all, in_dropped),
+                   info['vm']['dispatch_loops'] == heads_all == in_dropped > 0)
             left = [sp for sp in outer if sp not in exported and sp not in dropped]
             missed = [sp for sp in left if len(api.findall(src[sp[0]:sp[1]])) >= 5]
             report('%s: %d outermost functions; none with 5 or more API mentions is left out '

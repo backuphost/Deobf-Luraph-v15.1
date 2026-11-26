@@ -109,6 +109,7 @@ class Dump:
         self.cov = {int(tid): set(S.fix_int(x) for x in lst) for tid, lst in (d.get("cov") or {}).items()}
         self.cov_pcs = {tid: {x % 65536 for x in pairs} for tid, pairs in self.cov.items()}
         self.vm_used = False            # the lifted code names Luraph's VM object (luraph_vm)
+        self.u32_used = False           # ... and calls the number conversion helper (lph_u32, collapse_u32)
         self.late = self._lazy_late(d)
         # built now: the lifter writes into dump tables later
         self._by_operand = self._operand_facts()
@@ -896,6 +897,9 @@ class ProtoLifter:
         self.state_on = bool(getattr(vm, "scope", None))
         self.state_regs = set()
         self.state_cmp = {}          # reg -> integer constants an undecided branch compared it with
+        self.key_wants = {}          # pc of a re-keying from a register the run has no value for -> that register
+        self.frame_size = None       # size the interpreter creates the register table with (call_builtin)
+        self.cold = False            # the step in progress is of a state the traced run did not reach
         self.reg_nonnum = set()      # registers some walked instruction wrote with something else than a number constant
         self.stack_base = None       # stack VM: registers above this are its operand stack (Stepper.carry)
         self.captured_regs = set()   # registers captured by closures (calls may change them)
@@ -992,6 +996,23 @@ class ProtoLifter:
         """The unread packs carried into the next state."""
         return tuple(sorted(((r, l) for r, l in self.packs.items() if r not in self.pack_read
                              and (r, fmt_expr(l)) not in self.pack_unstable), key=lambda kv: kv[0]))
+
+    FRAME_SLACK = 16
+
+    def check_frame(self, k):
+        """v15.2, on a path the traced run did not take (self.cold, set by
+        Program._walk): an instruction that names a register the function
+        does not have. The interpreter creates the register table with the
+        function's frame size and the code the run executed stays below it,
+        but for a scratch register or two (measured on the sample: 0 ..
+        size-1 in 39 functions, `size` itself in the main function). Behind
+        a failed check Luraph re-keys with a wrong value on purpose, and
+        what the decryptors make of the code then is noise that names
+        registers in the hundreds or thousands."""
+        if self.cold and self.frame_size is not None and type(k) is int \
+                and k >= self.frame_size + self.FRAME_SLACK and self.stack_base is None and not self.in_prologue:
+            raise Unsupported("instruction uses register %d of a function with %d registers (code that is "
+                              "not decrypted, or decrypted with a wrong key)" % (k, self.frame_size))
 
     # ---- hooks used by luasym.Interp
     def is_dispatch(self, node):
@@ -1338,6 +1359,7 @@ class ProtoLifter:
             k = S.norm_key(key)
             if isinstance(k, (int, float)) and k < 1 and self.stack_base is not None:
                 raise Unsupported("read below the stack VM's frame (register %s)" % k)
+            self.check_frame(k)
             if self.jvals.get(k) is FRAME:
                 return FrameRef(k) if self.state_on else obj
             if k in self.jvals:
@@ -1486,6 +1508,7 @@ class ProtoLifter:
                 return
             if isinstance(key, (int, float)) and key < 1 and self.stack_base is not None:
                 raise Unsupported("store below the stack VM's frame (register %s)" % key)
+            self.check_frame(S.norm_key(key))
             self.emit(Assign(Reg(S.norm_key(key)), self.value_of(v)))
             return
         if isinstance(obj, FrameProxy):
@@ -1612,6 +1635,8 @@ class ProtoLifter:
         a = args
         if name in ("table.create",):
             if self.in_prologue:
+                if a.items and type(a.items[0]) is int and self.frame_size is None:
+                    self.frame_size = a.items[0]    # (the register table's size)
                 return RegFile()
             return LTable()
         if name == "getfenv":
@@ -1696,6 +1721,8 @@ class ProtoLifter:
         if isinstance(t, RegFile):
             if not isinstance(i, int) or not isinstance(j, int):
                 raise Unsupported("unpack registers with symbolic range")
+            if j >= i:
+                self.check_frame(j)
             return Multi([FrameArg(n) if self.jvals.get(n) is FRAME else Reg(n) for n in range(i, j + 1)])
         if isinstance(t, SymList):
             if i != 1:
@@ -1756,6 +1783,7 @@ class ProtoLifter:
 
     def elem(self, src, i):
         if isinstance(src, RegFile):
+            self.check_frame(i)
             return Reg(i)
         if isinstance(src, SymList):
             return self.symlist_get(src, i)
@@ -1765,6 +1793,7 @@ class ProtoLifter:
 
     def put(self, dst, i, v):
         if isinstance(dst, RegFile):
+            self.check_frame(i)
             self.emit(Assign(Reg(i), self.value_of(v) if v is not None else Const(None)))
         elif isinstance(dst, Expr):
             self.emit(Assign(Index(dst, Const(i)), self.value_of(v) if v is not None else Const(None)))
@@ -2101,14 +2130,18 @@ def eval_fact(e, facts):
     if isinstance(e, Const):
         return ("c", e.v)
     if isinstance(e, Reg):
+        if FOLD_FACTS[0] and isinstance(e, KeyRead):
+            return ("a", int(e.v))
         return facts.get(e.n)
     if isinstance(e, Un) and e.op == "Not":
         a = eval_fact(e.a, facts)
         t = truth_of(a)
         return None if t is None else ("c", not t)
+    if FOLD_FACTS[0] and isinstance(e, (Bin, Un, TempVal)) and not (isinstance(e, Bin) and e.op.startswith("Compare")):
+        return fold_fact(e, facts)
     if isinstance(e, Bin) and e.op.startswith("Compare"):
         a, b = eval_fact(e.a, facts), eval_fact(e.b, facts)
-        if a and b and a[0] == "c" and b[0] == "c":
+        if a and b and a[0] in ("c", "a") and b[0] in ("c", "a"):
             try:
                 x, y = a[1], b[1]
                 if e.op == "CompareEq":
@@ -2129,9 +2162,127 @@ def eval_fact(e, facts):
 def truth_of(f):
     if f is None or f[0] == "n":
         return None
-    if f[0] == "c":
+    if f[0] == "c" or f[0] == "a":
         return S.truthy(f[1])
     return f[0] == "t"
+
+
+# Luraph v15.2 lifts: the facts also fold arithmetic and bit32 calls of
+# constants. v15.2 mixes its key registers (constants per walk state) into
+# checks (`bit32.bxor(key, K1) ~= K2`) and re-keys from sums of constants; a
+# test left undecided there is a jump into other real code. A computed
+# constant is ("a", number), not ("c", ...): it decides branches like a
+# constant, but never becomes part of a walk state through a state register
+# (a counter would be unrolled round by round).
+FOLD_FACTS = [False]
+
+
+def fold_fact(e, facts):
+    """("c" | "a", value) of an expression over constants, key registers,
+    registers and bit32 call results with constant facts; else None."""
+    if isinstance(e, KeyRead):
+        return ("a", int(e.v))
+    if isinstance(e, Const):
+        v = e.v
+        return ("c", v) if isinstance(v, (int, float, bytes, bool)) or v is None else None
+    if isinstance(e, Reg):
+        f = facts.get(e.n)
+        return f if f is not None and f[0] in ("c", "a") else None
+    if isinstance(e, TempVal):
+        return facts.get(("T", e.t)) if e.i == 1 else None
+    if isinstance(e, Un):
+        if e.op == "Not":
+            return eval_fact(e, facts)
+        a = fold_fact(e.a, facts)
+        if e.op == "Minus" and a is not None and _plain_num(a[1]):
+            return ("a", S.fix_int(-a[1]))
+        return None
+    if isinstance(e, Bin):
+        if e.op.startswith("Compare"):
+            f = eval_fact(e, facts)
+            return f if f is not None and f[0] in ("c", "a") else None
+        if e.op not in ("Add", "Sub", "Mul", "Div", "Mod", "FloorDiv", "Pow"):
+            return None
+        a, b = fold_fact(e.a, facts), fold_fact(e.b, facts)
+        if a is None or b is None or not _plain_num(a[1]) or not _plain_num(b[1]):
+            return None
+        try:
+            r = S.arith(e.op, a[1], b[1])
+        except (Unsupported, OverflowError, ValueError, ZeroDivisionError):
+            return None
+        if isinstance(r, float) and (r != r or r in (float("inf"), float("-inf"))):
+            return None     # (nan is not equal to itself: facts must compare)
+        if isinstance(r, int) and abs(r) > 2 ** 53:
+            return None     # (Luau computes in doubles)
+        return ("a", r)
+    return None
+
+
+def _plain_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+
+
+U32_HELPER = "lph_u32"
+
+
+def u32_of(v):
+    """What Luraph v15.2's handlers do to a number to make it a 32-bit
+    unsigned integer: `v % 2^32`, 0 for nan, else its floor."""
+    v = S.arith("Mod", v, 4294967296)
+    if v != v:
+        return 0
+    return S.fix_int(v - S.arith("Mod", v, 1))
+
+
+def collapse_u32(node, tprefix, link, dump):
+    """Luraph v15.2's handlers end every step of the key / hash arithmetic
+    with an inline conversion to a 32-bit unsigned integer:
+
+        V = x % 4294967296; if V ~= V then R = 0 else R = V - V % 1 end
+
+    Stepped symbolically that is a branch (three blocks) per conversion, on
+    a test that only nan decides. In the instruction's tree such a branch
+    becomes one statement, `R = lph_u32(x)`: a helper function with exactly
+    that code, defined at the top of the lifted file (lift_program)."""
+    count = [0]
+
+    def visit(nd):
+        if nd is None or nd.cond is None:
+            return
+        visit(nd.then)
+        visit(nd.els)
+        c, t, e = nd.cond, nd.then, nd.els
+        if not (isinstance(c, Bin) and c.op == "CompareNe" and isinstance(c.a, Bin) and c.a.op == "Mod"
+                and isinstance(c.a.b, Const) and c.a.b.v == 4294967296):
+            return
+        vt = fmt_expr(c.a)
+        if fmt_expr(c.b) != vt or t is None or e is None or t.cond is not None or e.cond is not None:
+            return
+        if getattr(t, "error", None) or getattr(e, "error", None) or len(t.stmts) != 1 or len(e.stmts) != 1:
+            return
+        a, b = t.stmts[0], e.stmts[0]
+        if not (isinstance(a, Assign) and isinstance(b, Assign) and isinstance(a.target, Reg)
+                and type(a.target) is type(b.target) and isinstance(b.target, Reg) and a.target.n == b.target.n
+                and not getattr(a, "jump", False) and not getattr(b, "jump", False)):
+            return
+        v = b.value
+        if not (isinstance(a.value, Const) and type(a.value.v) is int and a.value.v == 0
+                and isinstance(v, Bin) and v.op == "Sub" and fmt_expr(v.a) == vt
+                and isinstance(v.b, Bin) and v.b.op == "Mod" and fmt_expr(v.b.a) == vt
+                and isinstance(v.b.b, Const) and v.b.b.v == 1 and type(v.b.b.v) is int):
+            return
+        if not (isinstance(t.outcome, Next) and isinstance(e.outcome, Next)
+                and t.outcome.state.key(link) == e.outcome.state.key(link)):
+            return
+        count[0] += 1
+        tmp = "%su%d" % (tprefix, count[0])
+        nd.stmts = list(nd.stmts) + [CallStmt(tmp, Global(U32_HELPER), Multi([c.a.a])),
+                                     Assign(b.target, TempVal(tmp, 1))]
+        nd.cond = nd.then = nd.els = None
+        nd.outcome = e.outcome
+        dump.u32_used = True
+    visit(node)
+    return node
 
 
 NEG_FACTS = [False]     # a ("n", R) fact was made in this process (only Luraph v15.2 lifts make them)
@@ -2199,11 +2350,30 @@ def apply_stmt_facts(st, facts, lf):
                         del facts[x]
         if fv is None and lf.state_on and isinstance(st.value, Global) and getattr(st.value, "builtin", False):
             fv = ("t", "g:" + st.value.name)    # (v15.2: frame_call_inert)
+        if fv is None and FOLD_FACTS[0] and isinstance(st.value, (Bin, Un, TempVal)):
+            fv = fold_fact(st.value, facts)
         if fv is None:
             facts.pop(st.target.n, None)
         else:
             facts[st.target.n] = fv
     elif isinstance(st, CallStmt):
+        if FOLD_FACTS[0] and isinstance(st.fn, Global) and st.fn.name.startswith("bit32.") and st.args.tail is None \
+                and st.fn.name in S.CONCRETE:
+            # a bit32 call of constants: its value, for the statements of
+            # this instruction that read the temp (propagate drops it after)
+            vals = [fold_fact(x, facts) if isinstance(x, Expr) else None for x in st.args.items]
+            if vals and all(v is not None and _plain_num(v[1]) for v in vals):
+                try:
+                    r = S.CONCRETE[st.fn.name](*[v[1] for v in vals])
+                except (struct.error, IndexError, ValueError, TypeError, OverflowError):
+                    r = None
+                if _plain_num(r):
+                    facts[("T", st.t)] = ("a", r)
+        elif FOLD_FACTS[0] and isinstance(st.fn, Global) and st.fn.name == U32_HELPER and len(st.args.items) == 1 \
+                and st.args.tail is None:
+            v = fold_fact(st.args.items[0], facts)
+            if v is not None and _plain_num(v[1]):
+                facts[("T", st.t)] = ("a", u32_of(v[1]))
         if any(isinstance(x, FrameArg) for x in st.args.items):
             writes = frame_call(st, facts, lf)
             prev = getattr(st, "frame_eval", None)
@@ -2611,6 +2781,63 @@ def tree_leaves(node):
             stack.append((n.els, n))
 
 
+_TEMP_NAME = re.compile(r"\bT[0-9][0-9_]*")
+
+
+def merge_loop_tests(order, walk, lf, link):
+    """Luraph v15.2 compiles a generic `for` with its iterator call and test
+    twice: behind the loop's preparation and at the bottom of the body (two
+    instructions with the same code and the same two ways on). Lifted as
+    they are that reads `if it() then repeat ... until not it() end`, with the
+    loop's hidden state named in the text. The later one is replaced by the
+    first, which makes it the loop's header again (loops.recognize).
+    -> number of tests merged."""
+    hot, states = walk
+    if not lf.state_on or not states:
+        return 0
+    first, same = {}, {}
+    for k, n in order:
+        if getattr(n, "error", None) or n.cond is None or len(n.stmts) != 1:
+            continue
+        st0 = n.stmts[0]
+        if not (isinstance(st0, CallStmt) and isinstance(st0.fn, Pseudo) and not st0.args.items
+                and st0.args.tail is None):
+            continue
+        leaves = [leaf for leaf, _ in tree_leaves(n)]
+        if not leaves or not all(isinstance(leaf.outcome, Next) for leaf in leaves):
+            continue
+        sig = (k[0], k[2:], _TEMP_NAME.sub("T#", "\n".join(fmt_node(n))),
+               tuple(leaf.outcome.state.key(link) for leaf in leaves))
+        if sig in first and first[sig] in states:
+            same[k] = first[sig]
+        else:
+            first[sig] = k
+    if not same:
+        return 0
+    cov = lf.dump.cov.get(getattr(lf.proto, "tid", None))
+    nodes = dict(order)
+    for k, to in same.items():
+        if hot and k in hot:
+            hot.add(to)
+        if cov:
+            # (what the run did at either is what it did at the one that stays)
+            for leaf, _ in tree_leaves(nodes[k]):
+                if k[1] * 65536 + leaf.outcome.state.pc in cov:
+                    cov.add(to[1] * 65536 + leaf.outcome.state.pc)
+    for k, n in order:
+        if k in same or getattr(n, "error", None):
+            continue
+        for leaf, _ in tree_leaves(n):
+            if isinstance(leaf.outcome, Next):
+                nk = leaf.outcome.state.key(link)
+                if nk in same:
+                    if cov and k[1] * 65536 + nk[1] in cov:
+                        cov.add(k[1] * 65536 + same[nk][1])
+                    leaf.outcome = Next(states[same[nk]])
+    order[:] = [(k, n) for k, n in order if k not in same]
+    return len(same)
+
+
 TRAP = "untaken path goes on at instruction"
 
 
@@ -2619,7 +2846,7 @@ def not_an_error(msg):
     return str(msg).startswith(TRAP)
 
 
-def cut_cold_jumps(order, s0, lf, prog, link):
+def cut_cold_jumps(order, s0, lf, walk, link):
     """Luraph v15.2 flattens the main function and guards it with checks
     whose failing side (a few statements of its own, a re-keying, a tamper
     call, or nothing) then jumps into unrelated code: a wrong key derails the
@@ -2642,11 +2869,12 @@ def cut_cold_jumps(order, s0, lf, prog, link):
         untaken code another untaken path showed first: the path ends in an
         error marker that names the instruction it would go on at.
     The untaken code itself stays, once.
+    walk: (hot states, {key: State}) of the function's walk (Program._walk).
     -> number of edges cut; `order` loses what only they reached."""
     import structure as ST
     tid = getattr(lf.proto, "tid", None)
     cov = lf.dump.cov.get(tid) if lf.state_on else None
-    hot = getattr(prog, "hot", None)
+    hot, states = walk
     if not cov or not hot:
         return 0
     covp = lf.dump.cov_pcs.get(tid, ())
@@ -2721,7 +2949,6 @@ def cut_cold_jumps(order, s0, lf, prog, link):
     by_pc = {}      # (mode, pc, state registers) -> a hot state of that instruction
     for k in succ:
         by_pc.setdefault((k[0], k[1], k[7]), k)
-    states = getattr(prog, "states", {})
     owner = {}      # (mode, pc, state registers) of untaken code -> the untaken path that shows it
     cut = {}        # id(leaf) -> (leaf, text)
     join = {}       # id(leaf) -> (leaf, hot state it joins)
@@ -2836,11 +3063,22 @@ def propagate(node, facts, succ, lf, pc=None):
                 to = observed_jump(lf, pc, ns.pc)
                 if to is not None:
                     n.outcome = Next(State(ns.mode, to, ns.kstack, ns.jregs, ns.ov, ns.packs, ns.locs, ns.sregs))
-            if lf.state_regs or n.outcome.state.sregs:
+            if FOLD_FACTS[0]:
+                for k_ in [k_ for k_ in f if type(k_) is tuple]:
+                    del f[k_]       # (bit32 call temps: this instruction's only)
+            if lf.state_regs or n.outcome.state.sregs or lf.key_wants:
                 # the successor is the copy for these values of the state
                 # registers (the facts at the last visit are the final ones)
                 sr = tuple(sorted((r, f[r][1]) for r in lf.state_regs
                                   if r in f and f[r][0] == "c" and type(f[r][1]) is int))
+                want = lf.key_wants.get(n.outcome.state.pc) if lf.key_wants else None
+                if want is not None and want not in lf.state_regs:
+                    # the next instruction re-keys from this register and
+                    # the run has no value for it: the value the facts know
+                    # goes into the state (Stepper._carried reads it there)
+                    fw = f.get(want)
+                    if fw is not None and fw[0] in ("c", "a") and type(fw[1]) is int:
+                        sr = tuple(sorted(sr + ((want, fw[1]),)))
                 if sr != n.outcome.state.sregs:
                     n.outcome = Next(n.outcome.state.with_sregs(sr))
             succ.append((n.outcome.state, f))
@@ -3106,9 +3344,17 @@ class Stepper:
                     tid = getattr(self.lf.proto, "tid", None)
                     v = dump.jumps.get(tid, {}).get(state.pc) if state is not None else None
                     if not isinstance(v, (int, float)) or isinstance(v, bool):
-                        raise Unsupported("key register set from a register whose value the run did not record "
-                                          "(the code behind it cannot be decrypted)")
-                    dump.keyed_jumps.add((tid, state.pc))
+                        # (a path the run did not take:) a value the walk's
+                        # facts computed from constants, carried in the state
+                        # for this instruction (lf.key_wants, propagate)
+                        reg = src.n if type(src) is Reg else None
+                        v = dict(state.sregs).get(reg) if state is not None and reg is not None else None
+                        if v is None:
+                            self.want = reg
+                            raise Unsupported("key register set from a register whose value the run did not record "
+                                              "(the code behind it cannot be decrypted)")
+                    else:
+                        dump.keyed_jumps.add((tid, state.pc))
                 if state is not None:
                     self.lf.emit(Assign(Reg(self.key_reg[k]), self.lf.value_of(src)))
                 out.append((k, int(v) if type(v) is KeyNum else v))
@@ -3954,6 +4200,7 @@ class Program:
         s0 = st.initial()
         link = vm.kstack_link
         lf.prog = self      # (frame_call_inert walks a callee)
+        FOLD_FACTS[0] = bool(lf.state_on)
         nodes = {}          # key -> Node
         states = {}         # key -> State
         facts = {}          # key -> dict of incoming facts
@@ -3991,9 +4238,31 @@ class Program:
                 # (a decryptor on a path the run did not take must leave the
                 # instructions the run executed alone, see Stepper.step)
                 st.guard_pcs = lf.dump.cov_pcs.get(lf.proto.tid) if cov and k not in hot else None
+                lf.cold = bool(lf.state_on and (not cov or k not in hot))
+                st.want = None
                 try:
                     node = st.step(s, "%d_%d_" % (s.pc, len(order)))
+                    if lf.state_on and node.cond is not None:
+                        collapse_u32(node, "%d_%d_" % (s.pc, len(order)), link, lf.dump)
                 except Unsupported as e:
+                    if st.want is not None and lf.state_on and s.pc not in lf.key_wants:
+                        # the instruction re-keys from a register and the run
+                        # recorded no value (a path it did not take). Where
+                        # the facts know the register (a sum of constants),
+                        # the states of this pc get the value: propagate the
+                        # predecessors again, their edges now carry it
+                        lf.key_wants[s.pc] = st.want
+                        ps = [p for p, es in self.edges.items() if k in es and p in nodes]
+                        if ps:
+                            for p in ps:
+                                self.edges[p].discard(k)
+                                if p not in inwork:
+                                    (work if not cov or p in hot else cold).append(p)
+                                    inwork.add(p)
+                            del states[k], facts[k]
+                            self.pred.pop(k, None)
+                            hot.discard(k)
+                            continue
                     if os.environ.get("DEVIRT_TB"):
                         import traceback
                         print("-- at %s:%s op %s" % (s.mode, s.pc, lf.last_op), file=sys.stderr)
@@ -4124,7 +4393,8 @@ class Program:
                     (work if not cov or nk in hot else cold).append(nk)
                     inwork.add(nk)
         self.facts = facts
-        self.states = states
+        # (of this walk: a callee walked meanwhile, frame_call_inert, set its own)
+        self.states, self.hot = states, hot
         if pending:
             lf.jump_regs |= pending
             if os.environ.get("DEVIRT_ORDER"):
@@ -4250,6 +4520,7 @@ class FunctionLifter:
             if not restart:
                 break
         self.prog.requests |= lf.requests
+        walk = (self.prog.hot, self.prog.states)    # (frame_regs below walks other functions)
         if lf.reg_arrays:
             k0 = s0.key(vm.kstack_link)
             for k, node in order:
@@ -4268,11 +4539,22 @@ class FunctionLifter:
         apply_frame_calls(order)
         drop_idle_closes(order, lf.captured_regs)
         settle_key_registers(order, s0, st, vm.kstack_link)
-        self.stats["traps"] = self.stats.get("traps", 0) + cut_cold_jumps(order, s0, lf, self.prog, vm.kstack_link)
+        merge_loop_tests(order, walk, lf, vm.kstack_link)
+        self.stats["traps"] = self.stats.get("traps", 0) + cut_cold_jumps(order, s0, lf, walk, vm.kstack_link)
         prefix = REG_PREFIX[depth % len(REG_PREFIX)]
-        lines, self.params, nerr, fallbacks = backend.lower(
-            s0.key(vm.kstack_link), order, me, vm.kstack_link, prefix, upnames,
-            lambda x, names: self.closure(vm, vmobj, x, names, depth))
+        import structure as ST
+        import loops as LP
+        # back end switches of the v15.2 shape (children are lifted inside
+        # lower(): each lift sets them for itself and puts them back)
+        saved = ST.GUARD_TAILS, ST.JOIN_DOM, LP.TABLE_FOR
+        if lf.state_on:
+            ST.GUARD_TAILS = ST.JOIN_DOM = LP.TABLE_FOR = True
+        try:
+            lines, self.params, nerr, fallbacks = backend.lower(
+                s0.key(vm.kstack_link), order, me, vm.kstack_link, prefix, upnames,
+                lambda x, names: self.closure(vm, vmobj, x, names, depth))
+        finally:
+            ST.GUARD_TAILS, ST.JOIN_DOM, LP.TABLE_FOR = saved
         self.stats["fallbacks"] += fallbacks
         if os.environ.get("DEVIRT_DEBUG"):
             pid = self.prog.dump.pid_of_table.get(proto.tid)
@@ -4540,6 +4822,13 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
         shared += ["-- Luraph's interpreter object (its functions and tables; the protected script inspects it:",
                    "-- an integrity check of the interpreter). Not part of the script: not lifted.",
                    "local luraph_vm = {}", ""]
+    if prog.dump.u32_used:
+        shared += ["-- Luraph's conversion of a number to a 32-bit unsigned integer. Its interpreter does this",
+                   "-- inline after every step of its key and hash arithmetic; the lifted code calls this instead.",
+                   "local function %s(x)" % U32_HELPER,
+                   "\tx %= 4294967296",
+                   "\treturn if x ~= x then 0 else x - x % 1",
+                   "end", ""]
     if shared:
         at = next((i for i, l in enumerate(out) if l and not l.startswith("--")), len(out))
         out[at:at] = shared

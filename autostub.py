@@ -10,6 +10,8 @@ autostub.py —— 自动补齐 Luau CLI 缺失的 Roblox 全局，让样本能�
     （Luau 的报错不带全局名；旧版把报错里的类型名 nil 当成全局名去补，生成的桩不合语法。）
 
     桩只是「什么都不做的占位」：补出来的环境不忠实，跑通不代表脚本行为被还原。
+    桩能调用、能取任意深度的字段、也能用数字下标（每个桩最多 256 个不同的下标，之后读到
+    nil，自己数下标的 while 循环因此会结束）；不能和数字比大小。
 
     每轮补的东西会累积到最终 stub 文件里，可以直接拿去做执行轨迹。
 
@@ -49,10 +51,33 @@ local function __value()
     return setmetatable({}, __num_mt)
 end
 
--- 万能桩：能调用、能取任意深度的字段（Foo.Bar.Baz、Foo.Bar().x.y()）、能参与算术和拼接；
--- 什么都不做。缺失的全局名补成它。数字下标读到 nil，所以 ipairs / # 这类循环会正常结束。
+-- 数字下标：桩的 t[1]、t[3] 也是桩（同一个下标每次读到同一个对象），所以
+-- `Foo:Bar(1).list[3]["k"]` 这样的链能一路读下去。每个桩最多给 __NUM_MAX 个不同的数字下标，
+-- 再往后读到 nil：`while t[i] do i += 1 end` 这种自己数下标的循环因此会结束
+-- （ipairs 和 # 不走元方法：对桩来说长度是 0，ipairs 一轮都不跑）。
+local __NUM_MAX = 256
+local __num_cache = setmetatable({}, { __mode = "k" })
+local function __nth(t, k, make)
+    if k ~= k then return nil end   -- NaN
+    local c = __num_cache[t]
+    if not c then
+        c = { count = 0, items = {} }
+        __num_cache[t] = c
+    end
+    local v = c.items[k]
+    if v == nil then
+        if c.count >= __NUM_MAX then return nil end
+        c.count += 1
+        v = make()
+        c.items[k] = v
+    end
+    return v
+end
+
+-- 万能桩：能调用、能取任意深度的字段和下标（Foo.Bar.Baz、Foo.Bar().x.y()、Foo.list[3].k）、
+-- 能参与算术和拼接；什么都不做。缺失的全局名补成它。
 -- 做不到的：和数字比大小（Luau 不为 table < number 调元方法，直接报错）；那种脚本会停在
--- 「非缺失类错误」上，如实报告。
+-- 「非缺失类错误」上，如实报告。数字下标见上：每个桩最多 __NUM_MAX 个。
 local __any_name = setmetatable({}, { __mode = "k" })
 local __any_mt = {}
 local function __any(name)
@@ -61,7 +86,9 @@ local function __any(name)
     return setmetatable(t, __any_mt)
 end
 __any_mt.__index = function(t, k)
-    if type(k) == 'number' then return nil end
+    if type(k) == 'number' then
+        return __nth(t, k, function() return __any(tostring(__any_name[t]) .. '[' .. tostring(k) .. ']') end)
+    end
     local v = __any(tostring(__any_name[t]) .. '.' .. tostring(k))
     rawset(t, k, v)                 -- 同一个字段每次读到同一个对象
     return v
@@ -85,11 +112,15 @@ local function __typetbl(name)
     return setmetatable(t, {
         __index = function(_, k)
             if type(k) == 'number' then return 0 end
-            local member = setmetatable({}, {
+            local member
+            member = setmetatable({}, {
                 __call = function() return __value() end,
                 __index = function(_, k2)
-                    if type(k2) == 'number' then return nil end
-                    return __any(name .. '.' .. tostring(k) .. '.' .. tostring(k2))
+                    local sub = name .. '.' .. tostring(k)
+                    if type(k2) == 'number' then
+                        return __nth(member, k2, function() return __any(sub .. '[' .. tostring(k2) .. ']') end)
+                    end
+                    return __any(sub .. '.' .. tostring(k2))
                 end,
                 __tostring = function() return name .. '.' .. tostring(k) end,
             })
@@ -109,20 +140,22 @@ local function __inst(name)
     __inst_cache[name] = t
     return setmetatable(t, {
         __index = function(_, k)
-            if type(k) == 'number' then return nil end
-            -- 已知需要返回具体类型的
-            local special = {
-                ScreenGui = 'Instance', Frame = 'Instance',
-                TextLabel = 'Instance', TextButton = 'Instance',
-            }
-            return setmetatable({}, {
+            if type(k) == 'number' then
+                return __nth(t, k, function() return __inst(name .. '[' .. tostring(k) .. ']') end)
+            end
+            local member
+            member = setmetatable({}, {
                 __index = function(_, k2)
-                    if type(k2) == 'number' then return nil end
-                    return __inst(name .. '.' .. tostring(k) .. '.' .. tostring(k2))
+                    local sub = name .. '.' .. tostring(k)
+                    if type(k2) == 'number' then
+                        return __nth(member, k2, function() return __inst(sub .. '[' .. tostring(k2) .. ']') end)
+                    end
+                    return __inst(sub .. '.' .. tostring(k2))
                 end,
                 __call = function() return __inst(name .. '.' .. tostring(k) .. '()') end,
                 __tostring = function() return name .. '.' .. tostring(k) end,
             })
+            return member
         end,
         __newindex = function() end,
         __call = function() return __inst(name .. '()') end,
@@ -291,7 +324,8 @@ def main():
         print(f"[✗] 文件不存在：{args[0]}")
         return 1
 
-    sample = Path(args[0]).read_bytes().decode('latin-1')
+    import luasandbox
+    sample = luasandbox.strip_bom(Path(args[0]).read_bytes().decode('latin-1'))
     luau = find_luau()
     if not luau:
         print("[✗] 找不到 luau（先跑 ./setup.sh）")
@@ -329,7 +363,7 @@ def main():
         seen.add(missing)
         last = missing
         print(f"[轮 {rd:>2}] {err[:90]}")
-        print(f"        出错前最后读到的缺失全局是 {missing} → 补成万能桩（能调用、能取任意深度的字段、"
+        print(f"        出错前最后读到的缺失全局是 {missing} → 补成万能桩（能调用、能取任意深度的字段和下标、"
               "能做算术和拼接，什么都不做）")
         extra.append(f'_ENV_T["{missing}"] = __any("{missing}")')
     else:

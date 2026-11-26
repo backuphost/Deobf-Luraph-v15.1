@@ -3,9 +3,14 @@
 
 Two parts live here:
 
-  derive / sanitize / BAD_BASE   the naming rules ("what to call a local, given the
-                                 expression it is initialised with").  These are used by
-                                 libs/luascope.py, which is what deob.py renames with.
+  derive / sanitize / BAD_BASE   the ORIGINAL naming rules ("what to call a local, given the
+                                 first tokens of the expression it is initialised with").
+                                 libs/luascope.py (what deob.py renames with) still uses
+                                 sanitize and BAD_BASE, and derive for function expressions
+                                 only: derive names a value after the FIRST name chain of the
+                                 expression (`game:GetService("X"):JSONDecode(s)` -> GetService),
+                                 so every other kind of value is now named from its syntax
+                                 tree by libs/luanames.py.
   rename(toks)                   the ORIGINAL renamer: it guesses scopes from the token stream
                                  in one pass.  The guess is wrong for `for` loops (the loop
                                  scope is never closed), for `a, b = ...` (b is not renamed)
@@ -509,7 +514,7 @@ if __name__ == '__main__':
     import deobf_plus as dp
     import luascope
     import luaubin
-    src = Path(sys.argv[1]).read_bytes().decode('utf-8', errors='surrogateescape')
+    src = dp.read_lua(sys.argv[1])
     ast_bin = luaubin.find_luau_ast()
     if not ast_bin:
         print('luau-ast not found: ' + luaubin.MISSING_HINT)

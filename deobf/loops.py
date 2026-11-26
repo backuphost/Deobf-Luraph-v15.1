@@ -14,8 +14,16 @@ generic for (coroutine-driven iterator):
 Both become a block of kind "for"/"forin" whose successors are [BODY, EXIT];
 the structurer turns it into a `for` statement. Pseudo loop-state
 assignments left over (saving/restoring the VM's loop stack) are dropped.
+
+numeric for compiled to plain instructions (TABLE_FOR, Luraph v15.2): the
+loop state is a table in an ordinary register, see try_table_numeric; it is
+rewritten into the protocol above first.
 """
-from luasym import Const, Reg, Pseudo, Bin, TempVal
+from luasym import Const, Reg, Pseudo, Bin, Un, Index, NewTable, TempVal, ClosureExpr
+
+# recognize numeric for loops whose state is a table in a register (a front
+# end switches it on: Luraph v15.2)
+TABLE_FOR = False
 
 
 def is_pseudo(e, name=None, depth=None):
@@ -24,6 +32,15 @@ def is_pseudo(e, name=None, depth=None):
 
 def recognize(entry, blocks, D):
     found = {"for": 0, "forin": 0}
+    if TABLE_FOR:
+        # innermost first: an outer loop is only taken once the loops in its
+        # body no longer use the state register
+        again = True
+        while again:
+            again = False
+            for h in list(blocks.values()):
+                if h.id in blocks and try_table_numeric(h, blocks, D, entry):
+                    again = True
     for h in list(blocks.values()):
         if h.id not in blocks:
             continue
@@ -221,6 +238,414 @@ def _run_once_for(h, s, blocks, D):
 
 def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# --------------------------------------------------------------------------
+# numeric for with its state in a table register (Luraph v15.2)
+
+def _regs(x):
+    """Numbers of the registers read anywhere inside IR x."""
+    out = set()
+    st = [x]
+    while st:
+        v = st.pop()
+        if isinstance(v, Reg):
+            out.add(v.n)
+        elif isinstance(v, (list, tuple)):
+            st += list(v)
+        elif isinstance(v, ClosureExpr):
+            st += list(v.upvals)
+        elif hasattr(v, "__dict__") and not isinstance(v, type):
+            st += list(v.__dict__.values())
+    return out
+
+
+def _stmt_rw(s, D):
+    """(registers a statement reads, the register it writes or None)."""
+    if isinstance(s, D.Assign):
+        if isinstance(s.target, Reg):
+            return _regs(s.value), s.target.n
+        return _regs(s.value) | _regs(s.target), None
+    if isinstance(s, D.Close):
+        return ({s.reg} if isinstance(s.reg, int) else _regs(s.reg)), None
+    return _regs(list(s.__dict__.values())), None
+
+
+def _block_tail_regs(b):
+    out = _regs(b.cond) if b.cond is not None else set()
+    if b.kind == "ret" and b.values is not None:
+        out |= _regs(b.values)
+    return out
+
+
+def _live(blocks, start, reg, D):
+    """Is register `reg` read before it is written on some path from block `start`?"""
+    seen = set()
+    st = [start]
+    while st:
+        x = st.pop()
+        if x in seen or x not in blocks:
+            continue
+        seen.add(x)
+        b = blocks[x]
+        dead = False
+        for s in b.stmts:
+            rd, wr = _stmt_rw(s, D)
+            if reg in rd:
+                return True
+            if wr == reg:
+                dead = True
+                break
+        if dead:
+            continue
+        if reg in _block_tail_regs(b):
+            return True
+        st += b.succ
+    return False
+
+
+def _last_def(stmts, upto, reg, D):
+    """(index, value) of the last assignment to register `reg` in stmts[:upto]."""
+    for i in range(upto - 1, -1, -1):
+        s = stmts[i]
+        if isinstance(s, D.Assign) and isinstance(s.target, Reg) and s.target.n == reg:
+            return i, s.value
+    return None, None
+
+
+def _unwritten(stmts, lo, hi, reg, D):
+    return not any(isinstance(s, D.Assign) and isinstance(s.target, Reg) and s.target.n == reg
+                   for s in stmts[lo:hi])
+
+
+def try_table_numeric(h, blocks, D, entry):
+    """Luraph v15.2 has no for-loop instructions: a numeric `for` is plain
+    code around a state table kept in one register (T), with the slots in a
+    different order at every loop:
+
+        prep:  F = {}; F[ks] = step; F[ki] = start - step; F[kl] = limit;
+               F[klink] = T; F[..] = ..; T = F
+        H:     i = T[ki]; st = T[ks]; lim = T[kl]; i = i + st
+               neg = st <= 0; pos = not neg; ge = i >= lim; le = i <= lim
+               if neg then (le = pos; if ge then goto J2 else goto J1)
+                      else (ge = neg; goto J1)
+        J1:    ge = le
+        J2:    T[ki] = i; if ge then goto BODY else goto EXIT
+        after the loop (EXIT and where its `break`s go):  T = T[klink]
+
+    The branch web is followed symbolically (flag moves, the store, tests of
+    flags), so it may be merged or laid out differently; it must go to BODY
+    exactly when (neg and ge) or (not neg and le). A side that ends in an
+    error block before the store (a path the front end cut) is accepted when
+    the step is a constant of the other sign. The loop is rewritten into the
+    FORPREP/FORLOOP protocol of try_numeric (pseudo registers); the table,
+    its push and its pops go. Not taken (left as it is) when anything else
+    uses T or the flag registers, when the loop has no back edge, or when the
+    prep is not one straight block."""
+    if h.kind != "cond" or len(h.stmts) < 8 or not isinstance(h.cond, Reg):
+        return False
+    pat, pre = h.stmts[-8:], h.stmts[:-8]
+    if not all(isinstance(s, D.Assign) and isinstance(s.target, Reg) for s in pat):
+        return False
+    if not _pure_moves(pre, D):
+        return False
+    slots = {}
+    T = None
+    for s in pat[:3]:
+        v = s.value
+        if not (isinstance(v, Index) and isinstance(v.obj, Reg) and isinstance(v.key, Const) and _num(v.key.v)):
+            return False
+        if T is None:
+            T = v.obj.n
+        if T != v.obj.n or s.target.n in slots or s.target.n == T:
+            return False
+        slots[s.target.n] = v.key.v
+    v = pat[3].value
+    if not (isinstance(v, Bin) and v.op == "Add" and isinstance(v.a, Reg) and isinstance(v.b, Reg)
+            and pat[3].target.n == v.a.n and v.a.n in slots and v.b.n in slots and v.a.n != v.b.n):
+        return False
+    ri, rs = v.a.n, v.b.n
+    rl = [r for r in slots if r not in (ri, rs)][0]
+    ki, ks, kl = slots[ri], slots[rs], slots[rl]
+    if len({ki, ks, kl}) != 3 or any(isinstance(s.target, Reg) and s.target.n == T for s in pre):
+        return False
+
+    def is_bin(e, op, a, b=None):
+        return (isinstance(e, Bin) and e.op == op and isinstance(e.a, Reg) and e.a.n == a
+                and (isinstance(e.b, Reg) and e.b.n == b if b is not None
+                     else isinstance(e.b, Const) and _num(e.b.v) and e.b.v == 0))
+    rneg, rpos, rge, rle = (s.target.n for s in pat[4:])
+    if not (is_bin(pat[4].value, "CompareLe", rs)
+            and isinstance(pat[5].value, Un) and pat[5].value.op == "Not"
+            and isinstance(pat[5].value.a, Reg) and pat[5].value.a.n == rneg
+            and is_bin(pat[6].value, "CompareGe", ri, rl) and is_bin(pat[7].value, "CompareLe", ri, rl)):
+        return False
+    if ({rneg, rpos} & {ri, rl, T} or rge in (ri, rl, T, rneg) or rle in (ri, T, rneg) or rpos == rneg
+            or h.cond.n != rneg):
+        return False
+    env0 = {}
+    for r, sym in ((rneg, "neg"), (rpos, "pos"), (rge, "ge"), (rle, "le")):
+        env0[r] = sym
+
+    # the loop: what the header reaches and what reaches the header
+    def sweep(start, nxt):
+        seen = set()
+        st = list(start)
+        while st:
+            x = st.pop()
+            if x in seen or x == h.id or x not in blocks:
+                continue
+            seen.add(x)
+            st += nxt(blocks[x])
+        return seen
+    body = sweep(h.succ, lambda b: b.succ) & sweep(h.preds, lambda b: b.preds)
+    body.add(h.id)
+    preps = [p for p in h.preds if p not in body]
+    if len(preps) != 1 or len(preps) == len(h.preds):
+        return False
+    pb = blocks[preps[0]]
+    if pb.kind != "goto" or pb.succ != [h.id] or pb.id == h.id:
+        return False
+
+    # the prep: F = {} ... F[k] = v ... T = F
+    ps = pb.stmts
+    j = None
+    for i in range(len(ps) - 1, -1, -1):
+        rd, wr = _stmt_rw(ps[i], D)
+        if wr == T:
+            j = i
+            break
+        if T in rd:
+            return False
+    if j is None or not isinstance(ps[j].value, Reg):
+        return False
+    F = ps[j].value.n
+    if F == T or any(F in _stmt_rw(x, D)[0] or _stmt_rw(x, D)[1] == F for x in ps[j + 1:]):
+        return False
+    a0, v0 = _last_def(ps, j, F, D)
+    if a0 is None or not isinstance(v0, NewTable) or v0.items:
+        return False
+    stores = {}
+    for i in range(a0 + 1, j):
+        x = ps[i]
+        if (isinstance(x, D.Assign) and isinstance(x.target, Index) and isinstance(x.target.obj, Reg)
+                and x.target.obj.n == F and isinstance(x.target.key, Const) and _num(x.target.key.v)
+                and isinstance(x.value, (Reg, Const)) and x.target.key.v not in stores
+                and not (isinstance(x.value, Reg) and x.value.n == F)):
+            stores[x.target.key.v] = (i, x.value)
+            continue
+        rd, wr = _stmt_rw(x, D)
+        if F in rd or wr == F or T in rd or wr == T:
+            return False
+    if not all(k in stores for k in (ki, ks, kl)):
+        return False
+    links = [k for k, (_, x) in stores.items() if isinstance(x, Reg) and x.n == T]
+    if len(links) != 1 or links[0] in (ki, ks, kl):
+        return False
+    klink = links[0]
+
+    def value_at_push(k):
+        """The value stored in slot k as an expression that can be evaluated
+        at the push (a constant, or the register if it still holds it), and
+        what defined it in this block when that is a constant or one `x + y`
+        / `x - y` of constants and registers unchanged since."""
+        i, x = stores[k]
+        if isinstance(x, Const):
+            return x, x
+        if not _unwritten(ps, i, j, x.n, D):
+            return None, None
+        d, dv = _last_def(ps, i, x.n, D)
+        if isinstance(dv, Const) and _num(dv.v):
+            return dv, dv
+        if isinstance(dv, Bin) and dv.op in ("Add", "Sub") and all(
+                isinstance(o, Const) or (isinstance(o, Reg) and _unwritten(ps, d, j, o.n, D)) for o in (dv.a, dv.b)):
+            return x, dv
+        return x, None
+    step, step_def = value_at_push(ks)
+    limit, limit_def = value_at_push(kl)
+    first, first_def = value_at_push(ki)
+    if step is None or limit is None or first is None:
+        return False
+    # (`x + 0`, the VM's number coercion of a bound: try_numeric strips it)
+    if isinstance(limit_def, Bin) and limit_def.op == "Add" and isinstance(limit_def.b, Const) \
+            and limit_def.b.v == 0 and isinstance(limit_def.a, Reg):
+        limit = limit_def
+    if isinstance(step_def, Bin) and step_def.op == "Add" and isinstance(step_def.b, Const) \
+            and step_def.b.v == 0 and isinstance(step_def.a, Reg):
+        step = step_def
+    # slot ki holds start - step
+    sv = stores[ks][1]
+    if isinstance(first_def, Bin) and first_def.op == "Sub" and (
+            (isinstance(sv, Reg) and isinstance(first_def.b, Reg) and first_def.b.n == sv.n)
+            or (isinstance(step, Const) and isinstance(first_def.b, Const) and first_def.b.v == step.v)):
+        start = first_def.a
+    elif isinstance(first, Const) and isinstance(step, Const) and _num(first.v) and _num(step.v):
+        start = Const(first.v + step.v)
+    else:
+        return False
+    step_sign = None
+    if isinstance(step, Const) and _num(step.v):
+        step_sign = "neg" if step.v <= 0 else "pos"
+
+    # the branch web
+    store_stmts = []
+    results = []
+
+    def follow(bid, env, assume, stored, depth):
+        if depth > 12:
+            return False
+        hops = 0
+        while True:
+            hops += 1
+            if bid == h.id or bid not in blocks or hops > 40:
+                return False
+            b = blocks[bid]
+            k = 0
+            for x in b.stmts:
+                if not isinstance(x, D.Assign):
+                    break
+                if (isinstance(x.target, Reg) and isinstance(x.value, Reg) and x.value.n in env
+                        and x.target.n not in (ri, T)):
+                    env = dict(env)
+                    env[x.target.n] = env[x.value.n]
+                elif (not stored and isinstance(x.target, Index) and isinstance(x.target.obj, Reg)
+                      and x.target.obj.n == T and isinstance(x.target.key, Const) and x.target.key.v == ki
+                      and isinstance(x.value, Reg) and x.value.n == ri):
+                    stored = True
+                    store_stmts.append(x)
+                else:
+                    break
+                k += 1
+            web_test = b.kind == "cond" and isinstance(b.cond, Reg) and b.cond.n in env
+            if k < len(b.stmts) or not (b.kind == "goto" or web_test):
+                # not (only) web code: BODY / EXIT behind the store, else a cut path
+                if k == 0 and stored:
+                    results.append((assume, bid, env))
+                    return True
+                if k == len(b.stmts) and b.kind == "error" and not stored:
+                    results.append((assume, None, env))
+                    return True
+                return False
+            if b.kind == "goto":
+                bid = b.succ[0]
+                continue
+            sym = env[b.cond.n]
+            val = assume.get("neg") if sym == "neg" else (not assume["neg"]) if sym == "pos" else assume.get(sym)
+            if val is None:
+                return all(follow(b.succ[0 if v else 1], env, dict(assume, **{sym: v}), stored, depth + 1)
+                           for v in (True, False))
+            bid = b.succ[0 if val else 1]
+    if not (follow(h.succ[0], env0, {"neg": True}, False, 0) and follow(h.succ[1], env0, {"neg": False}, False, 0)):
+        return False
+    body_id = exit_id = None
+    flag_regs = {rs, rl}
+    for assume, bid, env in results:
+        if bid is None:
+            if step_sign is None or (step_sign == "neg") == assume["neg"]:
+                return False
+            continue
+        test = "ge" if assume["neg"] else "le"
+        if test not in assume:
+            return False
+        flag_regs |= set(env)
+        if assume[test]:
+            if body_id not in (None, bid):
+                return False
+            body_id = bid
+        else:
+            if exit_id not in (None, bid):
+                return False
+            exit_id = bid
+    if body_id is None or exit_id is None or body_id == exit_id or body_id not in body or exit_id in body:
+        return False
+    flag_regs -= {ri, T}
+    if any(_live(blocks, body_id, r, D) or _live(blocks, exit_id, r, D) for r in flag_regs):
+        return False
+    if _live(blocks, exit_id, ri, D) or _live(blocks, h.id, F, D):
+        return False
+
+    # nothing else in the loop may use T
+    own = {id(x) for x in pat} | {id(x) for x in store_stmts}
+    for x in body:
+        b = blocks[x]
+        for st_ in b.stmts:
+            if id(st_) in own:
+                continue
+            rd, wr = _stmt_rw(st_, D)
+            if T in rd or wr == T:
+                return False
+        if T in _block_tail_regs(b) or (x != h.id and b.kind in ("for", "forin")
+                                         and T in _regs(list(b.values[1]))):
+            return False
+    # behind the loop T is first popped (T = T[klink]) or never used again
+    pops = []
+    seen = set()
+    st = [s for x in body for s in blocks[x].succ if s not in body]
+    while st:
+        x = st.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        if x in body or x == pb.id or x not in blocks:
+            return False
+        b = blocks[x]
+        hit = False
+        for st_ in b.stmts:
+            rd, wr = _stmt_rw(st_, D)
+            if T in rd or wr == T:
+                v = st_.value if isinstance(st_, D.Assign) else None
+                if not (wr == T and isinstance(v, Index) and isinstance(v.obj, Reg) and v.obj.n == T
+                        and isinstance(v.key, Const) and v.key.v == klink):
+                    return False
+                pops.append((b, st_))
+                hit = True
+                break
+        if hit:
+            continue
+        if T in _block_tail_regs(b):
+            return False
+        st += b.succ
+    # (a pop that can be reached without going through the loop is not this loop's)
+    out = set()
+    st = [entry]
+    while st:
+        x = st.pop()
+        if x in out or x == h.id or x not in blocks:
+            continue
+        out.add(x)
+        st += blocks[x].succ
+    if any(b.id in out for b, _ in pops) or body_id in out:
+        return False
+
+    # rewrite: the FORPREP / FORLOOP protocol of try_numeric
+    import structure
+    d = h.id
+    Z, P, A = Pseudo("Z", d), Pseudo("P", d), Pseudo("a", d)
+    drop = {id(ps[a0]), id(ps[j])} | {id(ps[i]) for i, _ in stores.values()}
+    new = []
+    for x in ps:
+        if x is ps[j]:
+            new += [D.Assign(Z, step), D.Assign(P, limit), D.Assign(A, Bin("Sub", start, Z))]
+        elif id(x) not in drop:
+            new.append(x)
+    pb.stmts = new
+    for b, st_ in pops:
+        b.stmts = [x for x in b.stmts if x is not st_]
+    h.stmts = pre + [D.Assign(A, Bin("Add", A, Z))]
+    h.cond = Bin("CompareLe", Z, Const(0))
+    sides = []
+    for op in ("CompareGe", "CompareLe"):
+        sb = structure.Block(max(blocks) + 1)
+        blocks[sb.id] = sb
+        tb = structure.Block(max(blocks) + 1)
+        blocks[tb.id] = tb
+        sb.kind, sb.cond, sb.succ = "cond", Bin(op, A, P), [tb.id, exit_id]
+        tb.stmts, tb.succ = [D.Assign(Reg(ri), A)], [body_id]
+        sb.origin = tb.origin = h.origin
+        sides.append(sb.id)
+    h.succ = sides
+    _recompute(blocks)
+    return True
 
 
 def _same(a, b):

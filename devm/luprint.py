@@ -166,6 +166,11 @@ def native_shape(func, underscore_is_name=False):
 def native_closure_text(func, upnames, level, cells=(1, 3), base=0):
     """Source of the inner function with upvalue-cell accesses replaced by the captured names."""
     shape = native_shape(func)
+    if shape is None and not func.params and len(func.body) == 1 and func.body[0][0] == 'return' \
+            and len(func.body[0][1]) == 1 and func.body[0][1][0][0] == 'func':
+        # a wrapper without parameters, `function() return function(...) ... end end`: a function
+        # that captures nothing (examples/layer3.lua keeps its first plain-Lua function this way)
+        shape = (None, {}, func.body[0][1][0][1])
     if shape is None:
         return None
     up, alias, inner = shape

@@ -119,6 +119,19 @@ ALIAS = {
     'alias_upvalue_copy': 'local function grab() local c2 = C; c2[1] = "changed" end\ngrab()',
 }
 ALIAS_FRAME = 'local C = {}\nlocal w = "first"\nC[1] = w\n%s\nprint(C[1], w)\n'
+# The hand-over that is let through (`W:m(..., {[1] = C})`, W a parameter) only keeps the
+# name while the VALUE of that call stays opaque: once the visible code indexes it, the
+# capture list is back in visible hands and the table may be written through it.
+HANDED_BACK = {
+    'handed_back_local': '    local p = W:pack({[1] = C})\n    p[1][1] = "changed"',
+    'handed_back_direct': '    W:pack({[1] = C})[1][1] = "changed"',
+    'handed_back_assigned': '    local p\n    p = W:pack({[1] = C})\n    p[1][1] = "changed"',
+    'handed_back_rawset': '    local p = W:pack({[1] = C})\n    rawset(p[1], 1, "changed")',
+    'handed_back_group': '    local p = (W:pack({[1] = C}))\n    p[1][1] = "changed"',
+    'handed_back_field': '    local p = W:pack({[1] = C})\n    local inner = p.caps or p[1]\n    inner[1] = "changed"',
+}
+HANDED_FRAME = ('local function part(W)\n    local C = {}\n    local w = "first"\n    C[1] = w\n%s\n'
+                '    print(C[1], w)\nend\npart({pack = function(_, c) return c end})\n')
 # Shapes that keep the name: T is only indexed, or handed to a method of a parameter in a
 # capture list (how Luraph gives captured variables to a closure the VM creates).
 KEEP = {
@@ -128,6 +141,11 @@ KEEP = {
     'keep_handed_to_param': ('local function part(W)\n    local C = {}\n    local w = "first"\n    C[1] = w\n'
                              '    local f = W:kk(1, 2, {[1] = C})\n    print(C[1], w)\nend\n'
                              'part({kk = function() end})\n'),
+    # the closure that comes back is called and passed on, never indexed
+    'keep_handed_called': ('local function part(W)\n    local C = {}\n    local w = "first"\n    C[1] = w\n'
+                           '    local f = W:kk(1, 2, {[1] = C})\n    f()\n    pcall(f)\n    pcall(W:kk(1, 2, {[1] = C}))\n'
+                           '    print(C[1], w)\nend\n'
+                           'part({kk = function() return function() end end})\n'),
 }
 
 NAMES = ['a', 'b', 's']
@@ -344,6 +362,15 @@ def main():
                 new, stats = reslot.process_text(text, ast_bin=ast, inline=inline)
                 check('%s: no slot name%s' % (name, ' (--inline)' if inline else ''),
                       new == text and stats['comment'] == 0 and stats['inline'] == 0, new)
+        for name, middle in sorted(HANDED_BACK.items()):
+            text = HANDED_FRAME % middle
+            rc0, out0 = run(luau, text, tmp)
+            check(name + ': original runs and really changes the slot', rc0 == 0 and out0.startswith('changed'),
+                  out0[:200])
+            for inline in (False, True):
+                new, stats = reslot.process_text(text, ast_bin=ast, inline=inline)
+                check('%s: no slot name%s' % (name, ' (--inline)' if inline else ''),
+                      new == text and stats['comment'] == 0 and stats['inline'] == 0, new)
         for name, text in sorted(KEEP.items()):
             rc0, out0 = run(luau, text, tmp)
             check(name + ': original runs', rc0 == 0, out0[:200])
@@ -354,7 +381,7 @@ def main():
             new, stats = reslot.process_text(text, ast_bin=ast, inline=True)
             rc1, out1 = run(luau, new, tmp)
             check(name + ': prints the same (--inline)', (rc1, out1) == (rc0, out0), new)
-            if name == 'keep_handed_to_param':
+            if name in ('keep_handed_to_param', 'keep_handed_called'):
                 check(name + ': not substituted (a closure the VM creates may write the slot)',
                       stats['inline'] == 0 and stats['comment'] >= 1, new)
 

@@ -91,7 +91,7 @@ HOOK = (
 
 def extract_bc(html_or_lua_path, workdir=None):
     """核心：从样本里截出字节码，返回 bytes 或 None"""
-    raw = Path(html_or_lua_path).read_text(encoding="utf-8", errors="ignore")
+    raw = Path(html_or_lua_path).read_text(encoding="utf-8", errors="ignore").lstrip("\ufeff")
 
     # 如果是 HTML，抽出 Luraph 代码那一行
     if "<html" in raw[:500].lower() or "<!doctype" in raw[:200].lower():

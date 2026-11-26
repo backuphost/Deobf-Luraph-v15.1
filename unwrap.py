@@ -122,7 +122,8 @@ def main():
         print(f"[✗] 文件不存在：{src}")
         return 1
     dst = Path(args[1]) if len(args) > 1 else src.with_suffix('.unwrap.luau')
-    text = src.read_bytes().decode('utf-8', errors='surrogateescape')
+    from deobf_plus import read_lua
+    text = read_lua(src)
     try:
         out, n = unwrap_one(text)
     except RuntimeError as e:

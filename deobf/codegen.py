@@ -53,6 +53,9 @@ def children(e):
         return list(e.items) + ([TailRef(e.tail)] if e.tail is not None else [])
     if isinstance(e, TailRef):
         return [e.tail.call] if isinstance(e.tail, InlineTail) else []
+    if isinstance(e, TailCount):
+        # (the number of values of a call: a use of its temp like a tail is)
+        return [TailRef(e.tail)]
     if isinstance(e, NewTableE):
         out = []
         for k, v in e.items:
@@ -101,6 +104,8 @@ def map_expr(e, fn):
         return GenIterE([map_expr(a, fn) for a in e.args])
     if isinstance(e, TailRef) and isinstance(e.tail, InlineTail):
         return TailRef(InlineTail(map_expr(e.tail.call, fn)))
+    if isinstance(e, TailCount):
+        return TailCount(map_tail(e.tail, fn))
     return e
 
 

@@ -624,13 +624,45 @@ def declared_here(st):
         return list(st.names)
     if isinstance(st, CG.AssignS) and getattr(st, "is_local", False):
         return [t.name for t in st.targets if isinstance(t, CG.LocalName)]
+    if isinstance(st, CG.TempDef):
+        # (a call's results kept in a pack: `local t<temp> = table.pack(...)`)
+        return ["t%s" % st.t]
     return []
 
 
 def names_anywhere(st):
     occ = {}
     occurrences(st.body if isinstance(st, DoBlock) else [st], (), occ)
-    return set(occ)
+    out = set(occ)
+    _temp_names(st.body if isinstance(st, DoBlock) else [st], out)
+    return out
+
+
+def _temp_names(stmts, out):
+    """Adds the call temps the statements define or read, by the name they
+    are rendered with: a `do ... end` segment must not close before the last
+    read of a temp declared in it."""
+    for st in stmts:
+        if isinstance(st, ST.SIf):
+            out.update("t%s" % t for t in CG.temps_read(st.cond))
+            _temp_names(st.then, out)
+            _temp_names(st.els, out)
+        elif isinstance(st, ST.SLoop):
+            for e in (st.forinfo[1] if st.kind in ("for", "forin") else ()):
+                out.update("t%s" % t for t in CG.temps_read(e))
+            if st.cond is not None:
+                out.update("t%s" % t for t in CG.temps_read(st.cond))
+            _temp_names(st.body, out)
+        elif isinstance(st, DoBlock):
+            _temp_names(st.body, out)
+        elif isinstance(st, ST.SReturn):
+            if st.values is not None:
+                for e in list(st.values.items) + ([CG.TailRef(st.values.tail)] if st.values.tail is not None else []):
+                    out.update("t%s" % t for t in CG.temps_read(e))
+        elif isinstance(st, (CG.AssignS, CG.CallS, CG.TempDef, CG.SetListS, CG.ForPrepS)):
+            if isinstance(st, CG.TempDef):
+                out.add("t%s" % st.t)
+            out.update("t%s" % t for t in CG.stmt_uses(st)[1])
 
 
 def limit_locals(stmts, outer=0, budget=180):
@@ -652,6 +684,22 @@ def limit_locals(stmts, outer=0, budget=180):
             st.body[:] = limit_locals(st.body, active, budget)
         active += len(declared_here(st))
     return stmts
+
+
+def peak_locals(stmts, outer=0):
+    """The most locals active at once in the block, counted as limit_locals does."""
+    active = peak = outer
+    for st in stmts:
+        if isinstance(st, ST.SIf):
+            peak = max(peak, peak_locals(st.then, active), peak_locals(st.els, active))
+        elif isinstance(st, ST.SLoop):
+            extra = 1 if st.kind == "for" else len(st.forinfo[0]) if st.kind == "forin" else 0
+            peak = max(peak, peak_locals(st.body, active + extra))
+        elif isinstance(st, DoBlock):
+            peak = max(peak, peak_locals(st.body, active))
+        active += len(declared_here(st))
+        peak = max(peak, active)
+    return peak
 
 
 def _hoistable(st):
@@ -784,6 +832,8 @@ def wrap_segments(stmts, room, chunk=None, dry=False):
         decl_at.append(declared_here(s_))
     life = []
     for i, names in enumerate(decl_at):
+        if isinstance(stmts[i], CG.TempDef):
+            continue        # (a call temp is declared where its call is: it cannot be hoisted)
         for nm in names:
             life.append((last.get(nm, i) - i, nm))
     life.sort(reverse=True)

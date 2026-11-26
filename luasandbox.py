@@ -111,6 +111,22 @@ SANDBOX_LUA = r'''(function()
 end)()'''.replace('@ALLOWED@', ', '.join('"%s"' % n for n in ALLOWED))
 
 
+def strip_bom(text):
+    """`text` without a leading UTF-8 byte order mark (EF BB BF).
+
+    Editors on Windows put one in front of a saved file.  It is not part of the script: Luau
+    does not skip it (`Expected identifier ..., got Unicode character U+feff`), so a file
+    that has one is not a program until it is gone.  Works on bytes, on a str decoded as
+    UTF-8 ('\ufeff') and on a str with one character per byte (latin-1: 'ï»¿')."""
+    if isinstance(text, bytes):
+        return text[3:] if text.startswith(b'\xef\xbb\xbf') else text
+    if text.startswith('\ufeff'):
+        return text[1:]
+    if text.startswith('\xef\xbb\xbf'):
+        return text[3:]
+    return text
+
+
 def lua_string_expr(text):
     """A Lua expression whose value is exactly `text`.
 
@@ -150,9 +166,10 @@ def launcher(body_lua, source_text, chunk_name='=sample', setup_lua=''):
         local __SRC = <source_text>
         local __CHUNK, __LOADERR = loadstring(__SRC, chunk_name), with __ENV as environment
         <body_lua>                          what to do with __CHUNK (call it, report errors)
-    `source_text`: str, one character per byte (file bytes decoded as latin-1).  setup_lua and
-    body_lua are ordinary text.  The result is a str with one character per byte: write it
-    with .encode('latin-1')."""
+    `source_text`: str, one character per byte (file bytes decoded as latin-1); a byte order
+    mark in front of it is dropped (strip_bom).  setup_lua and body_lua are ordinary text.
+    The result is a str with one character per byte: write it with .encode('latin-1')."""
+    source_text = strip_bom(source_text)
     return '\n'.join([
         'local __SANDBOX = ' + SANDBOX_LUA,
         'local __ENV = __SANDBOX()',

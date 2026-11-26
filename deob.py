@@ -18,7 +18,11 @@ Luraph v15.1 的常见形态是：
   3. 把没被虚拟化的明文函数按区间切出来：大函数；以及 VM 对象里更小的明文函数 ——
      闭包工厂形态（`function(..)return function(..) ... end end`，Luraph 存放未虚拟化函数
      的方式）、读全局变量的函数（VM 自己的代码从不直接读全局）、业务 API 密集（≥ 5 处）的
-     函数。其余没导出的函数逐项计数并说明依据（不会悄悄漏掉）
+     函数。其余没导出的函数逐项计数并说明依据（不会悄悄漏掉）。
+     哪个大函数是 VM 分派器，只看结构：解释器分派循环
+     （`while true do OP = CODE[PC]; if OP < n ...`，对取出的操作码做数值分支）占了函数的
+     大半，才算分派器；函数里出现什么名字（有没有 UI 代码）不影响判定。
+     想自己看被剔除的分派器：--keep-dispatchers
   4. 断行 + 语义重命名（作用域取自 luau-ast）
   5. 验证：语法、token 无损、重命名前后绑定一致
 
@@ -39,6 +43,7 @@ Luraph v15.1 的常见形态是：
 用法
 ----
     python deob.py 输入.lua [-o 输出.lua] [--min-size 20000] [--no-rename] [--no-run]
+                            [--force] [--keep-dispatchers]
 
     python deob.py 输入.lua --list       # 只列出发现的大函数，不输出
 
@@ -76,6 +81,14 @@ def write_source(path, text):
 def nbytes(text):
     """Size in bytes of a text read with read_source (not its length in characters)."""
     return len(text.encode("utf-8", errors="surrogateescape"))
+
+
+def strip_bom(text):
+    """(text without a leading UTF-8 byte order mark, whether there was one).  Editors on
+    Windows put one in front of a saved file; Luau's parser takes it for a syntax error."""
+    import luasandbox
+    bare = luasandbox.strip_bom(text)
+    return bare, len(bare) != len(text)
 
 
 # ---------------------------------------------------------------- Luraph 头注释
@@ -197,8 +210,10 @@ def looks_like_container(text):
     return longest >= PAYLOAD_MIN and longest * 2 > len(text)
 
 
-def unwrap_reason(text, header):
+def unwrap_reason(text, header, feats=None):
     """Why this text is worth running in the unwrap sandbox, or None.
+    `feats`: vm_features(text, tree) when the caller has parsed the text (Scan does), so
+    that "has dispatch loops" is the syntax tree's answer; else the text-level guess is used.
 
     Unwrapping means RUNNING the text (in the sandbox of mkfast.py, with loadstring hooked).
     That is done for exactly three kinds of text: one with the Luraph header comment; one
@@ -210,7 +225,8 @@ def unwrap_reason(text, header):
     not executed."""
     if header.get("version"):
         return "Luraph 头注释"
-    feats = vm_features(text)
+    if feats is None:
+        feats = vm_features(text)
     if feats["object"] and feats["loader"]:
         return "`return setmetatable({...},{}):%s()(...)` 形态" % feats["loader"]
     if feats["object"] and feats["entry"] and not feats["dispatch_loops"]:
@@ -385,7 +401,12 @@ def verify(text):
 
 # ---------------------------------------------------------------- 扫描（步骤 1 ~ 5b）
 
-VM_LOOP = re.compile(r'while true do (?:local )?\w+(?:,\w+)?=\w+\[\w+\];')
+# Text form of an interpreter dispatch loop head: `while true do [local] OP[, X] = CODE[PC];
+# if OP < 73 ...` (opcode fetched from an array by a program counter, then compared with a
+# number).  It is only a guess made BEFORE the text is parsed (may the text be run to unwrap
+# it?); every number the tool reports is counted on the syntax tree (luascope.dispatch_loops).
+VM_LOOP = re.compile(r'\bwhile\s+true\s+do\s+(?:local\s+)?([A-Za-z_]\w*)(?:\s*,\s*[A-Za-z_]\w*)*\s*='
+                     r'\s*[A-Za-z_]\w*\s*\[\s*[A-Za-z_]\w*\s*\]\s*;?\s*if\s+\1\s*(?:[<>]=?|==|~=)\s*\d')
 VM_TAIL = re.compile(r'\}\s*,\s*\{[^{}]*\}\s*\)\s*:\s*(\w+)\s*\(\s*\.\.\.\s*\)\s*;?\s*$')
 # the container Luraph wraps the VM chunk in ends `},{}):A()(...)`: A() decodes and loads the
 # chunk, and what it returns is called with the script's arguments
@@ -407,21 +428,25 @@ def api_mentions(text):
     return sum(len(re.findall(pat, text)) for _k, pat in SIGNALS)
 
 
-def part_kind(text, globals_read=None):
-    """Kind of an exported function and its business-API mention count:
-      'dispatcher'  VM dispatch loop
-      'business'    mentions business APIs
-      'script'      no business-API name, but it reads globals (`globals_read`, the result of
-                    luascope.globals_in): code of the script all the same (HttpGet, loadstring)
+def function_kind(fact):
+    """Kind of a function, from what Scan.fact() found (every item is a fact about the
+    function's syntax tree or text, none about a particular script):
+      'dispatcher'  VM dispatch loop: interpreter dispatch loops make up most of it
+      'business'    reads globals and mentions business APIs (or mentions them BUSINESS_MIN
+                    times without reading a global: the environment then comes in through
+                    captured variables)
+      'script'      reads globals, no business-API name: code of the script all the same
+                    (HttpGet, loadstring, task, ...).  The VM's own code never reads a global.
       'plain'       neither: it only works on its arguments and captured variables (Luraph's
                     own helper closures, VM methods, or logic that does not touch the
                     environment)"""
-    api = api_mentions(text)
-    if is_dispatcher_text(text):
-        return "dispatcher", api
-    if api:
-        return "business", api
-    return ("script" if globals_read else "plain"), api
+    if fact["dispatcher"]:
+        return "dispatcher"
+    if fact["globals"]:
+        return "business" if fact["api"] else "script"
+    if fact["api"] >= BUSINESS_MIN:
+        return "business"
+    return "plain"
 
 
 _LEAD_COMMENT = re.compile(r'\s*(?:--\[(=*)\[[\s\S]*?\]\1\]|--[^\n]*(?:\n|\Z))')
@@ -445,13 +470,23 @@ def code_start(src):
     return pos
 
 
-def vm_features(src):
+def vm_features(src, root=None):
     """What marks a chunk as Luraph's VM object: interpreter dispatch loops and the
-    `return setmetatable({...},{}):NAME(...)` shape."""
+    `return setmetatable({...},{}):NAME(...)` shape.
+
+    'dispatch_loops' is counted on the syntax tree when `root` (the luau-ast tree of `src`) is
+    given: luascope.dispatch_loops, the exact shape.  Without a tree it is the number of
+    places where the TEXT has that shape (VM_LOOP), which is good enough to tell a VM chunk
+    from a container before anything is parsed, and is not reported anywhere."""
     tail = VM_TAIL.search(src[-400:])
     loader = LOADER_TAIL.search(src[-400:])
     start = code_start(src)
-    return {"dispatch_loops": len(VM_LOOP.findall(src)),
+    if root is not None:
+        import luascope
+        loops = len(luascope.dispatch_loops(root))
+    else:
+        loops = sum(1 for _m in VM_LOOP.finditer(src))
+    return {"dispatch_loops": loops,
             "object": bool(re.match(r'return\s+setmetatable\s*\(', src[start:start + 64])),
             "entry": tail.group(1) if tail else None,
             "loader": loader.group(1) if loader else None}
@@ -465,31 +500,19 @@ def is_statement_function(toks):
     return not (len(code) >= 2 and code[0][1] == "function" and code[1][1] in ("(", "<"))
 
 
-def is_dispatcher_text(body):
-    """VM 分派器的特征：密集的「查表跳转」+ 一大串 if 比较，没有业务 API。
-    （实测 BBDHub 样本：查表 217+、if 比较 589+、业务 API 0）"""
-    if len(body) > 400000:
-        body = body[:400000]
-    jump_like = len(re.findall(r'\w+\s*=\s*\w+\[\s*\w+\s*\]', body))
-    cmp_like = len(re.findall(r'if\s+\w+\s*[<>~=]=?\s*\d+', body))
-    api = len(re.findall(r'GetService|Instance\s*\.\s*new|UDim2|Color3', body))
-    # 相对密度更可靠：字节数归一化
-    per_kb_jump = 1000.0 * jump_like / max(len(body), 1)
-    per_kb_cmp = 1000.0 * cmp_like / max(len(body), 1)
-    return (api < 5 and jump_like > 80
-            and (per_kb_cmp > 8 or per_kb_jump > 4))
-
-
 class Scan:
     """Steps 1 to 5b: read, find the binaries, peel shells and the container, parse, size up
     the functions, tell business code from VM code.  main() prints as it goes; probe() runs
     the same steps silently."""
 
-    def __init__(self, inp, min_size=20000, work_dir=None, say=print, allow_run=True):
+    def __init__(self, inp, min_size=20000, work_dir=None, say=print, allow_run=True,
+                 keep_dispatchers=False):
         self.inp = Path(inp)
         self.min_size = min_size
         self.say = say
         self.allow_run = allow_run  # False: never run the input (step 2b is skipped)
+        self.keep_dispatchers = keep_dispatchers    # export the VM dispatchers too (labelled)
+        self.bom = False            # the file started with a UTF-8 byte order mark (removed)
         self._own_work = work_dir is None
         self.work = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="lv151_"))
         self.work.mkdir(parents=True, exist_ok=True)
@@ -507,10 +530,12 @@ class Scan:
         self.parse_errors = []
         self.index = None
         self.funcs = []
+        self.loops = []             # (start, end, cases) of every interpreter dispatch loop
         self.all_sized = []         # outermost functions of at least min_size
         self.outer_all = []         # outermost functions of any size
         self.sized = []             # (start, end, size, node): what gets extracted
         self.dropped = []           # VM dispatchers among the big functions
+        self.kept = []              # the big functions that are no dispatchers
         self.small_plain = []       # functions below min_size that are exported all the same:
                                     # plain (not virtualized) functions of a VM object
         self.small_other = []       # (item, API mentions): below min_size, not exported
@@ -531,7 +556,7 @@ class Scan:
 
     # ---- 1
     def load(self):
-        self.raw = read_source(self.inp)
+        self.raw, self.bom = strip_bom(read_source(self.inp))
         self.header = luraph_header(self.raw)
         self.src = self.raw
 
@@ -566,6 +591,15 @@ class Scan:
         out.sort(key=lambda x: (x[0], -x[2]))
         return out
 
+    def features(self, text):
+        """vm_features(text) with the dispatch loops counted on the syntax tree (the
+        text-level guess only when luau-ast gives no tree at all)."""
+        try:
+            root, _errors, _index = self._parse(text)
+        except Exception:           # noqa: BLE001
+            root = None
+        return vm_features(text, root)
+
     def has_big_func(self, text):
         try:
             return any(n >= self.min_size for _s, _e, n, _f in self._functions(text))
@@ -579,15 +613,17 @@ class Scan:
     # ---- 2b
     def unwrap(self):
         """Luraph's own container.  Unwrapping RUNS the text (sandboxed), so it is tried only
-        when the text carries a payload (one string literal is more than half of the file),
-        or when it has no big function and has the header comment or Luraph's object shape
-        (unwrap_reason); and never with allow_run=False."""
+        when the text carries a payload (one string literal is more than half of the file)
+        or ends like Luraph's container (`},{}):X()(...)`), or when it has no big function
+        and unwrap_reason() names another reason (the header comment, an object without
+        dispatch loops); and never with allow_run=False."""
         say = self.say
-        if not looks_like_container(self.src) and self.has_big_func(self.src):
+        feats = self.features(self.src)
+        container_shape = looks_like_container(self.src) or bool(feats["object"] and feats["loader"])
+        if not container_shape and self.has_big_func(self.src):
             return False
-        why = unwrap_reason(self.src, luraph_header(self.src))
+        why = unwrap_reason(self.src, luraph_header(self.src), feats)
         if why is None:
-            feats = vm_features(self.src)
             if feats["object"] and feats["dispatch_loops"]:
                 self.unwrap_note = ("这一层是 VM 对象本身（setmetatable 对象，里面有解释器分派循环），"
                                     "不是容器：没有可剥的壳，没有执行它")
@@ -640,10 +676,14 @@ class Scan:
 
     # ---- 3 / 4 / 5 / 5a
     def functions(self):
+        import luascope
         root, errors, index = self._parse(self.src)
         self.root, self.parse_errors, self.index = root, errors, index
         allf = self._functions(self.src)
         self.funcs = allf
+        self.loops = sorted(index.span(d["node"]["location"]) + (d["cases"],)
+                            for d in luascope.dispatch_loops(root))
+        self._facts = {}
         outer = []
         for item in allf:           # sorted by (start, -size): an outer function comes first
             if outer and item[0] >= outer[-1][0] and item[1] <= outer[-1][1]:
@@ -658,7 +698,9 @@ class Scan:
         big.sort(key=lambda x: -x[2])
         self.all_sized = big
         self.dropped = [x for x in big if self.fact(x)["dispatcher"]]
-        kept = [x for x in big if x not in self.dropped]
+        kept = self.kept = [x for x in big if x not in self.dropped]
+        # A VM dispatcher is told by its structure alone (fact(): interpreter dispatch loops
+        # make up most of the function), never by which names the function mentions.
         # Functions below the size threshold are not all VM plumbing.  In Luraph's VM object
         # (`return setmetatable({...},{}):X(...)`) a function of the script that was left as
         # plain Lua can be small; three things mark one, and each is checked on the syntax
@@ -692,29 +734,46 @@ class Scan:
             # captured variables; the bigger the earlier
             self.sized = sorted(kept + self.small_plain,
                                 key=lambda x: (0 if self.is_script(x) else 1, -x[2], x[0]))
+            if self.keep_dispatchers:
+                self.sized += self.dropped      # asked for: last, and labelled as what they are
         else:
             self.sized = list(big)      # nothing but dispatchers: classify() will say so
 
     def fact(self, item):
         """What the tool goes by for one function (start, end, size, node):
-        {'api': business-API mentions, 'globals': {name: uses}, 'factory': depth of the
-        closure-factory shape (0 = not one), 'dispatcher': VM dispatch loop}."""
+          'api'         business-API mentions in its text (information; nothing is decided
+                        by these names alone except BUSINESS_MIN of them in one function)
+          'globals'     {name: uses} of the globals it reads or writes (syntax tree)
+          'factory'     depth of the closure-factory shape (0 = not one)
+          'loops'       interpreter dispatch loops inside it (luascope.dispatch_loops)
+          'loop_share'  share of the function's text that lies inside those loops (0..1)
+          'dispatcher'  True when the dispatch loops are more than half of the function:
+                        the function IS an interpreter.  A function that merely contains
+                        such a loop next to other code is not one."""
         import luascope
         key = (item[0], item[1])
         f = self._facts.get(key)
         if f is None:
             text = self.src[item[0]:item[1]]
             _leaf, depth = luascope.factory_leaf(item[3])
+            inside = [(s, e) for s, e, _c in self.loops if s >= item[0] and e <= item[1]]
+            covered, end = 0, item[0]
+            for s, e in inside:                 # sorted by start; nested loops count once
+                if e > end:
+                    covered += e - max(s, end)
+                    end = e
+            size = max(item[1] - item[0], 1)
             f = {"api": api_mentions(text), "globals": luascope.globals_in(item[3]),
-                 "factory": depth, "dispatcher": is_dispatcher_text(text)}
+                 "factory": depth, "loops": len(inside), "loop_share": covered / size,
+                 "dispatcher": covered * 2 > size}
             self._facts[key] = f
         return f
 
     def is_script(self, item):
-        """The function names the environment (reads a global or mentions a business API)
-        and is no dispatch loop: code of the script, not of the VM."""
-        f = self.fact(item)
-        return bool(f["globals"] or f["api"]) and not f["dispatcher"]
+        """The function names the environment (function_kind 'business' or 'script': it
+        reads a global, or mentions the business API BUSINESS_MIN times) and is no dispatch
+        loop: code of the script, not of the VM."""
+        return function_kind(self.fact(item)) in ("business", "script")
 
     def evidence(self):
         """What marks the input as Luraph's output (empty list: nothing does)."""
@@ -751,30 +810,45 @@ class Scan:
 
     # ---- 5b
     def classify(self):
-        region = "".join(self.src[s:e] for s, e, _n, _f in self.sized)
+        region = "".join(self.src[s:e] for s, e, _n, _f in self.sized if (s, e, _n, _f) not in self.dropped)
         self.signals = {k: len(re.findall(pat, region)) for k, pat in SIGNALS}
         self.score = sum(self.signals.values())
         self.chunk_score = api_mentions(self.src)
-        self.vm = vm_features(self.src)
+        # the loop count is taken from the syntax tree once there is one
+        self.vm = vm_features(self.src, self.root)
         # Every Luraph script has a virtualized part; what differs is how much of it the author
-        # left as plain Lua.  Form A = at least one plain business function of min_size or
-        # more: the static result is a substantial part of the script.  A VM object whose only
-        # plain business code is small functions is form vm (the devirtualizer's case); those
-        # functions are listed, and --force / a lower --min-size exports them.
+        # left as plain Lua.  Form A = at least one plain script function of min_size or more:
+        # a function that is no dispatcher and names the environment (is_script: it reads a
+        # global, which the VM's own code never does).  The static result is then a
+        # substantial part of the script.  Which names it reads plays no part: a script
+        # without any UI code is form A all the same.  A VM object whose only plain script
+        # code is small functions is form vm (the devirtualizer's case); those functions are
+        # listed, and --force / a lower --min-size exports them.
         # Form A is a statement about Luraph's output: a text that shows nothing of Luraph (no
         # header comment, no container, not the VM object) is not classified, however big its
         # functions are (an ordinary script is not "form A").
-        big_business = [x for x in self.sized if x[2] >= self.min_size and x not in self.dropped]
+        big_script = [x for x in self.kept if self.is_script(x)]
         luraph = bool(self.evidence())
-        if big_business and self.score >= BUSINESS_MIN and luraph:
+        if big_script and luraph:
             self.form = "A"
         elif self.vm["dispatch_loops"] >= 1 and (self.vm["object"] or self.container):
             self.form = "vm"
-        elif self.sized and self.score >= BUSINESS_MIN and luraph:
-            self.form = "A"             # plain business functions and no VM loop in sight
+        elif any(self.is_script(x) for x in self.sized) and luraph:
+            self.form = "A"             # plain script functions and no VM loop in sight
         else:
             self.form = "unknown"
         return self.form
+
+    def script_globals(self):
+        """{global name: uses} over the functions that would be extracted (dispatchers
+        aside): what the form-A decision rests on, for the log."""
+        out = {}
+        for x in self.sized:
+            if x in self.dropped:
+                continue
+            for name, n in self.fact(x)["globals"].items():
+                out[name] = out.get(name, 0) + n
+        return out
 
 
 def probe(path, work_dir=None, min_size=20000, allow_run=True):
@@ -783,7 +857,8 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
     Nothing is printed.  The outer container, if there is one, is unwrapped (its code is
     captured from loadstring, never run) and the result is saved in `work_dir` (a new temporary
     directory when None; the caller removes it).  allow_run=False: the input is never run,
-    so a container stays closed ('error' then says so).
+    so a container stays closed ('error' then says so).  A UTF-8 byte order mark in front of
+    the file is ignored.
 
     Returns a dict:
       'input'           the path given
@@ -797,9 +872,10 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
       'luraph'          what marks the input as Luraph's output: a list out of "头注释",
                         "容器", "setmetatable VM 对象", "结尾的 :X(...) 调用"; [] for a text
                         that shows nothing of Luraph (form is then 'unknown')
-      'form'            'A'   plain-Lua business functions inside the VM object, at least one
-                              of them of min_size or more: this tool extracts them
-                              (score >= 5)
+      'form'            'A'   plain-Lua script functions inside the VM object, at least one
+                              of them of min_size or more: this tool extracts them.  Such a
+                              function is no dispatcher and reads a global (the VM's own
+                              code reads none); which names it mentions plays no part
                         'vm'  the chunk is Luraph's VM (dispatch loops) and holds no plain-Lua
                               business function of min_size: needs the devirtualizer.  Small
                               plain functions may exist all the same: see 'small_functions'
@@ -808,6 +884,7 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
                               error; see 'luraph' and 'error')
       'engine'          'static' for form A, 'devm' for form vm, None otherwise
       'score'           business-API hits in the functions that would be extracted
+                        (information only: no decision rests on these names)
       'chunk_score'     the same count over the whole chunk (library references in the VM
                         table such as `[n]=Color3.new` and small helper functions that were
                         left as plain Lua show up here)
@@ -821,12 +898,18 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
                         environment (reads a global or mentions a business API): code of the
                         script for certain.  The others only work on captured variables
                         (Luraph's own helper closures, or pure logic)
-      'dispatchers'     [(start, end, size)] big functions recognised as VM dispatch loops
+      'dispatchers'     [(start, end, size)] big functions that are VM dispatchers: their
+                        interpreter dispatch loops are more than half of the function
       'sandbox_run'     True when the input's own code was run in the unwrap sandbox (only
                         done for a text that looks like Luraph's output; a plain script is
                         never executed)
       'vm'              {'dispatch_loops': n, 'object': bool, 'entry': 'yQ' or None,
                          'loader': 'A' or None (the text ends `:A()(...)`: a container)}
+                        dispatch_loops is counted on the syntax tree
+                        (luascope.dispatch_loops: `while true do OP = CODE[PC]; if ...` with
+                        OP compared with at least 4 number constants), so loops of the
+                        script's own functions that merely begin with a table read are not
+                        in it; it is the number devm reports for the same chunk
       'bare_chunk'      True when the input itself looks like a VM chunk that was cut out of
                         its container before (VM object with dispatch loops, no header
                         comment, no container around it).  A container starts its chunk with
@@ -1123,7 +1206,8 @@ def build_part(scan, item, all_ptoks, offsets, rename, slots, inline_slots, wrap
     b = bisect.bisect_left(offsets, e)
     ptoks = all_ptoks[a:b]
     orig = [(t, v) for t, v, _o in ptoks]
-    kind, api = part_kind(scan.src[s:e], scan.fact(item)["globals"])
+    fact = scan.fact(item)
+    kind, api = function_kind(fact), fact["api"]
     stmt = is_statement_function(orig)
     info = {"renamed": 0, "slots": {}, "slot_comment": 0, "slot_inline": 0, "decoded": 0,
             "layout": False, "literals": False, "binding": None, "tree": None, "note": None,
@@ -1232,17 +1316,23 @@ def handler_table(src_toks):
 def describe_function(scan, item, limit=4):
     """One short label for a function, from what Scan.fact() found."""
     f = scan.fact(item)
+    share = f"占函数 {100.0 * f['loop_share']:.0f}%"
     if f["dispatcher"]:
-        return "VM 分派器（查表跳转），不是业务源码"
-    if f["api"]:
-        return f"业务 API {f['api']} 处"
+        return f"VM 分派器（{f['loops']} 个分派循环，{share}），不是业务源码"
+    # a loop of the interpreter's shape inside a function that is mostly something else
+    note = f"；另含 {f['loops']} 个分派循环形态的循环（{share}）" if f["loops"] else ""
     if f["globals"]:
         names = sorted(f["globals"], key=lambda k: (-f["globals"][k], k))
+        if f["api"]:
+            return f"业务 API {f['api']} 处，读全局 {len(names)} 个" + note
         more = f" 等 {len(names)} 个" if len(names) > limit else ""
-        return "读全局 " + ", ".join(names[:limit]) + more + "（未见业务 API 名）"
+        return "读全局 " + ", ".join(names[:limit]) + more + "（未见业务 API 名）" + note
+    if f["api"]:
+        return (f"业务 API 名 {f['api']} 处，不读全局（名字在字符串 / 字段名里，"
+                "或环境经捕获的变量传入）") + note
     if f["factory"]:
-        return "闭包工厂形态，不读全局（只操作捕获的变量）"
-    return "未见业务 API，不读全局"
+        return "闭包工厂形态，不读全局（只操作捕获的变量）" + note
+    return "未见业务 API，不读全局" + note
 
 
 def small_plain_summary(scan):
@@ -1295,17 +1385,27 @@ def print_vm_block(scan, inp, kept_work):
     entry = f"，入口 :{scan.vm['entry']}(...)" if scan.vm["entry"] else ""
     print(f"  · 这一层是 Luraph 的 VM 对象：{scan.vm['dispatch_loops']} 个解释器分派循环{entry}")
     in_big = sum(api_mentions(scan.src[s:e]) for s, e, _n, _f in scan.all_sized)
-    if scan.all_sized:
-        print(f"  · {len(scan.all_sized)} 个大函数全是 VM 分派器，没有 ≥ {scan.min_size:,} 字节的明文业务函数"
-              f"（大函数里的业务 API 名：{in_big} 处）")
-    else:
+    nb, nd = len(scan.all_sized), len(scan.dropped)
+    if not nb:
         print(f"  · 没有 ≥ {scan.min_size:,} 字节的函数")
+    elif nd == nb:
+        print(f"  · {nb} 个大函数全是 VM 分派器（函数的大半是分派循环），没有 ≥ {scan.min_size:,} 字节的"
+              f"明文脚本函数（大函数里的业务 API 名：{in_big} 处）")
+    else:
+        # by classify(): none of the others names the environment (else this were form A)
+        print(f"  · {nb} 个大函数里 {nd} 个是 VM 分派器（函数的大半是分派循环）；其余 {nb - nd} 个不是分派器，"
+              f"但不读全局、业务 API 名不足 {BUSINESS_MIN} 处（VM 自己的方法，或不碰环境的逻辑）：")
+        for x in scan.kept:
+            print(f"      {x[0]:>8} - {x[1]:<8}  {x[2]:>8,} 字节  {describe_function(scan, x)}")
+        print(f"    没有 ≥ {scan.min_size:,} 字节的明文脚本函数（大函数里的业务 API 名：{in_big} 处）")
     if scan.small_plain:
         sp = scan.small_plain
         print(f"  · 有 {len(sp)} 个没被虚拟化的小函数（明文 Lua，共 {sum(x[2] for x in sp):,} 字节，业务 API "
               f"{sum(scan.fact(x)['api'] for x in sp)} 处）：{small_plain_summary(scan)}")
         print(f"    加 --force 可以导出它们；最大的 {max(x[2] for x in sp):,} 字节，"
               f"小于阈值 {scan.min_size:,}，所以不算作脚本主体")
+    if scan.dropped:
+        print("  · 被判为分派器的函数想自己看：加 --keep-dispatchers（连同 --force）一并导出，逐段标注")
     small = sum(a for _it, a in scan.small_other)
     if small or scan.api_outside:
         where = []
@@ -1352,6 +1452,9 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="判定为 VM 时也导出：有没被虚拟化的小函数就导出它们，否则导出 VM 函数骨架；"
                          "输入不像 Luraph 产物时，仍把其中的函数切出来")
+    ap.add_argument("--keep-dispatchers", action="store_true",
+                    help="被判为 VM 分派器的大函数也导出（排在最后，逐段标注为分派器）；"
+                         "判定依据是结构：函数的大半是解释器分派循环")
     ap.add_argument("--no-run", action="store_true",
                     help="完全不执行输入：跳过 [2b] 剥容器（那一步在沙箱里运行容器代码）")
     ap.add_argument("--vm-report", action="store_true",
@@ -1367,7 +1470,8 @@ def main():
 
     out_path = Path(args.output) if args.output else inp.with_name(inp.stem + "_反混淆.lua")
     work_dir = args.work or (str(out_path.parent) if args.output else None)
-    scan = Scan(inp, min_size=args.min_size, work_dir=work_dir, allow_run=not args.no_run)
+    scan = Scan(inp, min_size=args.min_size, work_dir=work_dir, allow_run=not args.no_run,
+                keep_dispatchers=args.keep_dispatchers)
     try:
         rc, _keep = run(scan, args, inp, out_path, kept_work=work_dir is not None)
         return rc
@@ -1382,7 +1486,8 @@ def run(scan, args, inp, out_path, kept_work):
     directory"; nothing is kept there any more."""
     scan.load()
     raw = scan.raw
-    print(f"[1] 读取：{inp.name}  {len(raw.encode('utf-8', 'surrogateescape')):,} 字节")
+    print(f"[1] 读取：{inp.name}  {inp.stat().st_size:,} 字节"
+          + ("（开头的 UTF-8 BOM 已去掉）" if scan.bom else ""))
     if scan.header["version"]:
         pre = scan.header["prelude"]
         extra = f"（头注释前有 {len(pre.strip().splitlines())} 行附加代码）" if pre else ""
@@ -1430,8 +1535,8 @@ def run(scan, args, inp, out_path, kept_work):
     print("[3] AST 解析成功")
     print(f"[4] 发现 {len(scan.funcs)} 个函数")
     print(f"[5] 长度 ≥ {args.min_size:,} 的函数：{len(scan.all_sized)} 个")
-    for s, e, n, _f in scan.all_sized:
-        print(f"      {s:>8} - {e:<8}  {n:>8,} 字节")
+    for x in scan.all_sized:
+        print(f"      {x[0]:>8} - {x[1]:<8}  {x[2]:>8,} 字节  {describe_function(scan, x)}")
     if scan.small_plain:
         sp = scan.small_plain
         how = "一并导出" if scan.form == "A" else \
@@ -1477,12 +1582,16 @@ def run(scan, args, inp, out_path, kept_work):
             print(f"    · 另有 {len(loops)} 个小于阈值的函数是查表跳转循环（VM 分派器的形态），不导出"
                   f"（共 {sum(x[2] for x in loops):,} 字节）")
 
+    keeping = "（--keep-dispatchers：仍然导出，排在最后）" if scan.keep_dispatchers else ""
     if scan.dropped and len(scan.dropped) < len(scan.all_sized):
-        print(f"[5a] 剔除 VM 分派器 {len(scan.dropped)} 个：")
+        print(f"[5a] 剔除 VM 分派器 {len(scan.dropped)} 个{keeping}：")
         for s, e, n, _f in scan.dropped:
             print(f"      {s:>8} - {e:<8}  {n:>8,} 字节  （查表跳转，非业务代码）")
     elif scan.dropped:
-        print(f"[5a] {len(scan.dropped)} 个大函数全部是 VM 分派器（查表跳转），没有业务函数")
+        print(f"[5a] {len(scan.dropped)} 个大函数全部是 VM 分派器（查表跳转），没有业务函数{keeping}")
+    if scan.dropped:
+        print("     依据是结构，不看函数里出现什么名字：解释器分派循环"
+              "（while true do OP = CODE[PC]; if OP < n …，对 OP 做数值分支）占了函数的大半")
     if args.list:
         return 0, keep
 
@@ -1527,6 +1636,18 @@ def run(scan, args, inp, out_path, kept_work):
     for k, v in scan.signals.items():
         print(f"      {k:<22} {v}")
     print(f"      综合得分 = {scan.score}")
+    # what the decision rests on is structure, not these names: which of the candidate
+    # functions read globals at all (the VM's own code keeps every library function in a
+    # table slot and reads none)
+    cand = [x for x in scan.sized if x not in scan.dropped]
+    n_script = sum(1 for x in cand if scan.is_script(x))
+    g = scan.script_globals()
+    names = sorted(g, key=lambda k: (-g[k], k))
+    print(f"      脚本函数（读全局，或业务 API ≥ {BUSINESS_MIN} 处）：{len(cand)} 个候选里 {n_script} 个；"
+          f"读到的全局名 {len(names)} 种" + ("：" + ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+                                       if names else ""))
+    print(f"      （形态 A = 候选里有 ≥ {scan.min_size:,} 字节的脚本函数；判定只看这一条和函数结构，"
+          "不看上面的 API 名：没有 UI 代码的脚本一样算数）")
 
     if forced_all:
         pass                    # the user asked for everything; said so above
@@ -1536,9 +1657,19 @@ def run(scan, args, inp, out_path, kept_work):
             keep = keep_vm
             if not args.force:
                 return 4, keep
-            if scan.small_plain:
-                print(f"  --force 已指定：导出 {len(scan.small_plain)} 个没被虚拟化的小函数"
-                      "（脚本主体仍在 VM 里，不在输出中）…")
+            plain = [x for x in scan.sized if x not in scan.dropped]
+            if plain:
+                bits = []
+                small = [x for x in plain if x[2] < scan.min_size]
+                if small:
+                    bits.append(f"{len(small)} 个没被虚拟化的小函数")
+                if len(plain) - len(small):
+                    bits.append(f"{len(plain) - len(small)} 个 ≥ {scan.min_size:,} 字节、不是分派器的函数"
+                                "（不读全局）")
+                if len(scan.sized) - len(plain):
+                    bits.append(f"{len(scan.sized) - len(plain)} 个 VM 分派器（--keep-dispatchers）")
+                print(f"  --force 已指定：导出 {len(scan.sized)} 个函数（" + "，".join(bits)
+                      + "）；脚本主体仍在 VM 里，不在输出中 …")
             else:
                 print("  --force 已指定，继续导出 VM 函数骨架（不是业务源码）…")
             print()
@@ -1562,7 +1693,7 @@ def run(scan, args, inp, out_path, kept_work):
             print("═" * 64)
             print("  ⚠ 业务代码已编译进 VM 字节码（静态提取拿不到源码）")
             print("═" * 64)
-            print("  大函数内部全是 VM 寄存器操作，没有可读的业务 API 调用。")
+            print("  候选函数都不读全局，也没有可读的业务 API 调用（只有 VM 寄存器操作）。")
             print("  静态路径到此为止 —— 但字节码本身是可解的。")
             print("═" * 64)
             print()
@@ -1693,12 +1824,16 @@ def run(scan, args, inp, out_path, kept_work):
     if n_disp:
         what.append(f"VM 分派器 {n_disp} 个（解释器骨架，不是业务源码）")
     not_exported = [x for x in scan.dropped if x not in scan.sized]
+    # a dispatcher is only ever in the output because the user asked (--keep-dispatchers) or
+    # because nothing else was there (--force on a VM-only chunk)
     out_lines.append(f"-- 共导出 {len(bodies)} 个函数：" + "，".join(what)
                      + (f"；另有 VM 分派器 {len(not_exported)} 个未导出" if not_exported else ""))
     if not luraph:
         out_lines.append("-- 注意：这里只有从文件里切出来的函数；函数之外的代码（顶层语句等）不在这份输出里")
     elif scan.form == "vm" and (n_bus or n_script):
-        out_lines.append("-- 注意：这里只有没被虚拟化的小函数。脚本主体由 VM 以字节码形式解释执行，不在这份输出里；"
+        size_word = "小函数" if all(x[2] < scan.min_size for x in scan.sized if x not in scan.dropped) \
+            else "函数"
+        out_lines.append(f"-- 注意：这里只有没被虚拟化的{size_word}。脚本主体由 VM 以字节码形式解释执行，不在这份输出里；"
                          "要用去虚拟化器（python3 -m devm.run）")
     elif n_bus + n_script == 0:
         out_lines.append("-- 注意：这份输出里没有业务源码。"
@@ -1710,7 +1845,8 @@ def run(scan, args, inp, out_path, kept_work):
     if any(i["fallback"] for i in infos):
         out_lines.append("-- 部分段落使用了保守排版（每条语句一行）：缩进排版没有通过 token 校验")
     if rename:
-        out_lines.append("-- 局部变量已重命名（作用域取自 luau-ast；每段都与原函数做过语法树比对）")
+        out_lines.append("-- 局部变量已重命名（作用域取自 luau-ast；每段都与原函数做过语法树比对）。名字说的是变量"
+                         "初始化时的值；之后又被赋了别的值的变量保留原名")
     n_comment = sum(i["slot_comment"] for i in infos)
     n_inline = sum(i["slot_inline"] for i in infos)
     if n_comment:

@@ -828,11 +828,18 @@ class PE:
         fstack = set()
         openups = set()
 
-        def visit(st):
+        def visit(st, prev=None):
             t = st[0]
             if t == 'assign' and len(st[1]) == len(st[2]):
                 # `stack = {..., stack}`, also as one target of a multiple assignment
                 # (`stack, a = {[9]=limit, [7]=stack, ...}, operand[pc]`)
+                # Other builds save the stack in a scratch variable first (`tmp = stack; stack, a =
+                # {[9]=limit, [6]=tmp, ...}, operand[pc]`: the second interpreter of
+                # examples/layer3.lua, Luraph v15.2).  The scratch variable is not for-loop state.
+                tmp = None
+                if prev is not None and prev[0] == 'assign' and len(prev[1]) == 1 and len(prev[2]) == 1 \
+                        and prev[1][0][0] == 'name' and prev[2][0][0] == 'name':
+                    tmp = (prev[1][0][1], prev[2][0][1])
                 for tg, val in zip(st[1], st[2]):
                     while val[0] == 'paren':
                         val = val[1]
@@ -844,6 +851,13 @@ class PE:
                         fstack.add(nm)
                         for v in vals:
                             if v[0] == 'name':
+                                fvars.add(v[1])
+                    elif tmp and tmp[1] == nm and sum(1 for v in vals if v == ('name', tmp[0])) == 1 \
+                            and len(vals) >= 3 and all(v[0] == 'name' for v in vals):
+                        fstack.add(nm)
+                        fvars.add(nm)
+                        for v in vals:
+                            if v[1] != tmp[0]:
                                 fvars.add(v[1])
             if t == 'forin' and len(st[2]) == 1 and st[2][0][0] == 'name' and len(st[1]) == 2:
                 body = st[3]
@@ -858,12 +872,13 @@ class PE:
                         txt = repr(body[:3])
                         if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
                             openups.add(c[1])
-            for sub in substmts(st):
-                visit(sub)
+            for blk in subblocks(st):
+                for i, sub in enumerate(blk):
+                    visit(sub, blk[i - 1] if i else None)
 
         for l in loops:
-            for st in l[2]:
-                visit(st)
+            for i, st in enumerate(l[2]):
+                visit(st, l[2][i - 1] if i else None)
         return fvars, fstack, openups
 
     # -- emission
@@ -1491,6 +1506,12 @@ class PE:
                 ups = tabs[0] if tabs else self.parked
                 self.parked = None
                 return [self.make_closure([f, ups])]
+            if a and not isinstance(a[0], LuaTable):
+                # a wrapper with several parameters of which only one is live (`function(m, m, m)`:
+                # the last one, examples/layer3.lua): the upvalue list is the one table passed
+                tabs = [x for x in a if isinstance(x, LuaTable)]
+                if len(tabs) == 1 and all(x is None or x is tabs[0] for x in a):
+                    return [self.make_closure([f, tabs[0]])]
             return [self.make_closure([f] + a)]
         if isinstance(f, Sym):
             return self.emit_call(f.e, args, want)
@@ -2146,6 +2167,15 @@ def substmts(st):
     if t == 'forin':
         return st[3]
     return []
+
+
+def subblocks(st):
+    """The statement lists nested directly in a statement, one per arm (substmts joins them)."""
+    t = st[0]
+    if t == 'if':
+        return [b for _, b in st[1]] + ([st[2]] if st[2] else [])
+    sub = substmts(st)
+    return [sub] if sub else []
 
 
 def lua_tostr(v):

@@ -566,6 +566,17 @@ class Structurer:
             # conditional
             t, e = b.succ
             m = self.ipdom_of(cur)
+            if GUARD_TAILS and m is not None and (t == m or e == m) and stop != m:
+                # one side goes straight to the join and the join runs
+                # straight into a return / error: a guard clause with a copy
+                # of that tail, the other side stays at this level (else a
+                # chain of such checks nests the rest of the function once
+                # per check)
+                tail = self.terminal_tail(m, loop)
+                if tail is not None:
+                    out.append(SIf(b.cond if t == m else negate(b.cond), SBlock(tail), SBlock()))
+                    cur = e if t == m else t
+                    continue
             if loop is not None and m is not None and m not in loop[1] and (m != loop[2] or m in self.stub_follows):
                 # (a follow behind exit stubs is where every break ends up,
                 # not a join: `if c then stub; break end` keeps the rest here)
@@ -580,26 +591,32 @@ class Structurer:
                     cur = e if t == loop[0] else t
                     continue
                 # one side continues: the other paths may still meet in the body
-                m = self.common_join(t, e, loop) or m
+                m = self.common_join(t, e, loop, stop) or m
             if m is None:
                 # paths that return early keep the join from post-dominating:
                 # join at the first block both sides can reach
-                m = self.common_join(t, e, loop)
+                m = self.common_join(t, e, loop, stop)
             if m is None:
                 # no join point: if one side always leaves (return / break /
                 # continue / error), keep the other side at this level
                 # (the sides still end at this region's stop: an outer join)
+                c1 = b.cond
+                if GUARD_TAILS and len(self.reach_from(e, loop)) * 2 < len(self.reach_from(t, loop)):
+                    # try the clearly smaller side first: when both sides
+                    # leave, the short one (a failed check's response) is
+                    # the guard clause and the long one stays at this level
+                    t, e, c1 = e, t, negate(b.cond)
                 then = self.region(t, stop, loop)
                 if terminal(then):
-                    out.append(SIf(b.cond, then, SBlock()))
+                    out.append(SIf(c1, then, SBlock()))
                     cur = e
                     continue
                 els = self.region(e, stop, loop)
                 if terminal(els):
-                    out.append(SIf(negate(b.cond), els, SBlock()))
+                    out.append(SIf(negate(c1), els, SBlock()))
                     out += then
                     return out
-                out.append(SIf(b.cond, then, els))
+                out.append(SIf(c1, then, els))
                 return out
             then = self.region(t, m, loop)
             els = self.region(e, m, loop)
@@ -690,9 +707,9 @@ class Structurer:
         self.stub_follows.add(f)
         return f
 
-    def reach_from(self, start, loop):
+    def reach_from(self, start, loop, stop=None):
         """Blocks reachable from `start` without passing the loop header/exit
-        (or leaving the loop body)."""
+        (or leaving the loop body), and without going on behind `stop`."""
         seen = set()
         st = [start]
         while st:
@@ -702,23 +719,94 @@ class Structurer:
             if loop is not None and (x == loop[0] or x == loop[2] or x not in loop[1]):
                 continue
             seen.add(x)
-            st += self.blocks[x].succ
+            if x != stop:
+                st += self.blocks[x].succ
         return seen
 
-    def common_join(self, t, e, loop):
+    def common_join(self, t, e, loop, stop=None):
         """The earliest (reverse post-order) block reachable from both branch
-        targets, not yet emitted; None if there is none."""
-        a = self.reach_from(t, loop)
-        if not a:
+        targets, not yet emitted; None if there is none. With JOIN_DOM: the
+        block both targets reach that the most of what both reach has to pass
+        (see dominant_join)."""
+        if JOIN_DOM:
+            m = self.dominant_join(t, e, loop, stop)
+        else:
+            a = self.reach_from(t, loop)
+            if not a:
+                return None
+            both = [x for x in self.reach_from(e, loop) if x in a and x not in self.emitted]
+            if not both:
+                return None
+            m = min(both, key=lambda x: self.rpo_index.get(x, 1 << 30))
+        if m is None:
             return None
-        both = [x for x in self.reach_from(e, loop) if x in a and x not in self.emitted]
-        if not both:
-            return None
-        m = min(both, key=lambda x: self.rpo_index.get(x, 1 << 30))
         # a join the branch targets themselves would be (then/else side empty) is fine;
         # a join inside a nested loop is not (the loop header is where it is entered)
         for h, body in self.loop_body.items():
             if m in body and h != m and (loop is None or h != loop[0]) and (t not in body or e not in body):
+                return None
+        return m
+
+    def dominant_join(self, t, e, loop, stop):
+        """A join for the branch targets t and e inside the region that ends
+        at `stop`. Of the blocks both targets reach (C), the first one in
+        reverse post-order need not be where the paths meet: a short block of
+        one path's own in front of the real join (`x = 1` on two of three
+        ways in), or an error handler both sides can end in, comes earlier,
+        and taking it as the join puts the real one inside a branch (then it
+        is reached again from outside: a copy per way in). So: dominators
+        from a root above t and e, over what they reach in this region.
+        - Some path reaches `stop`: the join has to be on every way from t
+          and e to `stop` (else that way would run the join's code on its way
+          out); of those blocks the one nearest to the branch. None in C: no
+          join (one side leaves on its own, the caller makes a guard clause).
+        - Else: the block of C that dominates the most of C; ties go to the
+          earlier one. Not a join: a small region nothing leaves again (a
+          shared failure handler, an error both sides can end in) when one
+          side is small too and the other many times larger. `if failed then
+          report; HANDLER end` reads better than the rest of the function
+          in an `else`, at the price of a copy of the handler per check."""
+        a = self.reach_from(t, loop, stop)
+        b = self.reach_from(e, loop, stop)
+        both = {x for x in b if x in a and x not in self.emitted}
+        if not both:
+            return None
+        nodes = a | b
+        blocks = self.blocks
+        root = -1
+
+        def succ(n):
+            if n == root:
+                return [t, e]
+            if n == stop:
+                return []
+            return [s for s in blocks[n].succ if s in nodes]
+
+        def preds(n):
+            ps = [p for p in blocks[n].preds if p in nodes and p != stop]
+            if n == t or n == e:
+                ps.append(root)
+            return ps
+        idom, index = dominators(root, succ, preds)
+        if stop is not None and stop in nodes:
+            m, x = None, stop
+            while x != root and x is not None:
+                if x in both:
+                    m = x
+                x = idom.get(x)
+            return m
+        size = dict.fromkeys(nodes, 0)
+        for n in sorted(nodes, key=lambda n: -index.get(n, -1)):
+            if n in both:
+                size[n] += 1
+            p = idom.get(n)
+            if p is not None and p != root and p != n:
+                size[p] += size[n]
+        m = min(both, key=lambda x: (-size[x], self.rpo_index.get(x, 1 << 30)))
+        rm = self.reach_from(m, loop, stop)
+        if len(rm) <= HANDLER_BLOCKS:
+            small, big = (a, b) if len(a) <= len(b) else (b, a)
+            if len(small) <= 2 * HANDLER_BLOCKS and len(big - rm) >= 4 * len(small):
                 return None
         return m
 
@@ -848,6 +936,14 @@ class Structurer:
 # CFG (semantics-preserving) and the function is structured again
 
 SPLIT_LIMIT = 3000      # statements node splitting may copy per function
+# Structurer.region: `if c then <join's short tail> end` guard clauses (a
+# front end switches it on: Luraph v15.2's flattened main function is a
+# chain of checks whose failing side goes to the function's end)
+GUARD_TAILS = bool(os.environ.get("DEVIRT_GUARD_TAILS"))
+# Structurer.common_join: choose the join by dominance instead of taking the
+# first block both sides reach (dominant_join; a front end switches it on)
+JOIN_DOM = bool(os.environ.get("DEVIRT_JOIN_DOM"))
+HANDLER_BLOCKS = 12     # dominant_join: largest shared failure handler that is copied per check
 
 
 def structure(entry, blocks, own=None, rounds=60):

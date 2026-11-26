@@ -13,8 +13,13 @@ exactly the uses the parser bound to it.
 What this module provides
 
   LineIndex            (line, column) of an AST location  ->  offset in the text
-  Renamer              new names for the locals of one AST subtree; the naming heuristics are
-                       the ones of readable3.derive (unchanged), the scoping is the parser's
+  Renamer              new names for the locals of one AST subtree; what a local is called
+                       comes from the tree of its initialising expression (libs/luanames.py:
+                       the value, not the first method of a chain), the scoping is the
+                       parser's
+  dispatch_loops       the interpreter dispatch loops of a tree (shape + decision tree on the
+                       opcode); factory_leaf / globals_in: the other structural facts
+                       deob.py classifies functions by
   slot_hints           `tbl[N]` reads whose slot is assigned exactly once, from a plain local,
                        in the visible code: the name of that local is a reading aid
   alpha_equal          proof obligation for the two above: two ASTs are the same program up to
@@ -32,13 +37,16 @@ import threading
 
 try:
     from readable3 import derive, sanitize, BAD_BASE, RESERVED
+    import luanames
 except ImportError:                                   # imported as libs.luascope
     from .readable3 import derive, sanitize, BAD_BASE, RESERVED
+    from . import luanames
 
 _LOC_KEYS = frozenset(('location', 'argLocation', 'varargLocation', 'indexLocation',
                        'nameLocation', 'prefixLocation', 'keyLocation', 'debugname',
                        'functionDepth', 'commentLocations'))
-_GENERIC_BASE = frozenset(('v', 'val', 'Res', 'num', 'str', 'cond', 'flag'))
+# bases too weak to replace a one- or two-letter original name
+_GENERIC_BASE = frozenset(('v', 'val', 'Res', 'Item', 'num', 'str', 'cond', 'flag'))
 _LOOPS = frozenset(('AstStatWhile', 'AstStatRepeat', 'AstStatFor', 'AstStatForIn'))
 
 _FN_HINTS = (
@@ -200,6 +208,88 @@ def globals_in(node):
     return out
 
 
+DISPATCH_MIN_CASES = 4
+_COMPARE_OPS = frozenset(('CompareLt', 'CompareLe', 'CompareGt', 'CompareGe', 'CompareEq',
+                          'CompareNe'))
+
+
+def _local_key(node):
+    """(location, name) of the declaration an AstExprLocal node refers to, else None."""
+    if isinstance(node, dict) and node.get('type') == 'AstExprLocal':
+        ref = node.get('local') or {}
+        return ref.get('location'), ref.get('name')
+    return None
+
+
+def dispatch_loops(node, min_cases=DISPATCH_MIN_CASES):
+    """The interpreter dispatch loops below `node`: [{'node': the AstStatWhile, 'cases': n,
+    'declared': bool}], in no particular order.
+
+    A dispatch loop fetches an opcode from an array by a program counter and branches on it:
+
+        while true do
+            local OP[, X] = CODE[PC]        -- one value: local[local]; `OP = CODE[PC]` with OP
+            if OP < 73 then ...             --   a local declared before the loop also occurs
+                                            --   (Luraph v15.2), 'declared' is then False
+
+    The shape is the one devm/vmmodel.py looks for (first statement binds from `CODE[PC]`,
+    second statement is an `if`).  On top of it the loop must be a decision tree on the
+    opcode: OP is compared with at least `min_cases` different number constants somewhere in
+    the loop ('cases' is that count; which variable a comparison names is taken from the
+    parser's binding, not from its spelling).  That keeps ordinary script loops out, e.g.
+    `while true do local item = queue[head]; if item == nil then break end ... end`."""
+    out = []
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, list):
+            stack.extend(v for v in n if isinstance(v, (dict, list)))
+            continue
+        if not isinstance(n, dict):
+            continue
+        stack.extend(v for v in n.values() if isinstance(v, (dict, list)))
+        if n.get('type') != 'AstStatWhile':
+            continue
+        cond = n.get('condition') or {}
+        if cond.get('type') != 'AstExprConstantBool' or cond.get('value') is not True:
+            continue
+        body = (n.get('body') or {}).get('body') or []
+        if len(body) < 2 or body[1].get('type') != 'AstStatIf':
+            continue
+        s0 = body[0]
+        values, vars_ = s0.get('values') or [], s0.get('vars') or []
+        if len(values) != 1 or not vars_:
+            continue
+        if s0.get('type') == 'AstStatLocal':
+            op = (vars_[0].get('location'), vars_[0].get('name'))
+            declared = True
+        elif s0.get('type') == 'AstStatAssign' and all(_local_key(v) for v in vars_):
+            op = _local_key(vars_[0])
+            declared = False
+        else:
+            continue
+        val = values[0]
+        if (val.get('type') != 'AstExprIndexExpr' or not _local_key(val.get('expr'))
+                or not _local_key(val.get('index'))):
+            continue
+        consts = set()
+        inner = [body]
+        while inner:
+            x = inner.pop()
+            if isinstance(x, list):
+                inner.extend(v for v in x if isinstance(v, (dict, list)))
+                continue
+            inner.extend(v for v in x.values() if isinstance(v, (dict, list)))
+            if x.get('type') == 'AstExprBinary' and x.get('op') in _COMPARE_OPS:
+                for a, b in ((x.get('left'), x.get('right')), (x.get('right'), x.get('left'))):
+                    if (_local_key(a) == op and isinstance(b, dict)
+                            and b.get('type') == 'AstExprConstantNumber'):
+                        consts.add(b.get('value'))
+        if len(consts) >= min_cases:
+            out.append({'node': n, 'cases': len(consts), 'declared': declared})
+    return out
+
+
 def _statements(fn):
     body = fn.get('body') or {}
     return body.get('body', []) if body.get('type') == 'AstStatBlock' else []
@@ -240,7 +330,8 @@ def factory_leaf(fn):
 # ------------------------------------------------------------------------------------------
 class _Local:
     __slots__ = ('key', 'name', 'kind', 'decl_tok', 'refs', 'pinned', 'assigned', 'new',
-                 'scope_id', 'block_id', 'decl_off', 'init', 'index', 'fn_tok')
+                 'scope_id', 'block_id', 'decl_off', 'init', 'init_node', 'later', 'index',
+                 'fn_tok')
 
     def __init__(self, key, name, kind):
         self.key = key
@@ -255,6 +346,9 @@ class _Local:
         self.block_id = None        # id of the AstStatBlock node that declares it
         self.decl_off = -1
         self.init = None            # (first token, end token) of the initialising expression
+        self.init_node = None       # its AST node (a `local` with a value of its own)
+        self.later = []             # value nodes assigned to it after the declaration (None:
+                                    # no expression of its own: `a, b = f()`, `x += 1`)
         self.index = 0              # position among the variables of its statement
         self.fn_tok = None          # token index of `function` for a local function
 
@@ -285,8 +379,14 @@ class Analysis:
                                     # which Luraph hands captured variables to a VM closure
         self.table_dynw = {}        # table key -> writes `T[<not a constant>] = ...`
         self.empty_tables = set()   # keys of locals declared as `local T = {}`
+        self.handover_result = {}   # table key -> for every such hand-over, what becomes of
+                                    # the VALUE of the call: 'indexed' (`obj:m({T})[1]`,
+                                    # `obj:m({T}).x`), the key of the local it is stored in,
+                                    # or None (called, passed on, stored in a field ...)
+        self.local_based = {}       # local key -> uses as the base of an index (x.name, x[k], x:m())
         self._as_base = set()       # ids of AstExprLocal nodes that are the base of an index
-        self._as_handed = {}        # id of an AstExprLocal node -> receiver key (see above)
+        self._as_handed = {}        # id of an AstExprLocal node -> (receiver key, destination)
+        self._call_dest = {}        # id of an AstExprCall node -> 'indexed' | local key
         self._scopes = []           # [{name: _Local}]
         self._scope_ids = []
         self._blocks = []           # ids of the enclosing AstStatBlock nodes
@@ -388,8 +488,16 @@ class Analysis:
     def _snapshot(self):
         return tuple(self._anc), tuple(self._blocks), tuple(self._scope_ids)
 
+    def _call_goes_to(self, value, dest):
+        """Remember what becomes of the value of the call expression `value`."""
+        while isinstance(value, dict) and value.get('type') == 'AstExprGroup':
+            value = value.get('expr')
+        if isinstance(value, dict) and value.get('type') == 'AstExprCall':
+            self._call_dest[id(value)] = dest
+
     def _slot_write(self, var, stmt, value, single):
         slot = self._slot_of(var)
+        self.local_based[slot[0]] = self.local_based.get(slot[0], 0) + 1
         self._use(var['expr'])
         rec = {'stmt': stmt, 'value': value, 'single': single, 'ctx': self._snapshot(),
                'block': self._blocks[-1] if self._blocks else 0}
@@ -445,12 +553,16 @@ class Analysis:
                 self._pop()
         elif ty == 'AstStatLocal':
             values = n.get('values', [])
+            for i, v in enumerate(n.get('vars', [])[:len(values)]):
+                self._call_goes_to(values[i], self._key(v))
             self._walk(values)
             for v in n.get('vars', []):
                 self._walk(v.get('luauType'))
             for i, v in enumerate(n.get('vars', [])):
                 init = self._tok_range(values[i]) if i < len(values) else None
                 lc = self._declare(v, 'local', init, i)
+                # `local a, b = f()`: b has no expression of its own (it is f's second result)
+                lc.init_node = values[i] if i < len(values) else None
                 if (i < len(values) and values[i].get('type') == 'AstExprTable'
                         and not values[i].get('items')):
                     self.empty_tables.add(lc.key)
@@ -512,13 +624,18 @@ class Analysis:
                 self._pop()
         elif ty == 'AstStatAssign':
             vars_, values = n.get('vars', []), n.get('values', [])
+            for i, v in enumerate(vars_[:len(values)]):
+                if _local_key(v):
+                    self._call_goes_to(values[i], _local_key(v))
             self._walk(values)
             single = len(vars_) == 1 and len(values) == 1
             for i, v in enumerate(vars_):
                 if self._slot_of(v) is not None:
                     self._slot_write(v, n, values[i] if i < len(values) else None, single)
                 elif v.get('type') == 'AstExprLocal':
-                    self._use(v).assigned += 1
+                    lc = self._use(v)
+                    lc.assigned += 1
+                    lc.later.append(values[i] if i < len(values) else None)
                 else:
                     self._dynamic_write(v)
                     self._walk(v)
@@ -528,14 +645,18 @@ class Analysis:
             if self._slot_of(v) is not None:
                 self._slot_write(v, n, None, False)
             elif v.get('type') == 'AstExprLocal':
-                self._use(v).assigned += 1
+                lc = self._use(v)
+                lc.assigned += 1
+                lc.later.append(None)
             else:
                 self._dynamic_write(v)
                 self._walk(v)
         elif ty == 'AstStatFunction':
             name = n['name']
             if name.get('type') == 'AstExprLocal':
-                self._use(name).assigned += 1
+                lc = self._use(name)
+                lc.assigned += 1
+                lc.later.append(None)
             else:
                 self._walk(name)
             self._walk(n['func'])
@@ -543,14 +664,18 @@ class Analysis:
             lc = self._use(n)
             self.table_uses[lc.key] = self.table_uses.get(lc.key, 0) + 1
             if id(n) in self._as_base:
-                pass                # `T[expr]` / `T.name`: the table itself goes nowhere
+                # `T[expr]` / `T.name`: the table itself goes nowhere
+                self.local_based[lc.key] = self.local_based.get(lc.key, 0) + 1
             elif id(n) in self._as_handed:
-                self.table_handed.setdefault(lc.key, []).append(self._as_handed[id(n)])
+                rkey, dest = self._as_handed[id(n)]
+                self.table_handed.setdefault(lc.key, []).append(rkey)
+                self.handover_result.setdefault(lc.key, []).append(dest)
             else:
                 self.table_escapes[lc.key] = self.table_escapes.get(lc.key, 0) + 1
         elif ty == 'AstExprIndexName':
             if (n.get('expr') or {}).get('type') == 'AstExprLocal':
                 self._as_base.add(id(n['expr']))
+            self._call_goes_to(n.get('expr'), 'indexed')
             self._children(n)
         elif ty == 'AstExprCall':
             fn = n.get('func') or {}
@@ -563,13 +688,14 @@ class Analysis:
                     for item in arg.get('items', []):
                         val = item.get('value') or {}
                         if val.get('type') == 'AstExprLocal':
-                            self._as_handed[id(val)] = rkey
+                            self._as_handed[id(val)] = (rkey, self._call_dest.get(id(n)))
             self._children(n)
         elif ty == 'AstExprGlobal':
             self.globals.add(n.get('global'))
         elif ty == 'AstExprIndexExpr':
             slot = self._slot_of(n)
             if slot is not None:
+                self.local_based[slot[0]] = self.local_based.get(slot[0], 0) + 1
                 self._use(n['expr'])
                 rng = self._tok_range(n)
                 # which of the locals assigned to this slot so far does their own NAME still
@@ -589,6 +715,7 @@ class Analysis:
             else:
                 if (n.get('expr') or {}).get('type') == 'AstExprLocal':
                     self._as_base.add(id(n['expr']))
+                self._call_goes_to(n.get('expr'), 'indexed')
                 self._children(n)
         elif ty == 'AstLocal':
             raise ScopeError('declaration in a place this walk does not know: %s'
@@ -645,10 +772,13 @@ class Renamer:
                 new = orig
             if new is None:
                 if self._taken(base):
+                    # the 2nd `child` is `child2`; the 2nd `tbl_60` is `tbl_60_2`, not `tbl_602`
+                    # (which would read as slot 602), the 2nd `arg12` is `arg12_2`
+                    sep = '_' if base[-1].isdigit() else ''
                     m = 2
-                    while self._taken(base + str(m)):
+                    while self._taken(base + sep + str(m)):
                         m += 1
-                    base = base + str(m)
+                    base = base + sep + str(m)
                 new = base
         lc.new = new
         if not self._scope_names:
@@ -681,26 +811,34 @@ class Renamer:
                         break
             return base
         if lc.kind == 'local':
-            seg = None
-            if lc.init is not None:
-                s, e = lc.init
-                seg = [(t[0], t[1]) for t in toks[s:e]]
-                first = s
-                if seg and first in self._ref_new:
-                    # name things after what the variable is called NOW (tbl_60, not B_60)
-                    seg[0] = ('w', self._ref_new[first])
+            node = lc.init_node
+            if node is None:
+                base = None
+            else:
+                def resolve(ref):
+                    # what the variable is called NOW (tbl_60, not B_60)
+                    other = a.locals.get((ref['local']['location'], ref['local']['name']))
+                    return (other.new or other.name) if other is not None else ref['local']['name']
 
-                def resolve(name, _first=first):
-                    # derive() only ever asks about the first word of the expression
-                    return self._ref_new.get(_first, name)
-            else:
-                def resolve(name):
-                    return name
-            if seg and len(seg) == 1 and seg[0][0] == 'w' and seg[0][1] in RESERVED:
-                # `local x = nil` / `= true`: nothing to name it after (not `nil2`, `true2`)
-                base = 'flag' if seg[0][1] in ('true', 'false') else None
-            else:
-                base = derive(seg, resolve) if seg else None
+                def function_name(fn):
+                    # a function is named after what its first statements touch (the token
+                    # text of that function, readable3.derive's keyword list)
+                    rng = a._tok_range(fn)
+                    if rng is None or toks[rng[0]][1] != 'function':
+                        return None
+                    return derive([(t[0], t[1]) for t in toks[rng[0]:rng[1]]], lambda name: name)
+
+                base = luanames.value_name(node, resolve, function_name)
+                # A name says what the variable holds.  One that is assigned again holds
+                # something else later (obfuscated code reuses its variables like registers):
+                # the name of the first value stays only if every later value gets the very
+                # same name by these rules (`s = B[28]` again); otherwise the variable keeps
+                # the name it has, which claims nothing.
+                if base is not None and lc.assigned:
+                    for other in lc.later:
+                        if other is None or luanames.value_name(other, resolve, function_name) != base:
+                            base = None
+                            break
             if base is None:
                 nm = lc.name
                 base = nm if (nm.isidentifier() and nm.isascii()) else 'v'
@@ -806,7 +944,11 @@ def slot_table_problem(analysis, tkey):
         The one use that is let through is Luraph's own way of handing captured variables to
         a closure it creates, `obj:method(..., {[k] = T, ...}, ...)` with `obj` a parameter
         (the VM object) that is never assigned: what such a closure writes is outside the
-        visible code in any case (the output's header says so)."""
+        visible code in any case (the output's header says so).  The value of that call
+        must stay opaque in the visible code, as a closure does: when the call itself is
+        indexed (`obj:m({T})[1]`), or the local it is stored in ever is
+        (`local p = obj:m({T}); p[1][10] = x`), the capture list is back in visible hands
+        and T may be written through it."""
     a = analysis
     tab = a.locals.get(tkey)
     if tab is None:
@@ -823,6 +965,9 @@ def slot_table_problem(analysis, tkey):
         recv = a.locals.get(rkey) if rkey is not None else None
         if recv is None or recv.kind not in ('param', 'external') or recv.assigned:
             return 'handed to a method of an object built in the visible code'
+    for dest in a.handover_result.get(tkey, ()):
+        if dest == 'indexed' or (dest is not None and a.local_based.get(dest)):
+            return 'the value of the hand-over call is indexed in the visible code'
     return None
 
 

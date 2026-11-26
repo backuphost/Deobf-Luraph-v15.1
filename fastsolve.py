@@ -7,7 +7,9 @@
 
 Runs the target in the sandbox that mkfast.py builds (a global table of its own, see
 luasandbox.py: Luau's libraries only, no file access, no require; what the target loads is
-captured and not run) and writes into outdir:
+captured and not run) and writes into outdir.  This tool runs WHATEVER file it is given, a
+plain script included (its prints show up as "[OUT] ..." lines): deciding whether a file is a
+container worth running is deob.py's job (deob.unwrap_reason), not this tool's.
 
   chunk<n>.lua            code the target handed to loadstring/load (n-th call); for a Luraph
                           container this is the VM chunk.  The code is NOT run.

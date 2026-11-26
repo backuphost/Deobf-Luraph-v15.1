@@ -157,7 +157,8 @@ def run_trace(sample, limit=20000, arg_file=None, timeout=60):
         print("[✗] 找不到 luau 运行时；" + luaubin.MISSING_HINT)
         return None
 
-    src = Path(sample).read_bytes().decode('latin-1')
+    import luasandbox
+    src = luasandbox.strip_bom(Path(sample).read_bytes().decode('latin-1'))
     injected, n = inject(src, limit)
     if injected is None:
         print("[✗] 找不到 VM 分派点（local X=Y[Z];if X<64 这种模式）")

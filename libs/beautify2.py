@@ -37,7 +37,8 @@ if __name__ == '__main__':
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
-    src = Path(sys.argv[1]).read_bytes().decode('utf-8', errors='surrogateescape')
+    from deobf_plus import read_lua
+    src = read_lua(sys.argv[1])
     toks = tokenize(src)
     lay = {}
     out, ok = format_checked(toks, info=lay)

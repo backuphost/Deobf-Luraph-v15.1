@@ -2030,6 +2030,28 @@ class Printer:
 
 FLAT_FALLBACK = True
 
+# Luraph's tamper response is a function that loads the instruction arrays of its own VM function
+# into registers and hands them to a routine that overwrites them (called wherever a check of the
+# protection fails).  No program of the script does that, so such a function is labelled in the
+# output.  Off by default (the committed v15.1 results were written without the label); run.py
+# switches it on for v15.2.
+NOTE_TRAPS = False
+TRAP_NOTE = "Luraph's tamper response: loads this function's own VM instruction arrays for a routine that scrambles them (the protection calls it where one of its checks fails)"
+
+
+def loads_own_code(pir):
+    """True when a lifted function reads the operand arrays of a VM function as values (the
+    dump names them `__LPH_PROTOS[n]["vars"][...]`)."""
+    def walk(x):
+        if isinstance(x, tuple):
+            if len(x) == 2 and x[0] == 'outer' and isinstance(x[1], str):
+                return x[1].startswith('__LPH_PROTOS[') and '["vars"]' in x[1]
+            return any(walk(y) for y in x)
+        if isinstance(x, list):
+            return any(walk(y) for y in x)
+        return False
+    return any(walk(n.tree) for n in pir.nodes.values() if n.tree is not None)
+
 
 def flat_ast(st, why, params=()):
     """Fallback for a function the structurer gives up on: a state machine with one `if` per basic
@@ -2130,6 +2152,8 @@ class Decompiler:
                 break
         self.stats['protos'] += 1
         self.stats['warnings'].extend(cfg.warnings)
+        if NOTE_TRAPS and loads_own_code(pir):
+            ast.insert(0, ['comment', TRAP_NOTE])
         return params, cfg.vararg, ast
 
     def closure_text(self, e, printer, name=None):

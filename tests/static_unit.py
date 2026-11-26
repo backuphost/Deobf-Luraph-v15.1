@@ -316,6 +316,146 @@ def main():
           luascope.globals_in(root_) == {'game': 1, 'loadstring': 1, 'newglobal': 1, 'print': 1},
           str(luascope.globals_in(root_)))
 
+    # ---- interpreter dispatch loops: the shape, and the parser's binding of the opcode
+    tree = 'if op<1 then a=1 elseif op<2 then a=2 elseif op==3 then a=3 elseif op>=4 then a=4 end'
+    loops = [
+        # (source, [(cases, declared)] expected)
+        ('local c,pc,a={},1,0 while true do local op=c[pc];%s;pc=pc+1 end' % tree, [(4, True)]),
+        ('local c,pc,a={},1,0 while true do local op,x=c[pc];%s;pc=pc+1 end' % tree, [(4, True)]),
+        # opcode variable declared before the loop (Luraph v15.2)
+        ('local c,pc,a,op={},1,0 while true do op=c[pc];%s;pc=pc+1 end' % tree, [(4, False)]),
+        # three different numbers are no decision tree
+        ('local c,pc,a={},1,0 while true do local op=c[pc];if op<1 then a=1 elseif op<2 then a=2 '
+         'elseif op<3 then a=3 elseif op<3 then a=4 end;pc=pc+1 end', []),
+        # the index is a constant: a slot read, not a fetch by program counter
+        ('local c,pc,a={},1,0 while true do local op=c[25];%s;pc=pc+1 end' % tree, []),
+        # the value is not an index expression / two values
+        ('local c,pc,a={},1,0 while true do local op=c(pc);%s;pc=pc+1 end' % tree, []),
+        ('local c,pc,a={},1,0 while true do local op,x=c[pc],1;%s;pc=pc+1 end' % tree, []),
+        # second statement is not an `if`
+        ('local c,pc,a={},1,0 while true do local op=c[pc];pc=pc+1;%s end' % tree, []),
+        # not `while true`
+        ('local c,pc,a={},1,0 while pc do local op=c[pc];%s;pc=pc+1 end' % tree, []),
+        # the numbers are compared with ANOTHER variable of the same name (inner declaration)
+        ('local c,pc,a,f={},1,0 while true do local op=c[pc];if op==nil then break end;'
+         'do local op=f();%s end;pc=pc+1 end' % tree, []),
+        # assignment to a field or a global is no opcode fetch
+        ('local c,pc,a,t={},1,0,{} while true do t.op=c[pc];if t.op<1 then a=1 end end', []),
+        # two loops, one nested in a function inside the other's handler
+        ('local c,pc,a={},1,0 while true do local op=c[pc];%s;local g=function(d,q)local a;while true do '
+         'local op=d[q];%s;q=q+1 end end;pc=pc+1 end' % (tree, tree), [(4, True), (4, True)]),
+    ]
+    for text, want in loops:
+        root_, errs_ = luascope.parse(text, ast)
+        got = sorted((d['cases'], d['declared']) for d in luascope.dispatch_loops(root_))
+        check('dispatch_loops %s: %s' % (want, text[30:90]), not errs_ and got == sorted(want), str(got) + str(errs_[:1]))
+
+    # ---- names say what the value is (libs/luanames.py): the last operation decides
+    import luanames
+    names = [
+        ('game:GetService("TweenService")', 'TweenService'),
+        ('game:GetService(name)', 'service'),
+        ('game:GetService("HttpService"):JSONDecode(readfile(p))', 'decoded'),
+        ('game:GetService("ReplicatedStorage").Assets.UI:FindFirstChild(n)', 'child'),
+        ('game:GetService("ReplicatedStorage").Assets', 'Assets'),
+        ('N("GuiService"):GetGuiInset().Y', 'Y'),
+        ('workspace:GetServerTimeNow()', 'serverTimeNow'),
+        ('obj:GetAttribute("ItemType")', 'ItemType'),
+        ('obj:FindFirstChild("not an identifier")', 'child'),
+        ('sig:GetPropertyChangedSignal("Size"):Connect(f)', 'conn'),
+        ('part:IsDescendantOf(m)', 'isDescendantOf'),
+        ('obj:Row("Quick", 1)', 'RowRes'),
+        ('Instance.new("UIGridLayout")', 'uiGridLayout'),
+        ('Instance.new(cls)', 'inst'),
+        ('Color3.fromRGB(1, 2, 3)', 'color'),
+        ('Vector3.new(1, 2, 3).Unit', 'Unit'),
+        ('UDim.new', 'UDim_new'),
+        ('math.floor(x / 2)', 'floorRes'),
+        ('os.clock() + 3', 'clockRes'),
+        ('tostring(x):lower()', 'lowerRes'),
+        ('make("Frame", {})', 'Frame'),
+        ('helper(1, 2)', 'helperRes'),
+        ('helper(1)(2)', 'helperRes'),
+        ('a.Name == true or a.Username == true', 'cond'),
+        ('not a', 'cond'),
+        ('a.ws and "Live" or "Connecting"', 'str'),
+        ('a and a:FindFirstChild("UI")', 'UI'),
+        ('a.x or 0', 'x'),
+        ('#a.items', 'len'),
+        ('-a.speed', 'speedRes'),
+        ('a.Scale - b', 'ScaleRes'),
+        ('1 + 2 * 3', 'num'),
+        ('"a" .. b', 'str'),
+        ('a.list[i]', 'listItem'),
+        ('a.list["key"]', 'key'),
+        ('tbl[60]', 'tbl_60'),
+        ('tbl[60].x[2]', 'xItem'),
+        ('{conns = {}, n = 1}', 'conns'),
+        ('{1, 2}', 'tbl'),
+        ('function() end', 'fn'),
+        ('if a then a.first else a.second', 'first'),
+        ('(a.b :: any)', 'b'),
+        ('nil', None),
+        ('...', None),
+    ]
+    for expr, want in names:
+        text = 'local tbl, a, b = ...\nlocal x = ' + expr + '\n'
+        root_, errs_ = luascope.parse(text, ast)
+        node = root_['body'][1]['values'][0]
+        got = luanames.value_name(node, lambda ref: ref['local']['name'])
+        check('value_name %s -> %s' % (expr, want), not errs_ and got == want, str(got) + str(errs_[:1]))
+    for a_, b_ in (('GuiInset', 'guiInset'), ('JSONData', 'jsonData'), ('UIScale', 'uiScale'), ('X', 'x'),
+                   ('already', 'already'), ('JSON', 'json')):
+        check('lower_first %s' % a_, luanames._lower_first(a_) == b_, luanames._lower_first(a_))
+    # the renamer with these rules: services by their names, the second of a kind numbered,
+    # and a number never appended to a digit (`tbl_60_2`, not `tbl_602`)
+    nsrc = ('local B = {}\nlocal a = game:GetService("TweenService")\nlocal b = game:GetService("TweenService")\n'
+            'local c = game:GetService("HttpService"):JSONDecode("{}")\nlocal d = B[60]\n'
+            'do local e = B[60]; print(d, e) end\nprint(a, b, c)\n')
+    root_, _e = luascope.parse(nsrc, ast)
+    ren = luascope.Renamer(luascope.Analysis(root_, luascope.LineIndex(nsrc), dp.tokenize_pos(nsrc)))
+    ntext, nok = dp.format_checked(ren.apply(dp.tokenize_pos(nsrc)))
+    check('renamer: values named after what they are',
+          nok and 'local TweenService = game:GetService("TweenService")' in ntext
+          and 'local TweenService2 = game:GetService("TweenService")' in ntext
+          and 'local decoded = game:GetService("HttpService"):JSONDecode("{}")' in ntext
+          and 'local tbl_60 = tbl[60]' in ntext and 'local tbl_60_2 = tbl[60]' in ntext, ntext)
+    root2_, errs2_ = luascope.parse(ntext, ast)
+    check('renamer: that text binds like the input', not errs2_ and luascope.alpha_equal(root_, root2_)[0], ntext)
+    # a variable that is assigned again holds something else later: it keeps its own name,
+    # unless every value it ever gets is named alike (the same slot read again)
+    rsrc = ('local B, other = {}, print\nlocal gui = game:GetService("CoreGui")\ngui = other()\n'
+            'local hit = B[28]\nhit = B[28]\nlocal made = game:FindFirstChild("Thing")\n'
+            'made = Instance.new("Frame")\nlocal total = game:GetService("Stats")\ntotal += 1\n'
+            'local once = game:GetService("Lighting")\nlocal u, v = game:GetService("Teams"), 1\nu, v = other()\n'
+            'print(gui, hit, made, total, once, u, v)\n')
+    root_, _e = luascope.parse(rsrc, ast)
+    ren = luascope.Renamer(luascope.Analysis(root_, luascope.LineIndex(rsrc), dp.tokenize_pos(rsrc)))
+    rtext, rok = dp.format_checked(ren.apply(dp.tokenize_pos(rsrc)))
+    check('renamer: a reassigned variable is not named after its first value',
+          rok and 'local gui = game:GetService("CoreGui")' in rtext and 'local tbl_28 = tbl[28]' in rtext
+          and 'tbl_28 = tbl[28]' in rtext and 'local made = game:FindFirstChild("Thing")' in rtext
+          and 'local total = game:GetService("Stats")' in rtext
+          and 'local Lighting = game:GetService("Lighting")' in rtext
+          and 'local u, v = game:GetService("Teams"), 1' in rtext, rtext)
+    root2_, errs2_ = luascope.parse(rtext, ast)
+    check('renamer: that text binds like the input (reassigned)', not errs2_ and luascope.alpha_equal(root_, root2_)[0], rtext)
+
+    # ---- a UTF-8 byte order mark is not part of a script
+    check('strip_bom: str, latin-1 str, bytes; nothing else is touched',
+          luasandbox.strip_bom('\ufeffx') == 'x' and luasandbox.strip_bom('\xef\xbb\xbfx') == 'x'
+          and luasandbox.strip_bom(b'\xef\xbb\xbfx') == b'x' and luasandbox.strip_bom('x\ufeff') == 'x\ufeff'
+          and luasandbox.strip_bom('') == '' and luasandbox.strip_bom(b'\xef\xbbx') == b'\xef\xbbx')
+    bom_file = os.path.join(tempfile.gettempdir(), 'static_unit_bom_%d.lua' % os.getpid())
+    try:
+        with open(bom_file, 'wb') as fh:
+            fh.write(b'\xef\xbb\xbflocal a = 1\nprint(a)\n')
+        check('read_lua drops the mark and nothing else', dp.read_lua(bom_file) == 'local a = 1\nprint(a)\n')
+        check('a text with the mark does not parse; without it, it does',
+              bool(luascope.parse('\ufefflocal a = 1', ast)[1]) and not luascope.parse(dp.read_lua(bom_file), ast)[1])
+    finally:
+        os.unlink(bom_file)
+
     # ---- compile-only really is compile-only
     marker = os.path.join(tempfile.gettempdir(), 'static_unit_breakout_%d' % os.getpid())
     okc, msg = luasandbox.compile_only('end pcall(writefile, "%s", "x") if false then' % marker, luau)

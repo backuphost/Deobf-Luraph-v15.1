@@ -154,6 +154,47 @@ def looks_like_lua(inp):
     return head.count(b"\0") == 0
 
 
+def after_static(scan, rc, args):
+    """Automatic mode: what to do once deob.py's static scan is through.
+
+    `scan` is deob.Scan after deob.run() returned `rc`.  Returns None (the static result stands)
+    or (engine, extra engine arguments).  Prints why.
+
+    Nothing is handed over when the user asked for a look only (--list), for the static export
+    anyway (--force), or for no execution at all (--no-run): the engines run the script in a mock
+    environment."""
+    if args.list or args.force or args.no_run:
+        return None
+    form = getattr(scan, "form", None)
+    if rc == 4 and form == "vm":
+        if scan.bare_chunk():
+            buf = scan.sibling_buffer()
+            if not buf:
+                return None         # the advice printed above says how to supply the buffer
+            say()
+            say("[auto] VM chunk + 同目录的数据 buffer → 自动交给去虚拟化器 devm"
+                " / handing the chunk and its buffer to the devirtualizer")
+            return "devm", ["--chunk-arg", str(buf)]
+        say()
+        say("[auto] 脚本主体在 VM 里 → 自动交给去虚拟化器 devm（只做静态分析：--engine static）")
+        say("       the script runs on Luraph's VM: handing over to the devirtualizer (static only: --engine static)")
+        return "devm", []
+    if rc == 2 and not scan.evidence():
+        if not looks_like_lua(str(scan.inp)):
+            return None
+        name, conf, label = detect_other(str(scan.inp))
+        if name not in ("generic", "luraph_v15") and conf >= 0.5:
+            say()
+            say("[auto] 不是 Luraph，识别为 %s（%.2f）→ 交给动态引擎 deobf / not Luraph: detected %s, "
+                "handing over to the dynamic engine" % (label, conf, label))
+            return "deobf", []
+        say()
+        say("[auto] 没有认出混淆器，什么都没有运行。想看脚本在模拟环境里做了什么：--engine trace")
+        say("       no known obfuscator and nothing was run.  For a behaviour trace (the script is run in a"
+            " mock environment): --engine trace")
+    return None
+
+
 def hand_over(inp, out, engine, work=None, timeout=None, extra=()):
     """Run one engine (or, for engine == 'devm', devm with the deobf engine as fallback) and
     print what came of it.  Returns the front end's exit code."""

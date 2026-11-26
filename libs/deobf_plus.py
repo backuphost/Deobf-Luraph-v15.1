@@ -13,7 +13,8 @@ copy that shadowed this one on sys.path).
   3. 常量算术折叠：((0b1100+0b1)+(0B101111-0b100001)) -> 27。只折叠 Luau 在任何机器上
      都算出同一个值的表达式（libs/luaunum.py），有 luau 时逐条交给解释器复核。
   4. handler 表语义标注：抽取 [key]=value 映射，写入代码注释并导出 handler_map.md。
-  5. 变量语义重命名：作用域取自 luau-ast（libs/luascope.py），命名规则沿用 libs/readable3.py。
+  5. 变量语义重命名：作用域取自 luau-ast（libs/luascope.py），名字按初始化表达式的语法树取（libs/luanames.py：
+     叫值是什么，而不是表达式里第一个方法的名字）。
   6. 排版只改空白：format_checked() 把结果重新词法化并与输入逐 token 比较。
 
 只做静态等价变换，不执行任何被分析脚本。业务层源码需要动态执行 VM 解密桩才能拿到，
@@ -995,6 +996,15 @@ def same_values(a, b):
     return a == b
 
 
+def read_lua(path):
+    """A Lua file as text for the tools that lex, format or parse it: every byte survives
+    (invalid UTF-8 as surrogate escapes), except a UTF-8 byte order mark in front of the
+    file, which is dropped (Luau's parser takes it for a syntax error; it is an artefact of
+    the editor that saved the file, not part of the script)."""
+    text = Path(path).read_bytes().decode('utf-8', errors='surrogateescape')
+    return text[1:] if text.startswith('\ufeff') else text
+
+
 # ---------------------------------------------------------------- 主流程
 def main():
     ap = argparse.ArgumentParser(description='Luraph v15.1 静态反混淆增强版')
@@ -1005,7 +1015,7 @@ def main():
     ap.add_argument('--no-fold', action='store_true', help='不做常量折叠')
     args = ap.parse_args()
 
-    src = Path(args.input).read_bytes().decode('utf-8', errors='surrogateescape')
+    src = read_lua(args.input)
     ptoks = tokenize_pos(src)
     toks = [(t, v) for t, v, _ in ptoks]
     print(f'[1] 词法: {len(toks):,} tokens')
@@ -1027,7 +1037,7 @@ def main():
     else:
         print('[!] 找不到 luau-ast：不重命名，不做语法树复核。' + luaubin.MISSING_HINT)
 
-    # 变量重命名：作用域来自 luau-ast，命名规则来自 readable3.derive
+    # 变量重命名：作用域来自 luau-ast，名字取自初始化表达式的语法树（libs/luanames.py）
     renamed = False
     if args.no_rename:
         print('[2] 按参数跳过重命名')

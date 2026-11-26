@@ -78,6 +78,12 @@ def lower(entry_key, order, D, link, prefix, upnames, closure):
         body = IDI.fold_single_use(body)    # (literals no longer stand between a temp and its use)
     body = VR.declare(body, (), own)
     body = VR.limit_locals(body)
+    for budget in (150, 120, 90, 60):
+        # a block that fills the budget leaves its nested blocks no room (a
+        # long main function with deep nesting): give the outer levels less
+        if VR.peak_locals(body) <= 195:
+            break
+        body = VR.limit_locals(body, 0, budget)
     params = VR.extract_params(body)
     rend = CG.Renderer(names)
     return rend.block(body, ""), params, nerr, sr.fallbacks

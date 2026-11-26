@@ -225,8 +225,9 @@ def build(src, minlen="512", stub=False, arg_files=(), call_result=True):
             args.append('"' + fh.read().hex() + '"')
 
     # SRC is the target byte for byte (luasandbox.lua_string_expr: a long bracket per piece,
-    # cut at carriage returns, which Luau would otherwise drop from "\r\n")
-    literal = luasandbox.lua_string_expr(src)
+    # cut at carriage returns, which Luau would otherwise drop from "\r\n"), except for a
+    # UTF-8 byte order mark in front of it, which no Luau accepts
+    literal = luasandbox.lua_string_expr(luasandbox.strip_bom(src))
     runner = (luasandbox.bytes_str(RUNNER).replace('@MINLEN@', str(int(minlen)))
               .replace('@EMU@', emu)
               .replace('@STUB@', stub_src)

@@ -66,7 +66,7 @@ def main():
         print('[✗] luau-ast 没有输出 AST：' + (r.stderr or r.stdout)[:200])
         return 1
     ast = json.loads(r.stdout[start:])
-    src = sample.read_text(encoding='utf-8', errors='ignore')
+    src = sample.read_text(encoding='utf-8', errors='ignore').lstrip('\ufeff')
     lines = src.split('\n')
 
     def off(l, c):

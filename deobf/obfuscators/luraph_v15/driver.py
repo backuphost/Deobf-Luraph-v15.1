@@ -211,6 +211,10 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             print("[*]   %d functions, %d unlifted blocks, %d unstructured jumps, %d new constant requests (%.1fs)"
                   % (stats["functions"], stats["errors"], stats["fallbacks"], len(new), time.time() - t1),
                   file=sys.stderr)
+            if stats.get("traps"):
+                # (Luraph v15.2, devirt.cut_cold_jumps)
+                print("[*]   %d jumps of untaken paths into other code not followed (marked in the output)"
+                      % stats["traps"], file=sys.stderr)
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
                 break
             if quick:
