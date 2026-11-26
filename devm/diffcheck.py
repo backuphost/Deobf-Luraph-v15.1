@@ -72,6 +72,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 US = '\x1f'
+CALLBACKS = 300      # --callbacks: at most this many functions are called after the run
 EVENT_KINDS = ('C', 'K', 'X', 'S')     # mock call, stand-in call, executor stand-in call, property write
 ID_RE = re.compile('\x01(\\d+)\x02')
 
@@ -170,6 +171,17 @@ def _key(a):
     return m.group(1) if m else '[' + a + ']'
 
 
+class Callback:
+    """A function the script handed to the environment, called once after the run."""
+
+    def __init__(self, index, at):
+        self.index, self.at = index, at      # at: number of events of the run recorded before it was handed over
+        self.events = []
+        self.errors = {}
+        self.end = None                      # 'returned' | 'waiting' | 'error' | None (cut)
+        self.end_message = ''
+
+
 class Run:
     """What one script did in the mock."""
 
@@ -180,6 +192,8 @@ class Run:
         self.notes = []           # (index of the next event, harness line): [http], [env], COMPILE ERROR ...
         self.globals = []         # (name, value) left behind
         self.placeholders = []    # (index of the next event, name): reads of REG_n, __LPH_ENV ... (a partial result)
+        self.callbacks = []       # with callbacks=<n>: functions called after the run, see Callback
+        self.callbacks_done = None  # number of functions the script handed over (None: that part did not finish)
         self.started = False
         self.end = None           # 'returned' | 'error' | None (cut)
         self.end_message = ''
@@ -245,7 +259,25 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
                 continue
             f = line[len(prefix):].split(US)
             kind = f[0]
-            if kind in EVENT_KINDS:
+            if kind in EVENT_KINDS and run.end is not None:
+                # after END: a function called afterwards (callbacks=<n>)
+                if run.callbacks:
+                    run.callbacks[-1].events.append(Event(kind, f[1] if len(f) > 1 else '', f[2:], line))
+                    counted += 1
+                    if counted >= 4 * max_events:
+                        break
+            elif kind == 'E' and run.end is not None:
+                if run.callbacks and run.callbacks[-1].events:
+                    run.callbacks[-1].errors[len(run.callbacks[-1].events) - 1] = f[2] if len(f) > 2 else ''
+            elif kind == 'CB':
+                run.callbacks.append(Callback(int(f[1]), int(f[2])))
+            elif kind == 'CE':
+                if run.callbacks:
+                    run.callbacks[-1].end = f[2] if len(f) > 2 else 'returned'
+                    run.callbacks[-1].end_message = _unquote(f[3]) if len(f) > 3 else ''
+            elif kind == 'DONE':
+                run.callbacks_done = int(f[1]) if len(f) > 1 and f[1].isdigit() else 0
+            elif kind in EVENT_KINDS:
                 ev = Event(kind, f[1] if len(f) > 1 else '', f[2:], line)
                 run.events.append(ev)
                 if not (kind == 'C' and ev.name in noise):
@@ -504,6 +536,51 @@ def _global_value(val):
     return _POSITION.sub('', _ADDRESS.sub(r'\1: 0x?', ID_RE.sub('#', val)))
 
 
+def compare_callbacks(orig, res, start, noise=NOISE_CALLS):
+    """The functions each script handed to the environment, called once after the run.
+    start: index in orig.events where the compared stretch begins (functions handed over before
+    it belong to Luraph's start-up).  Returns (same, headline part, report lines, data)."""
+    co_ = [c for c in orig.callbacks if c.at >= start]
+    cr_ = list(res.callbacks)
+    lines = []
+    handed_o = None if orig.callbacks_done is None else orig.callbacks_done - len([c for c in orig.callbacks if c.at < start])
+    data = {'callbacks_original': len(co_), 'callbacks_result': len(cr_), 'callbacks_same': 0, 'callback_events': 0}
+    n = min(len(co_), len(cr_))
+    for k in range(n):
+        a, b = co_[k], cr_[k]
+        ea = [(i, e) for i, e in enumerate(a.events) if not (e.kind == 'C' and e.name in noise)]
+        eb = [(i, e) for i, e in enumerate(b.events) if not (e.kind == 'C' and e.name in noise)]
+        m = _match_len(ea, 0, eb, frozenset(), frozenset())
+        if a.end is None or b.end is None:
+            # the run was cut inside this function: what both did so far must agree, nothing more is known
+            if m < min(len(ea), len(eb)):
+                break
+            lines.append('functions called afterwards: %d of %d compared (the %s run was cut inside function %d)' % (
+                k, n, 'original\'s' if a.end is None else 'result\'s', k + 1))
+            return True, 'the first %s the script handed over, called afterwards, do the same' % _n(k, 'function'), lines, data
+        if m < len(ea) or m < len(eb) or a.end != b.end or (
+                a.end == 'error' and _strip_position(a.end_message) != _strip_position(b.end_message)):
+            break
+        data['callbacks_same'] += 1
+        data['callback_events'] += len(ea)
+    else:
+        if len(co_) != len(cr_):
+            lines.append('original: %d functions handed over, result: %d' % (len(co_), len(cr_)))
+            return False, 'the original hands %s to the environment, the result %d' % (_n(len(co_), 'function'), len(cr_)), lines, data
+        if orig.callbacks_done is None or res.callbacks_done is None:
+            lines.append('functions called afterwards: the %s run was cut before all were called' % ('original\'s' if orig.callbacks_done is None else 'result\'s'))
+        return True, '%s the script handed over (handlers, callbacks), each called once afterwards, do the same (%s)' % (
+            _n(n, 'function'), _n(data['callback_events'])), lines, data
+    # function k differs
+    lines.append('function %d of %d (handed over after call %d of the result): original, then result' % (k + 1, n, len([1 for i, _ in compared(res, noise) if i < b.at])))
+    for tag, c, ev in (('original', a, ea), ('result', b, eb)):
+        lines.append('%s: %s, %s' % (tag, _n(len(ev)), {None: 'cut', 'returned': 'returned', 'waiting': 'waits',
+                                                          'error': 'stopped with an error: ' + c.end_message}[c.end]))
+        for line in _context(ev, min(m, max(len(ev) - 1, 0)), 3, 2) if ev else []:
+            lines.append(line)
+    return False, 'function %d of %d that the script handed over does something else when it is called' % (k + 1, n), lines, data
+
+
 def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS, vol_globals=frozenset()):
     """Compare two runs.  Returns a Verdict."""
     for run, who in ((orig, 'original'), (res, 'result')):
@@ -701,6 +778,14 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
         return finish(NOT_COMPARABLE, 'the result makes no call into the environment and leaves no global: there is nothing to compare '
                       '(the original %s after %s)' % (orig.how_ended(), _n(p, 'start-up call')))
     what = 'both return' if orig.end == 'returned' else 'both stop with the same error (%s)' % _strip_position(orig.end_message)[:120]
+    if orig.callbacks or res.callbacks:
+        ok, part, cb_lines, cb_data = compare_callbacks(orig, res, eo[p][0] if p < len(eo) else len(orig.events), noise)
+        data.update(cb_data)
+        main = '%s in the main run, %s' % (_n(m), what)
+        v = finish(SAME, 'the same %s; %s' % (main, part)) if ok else finish(DIFFERENT, '%s (the main run is the same: %s)' % (part, main))
+        for line in cb_lines:
+            v.add(line)
+        return v
     return finish(SAME, 'the same %s, %s%s' % (_n(m, 'call or property write') if m == 1 else '%d calls and property writes' % m, what,
                                              ', the same %s left behind' % _n(len(go), 'global') if go else ''))
 
@@ -826,11 +911,14 @@ def main(argv=None):
     ap.add_argument('--work', help='directory for the logs of the runs (default: a temporary one)')
     ap.add_argument('--timeout', type=float, default=120.0, help='time limit for the whole check in seconds (default 120)')
     ap.add_argument('--max-events', type=int, default=20000, help='compare at most this many calls of the script (default 20000)')
+    ap.add_argument('--callbacks', action='store_true',
+                    help='also call every function the script handed to the environment (event handlers, callbacks) once after '
+                         'the run, in both, and compare what they do (not compared: values that depend on time or chance)')
     ap.add_argument('--no-executor', action='store_true', help='run both as a plain Roblox client (default: executor environment)')
     ap.add_argument('--json', action='store_true', help='print the verdict as one JSON object')
     ap.add_argument('-v', '--verbose', action='store_true')
     a = ap.parse_args(argv)
-    options = [] if a.no_executor else ['executor=1']
+    options = ([] if a.no_executor else ['executor=1']) + (['callbacks=%d' % CALLBACKS] if a.callbacks else [])
     if a.log:
         return show_log(a.log, a.work, a.timeout, a.max_events, options, a.all)
     if not a.original or not a.result:

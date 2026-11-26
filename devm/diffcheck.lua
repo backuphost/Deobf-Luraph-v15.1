@@ -16,6 +16,10 @@
 --                                      partial result (REG_n, ARG_n, UPVAL_n, __LPH_..., LuraphVM)
 --   [dc] G<US>name<US>value            a global the script left behind (at the end, sorted)
 --   [dc] END<US>returned | error<US>message
+-- and with callbacks=<n>, after END (see the end of this file):
+--   [dc] CB<US>i<US>events before it was handed over     function i is called; its C/K/X/S/E lines follow
+--   [dc] CE<US>i<US>returned | waiting | error<US>message
+--   [dc] DONE<US>number of functions handed over
 --
 -- (<US> is the byte 0x1f.)  Values: strings and numbers by value, tables by content to a bounded
 -- depth, functions / instances / other objects by kind plus a serial number in order of first
@@ -48,6 +52,7 @@ end
 
 local salt = 1
 local TAG = "[dc] "
+local callbacksMax = 0        -- callbacks=<n>: after the run, call up to n functions the script handed over
 do
 	local pass = {}
 	for _, o in ipairs(options) do
@@ -56,7 +61,9 @@ do
 		-- nonce=<digits>: the lines of this log start with "[dc<digits>] ".  The reader picks the
 		-- digits per run, so text a script gets into another line (the URL of a request, with a
 		-- line break in it) cannot pass for a line of the recorder.
-		if s then salt = tonumber(s) elseif n then TAG = "[dc" .. n .. "] " else pass[#pass + 1] = o end
+		local c = string.match(o, "^callbacks=(%d+)$")
+		if s then salt = tonumber(s) elseif n then TAG = "[dc" .. n .. "] " elseif c then callbacksMax = tonumber(c)
+		else pass[#pass + 1] = o end
 	end
 	options = pass
 end
@@ -212,12 +219,46 @@ end
 
 -- ---------------------------------------------------------------- recording
 local logging, busy = false, false
+local inCallback, callbackCalls = false, 0
+local CALLBACK_CALLS = 400    -- a function called afterwards is stopped at its 400th call into the environment
 local function emit(kind, ...)
 	local n = select("#", ...)
 	local parts = table.create(n + 1)
 	parts[1] = TAG .. kind
 	for i = 1, n do parts[i + 1] = (select(i, ...)) end
 	ewrite(table.concat(parts, US) .. "\n")
+end
+
+-- Lua functions of the script that it hands to the environment (an event handler given to
+-- Connect, a Callback field of a table given to a library, a function assigned to a property):
+-- kept in the order they are handed over, with the number of events recorded before.
+local handed, handedSeen = {}, setmetatable({}, { __mode = "k" })
+local events = 0
+local function collect(v, depth)
+	local t = type(v)
+	if t == "function" then
+		if not handedSeen[v] and not known[v] then
+			local src = debug.info(v, "s")
+			if src ~= "[C]" and src ~= harnessPath and src ~= "rbxmock" and src ~= debug.info(1, "s") then
+				handedSeen[v] = true
+				handed[#handed + 1] = { fn = v, at = events }
+			end
+		end
+	elseif t == "table" and depth < 2 and (not mockTypeof or mockTypeof(v) == "table") then
+		-- in a fixed order: positions first, then string keys by name (the order `next` gives
+		-- depends on how the table was built, which differs between a VM and plain code)
+		local n = 0
+		while rawget(v, n + 1) ~= nil and n < 64 do
+			n += 1
+			collect(rawget(v, n), depth + 1)
+		end
+		local keys = {}
+		for k, x in next, v do
+			if type(k) == "string" and (type(x) == "function" or type(x) == "table") and #keys < 64 then keys[#keys + 1] = k end
+		end
+		table.sort(keys)
+		for _, k in ipairs(keys) do collect(rawget(v, k), depth + 1) end
+	end
 end
 
 local function record(kind, name, skip, ...)
@@ -228,7 +269,11 @@ local function record(kind, name, skip, ...)
 	parts[2] = name
 	local ok, err = pcall(function(...)
 		for i = skip + 1, n do parts[#parts + 1] = render((select(i, ...))) end
+		if callbacksMax > 0 then
+			for i = skip + 1, n do collect((select(i, ...)), 0) end
+		end
 	end, ...)
+	events += 1
 	if not ok then parts[#parts + 1] = "<not rendered: " .. clean(tostring(err)) .. ">" end
 	ewrite(table.concat(parts, US) .. "\n")
 	busy = false
@@ -276,6 +321,10 @@ G.cwrap = function(name, impl, ...)
 			now += (type(t) == "number" and t > 0 and t < 86400) and t or 0.03
 		end
 		local live = logging and not busy
+		if live and inCallback then
+			callbackCalls += 1
+			if callbackCalls > CALLBACK_CALLS then error("__LPH_BUDGET", 0) end
+		end
 		if live then
 			if name == "__newindex" then
 				record("S", "", 0, ...)
@@ -377,7 +426,13 @@ if type(globals) == "table" then
 	for _, k in ipairs(names) do
 		local f = rawget(globals, k)
 		rawset(globals, k, function(...)
-			if logging and not busy then record("X", k, 0, ...) end
+			if logging and not busy then
+				if inCallback then
+					callbackCalls += 1
+					if callbackCalls > CALLBACK_CALLS then error("__LPH_BUDGET", 0) end
+				end
+				record("X", k, 0, ...)
+			end
 			local r = table.pack(pcall(f, ...))
 			if r[1] then return unpack(r, 2, r.n) end
 			local msg = r[2]
@@ -446,6 +501,42 @@ G.__LPH_AFTER = function(okRun, message)
 		emit("END", "returned")
 	else
 		emit("END", "error", quote(string.match(tostring(message), "^[^\n]*") or ""))
+	end
+	if callbacksMax > 0 then
+		-- Second part: what the functions do that the script left with the environment.  Each is
+		-- called once, in the order it was handed over, on a thread of its own, with a permissive
+		-- stand-in of the mock for its first three arguments (the mock's `settings()` object: any
+		-- member, any call).  A wait suspends it (nothing resumes it: the run is over).
+		local arg = nil
+		do
+			local settings = env.settings
+			if type(settings) == "function" then
+				local okS, v = pcall(settings)
+				if okS then arg = v end
+			end
+		end
+		local resume = G.resumetop or coroutine.resume
+		busy, logging, inCallback = false, true, true
+		local i = 1
+		while i <= #handed and i <= callbacksMax do
+			local h = handed[i]
+			callbackCalls = 0
+			emit("CB", tostring(i), tostring(h.at))
+			local co = coroutine.create(h.fn)
+			local r = table.pack(pcall(resume, co, arg, arg, arg))
+			if not r[1] then
+				emit("CE", tostring(i), "error", quote(tostring(r[2])))
+			elseif r[2] == false then
+				emit("CE", tostring(i), "error", quote(string.match(tostring(r[3]), "^[^\n]*") or ""))
+			elseif coroutine.status(co) == "suspended" then
+				emit("CE", tostring(i), "waiting")
+			else
+				emit("CE", tostring(i), "returned")
+			end
+			i += 1
+		end
+		logging, inCallback = false, false
+		emit("DONE", tostring(#handed))
 	end
 end
 

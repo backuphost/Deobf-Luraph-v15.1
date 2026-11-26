@@ -433,6 +433,51 @@ print("end")
         self.assertEqual(run.events[0].text(), 'GetService(Instance<DataModel "Game">#1, "Players")')
 
 
+class Callbacks(Base):
+    """--callbacks: functions the script hands to the environment are called afterwards and compared."""
+    OPTIONS = ('executor=1', 'callbacks=%d' % diffcheck.CALLBACKS)
+    HUB = '''local button = Instance.new("TextButton")
+local count = 0
+button.MouseButton1Click:Connect(function()
+	count += 1
+	print("clicked", count)
+	button.Text = "Clicked " .. count
+end)
+game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
+	print("key", tostring(input.KeyCode))
+	task.wait(1)
+	print("never: nothing resumes a handler after the run")
+end)
+local Library = game:GetService("CoreGui").SomeUiLibrary
+Library:AddToggle({ Title = "Fly", Callback = function(on) print("toggle") setclipboard("fly") end, Default = false })
+task.defer(function() print("deferred") end)
+print("ready")
+'''
+
+    def test_handlers_are_called_and_compared(self):
+        v = self.expect(SAME, self.HUB, self.HUB, r'4 functions the script handed over .* do the same \(7 calls\)', options=self.OPTIONS)
+        self.assertEqual(v.data['callbacks_same'], 4)
+        # a difference inside a handler: invisible to the main run, found by this part
+        wrong = mutate(self.HUB, 'print("clicked", count)', 'print("Clicked", count)')
+        self.expect(SAME, self.HUB, wrong)
+        v = self.expect(DIFFERENT, self.HUB, wrong, r'function 1 of 4 that the script handed over does something else', options=self.OPTIONS)
+        self.assertIn('print("Clicked", 1)', v.text())
+        self.expect(DIFFERENT, self.HUB, mutate(self.HUB, 'setclipboard("fly")', 'setclipboard("walk")'), r'function 3 of 4', options=self.OPTIONS)
+        self.expect(DIFFERENT, self.HUB, mutate(self.HUB, 'print("deferred")', 'error("deferred")'), r'function 4 of 4', options=self.OPTIONS)
+        # a handler less
+        less = mutate(self.HUB, 'task.defer(function() print("deferred") end)\n', '')
+        self.expect(DIFFERENT, self.HUB, less, options=self.OPTIONS)
+
+    def test_functions_of_the_start_up_are_not_the_scripts(self):
+        v = self.expect(SAME, STARTUP + self.HUB, self.HUB, r'4 functions the script handed over', options=self.OPTIONS)
+        self.assertGreater(v.data['skipped'], 10)
+
+    def test_a_handler_that_never_ends_is_stopped(self):
+        a = 'game.ChildAdded:Connect(function() while true do print("again") end end)\nprint("ready")\n'
+        v = self.expect(SAME, a, a, r'1 function the script handed over', options=self.OPTIONS)
+        self.assertEqual(v.data['callback_events'], 400)
+
+
 class CommandLine(Base):
     def run_tool(self, *args):
         r = subprocess.run([sys.executable, '-m', 'devm.diffcheck'] + list(args), cwd=ROOT, capture_output=True, text=True, timeout=120)
