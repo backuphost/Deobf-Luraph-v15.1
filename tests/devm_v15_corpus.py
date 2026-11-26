@@ -394,6 +394,14 @@ class CallKeys(unittest.TestCase):
         self.assertTrue(any('per-call' in ln for ln in lines[1:]), lines)
         self.assertTrue(run.report('print("x")\n')[0].startswith('result: complete'))
 
+    def test_report_key_arithmetic_left(self):
+        from devm import run
+        text = 'local v2 = f()\nlocal v6 = bit32.band(v2, 65535) % 4294967296\nlocal v7 = v6 - v6 % 1 + 1912744306\nprint(1)\n'
+        lines = run.report(text)
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('key arithmetic' in ln for ln in lines[1:]), lines)
+        self.assertTrue(run.report('local x = y - y % 1\nprint(x)\n')[0].startswith('result: complete'))      # the script's own names
+
     def test_report_of_a_run_that_returned(self):
         from devm import run
         text = 'local a = (nil)[1]\nlocal b = (nil)[2]\nprint(1)\n'

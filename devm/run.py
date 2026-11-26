@@ -391,6 +391,9 @@ def run_report(notes):
 KEY_LEFT = re.compile(r'(?m)^[ \t]*return bit32\.bxor\(p\d+, \d{7,}\)(?:,.*)?$')
 
 
+KEY_MIX = re.compile(r'(?m)^.*\b(v\d+) - \1 % 1\b.*$')
+
+
 def report(text, returned=None):
     """What is left unrecovered in a result, in plain words.  `returned`: the traced run went to
     the script's end (None: read it off the head of a file main() wrote)."""
@@ -421,6 +424,9 @@ def report(text, returned=None):
     # Luraph's per-call keys (opaque._fold_call_keys) where they could not be folded: a parameter
     # xor-ed with a literal into an extra first result
     keys = len(KEY_LEFT.findall(code))
+    # ... and the interpreter's own key arithmetic where it did not fold to a constant: a number
+    # cut to 32 bits and to an integer by hand (`v = x % 4294967296; w = v - v % 1`)
+    mixes = len(KEY_MIX.findall(code))
     # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
     # protection's own checks, which a reader should not take for the script's
     traps = []
@@ -431,7 +437,7 @@ def report(text, returned=None):
                      'protection, not of the script' % (calls, m.group(1)))
     lines = max(1, text.count('\n'))
     out = []
-    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or keys):
+    if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or keys or mixes):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + traps
     out.append('result: PARTIAL')
@@ -462,6 +468,9 @@ def report(text, returned=None):
                    'this is how Luraph\'s per-call keys look, a number every caller passes and gets back changed.  They are folded '
                    'away where every caller is in the result; these were left because that could not be shown (or the script does '
                    'such arithmetic itself)' % keys)
+    if mixes:
+        out.append('  %d lines of Luraph\'s key arithmetic are left (`v - v %% 1` on a value cut to 32 bits): numbers the '
+                   'interpreter mixes into its keys, not part of the script' % mixes)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '

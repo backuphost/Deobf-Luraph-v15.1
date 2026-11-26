@@ -73,6 +73,7 @@ line per kind of thing that is missing:
 | `lines use UPVAL_n` | a captured variable of a function whose creation was not lifted |
 | `values printed as nil --[[...]]` | a loop variable, argument or operand without a known source |
 | `for loops without their loop statement`, `functions printed as a stub` | what the words say |
+| `lines of Luraph's key arithmetic are left` | `v - v % 1` on a value cut to 32 bits: numbers the interpreter mixes into its keys, where they did not fold to a constant |
 | `functions return a parameter xor-ed with a large literal` | Luraph's per-call keys (`return bit32.bxor(p, K), ...`) where they could not be folded because a caller is not in the result |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 
