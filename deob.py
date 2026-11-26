@@ -314,6 +314,26 @@ def static_container():
         return None
 
 
+def peek_container(src):
+    """What a container holds when the scan does not open it (a cut-off file whose first
+    payload is whole, a container built for another Lua, a container whose data payload does
+    not decode): the chunk as the static decoder reads it.  Nothing is run, and nothing is
+    read without the static decoder.  Returns (chunk text, complete) or None; `complete` is
+    False when the decoder got the chunk out of a damaged container (ContainerError.partial)."""
+    cs = static_container()
+    if cs is None:
+        return None
+    try:
+        r, complete = cs.decode(src), True
+    except cs.ContainerError as e:
+        r, complete = getattr(e, "partial", None), False
+    except Exception:           # noqa: BLE001  a peek never fails the run
+        return None
+    if r is None or not getattr(r, "chunk", None):
+        return None
+    return r.chunk.decode("utf-8", errors="surrogateescape"), complete
+
+
 def unwrap_container(src, workdir, arg_files=(), call_result=True, timeout=300, say=print):
     """Open Luraph's outer container and collect what it decodes.  The static decoder
     (static_container) is used when this tree has it; else, and when it does not know the
@@ -694,6 +714,7 @@ class Scan:
         self.inner_fx = None
         self.container_info = None  # {'opened': bool, 'via': ..., 'why': ...} for a container
         self._pre_unwrap = ""       # the text as it was before the container was opened
+        self.peeked = None          # what a container that stays closed holds (Scan.peek)
 
     def cleanup(self, keep_work=False):
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -732,6 +753,29 @@ class Scan:
         f = self.front
         return bool(f and self.front_decisive() and f["verdict"] == "luraph" and not self.container
                     and f["wrapper"] not in ("none", "container:other"))
+
+    def peek(self):
+        """For one of Luraph's containers that this scan does not open (damaged, or a build
+        for another Lua): what the static decoder can still read of the chunk inside, as
+        {'layout', 'entry', 'platform', 'chunk_bytes', 'complete', 'via'}; None when there
+        is nothing to say (no static decoder in the tree, chunk unreadable).  Information
+        only: the verdict stays what it is."""
+        f = self.front
+        if self.peeked is not None or self.container or not f \
+                or f["wrapper"] in ("none", "container:other"):
+            return self.peeked
+        got = peek_container(self._pre_unwrap or self.src)
+        if not got:
+            return None
+        import lphfront
+        text, complete = got
+        c = lphfront.classify(text)
+        known = c["layout"] in ("fn-args", "fn-args-vararg", "table", "setmt")
+        self.peeked = {"layout": c["layout"] if known else "unknown",
+                       "entry": c["entry"] if known else None,
+                       "platform": c["platform"] if known else "unknown",
+                       "chunk_bytes": nbytes(text), "complete": complete, "via": "static"}
+        return self.peeked
 
     def main_offset(self, text):
         """Offset of the main `return` of `text` when the front check located it."""
@@ -1821,6 +1865,18 @@ def print_front(scan):
         print("     ↳ 修整 / adjusted: " + r)
 
 
+def print_peek(scan):
+    """One line on what a container that stays closed holds, when the static decoder could
+    still read its chunk."""
+    pk = scan.peek()
+    if not pk or pk["layout"] == "unknown":
+        return
+    print("    容器里的 VM（静态解码读到的 chunk，%s 字节%s）/ the VM inside, as far as the static decoder reads "
+          "it: 主语句 %s；目标 / target: %s"
+          % (format(pk["chunk_bytes"], ","), "" if pk["complete"] else "，容器本身不完整",
+             LAYOUT_TEXT.get(pk["layout"], pk["layout"]), pk["platform"]))
+
+
 def front_exit(scan):
     """Exit code when the front check ends the run (not Luraph: 2; damaged or a build for
     another Lua: 8), else 0.  Prints the verdict and its reason."""
@@ -1828,6 +1884,7 @@ def front_exit(scan):
     v = f["verdict"]
     if v in ("damaged", "unsupported-target"):
         print(f"[✗] {VERDICT_TEXT[v]}")
+        print_peek(scan)
         print("    " + f["reason"])
         return allinone_code("UNPROCESSABLE")
     if v == "not-luraph" and scan.front_decisive() and not scan.layers:
@@ -1854,6 +1911,7 @@ def container_exit(scan):
         return 2
     if ci and not ci["opened"] and ci["kind"] == "damaged":
         print(f"[✗] {VERDICT_TEXT['damaged']}")
+        print_peek(scan)
         print("    容器打不开 / the container does not open: " + ci["why"])
         return allinone_code("UNPROCESSABLE")
     inner = scan.inner
@@ -1922,6 +1980,9 @@ def classify_file(path, work_dir=None, allow_run=True):
       bare_chunk  the input is a chunk taken out of a container (needs its data argument)
       container   None | {'opened': bool, 'via', 'chunk_bytes', 'chunk_name', 'data_kind',
                   'data_bytes'} or {'opened': False, 'kind', 'why'}
+      peek        only for a container that stays closed (damaged, another Lua) while the static
+                  decoder still reads its chunk: {'via', 'chunk_bytes', 'complete'}; layout,
+                  entry and platform are then those of that chunk
       route       engines the front end would try, in order ('' = none)
     """
     sc = Scan(path, work_dir=work_dir, say=lambda *a, **k: None, allow_run=allow_run)
@@ -1973,6 +2034,13 @@ def classify_file(path, work_dir=None, allow_run=True):
             out["container_platform"] = out["platform"]
             if out["verdict"] != "unsupported-target":      # (a Lua 5.3 container holds a Lua 5.3 VM)
                 out["platform"] = "unknown"
+        if out["wrapper"] not in ("none", "container:other") and not (out["container"] or {}).get("opened"):
+            pk = sc.peek()
+            if pk:
+                # the static decoder still reads the chunk: layout and target of the VM inside
+                out["peek"] = {k: pk[k] for k in ("via", "chunk_bytes", "complete")}
+                if pk["layout"] != "unknown":
+                    out["layout"], out["entry"], out["platform"] = pk["layout"], pk["entry"], pk["platform"]
         if out["verdict"] == "luraph":
             if out["layout"] in V14_LAYOUTS:
                 out["route"] = "devm"
