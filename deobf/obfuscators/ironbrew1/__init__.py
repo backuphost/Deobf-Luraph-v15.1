@@ -86,7 +86,7 @@ class Ironbrew1(Obfuscator):
         body, strings = trace.take_strings(body)
         if strings is not None:
             job.write(job.path(".strings.txt"), strings)
-        trace.status_line(body)
+        trace.status_line(body, job)
 
         def write_trace():
             # the VM's environment probes (Path2D, ...) open the trace: strip them
@@ -129,6 +129,10 @@ def lift(job, dump_path, dpath):
     st = prog.stats
     print("[*]   %d functions, %d unlifted blocks, %d unstructured jumps (%.1fs)"
           % (st["functions"], st["errors"], st["fallbacks"], time.time() - t0), file=sys.stderr)
+    if st["errors"]:
+        job.lacks("%d unlifted blocks" % st["errors"])
+    if st["fallbacks"]:
+        job.lacks("%d unstructured jumps" % st["fallbacks"])
     text = backend.run_big_stack(lambda: backend.finish_text(backend.polish(text)))
     header = (job.credit_header() +
               "-- Local names are inferred from use (the original names are not in the bytecode)\n")
