@@ -251,6 +251,23 @@ class Tool(unittest.TestCase):
         self.assertFalse(os.path.exists(out_path))
         self.assertIn("table VM", log)
 
+    def test_container_is_never_exported_as_the_script(self):
+        # a container whose payload is not a valid stream: damaged, exit 8, nothing written
+        out_path = os.path.join(self.tmp.name, "c.lua")
+        rc, log = self.run_tool(self.write("c_bad.lua", HEADER + CONTAINER), "-o", out_path, "--engine", "static")
+        self.assertEqual(rc, 8, log[-800:])
+        self.assertFalse(os.path.exists(out_path))
+        # a container that does not open here (it asks Roblox to inflate its payload) and has a
+        # big function reading globals: the static export must not take the container's own
+        # code for the script
+        big = "local function q()" + "".join('game:GetService("Players");Instance.new("Frame");' for _ in range(900)) + "end;"
+        z = CONTAINER.replace("local p=", big + "local p=").replace(
+            "local ok,f", 'local e=game:GetService("EncodingService"):DecompressBuffer(p);local ok,f')
+        rc, log = self.run_tool(self.write("c_closed.lua", HEADER + z), "-o", out_path, "--engine", "static")
+        self.assertIn(rc, (4, 8), log[-800:])           # 4: not opened here; 8: a static decoder calls it damaged
+        self.assertFalse(os.path.exists(out_path))
+        self.assertNotIn("[9]", log)
+
     def test_owner_statements_stay_guard_goes(self):
         text = ("-- This file is licensed with Luarmor.\n"
                 "if not is_from_loader then warn('Use the loadstring') return end;\n"

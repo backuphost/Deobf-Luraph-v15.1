@@ -5,9 +5,11 @@ deob.py —— Luraph 反混淆一体化入口（v15.1 / v15.2）+ 静态提取�
 
     python3 deob.py 输入.lua -o 输出.lua
 
-先做静态分析（剥容器、判断形态）。脚本的业务代码还是明文（形态 A）时，本文件自己把它切出来；
-脚本主体跑在 Luraph 的 VM 里时，自动交给去虚拟化器 devm（python3 -m devm.run）；devm 没出
-结果再试第二个引擎 deobf（python3 deobf/deob.py）；不是 Luraph 而是 IronBrew1 时交给 deobf。
+先做静态分析（识别、剥容器、判断形态）。脚本的业务代码还是明文（形态 A，v15.1 的写法）时，本文件
+自己把它切出来；脚本主体跑在 Luraph 的 VM 里时，自动交给去虚拟化器 devm（python3 -m devm.run）；
+devm 没出结果再试第二个引擎 deobf（python3 deobf/deob.py）。v14 的 VM 只交给 devm；v15.0 先交给
+deobf（它能提升那种布局）再试 devm。引擎的结果先核对再报告（引擎自己的 result: 行、未提升的块、
+能否解析、有没有代码行）。不是 Luraph 而是 IronBrew1 时交给 deobf。
 引擎之间的交接在 allinone.py。用 --engine static 可以只做下面说的静态部分。
 
 以下是静态提取引擎的说明。
@@ -39,8 +41,29 @@ Luraph v15.1 的常见形态是：
 函数），静态提取到剥壳为止：默认（--engine auto）接着自动交给去虚拟化器 devm；
 --engine static 时只说明情况并给出 `python3 -m devm.run` 的命令，退出码 4。
 
-关于「执行」：静态提取不运行脚本。唯一会运行输入的一步是 [2b] 剥 Luraph 容器。它只在
-下面三种情况之一成立时才做（unwrap_reason）：
+识别（[2a]，libs/lphfront.py，只看 token，不执行）
+----
+先找主语句：括号深度 0、块深度 0 上的第一个 `return`（`if not is_from_loader then ... return end`
+里的 return 不算），按它的形态分类，而不是按文件开头几个字节或最长字符串的大小：
+
+    return(function() ... end)()(...)   + 装载器文字        压缩容器（v14.0.3 - v15.0）
+    return(function(P1..Pn) ... end)(A1..An)(...)           fn-args VM（v14.0.2 - v14.3）
+    return({...}):M()(...)                                  table VM（v14.4 - v14.9）
+    return setmetatable({...},{}):M()(...)                  setmetatable VM（v15.x），带密文和装载器文字时是 v15 容器
+    local B=...;return({...}):M()  /  return setmetatable({...},{}):M(...)   从容器里取出的 chunk
+
+头注释 `-- This file was generated|protected using Luraph Obfuscator vX.Y[.Z]`（有没有
+` [https://lura.ph/]` 都行，后面可以粘着别的文字）可以在文件任何位置；它前后的注释、空行、
+`getgenv().x = ...` 这类语句、Luarmor 的 `if not is_from_loader then ... return end` 守卫、JSON 包装
+`{"luaCode": "..."}`、换行丢失（整个程序在头注释的 `--` 后面）都认得。结论有四种：luraph；
+not-luraph（退出码 2，说明理由）；damaged（退出码 8：主语句没有闭合、文本被改坏、容器密文解不开，
+说明哪里坏了）；unsupported-target（退出码 8：为 Lua 5.3/5.4 或 LuaJIT 生成，Luau 读不了）。
+v14 的两种 VM 布局里没有明文脚本函数：从不走形态 A 导出，直接交给 devm。
+
+关于「执行」：静态提取不运行脚本。唯一会运行输入的一步是 [2b] 剥 Luraph 容器。识别步骤认出来的
+文件，只有主语句是容器的才剥（VM 本体不执行，密文字符串再大也不是容器）；这棵树里有静态解码器
+devm/container_static.py 时连容器也不执行。识别步骤说不上来的文本（没有头注释、没有密文），
+只在下面三种情况之一成立时才剥（unwrap_reason）：
   · 文件带 Luraph 头注释；
   · 文件是 `return setmetatable({...},{}):X()(...)` 这种对象形态（Luraph 容器的写法），或者是
     `...):X(...)` 形态而且里面没有解释器分派循环（有分派循环的是 VM 本体，不是容器，不执行）；
@@ -58,7 +81,11 @@ Luraph v15.1 的常见形态是：
 
 退出码：0 完整结果；6 有结果但不完整（引擎的报告说明缺什么，或只有行为轨迹）；
 4 VM 形态而没有引擎给出结果（或 --engine static）；3 静态结果没通过语法校验；
-2 没认出来；1 出错；7 形态 C 自跑脚本。
+2 不是 Luraph（没认出来；仿造品；Luraph 头注释后面是别的混淆器）；
+8 是 Luraph 但按现状无法处理（文本被截断或损坏、容器密文损坏、为 Lua 5.3/5.4 或 LuaJIT 生成的版本）；
+1 出错；7 形态 C 自跑脚本。
+
+    python deob.py 输入.lua --classify   # 只识别：一行 JSON（版本、容器、VM 布局、结论），不启动引擎
 
     python deob.py 输入.lua --list       # 只列出发现的大函数，不输出
 
@@ -128,6 +155,9 @@ def luraph_header(text):
         return {"version": None, "offset": None, "prelude": ""}
     start, m = hit
     prelude = text[:start]
+    nl = text.find("\n", m.end())
+    if nl < 0 or not text[nl + 1:].strip():
+        prelude = ""            # the header is the last line: what stands in front of it is the program
     return {"version": m.group(2), "offset": start,
             "prelude": prelude if prelude.strip() else ""}
 
@@ -696,6 +726,13 @@ class Scan:
             return f["layout"]
         return None
 
+    def closed_container(self):
+        """True when the text is one of Luraph's containers (by its main statement) and it was
+        not opened: what the scan holds is then the container's own code, not the script's."""
+        f = self.front
+        return bool(f and self.front_decisive() and f["verdict"] == "luraph" and not self.container
+                    and f["wrapper"] not in ("none", "container:other"))
+
     def main_offset(self, text):
         """Offset of the main `return` of `text` when the front check located it."""
         if text is self.src:
@@ -832,10 +869,10 @@ class Scan:
         comment, an object without dispatch loops); and never with allow_run=False."""
         say = self.say
         self._pre_unwrap = self.src
-        decisive = self.front_decisive()
+        decisive = self.front_decisive() and self.front["verdict"] == "luraph"
         if decisive:
             f = self.front
-            if f["verdict"] != "luraph" or f["wrapper"] == "none":
+            if f["wrapper"] == "none":
                 return False
             why = "主语句是 Luraph 的压缩容器：%s" % f["wrapper"]
         else:
@@ -1086,9 +1123,10 @@ class Scan:
         self.chunk_score = api_mentions(self.src)
         # the loop count is taken from the syntax tree once there is one
         self.vm = vm_features(self.src, self.root, self.main_offset(self.src))
-        if self.layout() in V14_LAYOUTS:
+        if self.layout() in V14_LAYOUTS or self.closed_container():
             # A v14 VM (function-with-arguments or table layout) holds no plain-Lua script
-            # functions: every function in it is Luraph's own.  Never form A.
+            # functions: every function in it is Luraph's own.  Never form A.  The same goes
+            # for a container that did not open: its functions are the decoder.
             self.form = "vm"
             return self.form
         # Every Luraph script has a virtualized part; what differs is how much of it the author
@@ -1194,6 +1232,16 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
                         (the names this tool saves them under), else None
       'work_dir'        where chunk_path / buffer_path live
       'error'           None, or why the scan stopped
+      'verdict'         the front check's verdict (see classify_file): 'luraph' | 'not-luraph' |
+                        'damaged' | 'unsupported-target'; 'reason' says why for the last three.
+                        'damaged' and 'unsupported-target' end the scan ('error' = the reason).
+                        'not-luraph' does not end it here: the older tests still look at the
+                        text (and run it in the unwrap sandbox when it carries the header
+                        comment); a caller that wants the strict answer reads 'verdict'
+      'wrapper'         'none' | 'container:<head>-<codec>-<payloads>' by the main statement
+      'layout'          'fn-args' | 'fn-args-vararg' | 'table' | 'setmt' | 'unknown' | 'none':
+                        layout of the VM text (the chunk, when a container was opened).  The
+                        first three are the v14 layouts: form is then always 'vm'
     """
     sc = Scan(path, min_size=min_size, work_dir=work_dir, say=lambda *a, **k: None,
               allow_run=allow_run)
@@ -1202,7 +1250,8 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
            "form": "unknown", "engine": None, "score": 0, "chunk_score": 0, "big_functions": [],
            "small_functions": [], "script_functions": [], "dispatchers": [],
            "sandbox_run": False, "vm": dict(sc.vm), "bare_chunk": False,
-           "sibling_buffer": None, "work_dir": str(sc.work), "error": None}
+           "sibling_buffer": None, "work_dir": str(sc.work), "error": None,
+           "verdict": None, "reason": "", "wrapper": "none", "layout": "none"}
     try:
         sc.load()
         out["luraph_version"] = sc.header["version"]
@@ -1212,7 +1261,22 @@ def probe(path, work_dir=None, min_size=20000, allow_run=True):
             out["error"] = "luau / luau-ast not found: " + luaubin.MISSING_HINT
             return out
         sc.shells()
+        f = sc.front_check()
+        out["verdict"], out["reason"] = f["verdict"], f["reason"]
+        out["wrapper"], out["layout"] = f["wrapper"], f["layout"]
+        if f["verdict"] in ("damaged", "unsupported-target"):
+            out["error"] = f["reason"]
+            return out
+        # (a text with the header comment that is not Luraph's output still goes through the
+        # older tests here, which run it in the unwrap sandbox: tests/static_sandbox.py relies
+        # on probe() doing that.  deob.py's own run ends at the verdict and runs nothing.)
         sc.unwrap()
+        if sc.inner:
+            out["layout"] = sc.inner["layout"]
+            if sc.inner["verdict"] != "luraph":
+                out["verdict"] = "damaged" if sc.inner["verdict"] == "not-luraph" else sc.inner["verdict"]
+                out["reason"] = out["error"] = "the chunk inside the container: " + sc.inner["reason"]
+                return out
         out["sandbox_run"] = sc.sandbox_run
         if sc.container:
             out["container"] = True
@@ -1848,7 +1912,9 @@ def classify_file(path, work_dir=None, allow_run=True):
                   opened) | 'none'
       entry       call chain of the VM's main statement, e.g. ':M()(...)'
       platform    'luau' | 'lua5.1-syntax' | 'lua5.1' | 'lua5.3+' | 'luajit' | 'lua5.2+/luajit'
-                  of the VM text ('?' appended when the text is damaged)
+                  of the VM text ('?' appended when the text is damaged; 'unknown' for a
+                  container that was not opened: 'container_platform' is then that of the
+                  container's own text)
       validity    'ok' | 'ok-after-repair' | 'corrupt' | 'damaged' | 'not-luau' | 'n/a'
       repairs     what was changed so that Luau tools can read the text
       prefix, suffix   kinds of what stands around the header / behind the main statement
@@ -1890,12 +1956,17 @@ def classify_file(path, work_dir=None, allow_run=True):
                     out["verdict"], out["validity"] = "damaged", "payload-corrupt"
                     out["reason"] = "the container does not open: " + ci["why"]
             elif inner:
+                out["container_platform"] = f["platform"]
                 out["layout"], out["entry"], out["platform"] = inner["layout"], inner["entry"], inner["platform"]
                 if inner["verdict"] != "luraph":
                     out["verdict"] = "damaged" if inner["verdict"] == "not-luraph" else inner["verdict"]
                     out["reason"] = "the chunk inside the container: " + inner["reason"]
                     if inner.get("payload_corrupt"):
-                        out["validity"] = "payload-corrupt"
+                        # the decoded text is debris: its shape says nothing about the script
+                        out["validity"], out["layout"], out["platform"] = "payload-corrupt", "unknown", "unknown"
+            if f["wrapper"] != "none" and not ci["opened"] and out["verdict"] != "not-luraph":
+                # `platform` is that of the VM text, which nobody saw
+                out["container_platform"], out["platform"] = f["platform"], "unknown"
         if out["verdict"] == "luraph":
             if out["layout"] in V14_LAYOUTS:
                 out["route"] = "devm"
@@ -2097,6 +2168,16 @@ def run(scan, args, inp, out_path, kept_work):
     rc = container_exit(scan)
     if rc:
         return rc, False
+    if scan.closed_container() and not (args.force or args.list):
+        # Luraph's container, and it did not open here.  Its own code (the decoder) is not the
+        # script: nothing of it is parsed or exported.  The engines open containers themselves.
+        scan.form = "vm"
+        ci = scan.container_info or {}
+        print()
+        print("[2b] 容器没有在这里打开，容器自己的代码（解码器）不是脚本，不做静态导出 / the container did not open "
+              "here; its own code (the decoder) is not the script and is not exported")
+        print("     原因 / why: " + str(ci.get("why") or scan.unwrap_note or "?")[:400])
+        return 4, False
     if scan.layout() in V14_LAYOUTS and scan.front_decisive() and not (args.force or args.list):
         # a v14 VM: nothing in it is plain script code, so there is nothing to parse and cut
         # out here; the devirtualizer takes it (allinone.after_static)

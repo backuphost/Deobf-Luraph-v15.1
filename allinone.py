@@ -13,7 +13,13 @@ Three engines live in this repository; deob.py looks at the input and picks one:
           independent Luraph v15 lifter that serves as the fallback when devm gives up.
 
 Each engine runs as a child process (they keep global state, and a crash or a timeout of one
-must not take the front end down).  Their own output is passed through unchanged.
+must not take the front end down).  Their own output is passed through (a Python traceback is
+cut down to its last line).  A result is judged before it is reported: the engine's own
+`result:` line, unlifted blocks, a parse check, whether there is a line of code at all.
+
+Which engines, in which order (engine_order): a v14 VM goes to devm only; v15.0 to deobf first,
+then devm; everything else to devm, then deobf.  When no engine produced a result the exit code
+is 4 and the last lines are the engines' own reasons (`devm: <stage>: <reason>`).
 
 Direct use, for a single engine:
 
@@ -416,9 +422,9 @@ def engine_order(scan):
     v15.0 (by the header comment): the second engine first, since it lifts that layout and
     devm does not model it; devm after it.  Everything else: devm, then the second engine."""
     layout = scan.layout() if hasattr(scan, "layout") else None
-    if layout in V14_LAYOUTS:
-        return ("devm",)
     version = (getattr(scan, "header", None) or {}).get("version") or ""
+    if layout in V14_LAYOUTS or (layout is None and version.startswith("14.")):
+        return ("devm",)        # (a v14 container that did not open here: the layout follows the version)
     if version == "15.0" or version.startswith("15.0."):
         return ("deobf", "devm")
     return ("devm", "deobf")
