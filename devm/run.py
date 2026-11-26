@@ -945,8 +945,9 @@ def report(text, returned=None, notes=None):
                    'interpreter mixes into its keys, not part of the script' % mixes)
     if dead:
         out.append('  %d lines compute a constant into a local nothing reads (`local v = <literals, arithmetic, bit32 / '
-                   'string calls>`): Luraph\'s dead arithmetic, left because evaluating it here fails or is not '
-                   'supported (removing it could change what the script does if it raises)' % dead)
+                   'string calls>`): Luraph\'s dead arithmetic, left because it does not evaluate here (an operand '
+                   'printed as nil, an unsupported format or call: removing a line that raises could change what the '
+                   'script does)' % dead)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '
