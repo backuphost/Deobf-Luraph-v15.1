@@ -185,6 +185,20 @@ class HubLine(unittest.TestCase):
         self.assertEqual(lifter.hub_line(self.nodes, self.node_in, indirect, (2, 58)), 44)
         self.assertEqual(indirect, {(2, 58): 44, (2, 59): 44, (2, 60): 44})
 
+    def test_jump_into_the_copy_without_target(self):
+        """The instruction in front of the hub was first reached on a path without the jump register:
+        its jump points at the hub's copy for arrivals without a target, which carries the error.  A
+        later arrival that has the register must still find the line."""
+        self.nodes[(2, 59)] = node((2, 59), (2, 60, lifter.NO_TARGET))
+        self.nodes[(2, 60, lifter.NO_TARGET)] = node((2, 60, lifter.NO_TARGET), (2, 60),
+                                                     error='jump to a run-time computed instruction')
+        indirect = {(2, 60): 44}
+        self.assertEqual(lifter.hub_line(self.nodes, self.node_in, indirect, (2, 59)), 44)
+        self.assertEqual(indirect, {(2, 59): 44, (2, 60): 44})
+        indirect = {(2, 60): 44}
+        self.assertEqual(lifter.hub_line(self.nodes, self.node_in, indirect, (2, 57)), 44)
+        self.assertEqual(indirect, {(2, 57): 44, (2, 58): 44, (2, 59): 44, (2, 60): 44})
+
     def test_not_the_jump_itself_and_not_code(self):
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 60)))       # the caller's own case
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 20)))       # an instruction with an effect

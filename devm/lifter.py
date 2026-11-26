@@ -1372,10 +1372,16 @@ def hub_line(nodes, node_in, indirect, k):
     while len(line) < 64:
         # (`at`: the node looked at.  Behind the first one it can be the copy of an instruction
         # for one jump target, where a jump into the line was specialised already.)
+        r = indirect.get(x)
+        if r is not None and line:
+            # (a known hub: whatever copy of it the jump in front points at, also the copy for
+            # arrivals without a target, which carries an error)
+            for y in line:
+                indirect[y] = r
+            return r
         nd = nodes.get(at)
         if nd is None or nd.error or not nd.tree or nd.tree[0] or nd.tree[1][0] != 'goto':
             return None
-        r = indirect.get(x)
         if r is None and len(nd.kreads) == 1:
             r = next(iter(nd.kreads))
             if not P.is_num((node_in.get(at) or {}).get(r)):
