@@ -48,6 +48,12 @@ from obfuscators.base import Job  # noqa: E402
 # alone is ~230 KB).
 PYPY_MIN_SIZE = 350_000
 
+# The whole command ends after this long unless --time-limit says otherwise:
+# the largest script lifted so far took 8 minutes on a free machine, and a
+# lift that takes hours (constant rounds that keep finding requests in
+# code that never decrypts) is a hang to whoever waits for it.
+DEFAULT_TIME_LIMIT = 3600
+
 
 def find_pypy():
     import glob
@@ -90,10 +96,11 @@ def parser():
     ap.add_argument("--detect", action="store_true",
                     help="only print the detected obfuscator (NAME<tab>confidence<tab>label) and exit")
     ap.add_argument("--timeout", type=int, default=90, help="hard timeout per run in seconds")
-    ap.add_argument("--time-limit", type=int, default=0, metavar="S",
-                    help="wall-clock limit for the whole command in seconds (default: none). When it is "
-                         "reached the lift is given up and what was recovered so far is written (the "
-                         "behaviour trace), reported as PARTIAL")
+    ap.add_argument("--time-limit", type=int, default=None, metavar="S",
+                    help="wall-clock limit for the whole command in seconds (default: %d; 0: none, also the "
+                         "default with --studio). When it is reached the lift is given up and what was "
+                         "recovered so far is written (the behaviour trace), reported as PARTIAL"
+                         % DEFAULT_TIME_LIMIT)
     ap.add_argument("--budget", type=int, default=30, help="soft time budget for the traced script")
     ap.add_argument("--executor", default="Wave", help="name returned by identifyexecutor()")
     ap.add_argument("--keep-harness", action="store_true", help="keep the generated harness file")
@@ -146,7 +153,7 @@ def main():
         print("%s\t%s\t%s" % (plugin.name, "forced" if conf is None else "%.2f" % conf, plugin.label))
         return None
     maybe_reexec_pypy(args)
-    limits.set_limit(args.time_limit)
+    limits.set_limit(args.time_limit if args.time_limit is not None else 0 if args.studio else DEFAULT_TIME_LIMIT)
     print("[*] obfuscator: %s%s" % (plugin.label, "" if conf is None else " (detected, %.2f)" % conf),
           file=sys.stderr)
 

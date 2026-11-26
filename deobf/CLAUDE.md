@@ -79,7 +79,7 @@ python deobf/deob.py <script> --debug            # all intermediate files in <in
 - Exit status 0 with a result file, 1 on failure. **Last line** (stdout): `result: complete` or
   `result: PARTIAL: <what is missing>` (`Job.lacks()`: unlifted blocks, unstructured jumps, a run
   the tracer had to stop, ...; a behaviour trace is always PARTIAL); nothing produced: status 1,
-  last stderr line `deobf: <reason>` (`deob.run`). `--time-limit S` bounds the whole command
+  last stderr line `deobf: <reason>` (`deob.run`). `--time-limit S` (default 3600) bounds the command
   (`limits.py`: harness timeouts are cut to the time left, the lift thread is given up at the
   deadline and the trace is written, without its tidy pass if late). Harness processes are
   started with `limits.spawn`: none outlives the engine, even when it is killed.
