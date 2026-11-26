@@ -439,8 +439,8 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   missing the arithmetic stays and the report says so (`functions return a parameter xor-ed with a
   large literal`, never `complete`).
 * **Key arithmetic on an interpreter local the lifter has no value for** shows as
-  `local v = (121107783 + nil) % 4294967296; local w = bit32.bxor(v - v % 1, 283475159)`: in code
-  that never ran (junk arms) the key was never set.  `opaque._drop_blind_key_arith` removes such
+  `local v = (73519286 + nil) % 4294967296; local w = bit32.bxor(v - v % 1, 398765431)` (numbers
+  made up): in code that never ran (junk arms) the key was never set.  `opaque._drop_blind_key_arith` removes such
   a chain when nothing reads it, `opaque._fold_type_tests` decides the opaque test
   `type(0) == "buffer"` in front of a junk arm.
 * **v15.0** is a third layout: the function that makes a VM closure is a method of the VM object,

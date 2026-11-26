@@ -687,7 +687,7 @@ def main():
         bigfn = ('local function build()\n' + ''.join(
             '  do local q = Instance.new("Frame"); q.Size = UDim2.new(0, %d, 0, 1); '
             'q.BackgroundColor3 = Color3.new(); q.Name = "n%d" end\n' % (i, i) for i in range(220))
-            + 'end\npcall(writefile, "BIGFN_RAN.txt", "x")\nbuild()\nprint("done")\n')
+            + 'end\npcall(writefile, "BIGFN_RAN.txt", "x")\nbuild()\nprint("run over")\n')
         bin_ = os.path.join(tmp, 'bigfn.lua')
         with open(bin_, 'w', encoding='utf-8') as fh:
             fh.write(bigfn)

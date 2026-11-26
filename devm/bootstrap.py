@@ -36,8 +36,8 @@ def patch(text):
     info = {'crash': 0, 'fixkey': 0}
 
     # -- tamper routine
-    # (a local, or a slot of one of the init's tables: `p495[22] = function()`, and as an item of a
-    # table constructor: `[22] = function()`)
+    # (a local, or a slot of one of the init's tables: `p7[3] = function()`, and as an item of a
+    # table constructor: `[3] = function()`)
     head = re.compile(r'^(\t*)(?:(?:local )?\w+(?:\[[^\]=]*\]|\.\w+)*|(\[[^\]=]*\])) = function\(\)$')
     spans = []
     for i, ln in enumerate(lines):
