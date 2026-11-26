@@ -799,7 +799,7 @@ class PE:
         # been lifted, so the lifter repeats the lift when a slot it answered from the dump
         # turned out to be written (TableProtoLifter.lift_all).
         self.slot_policy = False
-        self.program_ids = frozenset()  # ids of the tables that are program data (protos, code arrays)
+        self.program_ids = set()    # ids of the tables that are program data (protos, code arrays)
         self.unstable = set()       # (table path, key) written by code that runs; (path, None): with a run-time key
         self.stable_reads = set()   # (table path, key) answered from the dump in this lift
         self.slot_writes = set()    # (table path, key) written in this lift

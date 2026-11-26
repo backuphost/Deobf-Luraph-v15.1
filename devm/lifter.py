@@ -1445,14 +1445,8 @@ class TableProtoLifter(Lifter):
                     counts[e[1][1]] = counts.get(e[1][1], 0) + 1
         self.proto_param = max(counts, key=counts.get)
         # tables handed to the wrapper's enclosing functions are loader state, not program data
-        program = set()
-        stack = [self.base.vars[self.proto_param]]
-        while stack:
-            t = stack.pop()
-            if id(t) in program:
-                continue
-            program.add(id(t))
-            stack.extend(x for x in t.h.values() if isinstance(x, LuaTable))
+        program = self.pe.program_ids = set()
+        self.mark_program(self.base.vars[self.proto_param])
         for f in model.chain[:-2]:
             for p in f.params:
                 v = self.base.vars.get(p)
@@ -1464,23 +1458,43 @@ class TableProtoLifter(Lifter):
         self.root_key = self.base.vars[self.proto_param].id
         self.proto_objs[self.root_key] = self.base.vars[self.proto_param]
         self.pe.slot_policy = True
-        self.pe.program_ids = frozenset(program)
         self.slot_rounds = 0
+
+    def mark_program(self, proto):
+        """Everything reachable from a proto is program data (code and constant arrays, nested
+        protos): the evaluator keeps it concrete and refuses run-time values stored into it."""
+        program = self.pe.program_ids
+        stack = [proto]
+        while stack:
+            t = stack.pop()
+            if id(t) in program:
+                continue
+            program.add(id(t))
+            stack.extend(x for x in t.h.values() if isinstance(x, LuaTable))
+
+    def on_closure(self, proto):
+        if isinstance(proto, LuaTable):
+            self.mark_program(proto)
+        return Lifter.on_closure(self, proto)
 
     def lift_all(self, root_key):
         """Lift every proto; again from the state of the dump when a loader-state slot that was
         answered from the dump turned out to be written by code that runs (see PE.slot_policy).
-        Slots are only ever added to the run-time set, so this ends; the bound is a safeguard."""
+        Slots are only ever added to the run-time set, so this ends."""
         protos = Lifter.lift_all(self, root_key)
-        for rnd in range(1, 7):
-            if not self.pe.slot_conflicts():
-                break
+        while self.pe.slot_conflicts():
+            self.slot_rounds += 1
             unstable = self.pe.unstable | self.pe.slot_writes
-            keep = (self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server)
+            if self.slot_rounds > 8:
+                # (not seen in any file: stop telling slots apart, every loader table read from
+                # the dump so far is run-time state as a whole)
+                unstable |= {(path, None) for path, _ in self.pe.stable_reads}
+            keep = (self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server,
+                    self.slot_rounds)
             self.__init__(self.model, P.Dump(self.dump.data, self.model), self.log)
-            self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server = keep
+            (self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server,
+             self.slot_rounds) = keep
             self.pe.unstable = unstable
-            self.slot_rounds = rnd
             if root_key not in self.proto_objs:
                 self.register(root_key)
             protos = Lifter.lift_all(self, root_key)
@@ -1488,6 +1502,7 @@ class TableProtoLifter(Lifter):
 
     def register(self, key):
         self.proto_objs[key] = self.dump.tables[key]
+        self.mark_program(self.dump.tables[key])
 
     def instantiate(self, key):
         proto = self.proto_objs[key]
