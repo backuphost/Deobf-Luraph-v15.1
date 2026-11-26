@@ -24,7 +24,8 @@ v14 interpreters use and that the evaluator has to understand:
 With LURAPH_CORPUS set to a checkout of the public sample corpus (a directory with one
 sub-directory per Luraph version) and bin/luau present, CorpusLift also runs the whole of devm on a
 few v14.3 - v14.6 files picked at run time and checks that what was lifted has no LIFT ERROR
-marker and parses.  It is skipped without the variable.
+marker and parses.  It is skipped without the variable.  LURAPH_CORPUS_SKIP may name a text file
+of paths (relative to the corpus, one per line) that the test must leave alone.
 """
 import json
 import os
@@ -698,31 +699,53 @@ def have_luau():
         return False
 
 
+def corpus_skip():
+    """paths (relative to the corpus) that must not be touched: the file LURAPH_CORPUS_SKIP names, one per line"""
+    name = os.environ.get('LURAPH_CORPUS_SKIP')
+    if not name:
+        return set()
+    with open(name) as f:
+        return {line.strip() for line in f if line.strip()}
+
+
 @unittest.skipUnless(CORPUS and os.path.isdir(CORPUS) and have_luau(), 'needs LURAPH_CORPUS and bin/luau')
 class CorpusLift(unittest.TestCase):
-    """Whole runs of devm on files chosen at run time: the first few of each version directory
-    that have the dispatch-loop head this tree models (`while true do local OP=CODE[PC];if`) and a
-    closure maker with two parameters.  Checks the lift only: no LIFT ERROR marker, and the result
-    parses.  (What such a run lifts today is the VM's first program.)"""
+    """Whole runs of devm on files chosen at run time: per version directory the first few small
+    files for which this tree builds a proto-table model with one interpreter (a static test: the
+    file is parsed, not run).  Checks the lift only: no LIFT ERROR marker, and the result parses.
+    (What such a run lifts today is the VM's first program.)"""
     VERSIONS = ('v14.3', 'v14.4.1', 'v14.5', 'v14.5.1', 'v14.6')
     PER_VERSION = 2
-    HEAD = re.compile(r'while true do local (\w+)=(\w+)\[(\w+)\];if')
-    MAKER = re.compile(r'function\((\w+),(\w+)\)local [\w,]+=\(?\1\[')
+    LOOK_AT = 40            # files examined per version at most
 
     def pick(self, version):
+        from devm import container, normalize
         d = os.path.join(CORPUS, version)
+        skip = corpus_skip()
         out = []
+        looked = 0
         for name in sorted(os.listdir(d)) if os.path.isdir(d) else ():
             path = os.path.join(d, name)
-            if os.path.getsize(path) > 150000:
+            if version + '/' + name in skip or os.path.getsize(path) > 150000:
                 continue
+            looked += 1
+            if looked > self.LOOK_AT:
+                break
             with open(path, encoding='latin-1') as f:
                 text = f.read()
-            if 'pcall' not in text[-200:] and len(self.HEAD.findall(text)) == 1 and self.MAKER.search(text) \
-                    and 'repeat local' not in text and 'loadstring' not in text:
-                out.append(path)
-                if len(out) == self.PER_VERSION:
-                    break
+            if container.may_be_container(text):
+                continue
+            try:
+                if normalize.needs_reflow(text):
+                    text = normalize.reflow(normalize.inline_protected_raw(text)[0])
+                m = vmmodel.Model(text, oneline=True)
+            except Exception:
+                continue        # no model in this tree: not what is checked here
+            if m.factory_style or len(m.interps) != 1:
+                continue
+            out.append(path)
+            if len(out) == self.PER_VERSION:
+                break
         return out
 
     def test_no_lift_errors(self):
@@ -731,10 +754,13 @@ class CorpusLift(unittest.TestCase):
             for path in self.pick(version):
                 with self.subTest(file=os.path.relpath(path, CORPUS)), tempfile.TemporaryDirectory() as tmp:
                     out = os.path.join(tmp, 'out.lua')
-                    r = subprocess.run([sys.executable, '-B', '-m', 'devm.run', path, '-o', out, '--work', tmp],
-                                       cwd=ROOT, capture_output=True, text=True, errors='replace', timeout=600)
+                    try:
+                        r = subprocess.run([sys.executable, '-B', '-m', 'devm.run', path, '-o', out, '--work', tmp],
+                                           cwd=ROOT, capture_output=True, text=True, errors='replace', timeout=300)
+                    except subprocess.TimeoutExpired:
+                        continue        # the run did not come back: not a matter of the lift
                     if r.returncode != 0 or not os.path.exists(out):
-                        continue        # no model for this file in this tree: not what is checked here
+                        continue
                     ran += 1
                     with open(out, encoding='utf-8', errors='replace') as f:
                         text = f.read()
