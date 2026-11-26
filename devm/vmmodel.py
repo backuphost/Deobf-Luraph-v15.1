@@ -34,10 +34,26 @@ def is_dispatch_loop(st, assigned=False):
     e = s0[2][0]
     if e[0] != 'index' or e[1][0] != 'name' or e[2][0] != 'name':
         return False
-    return body[1][0] == 'if'
+    return body[1][0] == 'if' or _outlined_test(body, s0)
 
 
-LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)(?:local\s+)?\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*if\b')
+def _outlined_test(body, s0):
+    """`local OP = CODE[PC]; local T = OP >= 10; if T then ...`: the dispatch tree of an interpreter
+    whose tests are each computed into a local first (the second interpreter of the v15.1 corpus
+    builds; the first one of the same file has the usual form)."""
+    if len(body) < 3 or s0[0] != 'local':
+        return False
+    s1, s2 = body[1], body[2]
+    if s1[0] != 'local' or len(s1[1]) != 1 or len(s1[2]) != 1 or s2[0] != 'if' or not s2[1]:
+        return False
+    t = s1[2][0]
+    if t[0] != 'bin' or t[1] not in ('<', '<=', '>', '>=', '==', '~='):
+        return False
+    return ('name', s0[1][0]) in (t[2], t[3]) and s2[1][0][0] == ('name', s1[1][0])
+
+
+LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)(?:local\s+)?\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*'
+                          r'(?:local\s+\w+\s*=\s*\w+\s*(?:[<>]=?|[~=]=)\s*\w+\s*;?\s*)?if\b')
 _NUM = r'(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*)'
 CELL_RE = re.compile(r'\b(\w+)\[' + _NUM + r'\]\[(\w+)\[' + _NUM + r'\]\]')
 
