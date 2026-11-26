@@ -70,18 +70,16 @@ PROBE_LIBS = frozenset([
     'OverlapParams', 'RaycastParams', 'SharedTable',
 ])
 PROBE_GLOBALS = frozenset([
-    'loadstring', 'require', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime', 'settings', 'UserSettings',
-    'identifyexecutor', 'iscclosure', 'islclosure', 'isreadonly', 'getrawmetatable', 'newproxy',
+    'loadstring', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime', 'iscclosure', 'islclosure',
 ])
-# methods a probe calls on objects that were there before it (game, a service): queries only
-QUERY_METHODS = frozenset([
-    'GetService', 'FindService', 'FindFirstChild', 'FindFirstChildOfClass', 'FindFirstChildWhichIsA', 'FindFirstAncestor',
-    'FindFirstAncestorOfClass', 'FindFirstAncestorWhichIsA', 'FindFirstDescendant', 'WaitForChild', 'GetChildren',
-    'GetDescendants', 'GetFullName', 'GetDebugId', 'IsA', 'IsDescendantOf', 'IsAncestorOf', 'GetAttribute', 'GetAttributes',
-    'GetAttributeChangedSignal', 'GetPropertyChangedSignal', 'HasTag', 'GetTags', 'GetTagged', 'GetAllTags',
-    'IsPropertyModified', 'IsLoaded', 'IsStudio', 'IsClient', 'IsServer', 'IsRunning', 'IsRunMode', 'IsEdit',
-    'GetEnumItems', 'GetEnums', 'FromName', 'FromValue', 'CompressBuffer', 'DecompressBuffer', 'GetGuiInset',
-    'GenerateGUID', 'JSONEncode', 'JSONDecode', 'UrlEncode',
+# On objects that were there before the start-up (game, a service) it has been seen to do this much
+# and no more: fetch one of three services and ask it a question.  Anything else in front of the
+# result's first call is reported; if a Luraph version turns out to ask more, the report names the
+# call and the sets below are the place to add it.
+PROBE_SERVICES = frozenset(['HttpService', 'RunService', 'EncodingService'])
+SERVICE_QUERIES = frozenset([
+    'IsServer', 'IsClient', 'IsStudio', 'IsRunning', 'IsRunMode', 'IsEdit', 'GenerateGUID', 'JSONEncode', 'JSONDecode',
+    'UrlEncode', 'CompressBuffer', 'DecompressBuffer',
 ])
 _NEW_INSTANCE = re.compile(r'Instance<.* new>\x01\d+\x02\Z', re.S)
 _INSTANCE = re.compile(r'Instance<.*>\x01\d+\x02\Z', re.S)
@@ -106,7 +104,10 @@ def _is_probe(e):
     if _NEW_INSTANCE.match(a) or (_VALUE.match(a) and not a.startswith('Instance<')):
         return True                  # a method of its own object, or of a value (vector math, a signal, a Random)
     if _INSTANCE.match(a):
-        return e.name in QUERY_METHODS
+        if e.name in ('GetService', 'FindService'):
+            return len(e.args) == 2 and e.args[1].strip('"') in PROBE_SERVICES
+        m = re.match(r'Instance<(\w+) ', a)
+        return e.name in SERVICE_QUERIES and bool(m) and m.group(1) in PROBE_SERVICES
     return e.name in PROBE_GLOBALS
 
 
@@ -151,6 +152,7 @@ class Run:
         self.errors = {}          # index of an event -> message the call raised
         self.notes = []           # (index of the next event, harness line): [http], [env], COMPILE ERROR ...
         self.globals = []         # (name, value) left behind
+        self.placeholders = []    # (index of the next event, name): reads of REG_n, __LPH_ENV ... (a partial result)
         self.started = False
         self.end = None           # 'returned' | 'error' | None (cut)
         self.end_message = ''
@@ -228,6 +230,8 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
             elif kind == 'E':
                 if run.events:
                     run.errors[len(run.events) - 1] = f[2] if len(f) > 2 else ''
+            elif kind == 'P':
+                run.placeholders.append((len(run.events), f[1] if len(f) > 1 else '?'))
             elif kind == 'G':
                 run.globals.append((f[1] if len(f) > 1 else '', f[2] if len(f) > 2 else ''))
             elif kind == 'START':
@@ -288,6 +292,9 @@ def volatile_args(a, b, noise=NOISE_CALLS):
     return vol, n
 
 
+_ADDRESS = re.compile(r'\b(function|table|userdata|thread|buffer|builtin): (?:builtin: )?0x[0-9a-f]{8,16}\b')
+
+
 class _Canon:
     """Renumbers object serials in order of first appearance."""
 
@@ -295,6 +302,9 @@ class _Canon:
         self.map = {}
 
     def __call__(self, text):
+        if '0x' in text:
+            # tostring(f) inside a string: "function: 0x000055839cce2dc0"
+            text = _ADDRESS.sub(lambda g: g.group(1) + ': 0x?', text)
         if '\x01' not in text:
             return text
         m = self.map
@@ -321,15 +331,17 @@ def _match_len(eo, p, er, vol_o, vol_r):
     return n
 
 
-def align(orig, res, vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS, max_candidates=4000):
+def align(orig, res, vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS, er=None, max_candidates=4000):
     """Where the result's log starts in the original's.  Returns (p, matched): the original's
     compared events from index p on equal the first `matched` compared events of the result."""
-    eo, er = compared(orig, noise), compared(res, noise)
+    eo = compared(orig, noise)
+    if er is None:
+        er = compared(res, noise)
     if not er:
         return len(eo), 0
     first = _shape(er[0][1])
     cands = [p for p in range(len(eo)) if _shape(eo[p][1]) == first]
-    both_ended = orig.end is not None and res.end is not None
+    both_ended = orig.end is not None and res.end is not None and not res.placeholders
     tail = len(eo) - len(er)
     if len(cands) > max_candidates:
         keep = cands[:max_candidates // 2] + cands[-max_candidates // 2:]
@@ -339,10 +351,11 @@ def align(orig, res, vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS, ma
     best = None
     for p in cands:
         m = _match_len(eo, p, er, vol_o, vol_r)
-        full = m == len(er) or m == len(eo) - p
-        if full and (not both_ended or p == tail):
-            return p, m
-        # otherwise: the longest match; among equals the one that ends at the original's end, then the earliest
+        if m == len(er) and (not both_ended or p == tail):
+            return p, m                 # the whole log of the result, and (both ended) up to the original's end
+        # otherwise the longest match; among equals the one that ends at the original's end, then the earliest.
+        # (A late start that merely runs off the end of a cut original does not beat a longer match:
+        # in the log of a loop every stretch looks like every other.)
         key = (m, p == tail, -p)
         if best is None or key > best[0]:
             best = (key, p, m)
@@ -416,35 +429,49 @@ def _kinds(events):
     return ', '.join('%s x%d' % kv for kv in c.most_common(12)) + (', ...' if len(c) > 12 else '')
 
 
+def _n(n, word='call'):
+    return '%d %s%s' % (n, word, '' if n == 1 else 's')
+
+
 def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS):
     """Compare two runs.  Returns a Verdict."""
     for run, who in ((orig, 'original'), (res, 'result')):
         if run.fatal:
-            v = Verdict(NOT_COMPARABLE, 'the %s did not run: %s' % (who, run.fatal))
-            return v
-    eo, er = compared(orig, noise), compared(res, noise)
+            return Verdict(NOT_COMPARABLE, 'the %s did not run: %s' % (who, run.fatal))
+    eo, er_all = compared(orig, noise), compared(res, noise)
     markers = _result_markers(result_text)
     partial = sum(markers.values()) > 0
-    p, m = align(orig, res, vol_o, vol_r, noise)
+    # A result that reads a placeholder (REG_n, __LPH_ENV ...) is not the script from there on:
+    # only what it did before is compared.
+    hole = None
+    er = er_all
+    if res.placeholders:
+        at, name = res.placeholders[0]
+        er = [(i, e) for i, e in er_all if i < at]
+        hole = name
+    p, m = align(orig, res, vol_o, vol_r, noise, er)
     n_o, n_r = len(eo) - p, len(er)
     prefix = eo[:p]
-    data = {'original_events': len(eo), 'result_events': n_r, 'skipped': p, 'matched': m,
+    data = {'original_events': len(eo), 'result_events': len(er_all), 'skipped': p, 'matched': m,
             'original_end': orig.how_ended(), 'result_end': res.how_ended(),
             'result_markers': dict(markers), 'masked_arguments': len(vol_o) + len(vol_r),
-            'requests': orig.requests[:20]}
+            'requests': orig.requests[:20], 'placeholder_read': hole}
 
     def finish(code, headline):
         v = Verdict(code, headline)
         v.data = data
-        v.add('original: %d calls and property writes (plus %d not compared: %s), %s' % (
-            len(eo), len(orig.events) - len(eo), '/'.join(sorted(noise)), orig.how_ended()))
-        v.add('result:   %d calls and property writes, %s' % (n_r, res.how_ended()))
+        v.add('original: %s (and %d not compared: %s), %s' % (
+            _n(len(eo), 'call or property write') if len(eo) == 1 else '%d calls and property writes' % len(eo),
+            len(orig.events) - len(eo), '/'.join(sorted(noise)), orig.how_ended()))
+        v.add('result:   %d calls and property writes, %s' % (len(er_all), res.how_ended()))
         if p:
-            v.add('skipped %d leading calls of the original as Luraph start-up (%s)' % (p, _kinds(prefix)))
+            v.add('skipped %s of the original as Luraph start-up (%s)' % (_n(p, 'leading call'), _kinds(prefix)))
         if vol_o or vol_r:
             v.add('%d arguments depend on time or chance (they differ between two runs of the same file) and were not compared' % (len(vol_o) + len(vol_r)))
         if partial:
             v.add('the result is partial: ' + ', '.join('%d x %s' % (n, t) for t, n in markers.most_common(6)))
+        if hole:
+            v.add('the result reads the placeholder %s after its call %d: what it does from there on is not the script and was not compared' % (hole, n_r))
         reqs = orig.requests
         if reqs:
             v.add('requests of the original (nothing was sent, each got an empty reply; what a real reply would trigger is not compared):')
@@ -454,18 +481,7 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
                 v.add('  ... %d more' % (len(reqs) - 5))
         return v
 
-    # 1. calls in front of the result's first call must be Luraph's
-    # (a call that raised did nothing: the start-up calls methods without their object to see the error)
-    odd = [(i, e) for i, e in prefix if not (i in orig.errors or _is_probe(e))]
-    if odd and m == n_r and n_r <= n_o:
-        # (when the result's own calls do not line up at all, that is the divergence to report)
-        v = finish(DIFFERENT, 'the original makes %d call(s) in front of the result\'s first call that Luraph\'s start-up does not make' % len(odd))
-        v.add('first of them (call %d of the original):' % (prefix.index(odd[0]) + 1))
-        for line in _context(eo, prefix.index(odd[0]), 2, 2):
-            v.add(line)
-        return v
-
-    # 2. a call that differs
+    # 1. a call that differs
     if m < n_r and m < n_o:
         v = finish(DIFFERENT, 'call %d of the result differs from the original (%d equal before it)' % (m + 1, m))
         v.add('original (call %d):' % (p + m + 1))
@@ -476,23 +492,41 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
             v.add(line)
         return v
 
+    # 2. calls of the original in front of the result's first call must be Luraph's start-up
+    # (a call that raised did nothing: the start-up calls methods without their object to see the error)
+    odd = [k for k, (i, e) in enumerate(prefix) if not (i in orig.errors or _is_probe(e))]
+    if odd:
+        v = finish(DIFFERENT, 'the original makes %s in front of the result\'s first call that Luraph\'s start-up does not make' % _n(len(odd)))
+        v.add('first of them (call %d of the original):' % (odd[0] + 1))
+        for line in _context(eo, odd[0], 2, 2):
+            v.add(line)
+        return v
+
+    def stops_at():
+        """Why a result that ends early is "not comparable" rather than "different", or None."""
+        if hole:
+            return 'reads the placeholder %s' % hole
+        at = _placeholder_at(res, result_text)
+        if at:
+            return 'stops at a placeholder (line %d: %s)' % at if at[0] else 'stops on %s' % at[1]
+        if partial:
+            return 'ends (%s); it is partial' % res.how_ended()
+        return None
+
     # 3. the result's log is used up, the original goes on
     if m == n_r and n_o > n_r:
-        nxt = _context(eo, p + m, 2, 2)
-        if res.cut:
-            v = finish(SAME, 'same for the first %d calls; the result\'s run was cut at the %s there, the original goes on' % (m, res.cut)) if m else \
-                finish(NOT_COMPARABLE, 'the result made no call before its %s' % res.cut)
-            return v
-        at = _placeholder_at(res, result_text)
-        if at or partial:
-            where = ('at a placeholder (line %d: %s)' % at if at and at[0] else 'on %s' % at[1] if at else
-                     'early (%s); it is partial' % res.how_ended())
-            v = finish(NOT_COMPARABLE, 'same up to call %d of %d, then the result stops %s' % (m, n_o, where))
+        why = stops_at()
+        if res.cut and not hole:
+            if m == 0:
+                return finish(NOT_COMPARABLE, 'the result made no call before its %s' % res.cut)
+            return finish(SAME, 'same for the first %s; the result\'s run was cut at the %s there, the original goes on' % (_n(m), res.cut))
+        if why:
+            v = finish(NOT_COMPARABLE, 'same up to call %d of %d, then the result %s' % (m, n_o, why))
         else:
-            v = finish(DIFFERENT, 'after %d equal calls the result %s, the original goes on (%d more calls)' % (
-                m, 'returns' if res.end == 'returned' else 'stops (%s)' % res.how_ended(), n_o - n_r))
+            v = finish(DIFFERENT, 'after %s the result %s, the original goes on (%d more)' % (
+                _n(m, 'equal call'), 'returns' if res.end == 'returned' else 'stops (%s)' % res.how_ended(), n_o - n_r))
         v.add('next calls of the original:')
-        for line in nxt:
+        for line in _context(eo, p + m, 2, 2):
             v.add(line)
         return v
 
@@ -501,53 +535,51 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
         if orig.cut:
             if m == 0:
                 return finish(NOT_COMPARABLE, 'the original made no call of the script before its %s' % orig.cut)
-            return finish(SAME, 'same for the first %d calls; the original\'s run was cut at the %s there, the result goes on' % (m, orig.cut))
-        v = finish(DIFFERENT, 'after %d equal calls the original %s, the result goes on (%d more calls)' % (
-            m, 'returns' if orig.end == 'returned' else 'stops', n_r - n_o))
+            return finish(SAME, 'same for the first %s; the original\'s run was cut at the %s there, the result goes on' % (_n(m), orig.cut))
+        v = finish(DIFFERENT, 'after %s the original %s, the result goes on (%d more)' % (
+            _n(m, 'equal call'), 'returns' if orig.end == 'returned' else 'stops', n_r - n_o))
         v.add('next calls of the result:')
         for line in _context(er, m, 2, 2):
             v.add(line)
         return v
 
     # 5. every call lines up (m == n_r == n_o): the endings
+    if hole:
+        return finish(NOT_COMPARABLE, 'same up to call %d, then the result reads the placeholder %s; the original %s' % (m, hole, orig.how_ended()))
     if orig.cut or res.cut:
         if orig.cut and res.cut:
             if m == 0:
                 return finish(NOT_COMPARABLE, 'neither run made a call of the script before its limit')
-            return finish(SAME, 'same for the first %d calls; both runs were still going at their limit (%s / %s)' % (m, orig.cut, res.cut))
+            return finish(SAME, 'same for the first %s; both runs were still going at their limit (%s / %s)' % (_n(m), orig.cut, res.cut))
         late, done = ('original', 'result') if orig.cut else ('result', 'original')
-        cut = orig.cut or res.cut
-        return finish(NOT_COMPARABLE, 'same for the %d calls both made, but the %s was still running at the %s without a further call, while the %s %s' % (
-            m, late, cut, done, (res if orig.cut else orig).how_ended()))
+        return finish(NOT_COMPARABLE, 'same for the %s both made, but the %s was still running at the %s without a further call, while the %s %s' % (
+            _n(m), late, orig.cut or res.cut, done, (res if orig.cut else orig).how_ended()))
     if orig.end != res.end:
-        at = _placeholder_at(res, result_text)
-        if res.end == 'error' and (at or partial):
-            where = 'at a placeholder (line %d: %s)' % at if at and at[0] else 'on %s' % at[1] if at else 'with an error; it is partial'
-            return finish(NOT_COMPARABLE, 'same up to call %d, then the result stops %s; the original %s' % (m, where, orig.how_ended()))
-        return finish(DIFFERENT, 'the same %d calls, but the original %s and the result %s' % (m, orig.how_ended(), res.how_ended()))
+        why = stops_at() if res.end == 'error' else None
+        if why:
+            return finish(NOT_COMPARABLE, 'same up to call %d, then the result %s; the original %s' % (m, why, orig.how_ended()))
+        return finish(DIFFERENT, 'the same %s, but the original %s and the result %s' % (_n(m), orig.how_ended(), res.how_ended()))
     if orig.end == 'error' and _strip_position(orig.end_message) != _strip_position(res.end_message):
         at = _placeholder_at(res, result_text)
         if at:
             return finish(NOT_COMPARABLE, 'same up to call %d, then the result stops at a placeholder (%s); the original %s' % (
                 m, 'line %d: %s' % at if at[0] else at[1], orig.how_ended()))
-        return finish(DIFFERENT, 'the same %d calls, but the runs stop with different errors' % m)
-    co, cr = _Canon(), _Canon()
-    go = sorted((n, ID_RE.sub('#', val)) for n, val in orig.globals)
-    gr = sorted((n, ID_RE.sub('#', val)) for n, val in res.globals)
+        return finish(DIFFERENT, 'the same %s, but the runs stop with different errors' % _n(m))
+    go = sorted((n, _ADDRESS.sub(r'\1: 0x?', ID_RE.sub('#', val))) for n, val in orig.globals)
+    gr = sorted((n, _ADDRESS.sub(r'\1: 0x?', ID_RE.sub('#', val))) for n, val in res.globals)
     if go != gr:
-        only_o = [g for g in go if g not in gr]
-        only_r = [g for g in gr if g not in go]
-        v = finish(DIFFERENT, 'the same %d calls and the same ending, but the globals left behind differ' % m)
-        for n, val in only_o[:6]:
+        v = finish(DIFFERENT, 'the same %s and the same ending, but the globals left behind differ' % _n(m))
+        for n, val in [g for g in go if g not in gr][:6]:
             v.add('original: %s = %s' % (n, val[:160]))
-        for n, val in only_r[:6]:
+        for n, val in [g for g in gr if g not in go][:6]:
             v.add('result:   %s = %s' % (n, val[:160]))
         return v
     if n_r == 0 and not go:
         return finish(NOT_COMPARABLE, 'the result makes no call into the environment and leaves no global: there is nothing to compare '
-                      '(the original %s after %d start-up calls)' % (orig.how_ended(), p))
+                      '(the original %s after %s)' % (orig.how_ended(), _n(p, 'start-up call')))
     what = 'both return' if orig.end == 'returned' else 'both stop with the same error (%s)' % _strip_position(orig.end_message)[:120]
-    return finish(SAME, 'the same %d calls and property writes, %s%s' % (m, what, ', the same %d globals left behind' % len(go) if go else ''))
+    return finish(SAME, 'the same %s, %s%s' % (_n(m, 'call or property write') if m == 1 else '%d calls and property writes' % m, what,
+                                             ', the same %s left behind' % _n(len(go), 'global') if go else ''))
 
 
 # ---------------------------------------------------------------------------- the tool

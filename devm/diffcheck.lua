@@ -11,6 +11,8 @@
 --   [dc] X<US>name<US>arg<US>arg...    a call of an executor function the harness keeps as a Lua stand-in
 --   [dc] S<US>object<US>key<US>value   a property write on a mock object
 --   [dc] E<US>name<US>message          that call raised (information; follows its C line)
+--   [dc] P<US>name                     the script read an undefined global that is a placeholder of a
+--                                      partial result (REG_n, ARG_n, UPVAL_n, __LPH_..., LuraphVM)
 --   [dc] G<US>name<US>value            a global the script left behind (at the end, sorted)
 --   [dc] END<US>returned | error<US>message
 --
@@ -235,9 +237,27 @@ local function recorded(name)
 	return true
 end
 
+-- A partial result names what it could not recover with globals that do not exist (REG_3, ARG_1,
+-- UPVAL_2, __LPH_ENV, LuraphVM).  Reading one is reported ([dc] P<US>name): from there on the
+-- result is not the script.  Reads of undefined globals go through the harness's fallback __index.
+local function placeholder(k)
+	return string.sub(k, 1, 6) == "__LPH_" or k == "LuraphVM" or string.match(k, "^ARG_%d+$") ~= nil
+		or string.match(k, "^REG_%d+$") ~= nil or string.match(k, "^UPVAL_%d+$") ~= nil
+end
+
 local recOf = setmetatable({}, { __mode = "k" })
 G.cwrap = function(name, impl, ...)
 	if name == "typeof" and not mockTypeof then mockTypeof = impl end
+	if name == "__index" and type(impl) == "function" and string.find(debug.info(impl, "s") or "", "harness%.lua$") then
+		return realCwrap(name, function(...)
+			local _, k = ...
+			if logging and type(k) == "string" and placeholder(k) then emit("P", k) end
+			local co = coroutine.create(impl)
+			local r = table.pack(coroutine.resume(co, ...))
+			if r[1] then return unpack(r, 2, r.n) end
+			error(r[2], 0)
+		end, ...)
+	end
 	if type(name) ~= "string" or type(impl) ~= "function" or not recorded(name) then return realCwrap(name, impl, ...) end
 	local yielder = select("#", ...) > 0 and (...) ~= nil     -- impl(callingThread, ...)
 	local skip = yielder and 1 or 0
