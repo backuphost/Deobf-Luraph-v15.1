@@ -248,6 +248,19 @@ show("below", debug.info(2, "l"))
         got, log = run('local x = __LPH_ENV\nlocal co = task.spawn(function() task.wait() end)\nshow("status", coroutine.status(co), x)')
         self.assertEqual(got.get('status'), 'suspended|nil', log)
 
+    def test_main_thread_of_a_chunk_started_by_the_carrier(self):
+        # a chunk unwrapped earlier runs through a stand-in carrier (harness.lua, carrier= / chunksrc=):
+        # the thread the carrier starts it in is the script's main thread
+        with tempfile.TemporaryDirectory() as tmp:
+            chunk, carrier = os.path.join(tmp, 'chunk.lua'), os.path.join(tmp, 'carrier.lua')
+            with open(chunk, 'w') as f:
+                f.write('local co = task.spawn(function() task.wait() end)\newrite("[t] status=" .. coroutine.status(co) .. "\\n")\n')
+            with open(carrier, 'w') as f:
+                f.write('local text, buf = __LPH_CARRY()\nlocal f = loadstring(text, "Luraph")\nreturn f(buf)\n')
+            r = subprocess.run([LUAU, os.path.join(DEVM, 'harness.lua'), '-a', chunk, os.path.join(tmp, 'out.trace'),
+                                'carrier=' + carrier, 'chunksrc=' + chunk], capture_output=True, text=True, errors='replace', timeout=120)
+        self.assertIn('[t] status=suspended', r.stderr, r.stderr)
+
     def test_clocks_and_wait_results(self):
         # tick() counts from the Unix epoch; a wait returns the time that passed: at least what was asked
         # for, at least one scheduler step, and not the same number twice (rbxmock.lua, "task")

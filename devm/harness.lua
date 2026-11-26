@@ -1907,9 +1907,8 @@ local src = readfile(samplePath)
 -- proto-table hooks, which do not mark the thread) is given a call of __LPH_MAIN in front of its
 -- first token: same line, no frame left on the stack, and the answers are the same in every kind of run.
 local fn, err
-if not string.find(src, "__LPH_PROTO", 1, true) and not string.find(src, "__LPH_MAIN", 1, true) then
-	fn = loadstring("__LPH_MAIN();" .. src, "=sample")
-end
+local markMain = not string.find(src, "__LPH_PROTO", 1, true) and not string.find(src, "__LPH_MAIN", 1, true)
+if markMain then fn = loadstring("__LPH_MAIN();" .. src, "=sample") end
 if not fn then fn, err = loadstring(src, "=sample") end
 if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
@@ -1963,7 +1962,8 @@ end
 if carrierPath then
 	if not chunkSrcPath then error("carrier= needs chunksrc=") end
 	chunkPatched, chunkOrig = src, readfile(chunkSrcPath)
-	fn, err = loadstring(readfile(carrierPath), "=sample")
+	-- (the carrier starts the chunk in its own thread: the same mark, unless the chunk's hooks set it)
+	fn, err = loadstring((markMain and "__LPH_MAIN();" or "") .. readfile(carrierPath), "=sample")
 	if not fn then
 		ewrite("COMPILE ERROR (carrier): " .. tostring(err) .. "\n")
 		error("compile")
