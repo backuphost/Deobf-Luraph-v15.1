@@ -1123,7 +1123,7 @@ def run_dump_script(model, workdir, tag, options=(), budget=12000000, timeout=15
         return f.read(), notes
 
 
-def run_dump(model, workdir, tag, layers=()):
+def run_dump(model, workdir, tag, layers=(), timeout=600):
     """layers: already-patched outer sources (outermost first); model is the innermost layer."""
     os.makedirs(workdir, exist_ok=True)
     patched = os.path.join(workdir, tag + '.patched.lua')
@@ -1133,9 +1133,14 @@ def run_dump(model, workdir, tag, layers=()):
     if os.path.exists(outjson):
         os.remove(outjson)
     chain = list(layers) + [patched]
-    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', chain[0], outjson] + chain[1:]
-                       + list(getattr(model, 'run_options', ())),
-                       capture_output=True, text=True, timeout=600)
+    try:
+        r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', chain[0], outjson] + chain[1:]
+                           + list(getattr(model, 'run_options', ())),
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # (subprocess.run has killed the harness)
+        raise RuntimeError('dump failed: the run did not reach the first interpreter entry within %d s '
+                           '(the loader itself waits or does not end)' % timeout)
     if not os.path.exists(outjson):
         raise RuntimeError('dump failed: ' + r.stderr[-2000:])
     with open(outjson) as f:

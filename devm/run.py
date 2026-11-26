@@ -233,6 +233,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                 src, n, removed = normalize.inline_protected_raw_info(run_src)
                 stage = pipeline.Stage(normalize.reflow(src), workdir, tag, log=log, oneline=True)
     stage.force_root = root
+    if run_timeout:
+        stage.dump_timeout = run_timeout
     stage.model.run_options = carrier.harness_options() if carrier else []
     stage.carrier = carrier
     if stage.model.factory_style:

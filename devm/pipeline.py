@@ -22,7 +22,7 @@ class Stage:
         m = self.model
         self.log('[%s] interpreter at line %d, %d dispatch loop(s), %s' % (
             self.tag, m.interp.line, len(m.loops), 'factory' if m.factory_style else 'proto-table'))
-        raw = vmmodel.run_dump(m, self.workdir, self.tag, self.layers)
+        raw = vmmodel.run_dump(m, self.workdir, self.tag, self.layers, timeout=getattr(self, 'dump_timeout', 600))
         self.dump = pe.Dump(raw, m)
         if m.factory_style:
             self.lifter = lifter.FactoryLifter(m, self.dump)
