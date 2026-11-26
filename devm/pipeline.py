@@ -146,9 +146,9 @@ def _dump_script(self, options=(), budget=None, timeout=None):
         # about 11 per byte of data where it decrypts it (v14.8); a failed check never ends.
         budget = max(12000000, 40 * size)
     if not timeout:
-        # (the dump decodes every lazy constant of the script: about 25 s per megabyte on a busy
-        # machine)
-        timeout = max(150, 30 * size // 1000000)
+        # (an init that decrypts its data runs about 11 instructions per byte, and the dump decodes
+        # every lazy constant of the script: 25 to 50 s per megabyte each on a busy machine)
+        timeout = max(150, 60 * size // 1000000)
     text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
     self.run_notes = notes
     for n in notes:
