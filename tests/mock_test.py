@@ -245,6 +245,27 @@ show("below", debug.info(2, "l"))
         self.assertEqual(got.get('signal'), 'suspended')
         self.assertEqual(got.get('below'), '')          # the chunk is the bottom of the stack, as in Roblox
 
+    def test_clocks_and_wait_results(self):
+        # tick() counts from the Unix epoch; a wait returns the time that passed: at least what was asked
+        # for, at least one scheduler step, and not the same number twice (rbxmock.lua, "task")
+        got, log = run('''
+show("tick", tick() > 1700000000, math.abs(tick() - os.time()) < 2, math.abs(tick() - DateTime.now().UnixTimestampMillis / 1000) < 2)
+local a, b = task.wait(), task.wait()
+local w, total = wait()
+show("task", a >= 1 / 60, a < 0.03, a ~= b, select("#", task.wait()))
+show("legacy", w >= 0.029, w < 0.06, w ~= a, type(total), select("#", wait()))
+show("asked", task.wait(0.5) >= 0.5, task.wait(0.5) < 0.52, wait(2) >= 2, task.wait(0) > 0)
+local got
+task.spawn(function() got = table.pack(wait(0.25)) end)
+task.wait()
+show("thread", got.n, got[1] >= 0.25, type(got[2]))
+''')
+        self.assertEqual(got.get('tick'), 'true|true|true', log)
+        self.assertEqual(got.get('task'), 'true|true|true|1')
+        self.assertEqual(got.get('legacy'), 'true|true|true|number|2')
+        self.assertEqual(got.get('asked'), 'true|true|true|true')
+        self.assertEqual(got.get('thread'), '2|true|number')
+
     def test_datetime(self):
         # documented datatype; 2020-01-02T10:30:45Z is the documentation's own example (1577961045 s)
         got, log = run('''

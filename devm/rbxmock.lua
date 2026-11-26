@@ -2117,24 +2117,39 @@ return function(G, fnames, libnames, opts)
 			end
 			return type(f) == "thread" and f or coroutine.create(f)
 		end)
-		local function waitImpl(co, t)
-			if t ~= nil and rawType(t) ~= "number" then
-				error("invalid argument #1 to 'wait' (number expected, got " .. rawTypeof(t) .. ")", 2)
-			end
-			if M.mainThread and co ~= M.mainThread then
-				-- a coroutine of the script: really yield (it shows as "suspended" until the scheduler,
-				-- i.e. the next wait of the main thread, resumes it)
-				queue[#queue + 1] = { co, t or 0.03 }
-				return YIELD
-			end
-			local q = queue
-			queue = {}
-			for _, item in ipairs(q) do
-				if coroutine.status(item[1]) == "suspended" then resume(unpack(item)) end
-			end
-			return t or 0.03
+		-- What a wait returns is the time that really passed (documentation of task.wait and wait): at
+		-- least what was asked for, at least one step of the scheduler (task.wait resumes on the next
+		-- Heartbeat, the legacy wait on its 30 Hz step), and in practice never the same number twice.
+		-- A key-system loader compares the results of wait() and task.wait() and takes equal ones for an
+		-- emulator.  Nothing really waits here, so the number is made: the asked time or one step, plus
+		-- a part of a step that changes from call to call (a fixed sequence, so that runs repeat).
+		local waits = 0
+		local function waited(t, step)
+			waits += 1
+			return math.max(t or 0, step) + (waits * 7919 % 997) / 997 * step * 0.25
 		end
-		task.wait = namedY("task.wait", waitImpl)
+		local function waiter(step, legacy)
+			return function(co, t)
+				if t ~= nil and rawType(t) ~= "number" then
+					error("invalid argument #1 to 'wait' (number expected, got " .. rawTypeof(t) .. ")", 2)
+				end
+				if M.mainThread and co ~= M.mainThread then
+					-- a coroutine of the script: really yield (it shows as "suspended" until the scheduler,
+					-- i.e. the next wait of the main thread, resumes it)
+					queue[#queue + 1] = { co, waited(t, step), legacy and os.clock() or nil }
+					return YIELD
+				end
+				local q = queue
+				queue = {}
+				for _, item in ipairs(q) do
+					if coroutine.status(item[1]) == "suspended" then resume(unpack(item)) end
+				end
+				if legacy then return waited(t, step), os.clock() end       -- (elapsed, elapsedTime())
+				return waited(t, step)
+			end
+		end
+		local waitImpl = waiter(1 / 30, true)
+		task.wait = namedY("task.wait", waiter(1 / 60, false))
 		task.cancel = named("task.cancel", function(...)
 			if select("#", ...) == 0 then error("missing argument #1 to 'cancel' (thread expected)", 2) end
 			local co = ...
@@ -2175,7 +2190,12 @@ return function(G, fnames, libnames, opts)
 		M.debug = d
 	end
 
-	M.tick = named("tick", os.clock)
+	-- tick(): seconds since the Unix epoch with a fraction (documentation; local time, taken as UTC here).
+	-- A key-system loader requires tick() and os.time() to be later than a date it carries.
+	do
+		local t0, c0 = os.time(), os.clock()
+		M.tick = named("tick", function() return t0 + (os.clock() - c0) end)
+	end
 	M.time = named("time", os.clock)
 	M.elapsedTime = named("elapsedTime", os.clock)
 	-- print / warn: nothing is shown, but what the script said goes into the run's log
