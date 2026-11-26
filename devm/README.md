@@ -207,7 +207,10 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   runs.  The result is a static lift of the script's program; the report says so.
 * **A single root program** (v14.9): no first-program call.  The root program starts with the same
   start-up code, builds the script's program and calls it itself.  The dump is taken when a program
-  is entered that did not exist when the root program started (`__LPH_ENTER`).
+  is entered that did not exist when the root program started (`__LPH_ENTER`).  A run that is
+  stopped before that falls back to the second-stage route and, when the lifted root program holds
+  no encrypted second stage, ends `devm: init did not hand over`; a root program that returns
+  without entering anything is the script itself and is lifted from its first entry.
 * **Key functions.**  From v14.8 on the script patches its own operands with the values of small
   functions the init installs.  At the hand-over they are closures of the VM; the harness calls
   each one twice under a budget and writes the value into the dump (`findConstFns`).
