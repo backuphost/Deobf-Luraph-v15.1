@@ -186,8 +186,12 @@ class Plain(Base):
         self.expect(SAME, original, result, r'Luau evaluates them before it looks the method up')
         # an argument with an effect is not waved through
         result2 = 'print("a")\nlocal lib = nil\nlib:CreateWindow({ Parent = game:GetService("CoreGui") })\n'
-        self.expect(DIFFERENT, original, result2, r'if the calls below are such arguments')
+        self.expect(DIFFERENT, original, result2, r'if the calls below are arguments of that call')
         self.expect(DIFFERENT, original, mutate(result, 'lib:CreateWindow', 'lib:CreateWindows'))
+        # not that case: a local the lift moved into a later expression, behind a call
+        o3 = 'print("a")\nlocal lib = nil\nlocal id = lib.Id\nprint(Vector3.new(1, 2, 3), id)\n'
+        r3 = 'print("a")\nlocal lib = nil\nprint(Vector3.new(1, 2, 3), lib.Id)\n'
+        self.expect(DIFFERENT, o3, r3, r'an expression that raises is evaluated after calls it preceded')
 
     def test_which_object(self):
         a = 'local x, y = Instance.new("Part"), Instance.new("Part")\nx.Name = "n"\ny:Destroy()\n'

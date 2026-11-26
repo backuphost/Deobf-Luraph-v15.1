@@ -419,6 +419,15 @@ def _placeholder_at(res, text):
     return None
 
 
+def _error_line(res, text):
+    """The line of the result its run stopped on, or None."""
+    m = re.match(r'sample:(\d+): ', res.end_message) if res.end == 'error' else None
+    lines = text.split('\n')
+    if m and 1 <= int(m.group(1)) <= len(lines):
+        return lines[int(m.group(1)) - 1]
+    return None
+
+
 def _context(events, k, before=3, after=2):
     out = []
     for i in range(max(0, k - before), min(len(events), k + after + 1)):
@@ -552,22 +561,31 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
                 return finish(NOT_COMPARABLE, 'the original made no call of the script before its %s' % orig.cut)
             return finish(SAME, 'same for the first %s; the original\'s run was cut at the %s there, the result goes on' % (_n(m), orig.cut))
         extra = [e for _, e in er[m:]]
-        late_lookup = (orig.end == 'error' and res.end == 'error' and not hole
-                       and _strip_position(orig.end_message) == _strip_position(res.end_message)
-                       and re.match(r"attempt to (index nil with '|call a nil value|call missing method)", _strip_position(orig.end_message)))
+        same_error = (orig.end == 'error' and res.end == 'error' and not hole
+                      and _strip_position(orig.end_message) == _strip_position(res.end_message))
+        # obj:Method(args) with a missing obj or method: Luau evaluates the arguments first and then
+        # looks the method up, Luraph's VM (Lua 5.1 order) looks it up first.  The same source text
+        # therefore makes the argument calls only in the result.
+        late_lookup = None
+        if same_error:
+            g = re.match(r"attempt to (?:index nil with|call missing method) '(\w+)'", _strip_position(res.end_message))
+            line = _error_line(res, result_text)
+            if g and line and re.search(r':\s*%s\s*[({"\']' % re.escape(g.group(1)), line):
+                late_lookup = g.group(1)
         if late_lookup and all(e.kind == 'C' and '.' in e.name and e.name.split('.')[0] in VALUE_LIBS for e in extra):
-            # obj:Method(args) with a missing obj or method: Luau evaluates the arguments first and then
-            # looks the method up, Luraph's VM (Lua 5.1 order) looks it up first.  The same source text
-            # therefore makes the argument calls only in the result; value constructors have no effect.
             v = finish(SAME, 'the same %s, then both stop with the same error (%s); before it the result makes %s of value constructors that the original does not' % (
                 _n(m), _strip_position(orig.end_message)[:100], _n(len(extra))))
-            v.add('those calls (%s) are arguments of the failing method call: Luau evaluates them before it looks the method up, Luraph\'s interpreter after' % _kinds(er[m:]))
+            v.add('those calls (%s) are arguments of the failing call of :%s(...): Luau evaluates them before it looks the method up, Luraph\'s interpreter after; they have no effect' % (
+                _kinds(er[m:]), late_lookup))
             return v
         v = finish(DIFFERENT, 'after %s the original %s, the result goes on (%d more)' % (
             _n(m, 'equal call'), 'returns' if orig.end == 'returned' else 'stops', n_r - n_o))
         if late_lookup:
-            v.add('both stop with the same error (%s).  Luau evaluates the arguments of obj:Method(...) before it looks the method up, '
-                  'Luraph\'s interpreter after: if the calls below are such arguments, the source is the same' % _strip_position(orig.end_message)[:100])
+            v.add('both stop with the same error (%s).  Luau evaluates the arguments of obj:%s(...) before it looks the method up, Luraph\'s '
+                  'interpreter after: if the calls below are arguments of that call, the source is the same' % (_strip_position(orig.end_message)[:100], late_lookup))
+        elif same_error:
+            v.add('both stop with the same error (%s), the result later: an expression that raises is evaluated after calls it preceded in the original '
+                  '(typically a local the lift moved into a later expression)' % _strip_position(orig.end_message)[:100])
         v.add('next calls of the result:')
         for line in _context(er, m, 2, 2):
             v.add(line)
