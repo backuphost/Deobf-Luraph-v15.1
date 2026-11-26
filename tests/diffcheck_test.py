@@ -193,6 +193,11 @@ class Plain(Base):
         r3 = 'print("a")\nlocal lib = nil\nprint(Vector3.new(1, 2, 3), lib.Id)\n'
         self.expect(DIFFERENT, o3, r3, r'an expression that raises is evaluated after calls it preceded')
 
+    def test_error_position_inside_a_printed_message(self):
+        a = 'local ok, err = pcall(function() local t = nil return t.Source end)\nwarn("UI Library failed to load: " .. tostring(err))\n'
+        self.expect(SAME, a, '\n\n-- moved two lines down\n' + a)
+        self.expect(DIFFERENT, a, mutate(a, 't.Source', 't.Sources'))
+
     def test_which_object(self):
         a = 'local x, y = Instance.new("Part"), Instance.new("Part")\nx.Name = "n"\ny:Destroy()\n'
         self.expect(SAME, a, a)

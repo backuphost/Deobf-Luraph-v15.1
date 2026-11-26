@@ -29,6 +29,10 @@ depend on a "salt".  When the first comparison (salt 1) finds a difference, both
 again with salt 2: an argument that differs between the two runs of the same file depends on
 time or chance and is not compared.
 
+Error positions.  `sample:61:` in front of a message names chunk and line; they differ between a
+VM and plain code and are left out of the comparison, in the error a run stops with and inside
+string arguments (a script that prints an error it caught).
+
 Partial results (LIFT ERROR markers, __LPH_ENV, ARG_n / REG_n / UPVAL_n placeholders) usually
 stop early.  They are compared as far as they run; "same up to call N, then the result stops"
 is reported as not comparable beyond that point (exit 2), never as same.
@@ -297,6 +301,9 @@ def volatile_args(a, b, noise=NOISE_CALLS):
 _ADDRESS = re.compile(r'\b(function|table|userdata|thread|buffer|builtin): (?:builtin: )?0x[0-9a-f]{8,16}\b')
 
 
+_POSITION = re.compile(r'(?:(?:sample|Luraph Script|LPH|\[string \\"[^"\\]*\\"\]):\d+: )+')
+
+
 class _Canon:
     """Renumbers object serials in order of first appearance."""
 
@@ -307,6 +314,10 @@ class _Canon:
         if '0x' in text:
             # tostring(f) inside a string: "function: 0x000055839cce2dc0"
             text = _ADDRESS.sub(lambda g: g.group(1) + ': 0x?', text)
+        if ': ' in text:
+            # the position in front of an error message a script caught and passes on (print(err)):
+            # chunk name and line differ between the VM and plain code
+            text = _POSITION.sub('', text)
         if '\x01' not in text:
             return text
         m = self.map
