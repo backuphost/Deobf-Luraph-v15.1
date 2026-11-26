@@ -112,12 +112,13 @@ def find_header(text):
         idx = text.find('Luraph Obfuscator v', at)
         if idx < 0:
             return None
-        line = text.rfind('\n', 0, idx) + 1
-        if idx - line < 400:
-            dd = text.find('--', line, idx)
-            m = HEADER_RE.search(text, max(line, idx - 40), idx + 80)
-            if dd >= 0 and m:
-                return dd, m
+        line = text.rfind('\n', max(0, idx - 400), idx) + 1
+        # the comment's `--`: the first one on the line when the line is short, else (the
+        # header glued behind the program on one line) the nearest one in front of the words
+        dd = text.find('--', line, idx) if idx - line < 400 else text.rfind('--', idx - 60, idx)
+        m = HEADER_RE.search(text, max(line, idx - 40), idx + 80)
+        if dd >= 0 and m:
+            return dd, m
         at = idx + 1
 
 

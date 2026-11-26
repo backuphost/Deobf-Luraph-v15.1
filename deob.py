@@ -1866,7 +1866,7 @@ def container_exit(scan):
 
 
 def print_v14_block(scan, inp, kept_work):
-    label = version_label(scan.header["version"])
+    label = version_label(scan.header["version"]) if scan.header["version"] else "Luraph v14.x"
     c = scan.container
     lay = scan.layout()
     print()
