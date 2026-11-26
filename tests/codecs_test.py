@@ -19,7 +19,8 @@ Without a corpus (everything is synthetic, built by the test itself):
 * devm/zstd.py: libzstd and the Luau fallback give the same bytes; errors are ZstdError.
 * devm/container_static.py on miniature containers built here from synthetic Lua text with Python's
   lzma module: one and two payloads, both byte orders, the variant without string.pack, the Zstd
-  variant, chunk names, what stands around a container, texts that are not containers, damaged ones.
+  variant, the v15 object form, chunk names, what stands around a container, texts that are not
+  containers, damaged ones; and on examples/v15.2/sample.luau against the sandbox (devm/unwrap.lua).
 
 With LURAPH_CORPUS (a directory with one sub-directory per Luraph version; files are picked by
 directory and by what they turn out to be, never by name; LURAPH_CORPUS_SKIP may name a file listing
@@ -628,6 +629,37 @@ def container(chunk, data=None, order='>', codec='lzma', spaces=0, data_kind='st
     return ''.join(t)
 
 
+def container_v15(chunk, data, offset=36, order=(4, 3, 1, 0, 2), data_first=False, tail=';'):
+    """A text with the token structure of the v15 container (object instead of function): the 85 digits start
+    at chr(offset), character k of a group is the digit of weight 85^order[k], and the ten printable characters
+    outside the alphabet stand for the ten most frequent groups."""
+    import collections
+
+    def groups(blob):
+        raw = lzma_raw(blob)
+        raw += b'\0' * (-len(raw) % 4)
+        out = []
+        for (v,) in struct.iter_unpack('<I', raw):
+            digit = [(v // 85 ** e) % 85 for e in range(5)]
+            out.append(''.join(chr(offset + digit[e]) for e in order))
+        return out
+    g1, g2 = groups(chunk), groups(data)
+    keys = [chr(c) for c in range(32, 127) if not offset <= c < offset + 85]
+    table = dict(zip(keys, [g for g, _n in collections.Counter(g1 + g2).most_common(10)]))
+    back = {v: k for k, v in table.items()}
+    lits = ['[==[LPH' + tag + ''.join(back.get(g, g) for g in gs) + ']==]' for gs, tag in ((g1, '+'), (g2, '!'))]
+    fields = ['p=' + lits[0], 'u=' + lits[1]]
+    if data_first:
+        fields.reverse()
+    return ''.join([
+        '-- This file was protected using Luraph Obfuscator v15.1 [https://lura.ph/]\n\n',
+        'return setmetatable({N="Luraph",k="function",[42]=loadstring,[56]=buffer.tostring,',
+        'W={' + ','.join('[%s]=%s' % (quoted(k), quoted(v)) for k, v in table.items()) + '},', fields[0], ',',
+        'q=function(g)local h,x,y=g.r,g.p,g.u;local a,b=h(g,x,%d),h(g,y,%d);' % (len(chunk), len(data)),
+        'local f=g[42](g[56](a),g.N,nil);assert(f,"Luraph Decompression Error: ");return f(b);end,',
+        fields[1], ',r=function(g,q,Q)return q;end,l="[ -#y-~]"},{}):q()(...)', tail])
+
+
 CHUNK = b'return(function(...)local t={...};' + synthetic(3000) + b'return t;end)(...);'
 DATA = bytes(range(256)) * 20 + bytes(4000) + synthetic(900)
 
@@ -745,6 +777,45 @@ class ContainerStatic(unittest.TestCase):
             container_static.decode(text[:second + 80])
         part = cm.exception.partial
         self.assertEqual((part.chunk, part.codec, part.data), (CHUNK, 'zstd', None))
+
+    def test_v15_container(self):
+        for offset, order, data_first in ((36, (4, 3, 1, 0, 2), False), (32, (1, 4, 3, 2, 0), True), (41, (0, 1, 2, 3, 4), False),
+                                          (39, (2, 0, 4, 1, 3), True)):
+            text = container_v15(CHUNK, DATA, offset, order, data_first)
+            res = container_static.decode(text)
+            self.assertIsNotNone(res, (offset, order))
+            self.assertEqual((res.chunk, res.chunk_name, res.data, res.data_kind, res.codec, res.payloads),
+                             (CHUNK, 'Luraph', DATA, 'buffer', 'lzma', 2))
+            self.assertTrue(any(''.join(map(str, order)) in n for n in res.notes), res.notes)
+        text = container_v15(CHUNK, DATA)
+        # cut off: inside a payload, and behind the object
+        first = text.index('LPH')
+        with self.assertRaises(container_static.ContainerError):
+            container_static.decode(text[:first + 400])
+        with self.assertRaises(container_static.ContainerError) as cm:
+            container_static.decode(text[:-7])
+        self.assertEqual((cm.exception.partial.chunk, cm.exception.partial.data), (CHUNK, DATA))
+        # damaged payload text
+        second = text.index('LPH', first + 3)
+        with self.assertRaises(container_static.ContainerError):
+            container_static.decode(text[:second + 300] + text[second + 301:])
+        # a plain v15 VM has one payload and no substitution table: not a container
+        one = text[:second - 6] + text[text.index(']==]', second) + 5:]
+        self.assertIsNone(container_static.decode(one))
+
+    @unittest.skipUnless(LUAU, 'bin/luau is not there')
+    def test_repository_sample(self):
+        """examples/v15.2/sample.luau is a v15 container: the static result is what the sandbox captures"""
+        path = os.path.join(ROOT, 'examples', 'v15.2', 'sample.luau')
+        if not os.path.exists(path):
+            self.skipTest('examples/v15.2/sample.luau is not there')
+        with open(path, 'rb') as f:
+            res = container_static.decode(f.read())
+        self.assertIsNotNone(res)
+        with tempfile.TemporaryDirectory(prefix='codecs-sample-') as tmp:
+            got = sandbox_unwrap(path, tmp)
+        self.assertIsNotNone(got)
+        self.assertEqual((got[0], got[1], got[2], got[3]), (res.chunk, res.chunk_name, res.data, res.data_kind))
 
     def test_lexer(self):
         lex = container_static._lex

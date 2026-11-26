@@ -11,7 +11,7 @@ r"""Open Luraph's compressed container without running it.
 
     python3 -m devm.container_static FILE [OUT_PREFIX]      (writes OUT_PREFIX.chunk.lua / .data.bin)
 
-What it reads (Luraph v14.0.3 ... v14.9, one v15.0 file; 1,706 files of the public corpus):
+What it reads.  Luraph v14.0.3 ... v14.9 and one v15.0 file (1,706 files of the public corpus):
 
     -- This file was protected using Luraph Obfuscator vX [https://lura.ph/]
     return(function()
@@ -35,8 +35,15 @@ Nothing of the input is executed; the text is only lexed.  A container that cann
 is damaged (text cut off, payload that does not decode) raises ContainerError; when the first payload
 could still be read, the exception carries it as `.partial` (a Result whose `data` is None).
 
-Not handled here (decode() returns None, the sandbox route opens them): the v15 containers, which are
-`return setmetatable({...},{}):M()(...)` objects with a state-machine decoder.
+The v15 container (7 corpus files) is an object instead of a function:
+
+    return setmetatable({ P=[==[LPH...]==], Q=[==[LPH...]==], W={["!"]="PveHq",...}, N="Luraph",
+                          ...methods: a state machine and the LZMA decoder... },{}):M()(...)
+
+Same idea, three per-file twists in the text decoder (ten spare characters stand for whole groups, the 85
+digits start at a per-file character, the five digits of a group are stored in a per-file order); the LZMA
+streams are the same, their lengths are literals in the text; see _decode_setmt.  Always two payloads, the
+data handed over as a buffer.
 """
 import lzma
 import re
@@ -209,8 +216,8 @@ def _is(tokens, i, pattern):
     return True
 
 
-def _main_statement(tokens):
-    """Index of the token after `return(function()` when that is the first top-level `return`; else None."""
+def _first_return(tokens):
+    """Index of the first `return` outside every bracket and block (the main statement of a Luraph file), or None."""
     depth = block = 0
     for i, (kind, value, _pos) in enumerate(tokens):
         if kind == 'op':
@@ -224,7 +231,29 @@ def _main_statement(tokens):
             elif value in _BLOCK_CLOSE:
                 block -= 1
             elif value == 'return' and depth <= 0 and block <= 0:
-                return i + 1 + len(_HEAD) if _is(tokens, i + 1, _HEAD) else None
+                return i
+    return None
+
+
+def _main_statement(tokens):
+    """Index of the token after `return(function()` when that is the first top-level `return`; else None."""
+    i = _first_return(tokens)
+    if i is None or not _is(tokens, i + 1, _HEAD):
+        return None
+    return i + 1 + len(_HEAD)
+
+
+def _closing(tokens, start):
+    """Index of the `)` that closes the `(` at tokens[start], or None when the text ends first."""
+    depth = 0
+    for i in range(start, len(tokens)):
+        if tokens[i][0] == 'op':
+            if tokens[i][1] == '(':
+                depth += 1
+            elif tokens[i][1] == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
     return None
 
 
@@ -305,10 +334,212 @@ def _chunk_name(tokens, start, notes):
     return 'Luraph'
 
 
+# ---------------------------------------------------------------------------------------------- v15: setmetatable object
+
+_SETMT_HEAD = (('id', 'setmetatable'), ('op', '('), ('op', '{'))
+_PERMUTATIONS = None
+
+
+def _substitution_table(tokens, start, stop):
+    """{character: five characters}: the table constructor whose entries all are  c = "xxxxx"  /  ["c"] = "xxxxx"."""
+    for i in range(start, stop):
+        if not (tokens[i][0] == 'op' and tokens[i][1] == '{'):
+            continue
+        table = {}
+        j = i + 1
+        while j < stop:
+            if _is(tokens, j, (('op', '['), ('str', None), ('op', ']'), ('op', '='), ('str', None))):
+                key, value, j = tokens[j + 1][1], tokens[j + 4][1], j + 5
+            elif _is(tokens, j, (('id', None), ('op', '='), ('str', None))):
+                key, value, j = tokens[j][1], tokens[j + 2][1], j + 3
+            else:
+                break
+            if len(key) != 1 or len(value) != 5 or key in table:
+                table = None
+                break
+            table[key] = value
+            if j < stop and tokens[j][0] == 'op' and tokens[j][1] in ',;':
+                j += 1
+        if table and j < stop and tokens[j][0] == 'op' and tokens[j][1] == '}':
+            return table
+    return None
+
+
+def _groups_to_bytes(raw, offset, perm, count=None):
+    """bytes of the first `count` five-character groups (all when None): character k of a group is the base-85
+    digit of weight 85^perm[k], digits count from `offset`, the value is written little-endian.
+    None when a group is not a 32-bit value."""
+    n = len(raw) // 5 if count is None else min(count, len(raw) // 5)
+    end = 5 * n
+    tabs = [[(c - offset) * 85 ** e for c in range(256)] for e in perm]
+    d0, d1, d2, d3, d4 = tabs
+    vals = [d0[a] + d1[b] + d2[c] + d3[d] + d4[e] for a, b, c, d, e in
+            zip(raw[0:end:5], raw[1:end:5], raw[2:end:5], raw[3:end:5], raw[4:end:5])]
+    try:
+        return struct.pack('<%dI' % n, *vals)
+    except struct.error:
+        return None
+
+
+def _looks_like_lua(chunk):
+    head = chunk[:256]
+    return bool(head) and all(32 <= b < 127 or b in (9, 10, 13) for b in head) and (b'return' in head or b'local' in head)
+
+
+def _decode_setmt(tokens, ret, notes):
+    """The v15 container:  return setmetatable({ ...methods..., P=[==[LPH...]==], Q=[==[LPH...]==],
+    W={["!"]="PveHq",...}, N="Luraph", ... },{}):M()(...)
+
+    Its payload text is base 85 as in v14, with three per-file twists the object's state machine implements:
+    ten characters outside the 85-character alphabet stand for whole groups (the table W), the alphabet starts
+    at a per-file character, and the five digits of a group are stored in a per-file order.  The LZMA streams
+    are inflated to lengths that are literals in the call that does it (chunk first, then data).
+    The digit order is found by trial: only the right one makes every group a 32-bit value and the bytes an
+    LZMA stream.  Which payload is the chunk is decided by the two lengths."""
+    global _PERMUTATIONS
+    open_paren = ret + 2
+    close = _closing(tokens, open_paren)
+    stop = close if close is not None else len(tokens)
+    pay = [i for i in range(open_paren, stop) if tokens[i][0] in ('str', 'cut') and tokens[i][1].startswith('LPH')
+           and (len(tokens[i][1]) >= 64 or tokens[i][0] == 'cut')]
+    table = _substitution_table(tokens, open_paren, stop)
+    if table is None or not pay:
+        return None                             # a plain v15 VM: one payload, no decompressor, no such table
+    for i in pay[:2]:
+        if tokens[i][0] != 'str':
+            raise ContainerError('the text ends inside a payload string (%d characters of it are there): the file is cut off'
+                                 % len(tokens[i][1]))
+    if len(pay) < 2:
+        if close is None:
+            raise ContainerError('the text ends before the second payload string: the file is cut off')
+        return None
+    if len(pay) > 2:
+        notes.append('%d payload strings; the first two are used' % len(pay))
+    complete = close is not None and _is(tokens, close + 1, (('op', ':'), ('id', None), ('op', '('), ('op', ')'),
+                                                               ('op', '('), ('op', '...'), ('op', ')')))
+    alphabet = [c for c in range(32, 127) if chr(c) not in table]
+    if len(alphabet) != 85 or alphabet[-1] - alphabet[0] != 84:
+        raise ContainerError('the substitution table of the container leaves no run of 85 characters for the digits '
+                             '(an unknown variant of the v15 container)')
+    offset = alphabet[0]
+    trans = {ord(k): v for k, v in table.items()}
+    raws = []
+    for n, i in enumerate(pay[:2]):
+        try:
+            raw = tokens[i][1][4:].translate(trans).encode('latin-1')
+        except UnicodeEncodeError:
+            raise ContainerError('a payload holds characters outside the byte range') from None
+        if len(raw) % 5:
+            notes.append('payload %d: %d character(s) after the last group of five' % (n + 1, len(raw) % 5))
+        raws.append(raw)
+    # the two lengths: ID(ID, ID, N1), ID(ID, ID, N2)
+    sizes = None
+    call = (('id', None), ('op', '('), ('id', None), ('op', ','), ('id', None), ('op', ','), ('num', None), ('op', ')'))
+    for i in _find_all(tokens[:stop], open_paren, call + (('op', ','),) + call):
+        a, b = _number(tokens[i + 6][1]), _number(tokens[i + 15][1])
+        if isinstance(a, int) and isinstance(b, int) and 0 < a <= MAX_OUTPUT and 0 < b <= MAX_OUTPUT:
+            sizes = (a, b)
+            break
+    if sizes is None and not complete:
+        notes.append('the text is cut off before the code that names the lengths of the payloads')
+    elif sizes is None:
+        notes.append('the lengths of the two payloads are not where this decoder looks for them; the chunk is '
+                     'told from its data by its content')
+    # digit order: every group must be a 32-bit value, and the bytes must start an LZMA stream
+    if _PERMUTATIONS is None:
+        import itertools
+        _PERMUTATIONS = list(itertools.permutations(range(5)))
+    found = None
+    for perm in _PERMUTATIONS:
+        ok = True
+        for raw in raws:
+            head = _groups_to_bytes(raw, offset, perm, 3000)
+            if head is None or head[:1] != b'\0':
+                ok = False
+                break
+            try:
+                dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[
+                    {'id': lzma.FILTER_LZMA1, 'lc': 3, 'lp': 0, 'pb': 0, 'dict_size': 1 << 16}])
+                if not dec.decompress(head, 4096):
+                    ok = False
+                    break
+            except lzma.LZMAError:
+                ok = False
+                break
+        if ok:
+            if found is not None:
+                raise ContainerError('the order of the base-85 digits cannot be told (two orders fit)')
+            found = perm
+    if found is None:
+        raise ContainerError('the payloads decode in no order of the base-85 digits: corrupt payload text, or an '
+                             'unknown variant of the v15 container')
+    data85 = []
+    for n, raw in enumerate(raws):
+        b = _groups_to_bytes(raw, offset, found)
+        if b is None:
+            raise ContainerError('payload %d: a base85 group is not a 32-bit value: the payload text is corrupt' % (n + 1))
+        data85.append(b)
+    names = [t[1] for t in tokens[open_paren:stop] if t[0] == 'str' and t[1].startswith('Luraph') and not t[1][6:].strip(' ')]
+    if names:
+        name = names[0]
+    else:
+        name = 'Luraph'
+        notes.append('no "Luraph" chunk name in the text; "Luraph" assumed')
+    kind = 'buffer' if len(_find_all(tokens[:stop], open_paren, (('id', 'buffer'), ('op', '.'), ('id', 'tostring')))) < 2 else 'string'
+    notes.append('v15 container (setmetatable object): digits start at %r, digit order %s found by trial'
+                 % (chr(offset), ''.join(str(e) for e in found)))
+    # inflate (the streams end in an end marker although the container's decoder stops at the known length), then
+    # tell the chunk from its data: by the two lengths, or by its content when the lengths are not known
+    outs, errors = [], []
+    for n in (0, 1):
+        try:
+            out, unused = _lzma(data85[n])
+            if unused > 3:
+                notes.append('payload %d: %d bytes after the LZMA end marker' % (n + 1, unused))
+            outs.append(out)
+        except ContainerError as e:
+            outs.append(None)
+            errors.append('payload %d: %s' % (n + 1, e))
+    which = None
+    if sizes is not None:
+        for n in (0, 1):
+            if outs[n] is not None and len(outs[n]) == sizes[0] and (outs[1 - n] is None or len(outs[1 - n]) == sizes[1]):
+                which = n
+                break
+        if which is None and not errors:
+            raise ContainerError('the payloads inflate to %d and %d bytes, the container expects %d (chunk) and %d (data)'
+                                 % (len(outs[0]), len(outs[1]), sizes[0], sizes[1]))
+    else:
+        texts = [n for n in (0, 1) if outs[n] is not None and _looks_like_lua(outs[n])]
+        if len(texts) == 1:
+            which = texts[0]
+        elif not errors:
+            raise ContainerError('cannot tell the chunk from its data (%d of the two payloads inflate to text)' % len(texts))
+    if which is None:
+        raise ContainerError('; '.join(errors))
+    chunk, data = outs[which], outs[1 - which]
+    if data is None:
+        raise ContainerError('data payload: %s' % errors[0].split(': ', 1)[1], Result(chunk, name, None, None, 'lzma', notes + [
+            'the data payload does not decode'], '<', len(pay)))
+    res = Result(chunk, name, data, kind, 'lzma', notes, '<', len(pay))
+    if not complete:
+        res.notes = notes + ['the text of the container is incomplete']
+        raise ContainerError('the text ends before the end of the container (no `):M()(...)` after the object): '
+                             'the file is cut off; both payloads were read', res)
+    if close is not None:
+        extra = tokens[close + 8:]
+        if extra and extra[0][1] == ';':
+            extra = extra[1:]
+        if extra:
+            notes.append('text after the end of the container (from offset %d) ignored' % extra[0][2])
+    return res
+
+
 def decode(text):
     """Open the compressed container in `text` (str; bytes are read as Latin-1).
 
-    None when the text is not a `return(function()...end)()(...)` container with `LPH` payload strings;
+    None when the text is not a compressed container (v14: `return(function()...end)()(...)` with `LPH` payload
+    strings; v15: `return setmetatable({...},{}):M()(...)` with two of them and a decompressor);
     a Result when it is; ContainerError when it is one but damaged."""
     if isinstance(text, (bytes, bytearray)):
         text = bytes(text).decode('latin-1')
@@ -324,19 +555,12 @@ def decode(text):
             if body is not None:
                 notes.append('the program follows the header comment on the same line (line break lost); read from there')
     if body is None:
+        ret = _first_return(tokens)
+        if ret is not None and _is(tokens, ret + 1, _SETMT_HEAD):
+            return _decode_setmt(tokens, ret, notes)
         return None
     # the statement ends where the parenthesis opened after `return` closes: return ( function() ... end ) () (...)
-    close = None
-    depth = 0
-    for i in range(body - len(_HEAD), len(tokens)):
-        if tokens[i][0] == 'op':
-            if tokens[i][1] == '(':
-                depth += 1
-            elif tokens[i][1] == ')':
-                depth -= 1
-                if depth == 0:
-                    close = i
-                    break
+    close = _closing(tokens, body - len(_HEAD))
     stop = close if close is not None else len(tokens)
     inner = tokens[body:stop]
     # payload strings: literals "LPH" + one character + base85 text, in source order
