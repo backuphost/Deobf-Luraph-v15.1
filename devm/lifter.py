@@ -43,6 +43,9 @@ ABS = '__truth__'         # ... and: frozenset of (register, 'T...' | 'F'), see 
 SYMPC = 'jump to a run-time computed instruction'
 
 
+NO_TARGET = -1      # third component of a hub copy's key for arrivals without a known jump target
+
+
 class Samp(tuple):
     """samples of a number that is not known (see known_after.num2)"""
 
@@ -679,6 +682,9 @@ class Lifter:
     def lift_node(self, interp, node, key2, snap, known, indirect, pkey, numknown=False):
         """Lift one instruction into node.tree; returns None or the error text."""
         self.pe.regknown = known
+        if self.end_state and any(isinstance(v, Samp) for v in known.values()):
+            # (samples of a number that is not known, see known_after: nothing the evaluator can read)
+            self.pe.regknown = {r: v for r, v in known.items() if not isinstance(v, Samp)}
         # (a never-run instruction that decrypts bytecode with a key it took from a register:
         # with the number that register held the decryption can be done -- see _upnum_retry)
         self.pe.sym_buf_error = bool(self.end_state and not self.pe.use_upnum and (self.up_nums or self.temp_vals)
@@ -755,7 +761,8 @@ class Lifter:
         self.pe.use_upnum = True
         snap2 = dict(snap)
         for name, v in snap.items():
-            if isinstance(v, Sym) and isinstance(v.e, tuple) and v.e[0] == 't' and v.e[1] in self.temp_vals:
+            if isinstance(v, Sym) and isinstance(v.e, tuple) and v.e[0] == 't' and v.e[1] in self.temp_vals \
+                    and not isinstance(self.temp_vals[v.e[1]], Samp):
                 snap2[name] = P.KNum(self.temp_vals[v.e[1]])
         try:
             return self.lift_node(interp, node, key2, snap2, known, indirect, pkey, numknown=True)
@@ -1029,6 +1036,13 @@ class Lifter:
                     key2 = key2 + (known[r],)
                     if pred is not None:
                         pred.tree = retarget_tree(pred.tree, {id(pend): key2})
+                elif r is not None and pathmode and not P.is_num(known.get(r)) and P.is_num(node_in[key2].get(r)):
+                    # ... and a path that arrives without the target (code no run took, reached
+                    # through a join that lost the register) gets a copy of its own: it must not
+                    # take the target away from the path that has one
+                    key2 = key2 + (NO_TARGET,)
+                    if pred is not None:
+                        pred.tree = retarget_tree(pred.tree, {id(pend): key2})
             if key2 in pir.nodes and pathmode and pir.nodes[key2].error and relifts.get(('err', key2), 0) < 6 \
                     and (key, key2[0], key2[1]) not in self.oracle:
                 # The instruction did not lift on the path that got here first.  That path may have
@@ -1098,7 +1112,14 @@ class Lifter:
                 switch(path if (replay or not ran) else None)
                 if replay and ran and not rec.get('p') and defer:
                     pc2 = key2[:2]
-                    for name in key_locals:
+                    names = key_locals
+                    if not self.defer_foreign_state:
+                        # Without wrapper keys the keys are interpreter locals all the same: set
+                        # from registers (`key = R[x]`) and used by instructions that decrypt
+                        # themselves on first execution.  A number the walk brings along that is
+                        # not the one the run had here belongs to another path.
+                        names = [n for n in rec['v'] if P.is_num(snap.get(n)) and not isinstance(snap.get(n), bool)]
+                    for name in names:
                         v = rec['v'].get(name)
                         if P.is_num(v) and name in snap and not same_value(snap[name], P.norm(v)):
                             snap = dict(snap)
