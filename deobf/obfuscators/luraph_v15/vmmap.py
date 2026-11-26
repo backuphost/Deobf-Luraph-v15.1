@@ -397,6 +397,20 @@ def maker_info(root):
                                              "pf_key": pk,
                                              "maker": stack[oi], "vm": clo, "stmt": st,
                                              "scope": stack[:oi + 1]}
+                            # the function around the maker returns it the same way
+                            # (`return function(Z,Z,Z,J,i,U) ... end`), once per proto,
+                            # when the proto is deserialised: the place to record
+                            # maker function -> proto and the proto's own values
+                            ost = [s for s, d in stmts if d == oi]
+                            ost = ost[-1] if ost else None
+                            if oi >= 1 and ost and ost["type"] == "AstStatReturn" \
+                                    and len(ost.get("list", [])) == 1 and ost["list"][0] is stack[oi] \
+                                    and pk in set(_scope_decls(stack[:oi]).values()) \
+                                    and pk not in set(_decls_in(stack[oi]).values()):
+                                ol1, oc1, ol2, oc2 = loc(ost)
+                                ml1, mc1, _, _ = loc(stack[oi])
+                                if ol1 == ml1 == ol2:
+                                    out[(l2, c2)]["outer_ret"] = (ol1, oc1, mc1, oc2)
             for v in n.values():
                 walk(v, stack, stmts)
         elif isinstance(n, list):
@@ -406,6 +420,8 @@ def maker_info(root):
     for info in out.values():
         info["capture_decls"] = _capture_decls(info)
         info["captures"] = sorted({name for _, name in info["capture_decls"]})
+        if info.get("outer_ret"):
+            info["outer_decls"] = _outer_capture_decls(info)
     return list(out.values())
 
 
@@ -552,6 +568,201 @@ def _capture_decls(info):
     visible = {name: keys[-1] for name, keys in by_name.items() if keys}
     return sorted(((key, name) for key, name in used.items()
                    if visible.get(name) == key), key=lambda item: item[0])
+
+
+def _outer_capture_decls(info):
+    """v15.2 nested maker: [(declaration key, name)] of the locals of the
+    functions around the maker that the maker (or its VM closure) uses and
+    that a reference at the outer function's `return <maker>` resolves to."""
+    decls = _scope_decls(info["scope"][:-1])
+    used = set()
+
+    def visit(n):
+        if isinstance(n, dict):
+            if n.get("type") == "AstExprLocal" and decl_key(n["local"]) in decls:
+                used.add(decl_key(n["local"]))
+            for v in n.values():
+                visit(v)
+        elif isinstance(n, list):
+            for v in n:
+                visit(v)
+    visit(info["maker"])
+    visible = {}
+    for key, name in decls.items():     # outer to inner, declaration order: the last one wins
+        visible[name] = key
+    return sorted(((key, decls[key]) for key in used if visible.get(decls[key]) == key),
+                  key=lambda item: item[0])
+
+
+def inner_functions(fn):
+    """Function expressions nested in fn (any depth)."""
+    out = []
+    stack = list(fn["body"].values())
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            if n.get("type") == "AstExprFunction":
+                out.append(n)
+            stack += list(n.values())
+        elif isinstance(n, list):
+            stack += n
+    return out
+
+
+def register_jumps(vm_fn):
+    """Statements `pc = R[B[pc]]` (a jump to the value of a register) in the
+    dispatch loops of one interpreter closure: [(line, col of the statement,
+    (pc name, value text `R[B[pc]]`))]."""
+    out = []
+    for d in find_dispatchers(vm_fn):
+        pc = d["pc"]
+        stack = [d["node"]]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, dict):
+                if n.get("type") == "AstStatAssign" and len(n["vars"]) == 1 and len(n["values"]) == 1 \
+                        and local_name(n["vars"][0]) == pc:
+                    v = n["values"][0]
+                    if v.get("type") == "AstExprIndexExpr" and v["expr"].get("type") == "AstExprLocal" \
+                            and v["index"].get("type") == "AstExprIndexExpr" \
+                            and v["index"]["expr"].get("type") == "AstExprLocal" \
+                            and local_name(v["index"]["index"]) == pc:
+                        l1, c1, _, _ = loc(n)
+                        out.append((l1, c1, (pc, "%s[%s[%s]]" % (v["expr"]["local"]["name"],
+                                                                   v["index"]["expr"]["local"]["name"], pc))))
+                stack += list(n.values())
+            elif isinstance(n, list):
+                stack += n
+    return out
+
+
+def key_registers(maker, vm_fn):
+    """Luraph v15.2 key registers: locals of the interpreter closure that start
+    as a number seed the closure maker was called with (`W,Q,Wh,mh = m,J,Z,E`)
+    and that handlers re-key from a register (`Q = R[A[pc]]`). Keyed
+    decryptors and string decryptors XOR with them, so the code behind a
+    re-keying can only be decrypted with the value of that run.
+    -> ({declaration key: name}, [(line, col of a statement `K = R[A[pc]]`,
+    (pc name, value text `R[A[pc]]`, declaration key of K))])."""
+    params = {decl_key(a) for a in maker["args"]}
+    disp = find_dispatchers(vm_fn)
+    loops = {id(d["node"]) for d in disp}
+    seeded = {}
+    stack = [vm_fn["body"]]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            t = n.get("type")
+            if id(n) in loops or (t == "AstExprFunction" and n is not vm_fn):
+                continue
+            if t in ("AstStatAssign", "AstStatLocal") and len(n["vars"]) == len(n["values"]):
+                for var, val in zip(n["vars"], n["values"]):
+                    lv = var if t == "AstStatLocal" else var.get("local") if var.get("type") == "AstExprLocal" else None
+                    if lv is not None and val.get("type") == "AstExprLocal" and decl_key(val["local"]) in params:
+                        seeded[decl_key(lv)] = lv["name"]
+            stack += list(n.values())
+        elif isinstance(n, list):
+            stack += n
+    sets = []
+    keys = {}
+    for d in disp:
+        pc = d["pc"]
+        stack = [d["node"]]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, dict):
+                if n.get("type") == "AstStatAssign" and len(n["vars"]) == 1 and len(n["values"]) == 1 \
+                        and n["vars"][0].get("type") == "AstExprLocal" \
+                        and decl_key(n["vars"][0]["local"]) in seeded:
+                    v = n["values"][0]
+                    if v.get("type") == "AstExprIndexExpr" and v["expr"].get("type") == "AstExprLocal" \
+                            and v["index"].get("type") == "AstExprIndexExpr" \
+                            and v["index"]["expr"].get("type") == "AstExprLocal" \
+                            and local_name(v["index"]["index"]) == pc:
+                        l1, c1, _, _ = loc(n)
+                        k = decl_key(n["vars"][0]["local"])
+                        keys[k] = seeded[k]
+                        sets.append((l1, c1, (pc, "%s[%s[%s]]" % (v["expr"]["local"]["name"],
+                                                                    v["index"]["expr"]["local"]["name"], pc), k)))
+                stack += list(n.values())
+            elif isinstance(n, list):
+                stack += n
+    return keys, sets
+
+
+def plain_factories(root):
+    """Luraph v15.2 compiles some script functions to plain Lua kept in the VM
+    object: `function(<deserialiser values>) return function(<seeds, upvalue
+    list>) local a = ups[1] ... return function(...) <body> end end end`. The
+    outer function ("factory") runs when the constant is decoded, a closure op
+    calls what it returned ("maker"). -> [{"factory", "maker", "inner": nodes,
+    "ret": (line, col of `return`, col of the maker, end col of the statement),
+    "at": (line, col) of the maker, "decls": [(declaration key, name)] of the
+    factory's locals the maker uses}], for functions without a dispatch loop."""
+    disp = {id(d["node"]) for d in find_dispatchers(root)}
+    out = []
+
+    def single_return(fn):
+        body = fn["body"]["body"]
+        if not body or body[-1]["type"] != "AstStatReturn" or len(body[-1].get("list", [])) != 1 \
+                or body[-1]["list"][0]["type"] != "AstExprFunction":
+            return None
+        return body[-1]
+
+    def has_dispatch(n):
+        stack = [n]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, dict):
+                if id(x) in disp:
+                    return True
+                stack += list(x.values())
+            elif isinstance(x, list):
+                stack += x
+        return False
+
+    def walk(n, depth):
+        if isinstance(n, dict):
+            if n.get("type") == "AstExprFunction":
+                ret = single_return(n) if len(n["body"]["body"]) == 1 else None
+                maker = ret["list"][0] if ret else None
+                if maker is not None and single_return(maker) is not None \
+                        and all(st["type"] == "AstStatLocal" for st in maker["body"]["body"][:-1]) \
+                        and not has_dispatch(n):
+                    l1, c1, l2, c2 = loc(ret)
+                    ml, mc, _, _ = loc(maker)
+                    if l1 == ml == l2:
+                        decls = _decls_in(n)
+                        last = {}
+                        for key, name in decls.items():
+                            last[name] = key
+                        for a in n["args"]:
+                            last[a["name"]] = decl_key(a) if decl_key(a) in decls else last.get(a["name"])
+                        used = set()
+                        stack = [maker]
+                        while stack:
+                            x = stack.pop()
+                            if isinstance(x, dict):
+                                if x.get("type") == "AstExprLocal" and decl_key(x["local"]) in decls:
+                                    used.add(decl_key(x["local"]))
+                                stack += list(x.values())
+                            elif isinstance(x, list):
+                                stack += x
+                        # (of repeated parameter names only the last is visible)
+                        vis = {}
+                        for a in n["args"]:
+                            vis[a["name"]] = decl_key(a)
+                        out.append({"factory": n, "maker": maker, "inner": single_return(maker)["list"][0],
+                                    "ret": (l1, c1, mc, c2), "at": (ml, mc),
+                                    "decls": sorted((k, decls[k]) for k in used if vis.get(decls[k], k) == k)})
+                    return      # (nothing of this shape nests inside one)
+            for v in n.values():
+                walk(v, depth)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v, depth)
+    walk(root, 0)
+    return out
 
 
 def _captures(info):

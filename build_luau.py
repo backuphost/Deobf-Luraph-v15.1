@@ -10,8 +10,10 @@ debug.info, error positions, the vector type's metatable), so a stock or newer L
 decryption keys.  The build is Luau 0.739 with two patches:
 
   * devm/luau_cli.patch: readfile/writefile/ewrite, cwrap (Lua functions that look like C functions
-    to the script), resumetop, setvectormetatable, and running a returned function as the main
-    function of a fresh thread.  Used by devm/harness.lua.
+    to the script), resumetop, setvectormetatable, running a returned function as the main function
+    of a fresh thread, and the natives behind the executor API of the mock (__LPH_NATIVE:
+    getrawmetatable, setrawmetatable, setreadonly, isreadonly, clonefunction).  Used by
+    devm/harness.lua; deobf/envlog.luau uses resumetop.
   * the vector type's metatable is left writable (stock Luau freezes it), so the mock environment
     can give Vector3 values Roblox's members.  Used by deobf/envlog.luau and devm.
 
@@ -41,8 +43,10 @@ VEC_PATCHED = ("    // deobf: left writable, envlog.luau adds Roblox's Vector3 m
 SMOKE = ('local v = vector.create(1, 2, 3)\n'
          'local mt = getmetatable(v)\n'
          'local writable = mt ~= nil and pcall(function() mt.__devm_probe = true; mt.__devm_probe = nil end)\n'
-         'print(cwrap ~= nil, readfile ~= nil, writefile ~= nil, resumetop ~= nil, __LPH_RUNMAIN ~= nil, writable)\n')
-SMOKE_NAMES = ["cwrap", "readfile", "writefile", "resumetop", "run-returned-function", "writable vector metatable"]
+         'print(cwrap ~= nil, readfile ~= nil, writefile ~= nil, resumetop ~= nil, __LPH_RUNMAIN ~= nil,\n'
+         '      type(__LPH_NATIVE) == "table" and __LPH_NATIVE.getrawmetatable ~= nil, writable)\n')
+SMOKE_NAMES = ["cwrap", "readfile", "writefile", "resumetop", "run-returned-function", "executor natives",
+               "writable vector metatable"]
 
 
 def say(msg):

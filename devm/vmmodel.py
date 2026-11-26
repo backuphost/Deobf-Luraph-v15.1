@@ -13,14 +13,23 @@ from .luparse import Func
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def is_dispatch_loop(st):
+def is_dispatch_loop(st, assigned=False):
+    """`while true do local OP[, X] = CODE[PC]; if ...`.
+
+    assigned=True tests for the variant in which the opcode variable is a local of the interpreter
+    declared before the loop (`while true do OP = CODE[PC]; if ...`, seen in Luraph v15.2: one mode
+    per interpreter can have this form).  It is only accepted inside a function that also has a
+    loop of the first form (see Model._find): on its own the shape is too common in ordinary code."""
     if st[0] != 'while' or st[1] != ('true',):
         return False
     body = st[2]
     if len(body) < 2:
         return False
     s0 = body[0]
-    if s0[0] != 'local' or len(s0[1]) < 1 or len(s0[2]) != 1:
+    if assigned:
+        if s0[0] != 'assign' or len(s0[1]) < 1 or len(s0[2]) != 1 or any(t[0] != 'name' for t in s0[1]):
+            return False
+    elif s0[0] != 'local' or len(s0[1]) < 1 or len(s0[2]) != 1:
         return False
     e = s0[2][0]
     if e[0] != 'index' or e[1][0] != 'name' or e[2][0] != 'name':
@@ -28,7 +37,7 @@ def is_dispatch_loop(st):
     return body[1][0] == 'if'
 
 
-LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)local\s+\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*if\b')
+LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)(?:local\s+)?\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*if\b')
 _NUM = r'(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*)'
 CELL_RE = re.compile(r'\b(\w+)\[' + _NUM + r'\]\[(\w+)\[' + _NUM + r'\]\]')
 
@@ -77,6 +86,8 @@ class Model:
     # -- generic walker
     def _find(self):
         best = {}
+        late = []       # dispatch loops whose opcode variable is declared outside the loop
+        order = {}      # id(loop statement) -> position in source order
 
         def walk_block(block, fstack):
             for st in block:
@@ -115,8 +126,12 @@ class Model:
         def walk_stmt(st, fstack):
             t = st[0]
             if t == 'while':
-                if is_dispatch_loop(st) and fstack:
+                if fstack and is_dispatch_loop(st):
                     best.setdefault(fstack[-1].id, (list(fstack), []))[1].append(st)
+                    order[id(st)] = len(order)
+                elif fstack and is_dispatch_loop(st, assigned=True):
+                    late.append((list(fstack), st))
+                    order[id(st)] = len(order)
                 walk_expr(st[1], fstack)
                 walk_block(st[2], fstack)
             elif t == 'local':
@@ -163,6 +178,10 @@ class Model:
         walk_block(self.body, [])
         if not best:
             raise RuntimeError('no Luraph dispatch loop found')
+        for fstack, st in late:
+            # only next to a loop of the usual form, in the same function
+            if fstack[-1].id in best:
+                best[fstack[-1].id][1].append(st)
         self.toplevel = set()
         self._mark_toplevel()
 
@@ -193,6 +212,8 @@ class Model:
             it = Interp()
             it.chain = chain
             it.func = chain[-1]
+            # source order: loop_positions() pairs them with the loop heads found in the text
+            loops.sort(key=lambda l: order[id(l)])
             it.loops = loops
             it.index = len(self.interps)
             it.visible = self._visible_names(it.func)
@@ -380,6 +401,54 @@ class Model:
                 return True
         return False
 
+    def wrapper_numbers(self, it):
+        """{index of a wrapper parameter: [interpreter locals it is copied into]}.
+
+        Luraph v15.2 hands the wrapper (the function between the proto-level factory and the
+        interpreter closure) per-closure numbers besides the upvalue list, e.g.
+        `function(Z,Z,Z,J,i,U) ... return function(...) ... W,Q,Wh,mh = m,J,Z,E`: Z and J are keys
+        the instructions of that closure are decrypted with, `i` is the upvalue list.  Found from
+        the interpreter's own set-up statements (the ones in front of / around its dispatch
+        loops): a visible wrapper parameter that is copied into a local there as a bare name is
+        such a number.  Empty for builds whose wrapper only takes the upvalue list (v15.1)."""
+        if len(it.chain) < 3:
+            return {}
+        mid = it.chain[-2]
+        shadowed = set(mid.body[0][1]) if mid.body and mid.body[0][0] == 'local' else set()
+        visible = {p: i for i, p in enumerate(mid.params)
+                   if p not in mid.params[i + 1:] and p not in shadowed and (p != '_' or self.underscore_is_name)}
+        out = {}
+        hidden = set()      # names redeclared by the interpreter before the copy
+
+        def scan(block, depth):
+            for st in block:
+                if st[0] in ('local', 'assign'):
+                    targets = st[1] if st[0] == 'local' else [t[1] if t[0] == 'name' else None for t in st[1]]
+                    for name, e in zip(targets, st[2]):
+                        if name and e[0] == 'name' and e[1] in visible and e[1] not in hidden:
+                            out.setdefault(visible[e[1]], [])
+                            if name not in out[visible[e[1]]]:
+                                out[visible[e[1]]].append(name)
+                    if st[0] == 'local':
+                        hidden.update(n for n in st[1] if n in visible)
+                elif st[0] == 'if' and depth < 3:
+                    for _c, b in st[1]:
+                        scan(b, depth + 1)
+                    if st[2]:
+                        scan(st[2], depth + 1)
+        scan(it.func.body, 0)
+        return out
+
+    @property
+    def keyed_wrappers(self):
+        """True for builds whose closure wrappers take per-closure keys (Luraph v15.2, see
+        wrapper_numbers).  The passes written for that generation are switched on by this, so
+        that what v15.1 inputs go through stays as it was."""
+        v = getattr(self, '_keyed_wrappers', None)
+        if v is None:
+            v = self._keyed_wrappers = any(self.wrapper_numbers(it) for it in self.interps)
+        return v
+
     def _mid_is_statement(self, mid):
         """True when the middle closure is declared with `local function`."""
         return self.src[mid.kw_pos - 6:mid.kw_pos].strip() == 'local' or \
@@ -559,6 +628,10 @@ class Model:
             for f in self.funcs_by_id:
                 if f.name_stmt:
                     edits.append((f.end_pos, ' __LPH_F(%d,%s)' % (f.fid, f.name_stmt)))
+                elif f.stmt_name:
+                    # `function a.b() ... end` / `function a:b() ... end` is a statement: nothing
+                    # to wrap; the closure is registered by reading the field it was stored in
+                    edits.append((f.end_pos, ' __LPH_F(%d,%s)' % (f.fid, f.stmt_name)))
                 elif self._is_expression(f):
                     edits.append((f.kw_pos, '__LPH_F(%d,' % f.fid))
                     edits.append((f.end_pos, ')'))
@@ -589,6 +662,8 @@ class Model:
 
     def _is_expression(self, f):
         """False for `function a.b() end` statements (nothing to wrap)."""
+        if f.stmt_name:
+            return False
         head = self.src[max(0, f.kw_pos - 64):f.kw_pos].rstrip()
         return bool(head) and (head[-1] in '=,({[' or head.endswith('return') or head[-1] in '+-*/%^.<>~' or
                                head.endswith(' and') or head.endswith(' or') or head.endswith(' not'))
@@ -732,6 +807,7 @@ def run_oracle(model, workdir, tag, options=()):
         from . import unidata
         unidata.generate(nf)
     cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] + list(options)
+    cmd += list(getattr(model, 'run_options', ()))      # carrier of a chunk the script loads itself (container.py)
     if model.oneline:
         # keep the run alive after the dump: the lifter asks it for lazily decoded constants
         stderr = start_server(cmd, workdir)
@@ -776,7 +852,8 @@ def run_dump_script(model, workdir, tag, options=()):
         from . import unidata
         unidata.generate(nf)
     try:
-        r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1'] + list(options),
+        r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1'] + list(options)
+                           + list(getattr(model, 'run_options', ())),
                            capture_output=True, text=True, errors='replace', timeout=900)
     except subprocess.TimeoutExpired:
         return None
@@ -796,7 +873,8 @@ def run_dump(model, workdir, tag, layers=()):
     if os.path.exists(outjson):
         os.remove(outjson)
     chain = list(layers) + [patched]
-    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', chain[0], outjson] + chain[1:],
+    r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', chain[0], outjson] + chain[1:]
+                       + list(getattr(model, 'run_options', ())),
                        capture_output=True, text=True, timeout=600)
     if not os.path.exists(outjson):
         raise RuntimeError('dump failed: ' + r.stderr[-2000:])

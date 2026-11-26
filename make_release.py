@@ -12,6 +12,10 @@ GitHub 的 Release 附件必须是单独文件，不能是 zip 里的成员。
 用法:
     python make_release.py              # 生成当前架构 + 所有已有架构
     python make_release.py --tag v1.5.0 # 同时打印上传说明
+    python make_release.py --out DIR    # 输出目录。默认 out_release/：它在仓库目录里，而且
+                                        # .gitignore 没有忽略它，不想留在仓库里就指定别处
+
+Note: bin/ holds the Luau that ./setup.sh builds (0.739 with this repository's patches).
 """
 import sys
 import shutil
@@ -37,10 +41,13 @@ def elf_arch(path):
 
 
 def main():
+    global OUT
     tag = "v1.5.0"
     for i, a in enumerate(sys.argv):
         if a == "--tag" and i + 1 < len(sys.argv):
             tag = sys.argv[i + 1]
+        if a == "--out" and i + 1 < len(sys.argv):
+            OUT = Path(sys.argv[i + 1]).resolve()
 
     if not BIN.is_dir():
         print(f"[错误] 没有 {BIN} 目录")
@@ -48,10 +55,10 @@ def main():
 
     files = sorted(p for p in BIN.iterdir() if p.is_file() and not p.name.startswith("."))
     if not files:
-        print("[错误] bin/ 是空的，先跑 python fetch_bin.py 或 build_x86.py")
+        print("[错误] bin/ 是空的，先跑 ./setup.sh")
         return 1
 
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     for f in OUT.iterdir():
         if f.is_file():
             f.unlink()
@@ -60,6 +67,9 @@ def main():
     total = 0
     for f in files:
         arch = elf_arch(f)
+        if arch == "unknown":
+            print(f"[跳过] {f.name} 不是 ELF 二进制")
+            continue
         base = f.name.split(".")[0]           # luau / luau-ast
         dest = OUT / f"{base}.{arch}"         # 统一成 <name>.<arch>
         if dest.exists() and dest != f:
@@ -95,6 +105,7 @@ def main():
 
     print(f"\n[汇总] {len(list(OUT.iterdir()))} 个文件，共 {total:,} 字节")
     print(f"[位置] {OUT}\n")
+    out_name = OUT.name
     print("=" * 66)
     print("上传步骤（GitHub 网页）")
     print("=" * 66)
@@ -102,10 +113,10 @@ def main():
 1. 打开 https://github.com/{REPO}/releases/new
 2. 选 tag:  {tag}      （没有就新建）
 3. 标题:    Luraph v15.1 Deob Tool {tag}
-4. 把 out_release/ 里的文件全部拖进「Attach binaries」框
+4. 把 {out_name}/ 里的文件全部拖进「Attach binaries」框
 5. 发布
 
-fetch_bin.py 会按下面的地址取：
+python fetch_bin.py --download 会按下面的地址取（默认不联网，见 fetch_bin.py 开头）：
   https://github.com/{REPO}/releases/download/{tag}/luau.aarch64
   https://github.com/{REPO}/releases/download/{tag}/luau-ast.aarch64
   https://github.com/{REPO}/releases/download/{tag}/luau.x86_64

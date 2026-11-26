@@ -14,6 +14,8 @@ DEBUG_UNFLATTEN = bool(os.environ.get('DEVM_DEBUG_UNFLATTEN'))
 # Undo state-machine control flow (see ProtoCFG._unflatten).  Scripts protected from source have
 # none in their payload, and there the pass only splits loops on the script's own boolean flags.
 UNFLATTEN = True
+# Keep the lifter's marks on branch arms the traced run never took (see structure.MARK_COLD).
+KEEP_COLD = False
 
 
 class Block:
@@ -1545,8 +1547,9 @@ class ProtoCFG:
             if not (e[0] == 'bin' and e[1] in ('==', '~=')):
                 continue
             consts = [x[1] for x in (e[2], e[3]) if _isnum(x)]
-            if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != round(consts[0]):
-                continue
+            if len(consts) != 1 or abs(consts[0]) < 65536 or consts[0] != consts[0] or abs(consts[0]) == float('inf') \
+                    or consts[0] != round(consts[0]):
+                continue        # (math.huge and nan are no opaque keys, and round() raises on them)
             other = e[3] if _isnum(e[2]) else e[2]
             n = pos        # (where the comparison is made: its operands may be reassigned after)
             proven = opaque(b, n, other)
@@ -1928,7 +1931,7 @@ class ProtoCFG:
                 continue
             if reg in keyregs:
                 equal = keyregs[reg] == c
-            elif c != round(c) and abs(c - round(c)) < 1e-6:
+            elif c == c and abs(c) != float('inf') and c != round(c) and abs(c - round(c)) < 1e-6:
                 equal = False
             else:
                 continue
@@ -1992,7 +1995,9 @@ class ProtoCFG:
 
         for c in cold:
             only = len(c.stmts) == 1 and c.term[0] == 'goto' and len(c.preds) == 1
-            c.stmts = [st for st in c.stmts if st[0] != 'cold']
+            # (KEEP_COLD: an arm that stays keeps its mark, for a comment in the output; an arm
+            # that is nothing but a jump -- an edge back to shared code -- has nothing to mark)
+            c.stmts = [st for st in c.stmts if st[0] != 'cold' or (KEEP_COLD and not only and len(c.preds) == 1)]
             if not only:
                 continue
             pred = blocks[next(iter(c.preds))]

@@ -66,18 +66,17 @@ KNOWN_LIBS = {
 
 def _ast(sample: Path):
     """跑 luau-ast 拿 AST"""
-    cands = [HERE / 'bin' / 'luau-ast.aarch64', HERE / 'bin' / 'luau-ast.x86_64']
-    exe = next((c for c in cands if c.is_file()), None)
+    sys.path.insert(0, str(HERE))
+    import luaubin
+    exe = luaubin.find_luau_ast()
     if not exe:
-        import shutil
-        exe = shutil.which('luau-ast')
-    if not exe:
-        raise RuntimeError('找不到 luau-ast，先跑 python fetch_bin.py')
-    r = subprocess.run([str(exe), str(sample), '--ast-json'],
+        raise RuntimeError('找不到 luau-ast；' + luaubin.MISSING_HINT)
+    r = subprocess.run([str(exe), str(sample)],
                        capture_output=True, text=True, timeout=180)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr[:400])
-    return json.loads(r.stdout)
+    start = r.stdout.find('{')
+    if r.returncode != 0 or start < 0:
+        raise RuntimeError((r.stderr or r.stdout)[:400])
+    return json.loads(r.stdout[start:])
 
 
 def _loc(node):
@@ -711,6 +710,14 @@ def make_harness(sample: Path, info: dict, out: Path = None):
         'local Faces, Axes = __FB("Faces"), __FB("Axes")\n'
         'local game, workspace, script = __FB("game"), __FB("workspace"), __FB("script")\n'
         'local Instance, Enum = __FB("Instance"), __FB("Enum")\n'
+        # 执行器全局：脚本作者常在 Luraph 头注释之前加一行
+        #   getgenv().SCRIPT_KEY = "..."
+        # 本地 Luau CLI 没有 getgenv，这一行会以 "attempt to call a nil value" 中断整次运行。
+        # 真执行器里有就用真的，没有才用占位表。
+        'local __GENV = {}\n'
+        'local getgenv = getgenv or function() return __GENV end\n'
+        'local getrenv = getrenv or function() return __GENV end\n'
+        'local shared = shared or {}\n'
     )
     body = inject + src
 
@@ -802,29 +809,38 @@ def run_harness(harness: Path, timeout=180):
     解析 harness 自己打印的 [harness] 行和报告头。
     返回 dict，跑不起来时返回 {'ok': False, 'error': ...}。
     """
-    exe = None
-    for cand in (HERE / 'bin' / 'luau.aarch64', HERE / 'bin' / 'luau.x86_64',
-                 HERE / 'bin' / 'luau'):
-        if cand.is_file():
-            exe = cand
-            break
+    sys.path.insert(0, str(HERE))
+    import luaubin
+    exe = luaubin.find_luau()
     if exe is None:
-        import shutil
-        p = shutil.which('luau')
-        exe = Path(p) if p else None
-    if exe is None:
-        return {'ok': False, 'error': '找不到 luau 运行时'}
+        return {'ok': False, 'error': '找不到 luau 运行时；' + luaubin.MISSING_HINT}
 
+    # The harness file is written for a Roblox executor, where it runs as it is.  Here it is
+    # run with bin/luau, a patched build that has readfile / writefile / require: so it (and
+    # with it the sample, and everything the sample loads) runs inside the sandbox table of
+    # luasandbox.py, which holds Luau's own libraries and nothing else of the interpreter.
+    import shutil
+    import tempfile
+    import luasandbox
+    body = ('if not __CHUNK then print("[harness] load failed: " .. tostring(__LOADERR)) '
+            'else __CHUNK() end\n')
+    launcher = luasandbox.launcher(body, harness.read_bytes().decode('latin-1'),
+                                   chunk_name='=harness')
     out_file = harness.with_suffix('.harness.log')
+    tmpd = Path(tempfile.mkdtemp(prefix='lv151_harness_'))
     try:
+        run_file = tmpd / 'run.lua'
+        run_file.write_bytes(launcher.encode('latin-1'))
         with open(out_file, 'wb') as fh:
-            subprocess.run([str(exe), str(harness)], stdout=fh,
+            subprocess.run([str(exe), str(run_file)], stdout=fh,
                            stderr=subprocess.STDOUT, timeout=timeout)
         text = out_file.read_text(encoding='utf-8', errors='ignore')
     except subprocess.TimeoutExpired:
         return {'ok': False, 'error': f'执行超时（{timeout}s）'}
     except Exception as e:
         return {'ok': False, 'error': str(e)}
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
 
     res = {'ok': True, 'log': str(out_file), 'raw': text}
 

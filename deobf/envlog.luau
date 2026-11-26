@@ -113,6 +113,17 @@ function CHAIN.get()
 	elseif #parts == 1 and R.match(parts[1], "^1:") then
 		for c in R.next, CHAIN.seen do CHAIN.seen[c] = "probe" end
 	end
+	if #parts > 900 then
+		-- a recursion thousands of frames deep (Luraph v15.2's call-depth probe
+		-- runs its datatype battery near LUAI_MAXCALLS): the frames of one
+		-- proto carry the same entry number, so repeats add nothing, and the
+		-- fold pass recurses once per chain entry
+		local short = { parts[1] }
+		for i = 2, #parts do
+			if parts[i] ~= short[#short] then R.insert(short, parts[i]) end
+		end
+		parts = short
+	end
 	return R.concat(parts, ",")
 end
 
@@ -413,6 +424,19 @@ do
 	end
 end
 
+-- inst:IsA(name) for a known class: the class itself or one it inherits from
+local function classIsA(cls, name)
+	local guard = 0
+	while cls and guard < 32 do
+		guard += 1
+		if cls == name then return true end
+		local c = API.classes[cls]
+		if not c then return false end
+		cls = c.super
+	end
+	return false
+end
+
 local function memberKind(cls, k)
 	local guard = 0
 	while cls and guard < 32 do
@@ -603,7 +627,17 @@ local function attachReal(p, libName, k, call, ...)
 		if R.type(lib) ~= "table" then return end
 	end
 	if lib == nil then return end
-	local u = unwrapArgs(table.pack(...))
+	local args = table.pack(...)
+	if not NATIVE then
+		-- the offline models take an Enum item as its tostring ("Enum.RotationOrder.XYZ")
+		for i = 1, args.n do
+			local a = args[i]
+			if isP(a) and INFO[a].tname == "EnumItem" and INFO[a].enumName then
+				args[i] = "Enum." .. INFO[a].enumName .. "." .. R.tostring(INFO[a].props.Name)
+			end
+		end
+	end
+	local u = unwrapArgs(args)
 	if not u then return end
 	local ok, r = R.pcall(function()
 		local f = lib[k]
@@ -687,6 +721,35 @@ end
 local popTo -- forward
 
 local lastThread = nil
+-- threads the runtime made itself: CHAIN.own[thread] = true (the script's
+-- main thread) or the block a recorded callback writes to. With --cfg
+-- top_thread a wait yields every other thread (doWait); CHAIN.sleepers holds
+-- them ({thread, block}) until the scheduler (CHAIN.wake) resumes them.
+CHAIN.own = R.setmetatable({}, { __mode = "k" })
+CHAIN.sleepers = {}
+CHAIN.parked = {}       -- threads in the Wait of a signal that never fires (see callMethod "Wait")
+CHAIN.wake = function()
+	local q = CHAIN.sleepers
+	if #q == 0 then return end
+	CHAIN.sleepers = {}
+	local resume = REAL_G.resumetop or coroutine.resume
+	for _, s in q do
+		local co, block = s[1], s[2]
+		if coroutine.status(co) == "suspended" then
+			local level = nil
+			if block then
+				R.insert(STACK, block)
+				level = #STACK
+			end
+			local ok, err = resume(co)
+			if level then popTo(level - 1) end
+			if err == ABORT and (not ok or coroutine.status(co) == "suspended") then R.error(ABORT, 0) end
+			if not ok and block and err ~= LOOP and err ~= TAMPER then
+				R.insert(block.lines, { text = "-- [envlog] error: " .. R.gsub(R.tostring(err), "\n", " ") })
+			end
+		end
+	end
+end
 
 -- Callbacks (task.spawn, event handlers, ...) run in a thread of their own, as
 -- they do in Roblox; Luraph checks this by closing a thread it captured with
@@ -697,6 +760,7 @@ local function runInBlock(block, fn, ...)
 	local level = #STACK
 	captureDepth += 1
 	local th = R.type(fn) == "thread" and fn or coroutine.create(fn)
+	if th ~= fn or CHAIN.own[th] == nil then CHAIN.own[th] = block end
 	lastThread = th
 	local res = table.pack(coroutine.resume(th, ...))
 	if res[1] and res[2] == ABORT and coroutine.status(th) == "suspended" then res = { false, ABORT, n = 2 } end
@@ -758,6 +822,7 @@ function captureFunction(fn, names, args, defer)
 		-- task.delay / task.defer: the thread exists now but only runs after the
 		-- main script, and only if nothing cancelled it in the meantime
 		local th = coroutine.create(fn)
+		CHAIN.own[th] = rec.block
 		lastThread = th
 		R.insert(DEFERRED, { rec = rec, thread = th, args = callArgs, n = args and args.n or #callArgs, due = defer })
 		return "\3" .. fid .. "\4"
@@ -1071,6 +1136,25 @@ local function setParent(child, parent)
 		local rp = isP(parent) and REALV[parent] or nil
 		R.pcall(function() rc.Parent = (R.typeof(rp) == "Instance") and rp or nil end)
 	end
+end
+-- is `low` below `high` in the hierarchy? nil when a parent on the way is not known
+function CHAIN.descends(low, high)
+	if R.rawequal(low, high) then return false end
+	local q, guard = low, 0
+	while guard < 256 do
+		guard += 1
+		local qi = INFO[q]
+		if qi.nilParent then return false end
+		local par = qi.props and qi.props.Parent
+		if par == nil then
+			if qi.created then return false end
+			return nil
+		end
+		if not isP(par) then return nil end
+		if R.rawequal(par, high) then return true end
+		q = par
+	end
+	return nil
 end
 local function findKid(p, name, recursive)
 	for _, c in kidsOf(p) do
@@ -1423,15 +1507,31 @@ local function onCall(p, ...)
 	if name == "Wait" and isMethod then
 		-- frame signals return numbers (Script42 checks typeof(Heartbeat:Wait()))
 		local sp = SIGNAL_PARAMS[methodName(INFO[info.parent])]
+		-- --cfg top_thread: like a wait (doWait), a signal's Wait yields every
+		-- thread but the script's main one. Frame signals fire at the next
+		-- scheduler step; any other signal never fires during the run, so the
+		-- thread stays suspended (CHAIN.parked; recorded callbacks go on after
+		-- the script, like event handlers).
+		local co = CFG.top_thread and coroutine.running()
+		local own = co and CHAIN.own[co]
+		local yields = co and own ~= true and coroutine.isyieldable()
 		if sp and (sp[1] == "deltaTime" or sp[2] == "deltaTime") then
 			emit({ text = calleeText .. "()" })
 			onWait()
+			if yields then
+				R.insert(CHAIN.sleepers, { co, own })
+				coroutine.yield()
+			end
 			if sp[2] == "deltaTime" then return 1, 1 / 60 end
 			return 1 / 60
 		end
 		callP(calleeText .. "()", "result")
 		local r = BYID[nextId]
 		onWait() -- a yield: lets the loop detector see signal-driven loops
+		if yields then
+			R.insert(CHAIN.parked, { co, own })
+			coroutine.yield()
+		end
 		return r
 	end
 
@@ -1449,6 +1549,7 @@ local function onCall(p, ...)
 		local r = callP(calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")", R.type(svc) == "string" and svc or "service", "Instance", true)
 		if R.type(svc) == "string" and API.classes[svc] then
 			INFO[r].className = svc
+			INFO[r].classSure = true
 			INFO[r].props.Name = svc
 			INFO[r].props.ClassName = svc
 			INFO[r].props.Parent = GAMEP
@@ -1522,9 +1623,25 @@ local function onCall(p, ...)
 			emit({ text = calleeText .. "()" })
 			for _, c in table.clone(kidsOf(self)) do destroyInst(c) end
 			return
-		elseif name == "IsA" and sinfo.created then
-			return a1 == sinfo.className or a1 == "Instance" or (a1 == "GuiObject" and sinfo.className == "Frame")
-				or (a1 == "BasePart" and (sinfo.className == "Part" or sinfo.className == "MeshPart"))
+		end
+	end
+	if name == "IsA" and sinfo and sinfo.className and API.classes[sinfo.className] and R.type(a1) == "string" then
+		-- Roblox's class tree answers for a known class. A class that is only
+		-- guessed from a child's name (`x.Frame`) keeps the default guess below
+		-- when the tree says no.
+		if classIsA(sinfo.className, a1) then return true end
+		if sinfo.created or sinfo.classSure then return false end
+	end
+	if self and (name == "IsDescendantOf" or name == "IsAncestorOf") and args.n >= 1 then
+		-- answered from the hierarchy where it is known (game, services,
+		-- created instances); nil = not known: the default guess below
+		local low, high = self, a1
+		if name == "IsAncestorOf" then low, high = a1, self end
+		if low == nil then return false end
+		if high == nil then return true end -- everything descends from nil
+		if isP(low) and isP(high) then
+			local r = CHAIN.descends(low, high)
+			if r ~= nil then return r end
 		end
 	end
 	if name == "IsA" or name == "IsDescendantOf" or name == "IsAncestorOf" then
@@ -1789,7 +1906,11 @@ function methodFn(p, k)
 	local ip = indexP(p, k)
 	f = function(...)
 		local self = ...
-		if not isP(self) then
+		-- (also an Instance method given a datatype / Enum / signal as self:
+		-- Luraph v15.2 calls `folder.FindFirstChildOfClass(UDim.new(..), n)` and wants the error)
+		local st = isP(self) and INFO[self].tname
+		if not isP(self) or (want == "Instance" and st ~= want
+			and (DATATYPES[st] or st == "EnumItem" or st == "Enum" or SIGNAL_T[st])) then
 			R.error("Expected ':' not '.' calling member function " .. k, 0)
 		end
 		return PMT.__call(indexP(self, k), ...)
@@ -2439,6 +2560,22 @@ local function spawnLike(label, fn, ...)
 end
 local function doWait(label, t)
 	emit({ text = label .. "(" .. (t ~= nil and fmt(t) or "") .. ")" })
+	if CFG.top_thread then
+		-- A wait really yields the thread, as in Roblox, unless it is the
+		-- script's main thread: Luraph v15.2 checks that a coroutine it resumed
+		-- and a function it task.spawn'ed are "suspended" in their wait. The
+		-- scheduler (CHAIN.wake) is the next wait of the main thread and the
+		-- end of the script; a recorded callback goes on writing to its block.
+		local co = coroutine.running()
+		local own = CHAIN.own[co]
+		if own ~= true and coroutine.isyieldable() then
+			onWait()
+			R.insert(CHAIN.sleepers, { co, own })
+			coroutine.yield()
+			return (R.type(t) == "number" and t) or 0.03, R.clock()
+		end
+		CHAIN.wake()
+	end
 	onWait()
 	return (R.type(t) == "number" and t) or 0.03, R.clock()
 end
@@ -2554,9 +2691,11 @@ E._G = genvTable("_G")
 E.shared = genvTable("shared")
 E.game = globalP("game")
 INFO[E.game].className = "DataModel"
+INFO[E.game].classSure = true
 E.Game = E.game
 E.workspace = globalP("workspace")
 INFO[E.workspace].className = "Workspace"
+INFO[E.workspace].classSure = true
 E.Workspace = E.workspace
 -- identity properties Luraph checks (game.Parent == nil, type(game.Name), ...)
 INFO[E.game].nilParent = true
@@ -2570,6 +2709,7 @@ GAMEP = E.game
 WORKSPACEP = E.workspace
 E.script = globalP("script")
 INFO[E.script].className = "LocalScript"
+INFO[E.script].classSure = true
 E.plugin = nil
 
 -- Roblox library globals are frozen tables of C functions, not userdata
@@ -2578,7 +2718,7 @@ local NS_MEMBERS = {
 	Vector3 = { "new", "zero", "one", "xAxis", "yAxis", "zAxis", "FromNormalId", "FromAxis", "fromNormalId", "fromAxis" },
 	Vector2 = { "new", "zero", "one", "xAxis", "yAxis" },
 	CFrame = { "new", "fromEulerAnglesXYZ", "fromEulerAnglesYXZ", "Angles", "fromOrientation", "fromAxisAngle",
-		"fromMatrix", "lookAt", "lookAlong", "identity", "fromEulerAngles" },
+		"fromMatrix", "lookAt", "lookAlong", "identity", "fromEulerAngles", "fromRotationBetweenVectors" },
 	Color3 = { "new", "fromRGB", "fromHSV", "fromHex", "toHSV" },
 	UDim2 = { "new", "fromScale", "fromOffset" },
 	Font = { "new", "fromEnum", "fromName", "fromId" },
@@ -2649,6 +2789,20 @@ end
 local function vec(x, y, z)
 	return vector.create(R.tonumber(x) or 0, R.tonumber(y) or 0, R.tonumber(z) or 0)
 end
+-- Vector3.FromAxis / FromNormalId: the unit vector of an Enum item (a real
+-- vector: Luraph v15.2 checks type() == "vector"); anything else stays symbolic
+local function axisVector(fname, enumName, units)
+	return function(...)
+		local e = ...
+		local info = isP(e) and INFO[e]
+		local v = info and info.tname == "EnumItem" and info.enumName == enumName and units[info.props.Name]
+		if v then return v end
+		return exprP("Vector3." .. fname .. "(" .. fmtArgs(...) .. ")", "Vector3")
+	end
+end
+local AXIS_UNITS = { X = vec(1, 0, 0), Y = vec(0, 1, 0), Z = vec(0, 0, 1) }
+local NORMAL_UNITS = { Right = vec(1, 0, 0), Top = vec(0, 1, 0), Back = vec(0, 0, 1),
+	Left = vec(-1, 0, 0), Bottom = vec(0, -1, 0), Front = vec(0, 0, -1) }
 E.Vector3 = namespace("Vector3", {
 	new = function(x, y, z)
 		if isP(x) or isP(y) or isP(z) then
@@ -2656,6 +2810,10 @@ E.Vector3 = namespace("Vector3", {
 		end
 		return vec(x, y, z)
 	end,
+	FromAxis = axisVector("FromAxis", "Axis", AXIS_UNITS),
+	fromAxis = axisVector("fromAxis", "Axis", AXIS_UNITS),
+	FromNormalId = axisVector("FromNormalId", "NormalId", NORMAL_UNITS),
+	fromNormalId = axisVector("fromNormalId", "NormalId", NORMAL_UNITS),
 	zero = vector.zero or vec(0, 0, 0),
 	one = vector.one or vec(1, 1, 1),
 	xAxis = vec(1, 0, 0),
@@ -3060,7 +3218,29 @@ E.newcclosure = function(f)
 	return f
 end
 E.newlclosure = function(f) return f end
-E.clonefunction = function(f) return f end
+-- a new function object that behaves like the given one (scripts test
+-- `clonefunction(f) ~= f`): the runtime's native clones a Lua closure (the
+-- clone gets the thread's globals, so its original's are put back); a C
+-- function gets a trampoline. Without the native: the function itself.
+E.clonefunction = function(...)
+	local f = ...
+	if R.type(f) ~= "function" then argError(1, "clonefunction", "function", ...) end
+	local nat = REAL_G.__LPH_NATIVE
+	if not nat or isP(f) then return f end
+	local c = nat.clonefunction(f)
+	if c ~= nil then
+		R.setfenv(c, R.getfenv(f))
+	else
+		c = tramp(function(...) return f(...) end)
+		CFUNCS[c] = true
+	end
+	if CFUNCS[f] then CFUNCS[c] = true end
+	CNAME[c] = CNAME[f]
+	FNAME[c] = FNAME[f]
+	local pf = R.rawget(E.__PF, f)
+	if pf ~= nil then R.rawset(E.__PF, c, pf) end
+	return c
+end
 E.checkcaller = function() return true end
 -- hook checks (a truthy stand-in would make scripts run their LPH_CRASH spin)
 -- but true for a function the script hooked itself (Script42 hooks print, checks)
@@ -3113,21 +3293,59 @@ local function httpRequest(label)
 		if R.type(opts) ~= "table" then
 			argError(1, R.match(label, "([%w_]+)$"), "table", ...)
 		end
-		if R.type(opts.Url) == "string" then remember(urls, opts.Url) end
+		-- native code reads the option fields itself: no metamethod runs, and
+		-- what is not a string where one is needed is refused (scripts pass
+		-- options whose Url / Headers carry __tostring, __concat and __index
+		-- traps to tell an HTTP spy written in Lua from the real function).
+		-- A proxy stands for a string the trace does not know.
+		local function field(k, want)
+			local v = R.rawget(opts, k)
+			if v ~= nil and R.type(v) ~= want and not isP(v) then
+				R.error(R.fmt("invalid '%s' field in request options (%s expected, got %s)", k, want, R.typeof(v)), 0)
+			end
+			return v
+		end
+		local url = field("Url", "string")
+		if url == nil then R.error("missing 'Url' field in request options", 0) end
+		field("Method", "string")
+		field("Body", "string")
+		local headers = field("Headers", "table")
+		if R.type(headers) == "table" then
+			local k, v = R.next(headers)
+			while k ~= nil do
+				if (R.type(k) ~= "string" and not isP(k)) or (R.type(v) ~= "string" and not isP(v)) then
+					R.error("invalid 'Headers' field in request options (strings expected)", 0)
+				end
+				k, v = R.next(headers, k)
+			end
+		end
+		if R.type(url) == "string" then remember(urls, url) end
 		return callP(label .. "(" .. fmt(opts) .. ")", "response", "table")
 	end
 end
 E.request = httpRequest("request")
 E.http_request = httpRequest("http_request")
 E.http = { request = httpRequest("http.request") }
+-- The runtime's natives (devm/luau_cli.patch, `__LPH_NATIVE`) see behind a
+-- `__metatable` lock the script put on its own table, as an executor's do
+-- (scripts test exactly that); without them a locked metatable stays hidden.
 E.getrawmetatable = function(x)
 	if GENVNAME[x] then return nil end
 	if isP(x) then
 		return { __index = function() end, __newindex = function() end, __namecall = function() end }
 	end
+	local nat = REAL_G.__LPH_NATIVE
+	if nat then return nat.getrawmetatable(x) end
 	return R.getmetatable(x)
 end
-E.setrawmetatable = function(x, mt) return x end
+E.setrawmetatable = function(x, mt)
+	local nat = REAL_G.__LPH_NATIVE
+	if nat and R.type(x) == "table" and not isP(x) and not GENVNAME[x] and x ~= ENV
+		and (mt == nil or (R.type(mt) == "table" and not isP(mt))) then
+		nat.setrawmetatable(x, mt)
+	end
+	return x
+end
 E.getgc = function() return {} end
 E.getreg = function() return {} end
 E.getloadedmodules = function() return {} end
@@ -3500,7 +3718,10 @@ end
 -- line: {"protos": {pid: {name: value}}, "tables": {id: {...}}, ...}
 E.__PA = CFG.devirt and { n = 0 } or false
 E.__PK = {}     -- proto -> its first closure (maker hook; see CHAIN callPath)
-E.__MK = {}     -- v15.2 makers `return function(...)`: the closure waits in __MK[1] while the hooks run
+E.__MK = {}     -- v15.2 makers `return function(...)`: the closure waits in __MK[1] (the maker itself in [2]) while the hooks run
+E.__PM = R.setmetatable({}, { __mode = "k" })   -- v15.2: per-proto maker function -> proto key (hook of the function around it)
+E.__JT = CFG.devirt and {} or false     -- v15.2: proto key -> {pc = where its jump-to-a-register's-value went} (false: several targets)
+E.__CV = CFG.devirt and {} or false     -- v15.2: proto key -> {[previous pc * 65536 + pc] = true}: the instruction pairs this run executed (hook at the dispatch loop heads)
 if E.__PA then
 	-- Copy of each proto's number arrays (instructions, operands) when its
 	-- first closure is made (`__PA[proto]={}` in the maker runs this
@@ -3694,10 +3915,25 @@ if E.__PA then
 	end
 end
 do
-	local LIBS = { "string", "table", "math", "bit32", "buffer", "coroutine", "utf8", "os", "debug", "task" }
+	local LIBS = { "string", "table", "math", "bit32", "buffer", "coroutine", "utf8", "os", "debug", "task", "vector" }
 	CHAIN.dumpProtos = function()
 		local PA = E.__PA
 		if not PA then return nil end
+		-- v15.2 protos deserialised by an earlier dump's constant requests
+		-- (their makers ran the capture hook then): each dump starts from the
+		-- protos the script itself made
+		CHAIN.paBase = CHAIN.paBase or PA.n
+		local paBase = CHAIN.paBase
+		do
+			local late = {}
+			for proto, cap in R.next, PA do
+				if R.type(cap) == "table" and R.type(cap.__seq) == "number" and cap.__seq > paBase then
+					R.insert(late, proto)
+				end
+			end
+			for _, proto in R.ipairs(late) do R.rawset(PA, proto, nil) end
+			PA.n = paBase
+		end
 		CHAIN.unscrambled = CHAIN.unscramble()
 		local fname = {}
 		for k, v in R.next, E do
@@ -3711,10 +3947,24 @@ do
 				end
 			end
 		end
-		local stop = { [E] = "ENV" }
+		-- (ENV: what getfenv() gives the script, a table of its own in front of E)
+		local stop = { [E] = "ENV", [ENV] = "ENV" }
 		for _, lib in R.ipairs(LIBS) do
 			local t = R.rawget(E, lib)
 			if R.type(t) == "table" then stop[t] = lib end
+		end
+		-- datatype namespaces (Vector2, CFrame, Instance, ...) are global tables
+		-- too: a VM that keeps one in a register (Luraph v15.2's start-up code)
+		-- holds the global, not a table of its own
+		for name, t in R.next, E do
+			if R.type(name) == "string" and R.type(t) == "table" and not stop[t]
+				and (DATATYPES[name] or name == "Vector3" or name == "Instance") then
+				stop[t] = name
+				-- their functions by name too (a VM object can hold `Color3.new`)
+				for k, v in R.next, t do
+					if R.type(v) == "function" and R.type(k) == "string" then fname[v] = fname[v] or (name .. "." .. k) end
+				end
+			end
 		end
 		local ids, queue, fids = {}, {}, {}
 		local nfid = 0
@@ -3742,6 +3992,11 @@ do
 				local pf = R.rawget(E.__PF, v)
 				if R.type(pf) == "table" then
 					return '{"lf":' .. fids[v] .. ',"pf":' .. enc(pf) .. '}'
+				end
+				-- a v15.2 per-proto closure maker: its proto key (a closure op calls it)
+				local pm = R.rawget(E.__PM, v)
+				if R.type(pm) == "table" then
+					return '{"lf":' .. fids[v] .. ',"mk":' .. enc(pm) .. '}'
 				end
 				if CFG.lf_debug then
 					local na, va = debug.info(v, "a")
@@ -3828,6 +4083,10 @@ do
 					if si == 1 then v = byseq[k]
 					elseif si == 2 and R.type(v) == "table" then v = v[k]
 					elseif R.type(v) == "table" then v = R.rawget(v, k)
+					elseif R.type(v) == "function" and R.rawget(E.__PM, v) then
+						-- through a v15.2 closure maker: a captured value of its proto
+						local cap = R.rawget(PA, R.rawget(E.__PM, v))
+						v = R.type(cap) == "table" and cap[k] or nil
 					else v = nil end
 				end
 				if R.type(v) == "table" then
@@ -3862,7 +4121,7 @@ do
 		end
 		local bufRestore = applyBufs(CFG.force_buf)
 		-- a path walks from a captured proto: "seq,name,key,...". A step
-		-- "slot@v" decodes that lazy slot as if its key-0 operand were v
+		-- "slot@v" decodes that lazy slot as if its operand (in the array at key 0, v15.2: -2) were v
 		-- (the lifter decrypted that instruction; the arrays here are still
 		-- encrypted). Such results are not cached in the arrays; a path
 		-- through such a step reports its value in fstats.over.
@@ -3902,12 +4161,22 @@ do
 			local derived = false
 			local v = byseq[steps[1]]
 			local prefix = toks[1]
+			local viaMaker = false
 			for si = 2, #steps do
 				prefix ..= "," .. toks[si]
+				if R.type(v) == "function" then
+					-- a v15.2 closure maker decoded from a constant slot: the next
+					-- step names a captured value of its proto
+					local pk = R.rawget(E.__PM, v)
+					local cap = pk and R.rawget(PA, pk)
+					v = R.type(cap) == "table" and R.setmetatable({ self = pk }, { __index = cap }) or nil
+					viaMaker = true
+				end
 				if R.type(v) ~= "table" then v = nil break end
 				local k = steps[si]
 				local x
-				if si == 2 then
+				if si == 2 or viaMaker then
+					viaMaker = false
 					x = v[k]
 				elseif ovs[si] ~= nil and derivedCache[prefix] ~= nil then
 					derived = true
@@ -3917,6 +4186,8 @@ do
 					fstats.calls += 1
 					derived = true
 					local k0 = R.rawget(v, 0)
+					-- (Luraph v15.2 keeps the operand array at key -2)
+					if R.type(k0) ~= "table" then k0 = R.rawget(v, -2) end
 					local old = R.rawget(v, k)
 					local saved
 					if R.type(k0) == "table" then
@@ -4032,16 +4303,27 @@ do
 		end
 		local out = {}
 		local protos = {}
-		for proto, cap in R.next, PA do
-			if R.type(proto) ~= "table" then continue end
+		local protoSent = {}
+		-- (a proto made by a constant request has no stable capture number:
+		-- "__late", reached through the path of its maker function instead)
+		local function protoJson(proto, cap)
 			local pid = E.__PID[proto]
 			local fields = {}
+			local late = R.type(cap.__seq) == "number" and cap.__seq > paBase
 			for k, v in R.next, cap do
-				R.insert(fields, '"' .. R.tostring(k) .. '":' .. enc(v))
+				if not (late and k == "__seq") then
+					R.insert(fields, '"' .. R.tostring(k) .. '":' .. enc(v))
+				end
 			end
+			if late then R.insert(fields, '"__late":true') end
 			local self = enc(proto)
-			R.insert(protos, '"' .. (pid and R.tostring(pid) or ("t" .. ids[proto])) .. '":{"self":' .. self .. ","
-				.. R.concat(fields, ",") .. "}")
+			return '"' .. (pid and R.tostring(pid) or ("t" .. ids[proto])) .. '":{"self":' .. self .. ","
+				.. R.concat(fields, ",") .. "}"
+		end
+		for proto, cap in R.next, PA do
+			if R.type(proto) ~= "table" then continue end
+			protoSent[proto] = true
+			R.insert(protos, protoJson(proto, cap))
 		end
 		-- a lazy table's decoder (its __index metamethod, shared by every
 		-- table of one constant pool): the devirtualizer reuses a constant
@@ -4118,6 +4400,8 @@ do
 			-- carries every table made since the dump (ids are stable), later
 			-- ones only the tables made since the previous answer
 			local dumpEnd, sentEnd = #queue, #queue
+			local dumpProtos = protoSent
+			protoSent = {}
 			CHAIN.fetch = function(req, bufs)
 				local t0 = R.clock()
 				CHAIN.fetchEnd = function()
@@ -4136,10 +4420,20 @@ do
 				if string.sub(req, 1, 1) == "*" then
 					req = string.sub(req, 2)
 					start = dumpEnd + 1
+					protoSent = {}
 				end
 				for path in string.gmatch(req, "[^;]+") do
 					local ok, v = R.pcall(decodeAny, path, sessDerived, sessForced)
 					R.insert(vals, '["' .. path .. '",' .. (ok and v ~= nil and enc(v) or "null") .. "]")
+				end
+				-- protos these requests deserialised (v15.2 closure makers)
+				local newProtos = {}
+				for proto, cap in R.next, PA do
+					if R.type(proto) == "table" and R.type(cap) == "table" and not dumpProtos[proto]
+						and not protoSent[proto] then
+						protoSent[proto] = true
+						R.insert(newProtos, protoJson(proto, cap))
+					end
 				end
 				local parts = {}
 				local j = start
@@ -4148,12 +4442,42 @@ do
 					j += 1
 				end
 				sentEnd = #queue
-				return '{"t":' .. R.fmt("%.4f", R.clock() - t0) .. ',"values":[' .. R.concat(vals, ",") .. '],"tables":{'
-					.. R.concat(parts, ",") .. "}}"
+				return '{"t":' .. R.fmt("%.4f", R.clock() - t0) .. ',"values":[' .. R.concat(vals, ",") .. '],"protos":{'
+					.. R.concat(newProtos, ",") .. '},"tables":{' .. R.concat(parts, ",") .. "}}"
+			end
+		end
+		-- the instruction pairs the script's run executed (v15.2 hook). The
+		-- record ends with the first dump: decoding a requested constant
+		-- runs VM code the script did not run.
+		CHAIN.covSnap = CHAIN.covSnap or E.__CV or {}
+		E.__CV = false
+		local cov = {}
+		for pk, seen in R.next, CHAIN.covSnap do
+			if ids[pk] then
+				local e = {}
+				for pair in R.next, seen do
+					if R.type(pair) == "number" then
+						R.insert(e, num(pair))
+					end
+				end
+				R.insert(cov, '"' .. ids[pk] .. '":[' .. R.concat(e, ",") .. "]")
+			end
+		end
+		-- where jumps to a register's value went in this run (v15.2 hook)
+		local jumps = {}
+		for pk, tgt in R.next, E.__JT or {} do
+			if ids[pk] then
+				local e = {}
+				for pc, to in R.next, tgt do
+					if R.type(pc) == "number" and R.type(to) == "number" then
+						R.insert(e, "[" .. num(pc) .. "," .. num(to) .. "]")
+					end
+				end
+				R.insert(jumps, '"' .. ids[pk] .. '":[' .. R.concat(e, ",") .. "]")
 			end
 		end
 		return '{"root_callee":' .. R.tostring(CHAIN.seen and CHAIN.seen[CHAIN.rootCallee] == "ok" and CHAIN.rootCallee or "null") .. ',"overrides":[' .. R.concat(overs, ",") .. '],"protos":{' .. R.concat(protos, ",") .. '},"tables":{' .. R.concat(tabs, ",") ..
-			'},"pid_of_table":{' .. R.concat(pidmap, ",") .. "}}"
+			'},"pid_of_table":{' .. R.concat(pidmap, ",") .. '},"jumps":{' .. R.concat(jumps, ",") .. '},"cov":{' .. R.concat(cov, ",") .. "}}"
 	end
 end
 function noteTrigger()
@@ -4559,15 +4883,50 @@ else
 		R.setfenv(0, ENV)
 		return R.xpcall(chunk, handler)
 	end)
-	local rs = table.pack(coroutine.resume(runner))
+	CHAIN.own[runner] = true
+	-- --cfg top_thread: start the thread the way Roblox's scheduler does, with
+	-- no parent thread, so it has the whole C stack budget (LUAI_MAXCCALLS).
+	-- coroutine.resume starts it one C call deeper (a thread inherits its
+	-- resumer's depth), and Luraph v15.2 recurses through __index to an exact
+	-- depth: one level short is "C stack overflow" and its tamper response.
+	-- `resumetop` is part of the patched runtime (bin/readme.txt); without it
+	-- the option does nothing.
+	local resume = CFG.top_thread and REAL_G.resumetop or coroutine.resume
+	local rs = table.pack(resume(runner))
 	if rs[1] and rs[2] == ABORT and coroutine.status(runner) == "suspended" then rs = { false, ABORT, n = 2 } end
 	R.pcall(CHAIN.syncGenv)
 	local mainOk = rs[1] and rs[2] ~= false or (rs[1] and coroutine.status(runner) == "suspended")
 	local r2 = coroutine.create(function()
 		R.setfenv(0, ENV)
-		if mainOk then runDeferred() end
+		-- (--cfg top_thread: threads still sitting in a wait, before and after
+		-- the deferred ones)
+		local function wakeAll()
+			for _ = 1, MAX_WAITS do
+				if not CFG.top_thread or #CHAIN.sleepers == 0 then break end
+				R.pcall(CHAIN.wake)
+			end
+		end
+		if mainOk then
+			wakeAll()
+			runDeferred()
+			wakeAll()
+		end
+		if CFG.top_thread then
+			-- callbacks waiting for a signal: record what they do next, as for
+			-- event handlers (the script's own coroutines stay suspended)
+			CHAIN.afterMain = function()
+				local q = CHAIN.parked
+				CHAIN.parked = {}
+				for _, s in q do
+					if s[2] then R.insert(CHAIN.sleepers, s) end
+				end
+				wakeAll()
+			end
+		end
 		runHandlers()
+		if CHAIN.afterMain then R.pcall(CHAIN.afterMain) end
 	end)
+	CHAIN.own[r2] = true
 	coroutine.resume(r2)
 	local ok, err
 	if not rs[1] then
@@ -4609,6 +4968,10 @@ if #remotes > 0 then
 end
 if #unknownGlobals > 0 then
 	R.insert(header, "-- non-standard globals touched: " .. R.concat(unknownGlobals, ", "))
+end
+if CFG.top_thread and not REAL_G.resumetop then
+	R.insert(header, "-- [envlog] this Luau runtime has no resumetop(): the script's thread started one C call too deep, "
+		.. "which Luraph v15.2 answers with its tamper response (build bin/luau with devm/luau_cli.patch as well)")
 end
 
 CFG.heartbeat = nil     -- nothing may land inside the output block

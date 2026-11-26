@@ -1,724 +1,162 @@
-# Luraph v15.1 反混淆工具
+# Luraph deobfuscator, all in one (v15.1 and v15.2)
 
-自动识别样本形态，两种都能还原源码 —— **不报假成功**。
-
-## 一、这个工具到底做什么
-
-Luraph v15.1 有**两种发布形态**，工具会自动判断：
-
-### 形态 A：业务代码留在明文 ✅ 完整解出
-
-Luraph 只是把代码压成一行、塞进 `setmetatable({...})` 表里，外层套个加密壳。
-代码本身**还是明文的 Lua**。
-
-```
-setmetatable({
-  [87] = function(...) ... 真实的 UI / 功能代码 ... end,
-  [1033] = math.random,
-  ...
-})
-```
-
-工具会自动：
-1. 剥外层加密壳（十进制转义 / base64 / Luraph VM 壳）
-2. 用 `luau-ast` 定位所有大函数的**精确字节区间**
-3. 按区间切出来、断行、语义重命名
-4. 提取 handler 表并加注释
-5. 用 `luau` 验证语法
-
-→ 输出完整可读源码。
-
-### 形态 B：业务代码编译进 VM 字节码 ✅ 自动反向还原
-
-明文里只剩 handler 表，业务代码在 VM 字节码里。工具会自己走动态路径截获
-字节码再反编译：
-
-```
-[5b] 综合得分 = 0
-  ⚠ 业务代码已编译进 VM 字节码（静态提取拿不到源码）
-[6b] 尝试动态路径：在桩环境里截获字节码并反编译…
-     ✓ 截获字节码 44,090 字节
-     ✓ 49,347 字节  2,134 行
-[✓] 已还原源码 → out.luau
-```
-
-原理是 Luraph 的加载器最终必调 `luau_load(bytecode, ...)`，字节码在那之前
-已是明文。截获它即可，不需要逆向 VM 或破解分片解密。
-
-还原后变量名会是 `v3`/`v8` 这类（Luau 字节码里没有变量名信息），
-但控制流、字符串、函数边界、闭包全部完整。不想走动态路径加 `--no-lift`。
-
-下面是静态路径看到的原始形态：
-
-```
-setmetatable({
-  [1033] = math["random"],
-  [106]  = buffer["writeu32"],
-  ...
-})
-```
-
-大函数内部全是 `arg2[1201](11, 122)` 这种寄存器操作，**一句业务代码都没有**。
-
-工具会扫描业务特征（`GetService` / `Instance.new` / `UDim2` / `Color3` / 可读字符串），
-得分过低就直接停下，告诉你：
-
-```
-════════════════════════════════════════════════════════════
-  ⚠ 此样本的业务代码已编译进 VM 字节码
-════════════════════════════════════════════════════════════
-  ...
-  已停止输出。加 --force 仍可导出骨架（仅供分析）。
-```
-
-加 `--force` 可以导出骨架 + handler 映射表，但**那不是源码**。
-
-### 形态 C：内联展开 VM ✅ 解剖 + 生成自跑捕获脚本
-
-有些 Luraph 变体把 VM **完全内联展开**在一个表达式里，末尾是：
-
-```lua
-return setmetatable({ ...180 个槽位... }, {}):k6()(...)
-```
-
-没有 `luau_load`、没有 `vmcore`、没有 `loadstring` 锚点 —— 形态 B 的动态路径
-抓不到任何东西。业务代码被编译进 VM 自己管理的 `buffer` 里，明文里只剩
-handler 表和一大段密文串。
-
-工具会自动识别这种形态并做两件事：
-
-**1. 静态解剖 —— VM 的语义层全部还原**
-
-```
-[vm] 槽位 178 个：原语 88 / handler 81 / 表 6 / 字符串 2
-[vm] 顶层调度器 m[qA]，转发 13 个别 handler
-[vm] 最大解释器 m[DA]，212 个状态比较
-[vm] 诱饵槽位（定义了但从未被引用）：116, 70, 64, 100, 27, ... × 55
-```
-
-> 以上是实测输出。**所有数字都由程序自己统计**，不是写死的常量。
-> 换一个样本，槽位名、数量、状态比较数全都不一样 —— 工具会如实打印它看到的。
-
-- **88 个原语可读**：`m[27]` 就是 `buffer.readu8`，`m[38]` 是 `buffer.create` ——
-  Luraph 没混淆标准库名，只是把它们挂在数字下标上
-- **83 个 handler 的状态转移**：每个 handler 返回的第一个值是下一状态码，
-  据此可重建整个状态机
-- **顶层调度器 vs 最大解释器**：`k6` 只转发，`L6` 才是 207 分支的状态机主体
-- **诱饵识别**：`m.M`（9 个 u32）、`m.l6`（10 个 5 字符串）虽然长得像密钥表，
-  但**一次都没被引用** —— 逆向时直接跳过，别浪费时间
-
-加 `--vm-report` 导出完整报告（`<样本>.vm_anatomy.md`）。
-
-**2. 生成自跑捕获脚本 `<样本>.harness.lua`**
-
-这是这个形态的核心交付，理由见下。
-
-## 为什么形态 C 交付的是「自跑脚本」而不是源码
-
-先说已经做到什么：**VM 在本地已经跑起来了。**
-
-工具会**自己跑一遍**并把实测数据打出来：
-
-```
-[6e] 在本地运行自跑脚本，采集实测数据…
-
-  在本地实际跑了一遍（数字全部来自这次运行）：
-    · buffer.readu8 调用 124,780 次
-    · 分配 8 个 buffer：16, 200,160, 69,856, 7, 2,311, 1, 4, 6
-    · writeu8 17 次 / writestring 0 次
-    · 拦到 0 次加载调用
-```
-
-换一个样本，这些数字全都不一样（另一个样本跑出来是 `101,017` 次、
-buffer 尺寸 `16, 156,278, 54,960, ...`）。**没有一个数字是写死的**。
-
-卡在哪：**最后一跳**。
-
-VM 解开之后的业务代码会去调 Roblox 运行时对象（tween、instance、
-`game:GetService`）。本地桩环境给不出真对象，于是停在：
-
-```
-attempt to index nil with 'cancel'
-```
-
-关键判断：**`cancel` 这个词在整份 329 KB 源码里搜不到，一次都没有。**
-它只可能来自解密后的字节码 —— 也就是说**解密本身是成功的**，失败的是
-「在没有 Roblox 的机器上跑 Roblox 脚本」这件本来就做不到的事。
-
-所以在缺少 Roblox 运行时的环境里，诚实的交付不是假装解出了源码，
-而是把「已经能跑起来的 VM」打包成一个自跑脚本：
-
-- 它会 dump VM 分配的每一个 buffer（base64 + 可打印率判定）
-- 记录每一次 `buffer.readu8`（可以重放）
-- 挂 `loadstring` / `setfenv` / `luau_load`，谁拿到明文就拦谁
-- 输出用 markdown 包起来，直接粘回对话
-
-放到有 Roblox 的机器上（或任何带真实运行时桩的环境）跑一次，就能补上最后一跳。
-
-生成的脚本本身是**可验证的**，而且工具会**替你验证**：生成后立刻在本地
-Luau CLI 上实跑一遍，把这次执行的真实数字（`buffers` / `reads` / `writes` /
-`loads` / 每个 buffer 的实际尺寸）打印出来。数字对得上，说明捕获框架在工作，
-只是样本没跑完。这不是空壳，也不是写死的话术。
-
-## 一·B、运行时会看到什么
-
-工具启动后会先做前置自检，把「正在准备什么」和「准备好了没有」都打出来，
-不会静默卡住：
-
-```
-[1] 读取：sample.lua  636,457 字节
-[1b] 检查解析器（luau-ast / luau）…
-     ✓ luau-ast  luau-ast  6,711,744 字节
-     ✓ luau      luau  2,692,816 字节
-[2] 未检测到简单外层壳
-[2b] 正在启动剥壳引擎（bufemu 模拟执行 + buffer dump）…
-     首次运行可能需要几秒到几十秒，请稍候
-[2b] ✓ 剥壳完成 → 948,746 字节
-[3] AST 解析成功
-[4] 发现 2580 个函数
-[5] 长度 ≥ 20,000 的函数：4 个
-[5b] 业务特征扫描：… 综合得分 = 1375
-[8] 语法验证：✓ 通过  OK
-[9] 输出：output.lua  3,988,902 字节  43,262 行
-```
-
-每一行都标了 `✓` / `✗`，哪一步没准备好一眼能看到。
-
-## 二、用法
+One command for a Luraph-protected Roblox script:
 
 ```bash
-# 自动判断 + 解出（形态 A）
-python deob.py 样本.lua -o 输出.lua
-
-# 只看发现了哪些大函数，不输出
-python deob.py 样本.lua --list
-
-# 强制导出骨架（形态 B 分析用）
-python deob.py 样本.lua -o 骨架.lua --force
-
-# 不做语义重命名（保留原始变量名）
-python deob.py 样本.lua -o 输出.lua --no-rename
-
-# 调整大函数阈值（默认 20000 字节）
-python deob.py 样本.lua -o 输出.lua --min-size 5000
+./setup.sh                                  # once: builds the interpreter the engines run on (~3 min)
+python3 deob.py protected.lua -o out.lua    # looks at the file, picks the engine, writes the result
 ```
 
-## 三、输出长什么样
+`deob.py` unwraps Luraph's compressed container, decides what kind of script is inside, and hands it
+to the engine that can recover it:
 
-```lua
---[[
-  Luraph v15.1 自动反混淆输出
-  源文件：样本.lua
-  共提取 4 个业务函数
-]]
-
--- ============================================================
--- handler 表（VM 索引 → 实际值）
--- ============================================================
--- [1033] = math.random
--- [268]  = buffer.writef64
--- [1156] = table.clear
-
--- ============================================================
--- 第 1 段  原始偏移 252393 - 944109  (691,716 字节)
--- ============================================================
-local __part1 = function(...)
-    local Players = game:GetService("Players")
-    local TweenService = game:GetService("TweenService")
-    ...
-end
-```
-
-## 四、实测数据
-
-| 样本 | 形态 | 结果 |
-|------|------|------|
-| `StealAnEggg.txt` (636 KB) | A | ✅ 43,262 行，4 个函数，103 条 handler，语法通过 |
-| 数字字面量变体 (264 KB) | B | ✅ 正确识别并拒绝输出（得分 0） |
-| CatHub (105 KB) | 非 Luraph | ✅ 提示不是 Luraph v15.1 |
-
-形态 A 的业务特征得分实测 **1375**（`UDim2` 457 次、`Color3` 551 次、功能名 125 处），
-形态 B 得分 **0**，区分度极高。
-
-## 五、目录结构
-
-```
-luraph_v151/
-├── deob.py              主程序
-├── fetch_bin.py         按需下载二进制（首次运行自动调用）
-├── build_x86.py         自己编译（没网 / 要 x86_64 时用）
-├── bin/                 运行时生成，不进仓库
-│   ├── luau.aarch64
-│   ├── luau-ast.aarch64
-│   ├── luau.x86_64
-│   └── luau-ast.x86_64
-├── libs/
-│   ├── deobf_plus.py    词法器（支持 0b/0x/下划线/转义）
-│   ├── beautify2.py     基础排版
-│   └── readable3.py     语义重命名
-├── dynlift.py           形态 B：动态截获 Luau 字节码
-├── inlinevm.py          形态 C：内联 VM 识别 / 解剖 / 自跑脚本生成
-├── lift.py              封装的反编译器（Tovek）
-├── fastsolve.py         剥壳执行器
-├── mkfast.py            剥壳探针生成
-├── bufemu.lua           buffer 模拟
-├── robstub.lua          Roblox 环境桩
-├── reslot.py            还原 VM 槽位（tbl[6] → conns）
-├── humanize.py          排版整理（长行折行、关键字空格）
-├── readability.py       可读性量化打分（对比两份产物）
-├── report.py            多产物横向对比表
-├── pretty.py            反汇编整理成人能读的形式
-├── pack.sh              安全打包（不动工作目录）
-├── tools/               反编译器，运行时生成，不进仓库
-│   ├── luau-lifter
-│   └── glibc/
-├── examples/            示例样本（从 Release 下载）
-└── README.md
-```
-
-### 附加工具
-
-**可读性打分** —— 判断一份反混淆产物到底能不能用：
-
-```bash
-python readability.py 旧产物.lua 新产物.luau
-```
-
-7 个维度：语法可解析 30 / 语句密度 15 / 命名质量 15 / 缩进 10 /
-无噪音 5 / **逻辑完整度 20** / 业务文案 5。
-
-其中「逻辑完整度」权重最高——统计有多少函数体是空的、被标注 `⚠ 未记录`。
-一份看着漂亮的产物如果丢了一半逻辑，这一项会直接暴露。
-
-**槽位还原**（单独跑，也可被 deob.py 自动调用）：
-
-```bash
-python reslot.py 输入.luau 输出.luau
-```
-
-扫出 `表名[数字] = 标识符` 的映射并全局替换。BBDHub 样本实测替换 2,297 处。
-
-**排版整理**：
-
-```bash
-python humanize.py 输入.luau [输出.luau] [--max-len 100]
-```
-
-长行在 `,` / `and` / `or` 处折行，`)do` → `) do`，单目运算符去空格，函数间补空行。
-
-**多产物对比**：
-
-```bash
-python report.py a.lua b.lua c.luau
-```
-
-**反汇编整理**（形态 B 的中间产物，不想要源码只要结构时用）：
-
-```bash
-python pretty.py dump.txt 输出.txt
-```
-
-## 六、环境与安装
-
-Python 3.8+，无第三方依赖。
-
-### 二进制不进仓库，首次运行自动获取
-
-仓库里**没有任何二进制**（只有约 100 KB 代码）。`bin/` 下的 luau / luau-ast
-在第一次运行时由 `fetch_bin.py` 从 GitHub Release 下载，之后一直走本地缓存：
-
-```
-[1] 读取：sample.lua  948,746 字节
-[1b] 检查解析器（luau-ast / luau）…
-     本地没有可用的 luau-ast，正在从 GitHub Release 获取…
-[下载] https://ghproxy.net/https://github.com/…  ✓ 6,711,744 字节
-     ✓ luau-ast  luau-ast.aarch64  6,711,744 字节
-```
-
-想提前装好、或者网络受限，可以手动跑：
-
-```bash
-python fetch_bin.py            # 下载当前架构所需二进制
-python fetch_bin.py --check    # 只看有什么、缺什么
-python fetch_bin.py --force    # 强制重下
-python fetch_bin.py --url https://你的镜像/luau   # 自定义源
-```
-
-支持的环境变量：
-
-| 变量 | 作用 |
-|------|------|
-| `LUAU_BIN_URL` | 覆盖下载源前缀（自建服务器 / 网盘直链目录） |
-| `LUAU_BIN_MIRROR` | 镜像前缀，默认走 `ghproxy.net` 中转 |
-
-下载失败时脚本会给出三条替代路线（换镜像手动 curl、装官方包、自己编译），
-不会只丢一个报错就结束。
-
-### 自己编译
-
-```bash
-python build_x86.py            # 自动装工具链 + 依赖 + 编译
-python build_x86.py --check    # 只看现有二进制架构
-```
-
-编译产物放在 `bin/` 下，已被 `.gitignore` 排除。
-
-## 七、能力边界（请务必读）
-
-✅ **能做**
-- 剥 Luraph 外层加密壳
-- 精确定位明文业务函数（AST 字节区间，不是正则猜边界）
-- 处理 `0B110001_1_1_111`、`0X3b_D` 这类数字字面量变体
-- 解码 `\x72\x61\110`、`\u{0077}` 混合转义
-- 提取 handler 表并标注含义
-- 语法验证（luau 解析）
-- **识别内联展开 VM（形态 C）并解剖其全部语义层**：命名原语、还原状态转移、
-  区分顶层调度器 / 最大解释器、识别诱饵槽位
-- **生成可验证的自跑捕获脚本**，把最后一跳交给有 Roblox 运行时的环境
-
-❌ **不能做**
-- **在缺少 Roblox 运行时的环境里，把内联 VM 形态跑到吐出明文** ——
-  VM 本身能跑（工具会实跑并报出真实的 `readu8` 调用次数），但解密后的业务代码
-  会去调 tween / instance 这类真实对象，桩给不出来。工具会如实报告这一点，
-  并交付自跑脚本，而不是假装解出了源码
-- **还原局部变量的原始名字** —— Luau 字节码里没有变量名，只有寄存器编号。
-  反编译能恢复作用域、类型推断、控制流，但名字只能是 `v3`/`v8`
-
-## 八、许可
-
-MIT License
-
-# 更新日志
-
-## v1.6.1 (2026-11-09)
-
-**所有统计数字改为实跑采集，不再写死**
-
-- 新增 `inlinevm.run_harness()`：生成自跑脚本后立刻在本地 Luau 上执行一遍，
-  解析 `[harness]` 行和报告头，把 `buffers / reads / writes / strings / loads /
-  buffer_sizes / 执行结果 / 是否拦到明文` 全部抓回来
-- `deob.py` 的输出改为引用这次实跑的数据
-- 修掉一处**假阳性**：harness 自己的 `loadstring(SAMPLE_SRC)` 会被钩子拦下，
-  看起来像"捕获到明文"，实际是自己的样本。改成按内容特征排除
-- 修掉一处**硬编码变量名**：之前只认 `m:xxx(`，换成任意标识符
-  （另一个样本用 `A:qA(`，之前完全识别不出调度器）
-
-实测两个样本，数字各不相同（证明是现场采集）：
-
-| 样本 | readu8 | buffer 尺寸 |
+| What the file is | Engine | What you get |
 |---|---|---|
-| 3.lua | 124,780 次 | 16, 200,160, 69,856, 7, 2,311, 1, 4, 6 |
-| 8.lua | 101,017 次 | 16, 156,278, 54,960, 6, 1, 2,311, 4, 6 |
+| Luraph script whose code runs on the VM (v15.1, **v15.2**) | `devm` (devirtualizer) | the script as Luau: control flow, strings, calls, closures. Local names are re-derived from use (protection discards them). Ends with a report of what, if anything, is left unrecovered. |
+| Luraph script that kept its code as plain Lua inside the VM object ("form A") | static extraction (`deob.py` itself) | those functions cut out, formatted and renamed. Every step is checked: formatting must keep the token stream, renaming must keep the syntax tree up to local names. |
+| IronBrew1, or anything else | `deobf` (dynamic engine) | IronBrew1: devirtualized Luau. Unknown obfuscators: a behaviour trace on request (`--engine trace`). |
 
-## v1.6.0 (2026-11-09)
+If `devm` gives up on a Luraph script, the second, independent Luraph lifter in `deobf/` is tried
+before anything is reported as failed.
 
-**新增形态 C：内联展开 VM —— 解剖 + 自跑捕获脚本**
+Nothing here contacts the network and nothing touches Roblox. Scripts are run only inside mock
+environments (`devm/harness.lua` + `rbxmock.lua`, `deobf/envlog.luau`, `luasandbox.py`).
 
-- 新增 `inlinevm.py`：识别 `setmetatable({...},{...}):X()(...)` 这种内联 VM，
-  解剖出 88 个原语 / 83 个 handler 状态转移 / 顶层调度器 / 最大解释器 / 诱饵槽位
-- 新增 `--vm-report`：导出 `vm_anatomy.md`
-- `deob.py` 在 `dynlift.probe_loader` 判定「不适用」后自动尝试形态 C，
-  命中则生成 `<样本>.harness.lua`（自跑捕获脚本）并附上完整的原因说明
-- 返回码 `7` = 形态 C，已产出解剖报告与自跑脚本
+## Setup
 
-**为什么形态 C 交付自跑脚本**
+Python 3.8+ (no third-party packages), git, cmake and a C++ compiler.
 
-实测样本：VM 本地完全跑得起来（`buffer.readu8` 调用 101,017 次，
-按指令流分配 8 个 buffer），唯一堵点是解密后的业务代码调用 Roblox 运行时对象
-（`attempt to index nil with 'cancel'`）。`cancel` 在 329 KB 源码里**一次都搜不到**，
-只可能来自解密后的字节码 —— 证明解密成功，缺的是 Roblox 运行时。
-
-工具不再对此报「无法还原」，而是解析出 VM 的全部语义层，并生成一个
-**可本地验证的捕获脚本**（工具生成后会立刻在 Luau CLI 上实跑一遍，
-把 `buffers / reads / writes / loads` 等真实数字打给你看），
-放到有 Roblox 的环境跑一次即可补上最后一跳。
-
-**踩过的坑（写进代码注释了）**
-- Luau CLI 的 `_G` 只读，`loadstring`/`setfenv`/`game` 都不能直接赋值
-- `setfenv` 对 `loadstring` 的 chunk 不生效，必须让 chunk 自带桩
-- 样本末尾 `:k6()(...)` 用了 vararg，外层必须包成 `function(...)`
-- 生成脚本里不能有中文注释，Luau 按字节算行号会报语法错
-- `_G` 注入失败时，用 `local` 声明（优先级高于全局查找）是唯一干净的路
-
-## v1.5.0 (2026-11-09)
-
-**目标：让产物读起来像人写的。** 这版不加新能力，全部在「同一份代码，看起来更像人写的」上。
-
-### 核心：VM 槽位还原（效果最明显）
-
-Luraph 把局部变量存在表里，用数字下标访问：
-
-```lua
-tbl[6].conns = ...
-tbl[6].drawings = ...
-for k in pairs(tbl[6].repaint) do
+```bash
+./setup.sh                      # installs a toolchain if one is missing, then runs build_luau.py
+python3 build_luau.py --check   # tells you whether the installed interpreter is usable
 ```
 
-只要能找到 `tbl[6] = conns` 这句赋值，后面所有 `tbl[6]` 都能换成那个名字。
-实测 BBDHub 样本：**2,297 处替换**，`tbl[6]` → `conns`（1,598 次）、`tbl[7]` → `sprint`（541 次）。
+The engines need **Luau 0.739 with two patches**, not a stock or newer Luau: protected scripts
+measure their interpreter (C stack use of `pcall`, how a C function looks in `debug.info`, error
+positions, the vector type's metatable) and derive decryption keys from what they see.
+`build_luau.py` clones Luau, applies `devm/luau_cli.patch` and the writable-vector-metatable patch,
+builds `luau` and `luau-ast`, and installs them into `bin/` and `deobf/bin/`. The binaries are not
+in the repository. `LUAU_BIN` / `LUAU_AST_BIN` point the tools at binaries kept elsewhere.
 
-```lua
--- 之前
-k4,p = tbl[6],tbl[6]
-f2Res,k4.swingLog[ # tbl[6].swingLog + 1] = tbl[6],(...)
+## Usage
 
--- 之后
-k4,p = conns, conns
-f2Res, k4.swingLog[#conns.swingLog + 1] = conns, (...)
+```bash
+python3 deob.py INPUT [-o OUT]              # automatic
+python3 deob.py INPUT --engine static       # only unwrap + static extraction (fast, never runs the VM)
+python3 deob.py INPUT --engine devm         # force the devirtualizer
+python3 deob.py INPUT --engine deobf        # force the dynamic engine (its Luraph v15 lifter, IronBrew1)
+python3 deob.py INPUT --engine trace        # behaviour trace only (what the script did in the mock)
+python3 deob.py INPUT --list                # what is inside (functions, VM dispatchers), no output
 ```
 
-新增 `reslot.py`，自动扫出 `表名[数字] = 标识符` 的映射并全局替换。
+Other options: `--work DIR` keeps intermediate files (the unwrapped VM chunk and its data buffer,
+the engines' dumps), `--timeout S`, `--engine-args "..."` passes options through to the engine
+(for example `--engine-args "--http-map replies.txt"` for `devm`, see below). `python3 deob.py -h`
+lists the options of the static path.
 
-### 核心：修掉「短名被推成大编号」的 bug
+Exit status:
 
-`bind()` 原来用**全文件**的 `used` 集合查重名。原代码里的 `C`、`o`、`w`、`X`
-（Luraph 压缩后的局部名）第 2 个撞名就变 `C2`，第 3 个变 `C3`……一路推到 `v3452`。
+| Code | Meaning |
+|---|---|
+| 0 | complete result written |
+| 6 | result written, but **partial**: the report that was printed says what is missing |
+| 4 | a VM-only script and no engine produced a result (or `--engine static` on such a script) |
+| 3 | static result written, but it failed its own syntax check |
+| 2 | nothing recognised (not a Luraph product, no extractable function) |
+| 1 | error (file or interpreter missing, engine crashed without a result) |
+| 7 | "form C" capture harness written (old static path, see `docs/static-tool.zh-CN.md`) |
 
-改成**按作用域链**查重后，`v*` 从 3,452 个降到 **0**，原文的 `C`、`o`、`w` 全部保留。
+Each engine can also be run on its own: `python3 -m devm.run`, `python3 deobf/deob.py`.
 
-```python
-def in_scope_listed(nm):
-    sc = cur
-    while sc is not None:
-        for lst in sc.names.values():
-            for _, b in lst:
-                if b == nm: return True
-        sc = sc.parent
-    return nm in BAD_BASE
-```
+## Luraph v15.2
 
-### 新增：humanize.py 排版整理
+What v15.2 changed, and what was added for it (details: `devm/README.md`, section "Luraph v15.2";
+`deobf/V15_2.md`):
 
-纯文本后处理，不改语义：
+- **Compressed container.** The shipped file is only a decoder: base85 + range decoder produce a
+  Lua source (the VM, loaded with `loadstring(src, "Luraph")`) and a data buffer (the script's
+  bytecode). Both tools unwrap it on their own. `devm` runs the *shipped* file and swaps the
+  instrumented chunk in at `loadstring`, so call depth, chunk name and error positions are exactly
+  the shipped file's.
+- **Four interpreters in one chunk, three-level closure makers** with per-closure keys, dispatch
+  loop heads without `local`.
+- **A much larger start-up probe** (a battery of CFrame/Vector3/Vector2/UDim/Enum/Random/Path2D
+  calls run at C-stack depth 199, coroutine and `task` scheduling states, `IsA`/`IsDescendantOf`,
+  library fingerprints). Any wrong answer gives a wrong key and the script scrambles itself; both
+  mock environments were corrected until every probe passes.
+- **A main function flattened three ways**: jump-register trampolines, a state variable with a
+  compare tree, and block-wise self-decryption with rolling keys held in interpreter locals.
 
-- **长行折行**：超过 100 字符的行在 `,` / `and` / `or` / `..` 处断开，
-  按优先级选断点（`,` 最高），续行缩进
-- **关键字空格**：`)do` → `) do`，`[x]then` → `[x] then`
-- **单目运算符**：`# c.ambigLog` → `#c.ambigLog`、`- 0.06` → `-0.06`
-- **函数间空行**、压缩连续空行
-
-BBDHub 样本：长行（>120 字符）605 → 417，语法验证通过。
-
-### 修复：tidy() 重复排版
-
-`format_tokens` 输出后又被 `tidy()` 拿去 `tokenize` + `format_tokens` 跑第二遍。
-换行在 tokenize 时就丢了，第二遍把所有语句拼回一行。`format_tokens` 是幂等的，不需要跑两遍。
-
-### 修复：分号不断行
-
-`};tbl[6] = conns;getgenvRes.BBD = tbl[6];` 三个语句挤一行。
-根因是 `;` 在 `TIGHT` 集合里，被前面「紧凑符号」分支吃掉，后面的断行逻辑永远走不到。
-
-### 修复：表字段缩进
-
-行首锁定缩进时用的是 flush 时的 `brace` 值（那时 `{` 已经打开），
-导致 `drawing = {},` 比 `local conns = {` 少缩进一级。改成行首锁定 + `end`/`else` 提前减一级。
-
-### 新增：可读性打分里加「行长合理」
-
-原来 7 个维度看不出排版改善，加了行长项（>120 字符的行占比）。
-
-### 实测
-
-| 指标 | 改前 | 改后 |
-|---|---:|---:|
-| VM 槽位访问 `tbl[6]` | 1,598 | **0** |
-| 无意义编号名 `v*` | 3,452 | **0** |
-| 长行（>120 字符） | 605 | **417** |
-| 语法验证 | ✓ | ✓ |
-| 可读性总分 | 79 | **86** |
-
-### 边界（说清楚）
-
-命名分数仍然上不去，原因是有 4,218 个变量在这份样本里**根本没有名字**——
-Luraph 压缩后就是 `arg1`、`tbl`、`X`，反推不出语义。任何静态工具都做不到。
-
-要做到 95%，必须走字节码反编译（见 v1.4.0 的 Tovek 路径），
-但那条路要求样本的 VM 暴露 `luau_load`，形态 A 的样本用不上。
-
----
-
-
-## v1.4.0 (2026-11-09)
-
-**形态 B 从「拒绝输出」变成「自动还原源码」。** 这是本工具第一次能处理业务代码
-被编译进 VM 字节码的样本。
-
-### 核心：形态 B 自动反编译
-
-以前的形态 B 只能给 handler 表和骨架，然后说「做不到」。现在会自己走动态路径：
+The sample in `examples/v15.2/sample.luau` is a Luraph v15.2 build of a **key-system loader**
+(JNKIE): it checks its environment and executor, then POSTs `SCRIPT_KEY` to the key server and
+mixes the server's numeric answer into the key of the next stage. The tool recovers the loader
+and stops at the request:
 
 ```
-[5b] 业务特征扫描：综合得分 = 0
-  ⚠ 业务代码已编译进 VM 字节码（静态提取拿不到源码）
-[6b] 尝试动态路径：在桩环境里截获字节码并反编译…
-     ✓ 截获字节码 44,090 字节
-     交给反编译器（Tovek）…
-     ✓ 49,347 字节  2,134 行
-[✓] 已还原源码 → out.luau
-```
-
-原理：Luraph 的加载器最终一定调用 `luau_load(bytecode, env, settings)`，
-字节码在那之前已经是明文。在调用点截获即可 —— 不需要逆向它的 VM、
-不需要破分片解密算法、不需要真实 Roblox 环境。
-
-产物质量：变量名、字符串、控制流、`pcall`/`warn`、闭包捕获、表结构都还原，
-143 个函数无一缺失。唯一的损失是局部变量名变成 `v3`/`v8`
-（Luau 字节码里本来就没有变量名）。
-
-新增文件：`dynlift.py`（截字节码）、`lift.py`（封装 Tovek 反编译器）。
-
-### 修复：形态识别假阳性（严重）
-
-旧版用 `"[A-Z][A-Za-z ]{8,}"` 数「可读 UI 文案」，按 1/20 加权。
-两种样本都会骗过它：
-
-- 随机标识符 `YmhpVeGpVQ`（全大写开头、无空格、长度 11）→ 4,421 个误判，凑出 219 分
-- 明文 Lua 片段 `" end local ttisstring = function(v) return type(v) == "` → 得分涨到 4,362
-
-结果是：**内部一个业务 API 都没有的文件，仅调整 `--min-size` 就能从「拒绝」翻成「成功输出」，还打 ✓ 语法验证通过。**
-
-修法：**彻底移除所有字符串信号**，只保留 5 个 VM 字节码里不可能出现的 API 结构名：
-
-```
-GetService / Instance.new / UDim2 / Color3 / TweenService
-```
-
-实测区分度：
-
-| 样本 | 得分 | 结果 |
-|---|---:|---|
-| `demo_2.html`（形态 B） | **0** | 拒绝 ✅ |
-| `layer3.lua`（形态 A） | **1143** | 输出 43,954 行 ✅ |
-
-### 修复：`--force` 对「零大函数」无效
-
-原来的顺序是：
-
-```python
-if not sized: return 2        # ← 先返回了
+$ python3 deob.py examples/v15.2/sample.luau -o out.lua
 ...
-if score < 5:                 # ← --force 只在这之后生效
+traced run: the script stopped ... (984140 VM instructions)
+  request: POST https://api.jnkie.com/api/v1/luascripts/precheck/... -> ... (no network)
+result: PARTIAL
 ```
 
-所以一个连大函数都找不到的样本，加 `--force` 也没用。
-现在 `--force` 会把阈值降到 0，重新从 `outer` 里收集非空函数：
+`examples/v15.2/sample_src.luau` (a fly script) is **not** what this file contains before the key
+check; whatever the loader starts afterwards is encrypted with a key that needs the server's reply.
 
-```
-[!] 没有找到大函数。
-    加 --force 可导出最佳猜测的骨架（跳过大小阈值）。
-    --force 已指定，跳过大小阈值，重新收集候选…
-[✗] 连非空函数都没有，这个文件不像是 Luraph v15.1 产物。
-```
+### Scripts behind a key system or a server
 
-### 修复：HTML 外壳没处理
-
-之前把 `.html` 整个丢给 Luau 解析器，必然失败。现在 `unwrap_shell`
-会先剥 HTML（取最长那行），再做已知语法瑕疵修补（缺 1 个 `end`），
-最后才进 AST。
-
-### 新增：可读性打分工具
-
-用来判断一份反混淆产物能不能用：
+The tool never sends a request and never invents a server's confirmation. If you hold a valid key
+and have the reply the server gave *you*, you can replay it: `devm` takes canned replies
+(`--http-map FILE` with `<url substring><TAB><reply body>` lines, or `--http-reply VALUE`), e.g.
 
 ```bash
-python readability.py 旧产物.lua 新产物.luau
-python report.py a.lua b.lua c.luau
+python3 deob.py protected.lua -o out.lua --engine-args "--http-map replies.txt"
 ```
 
-7 维度打分，其中「逻辑完整度」权重最高（20 分）——
-统计有多少函数体是空的 / 被标注「未记录」。
+Without the reply, the stage behind the check stays encrypted and is reported as missing.
 
-同一份 Scorched Earth 样本，人工重写版 vs 本工具反编译版：
+## The engines
 
-| 维度 | 人工重写 | 本工具 |
-|---|---:|---:|
-| 命名质量 | **14** | 0 |
-| 无噪音 | 0 | **5** |
-| 逻辑完整度 | **5** | **20** |
-| 总分 | 79 | **85** |
+| Directory | Engine | Notes |
+|---|---|---|
+| repo root (`deob.py`, `libs/`, `fastsolve.py`, `luasandbox.py`, ...) | static tool: container unwrap, form detection, extraction of plain-Lua functions, formatter and renamer with self-checks | `docs/static-tool.zh-CN.md` (Chinese; the original README of this repository, with a list of what changed since) |
+| `devm/` | devirtualizer: static model of the interpreter, instrumented run in a mock Roblox/executor, partial evaluation of the interpreter per instruction, structuring, cleanup, naming | `devm/README.md` |
+| `deobf/` | dynamic engine: mock environment that records behaviour, plugins `luraph_v15`, `ironbrew1`, `generic`, a lifter back end shared by the plugins | `deobf/CLAUDE.md` (architecture and hard-won facts), `deobf/LURAPH.md`, `deobf/V15_2.md`, `deobf/IRONBREW1.md` |
 
-人工重写版看起来更漂亮（变量名有意义、有章节注释），但
-**16 处函数体是空的**，包括 NoClip 里真正的 `part.CanCollide = false`。
-本工具版变量名是 `v3`/`v8`，但 143 个函数一个都不缺。
+`allinone.py` is the hand-over between them; `luaubin.py` is the one place that finds the
+interpreter binaries.
 
-### 新增：反编译器依赖自动获取
+Earlier results recovered with `devm` are in `deobfuscated/` (their protected inputs are not in
+the repository; `tests/regress.py DIR` re-runs them if you have the inputs).
 
-`fetch_bin.py` 现在一并处理 `luau-lifter` 和 glibc：
+## Limits, stated plainly
 
-```
-luau-lifter.aarch64     8.1 MB   反编译（形态 B 必需）
-glibc-aarch64.tar.gz    1.3 MB   Alpine 跑 glibc 程序用
-```
+- **Per-script VMs.** Every Luraph file carries its own interpreter: opcodes, operand layout and
+  handlers are generated per script. What carries over is the tool's understanding of a *layout*;
+  an option or layout it has not met needs new support, and the tool says so instead of guessing.
+- **Only what a run reached is known to be right.** Code that never ran is lifted statically; where
+  it needs a key the run never produced it is marked (`LIFT ERROR`, a count in the report).
+- **Remote code and key systems**: see above.
+- **Names, comments, formatting** do not survive protection. Names are re-derived from use.
+- **A behaviour trace is not source.** It shows the branches one run took in a mock environment.
+- The v15.1 results in `deobfuscated/` could not be re-run here (no inputs), so changes to shared
+  code paths were kept behind checks on the layout; `tests/regress.py` is the way to confirm on
+  your own inputs.
 
-`--lifter-only` 只装反编译器；Debian/Ubuntu 上会自动用系统 glibc，不用下载。
-
-### 新增：安全打包脚本
-
-`pack.sh` 用 `mktemp -d` 复制到临时目录再压缩，并校验必带文件清单。
-之前的版本直接在工作目录 `rm -rf tools/` 再 zip，
-结果打出了空的 `tools/`，还把工作目录自己的文件删了。
-
----
-
-## v1.3.0 (2026-11-09)
-
-### 新增：x86_64 二进制（免自己编译）
-
-`bin/` 现在同时提供两套：
-
-| 文件 | 架构 | 大小 |
-|------|------|------|
-| `luau.aarch64` / `luau-ast.aarch64` | ARM64 | 2.6 MB / 6.5 MB |
-| `luau.x86_64` / `luau-ast.x86_64` | x86-64 | 3.6 MB / 8.7 MB |
-
-**运行时自动按 `platform.machine()` 选对应版本**，用户不用手改文件名。
-
-查找顺序：`luau-ast.<架构>` → `luau-ast`（架构校验）→ PATH。
-
-### 新增：二进制改从 Release 按需下载
-
-仓库里不放二进制（只有 ~100 KB 代码），首次运行时由 `fetch_bin.py`
-从 GitHub Release 拉取，之后走本地缓存。
+## Tests
 
 ```bash
-python fetch_bin.py            # 下载当前架构所需
-python fetch_bin.py --check    # 只看有什么、缺什么
-python fetch_bin.py --force    # 强制重下
+python3 tests/run_all.py            # quick checks (a few minutes)
+python3 tests/run_all.py --full     # also the slow ones: full devirtualization of the v15.2 sample
 ```
 
-多镜像回退：`ghproxy.net` → 直连 GitHub。
+## Where the code came from
 
-### 新增：build_x86.py 自动构建脚本
+- The static tool and `devm/` are this repository's own history.
+- `deobf/`, its notes and `examples/v15.2/` were imported from
+  [pro628713-arch/luraph-v15.2-deobf](https://github.com/pro628713-arch/luraph-v15.2-deobf)
+  (commit `ce58767`) and extended here. That repository carries no licence file; check with its
+  owner before redistributing that part.
+- Luau is © Roblox Corporation (MIT); it is downloaded and built by `build_luau.py`, not vendored.
 
-如果官方二进制不可用，可以自己构建：
-
-```bash
-python build_x86.py          # 自动装工具链、下依赖、编译
-python build_x86.py --check  # 只检查现有二进制架构
-```
-
-会自动处理：缺 `clang`/`lld`/`cmake` → `apk add`；
-缺 x86_64 libc → 从 Alpine 源下载解压成 sysroot；
-缺 `linux/kd.h` → 自动补 `linux-headers`。
-
-### 改进：运行前打印准备状态
-
-```
-[1b] 检查解析器（luau-ast / luau）…
-     ✓ luau-ast  luau-ast.aarch64  6,711,744 字节
-     ✓ luau      luau.aarch64  2,692,816 字节
-```
-
----
-
-## v1.2.0 (2026-11-08)
-
-修 3 个必修问题：
-
-- `tidy()` 改字符串内容（`"hello . world"` → `"hello.world"`）→ 改 token 级
-- `verify()` 会真的执行被测代码（恶意脚本能写文件）→ 包 `if false then ... end`
-- `mkfast.py` 硬编码路径 + 用 `loadstring`/`setfenv`（Luau 已移除）→ 多目录回退 + `load` 兼容
-
----
-
+Licence of this repository: MIT (`LICENSE`).

@@ -75,8 +75,14 @@ class ForPrep(IRStmt):
 
 
 class Close(IRStmt):
-    def __init__(self, reg):
+    """The VM's close op for one register. stable: fmt_stmt gives it a text
+    that is equal for equal registers, so copies of a block that close a
+    captured register can merge (structure.merge_equivalent); without it
+    every Close object reads differently (Luraph v15 lifts, unchanged)."""
+
+    def __init__(self, reg, stable=False):
         self.reg = reg
+        self.stable = stable
 
 
 class Opaque(Expr):
@@ -179,7 +185,9 @@ def fmt_const(v):
     if v is False:
         return "false"
     if isinstance(v, bytes):
-        return '"%s"' % "".join(chr(c) if 32 <= c < 127 and c not in (34, 92) else "\%d" % c for c in v)
+        # other bytes as Lua decimal escapes, three digits each (a shorter one
+        # would swallow a digit that follows: "\1" + "0" must not read "\10")
+        return '"%s"' % "".join(chr(c) if 32 <= c < 127 and c not in (34, 92) else "\\%03d" % c for c in v)
     if isinstance(v, (int, float)):
         return S.fmt_num(v)
     return repr(v)
@@ -192,6 +200,8 @@ def fmt_stmt(s):
         return "%s = %s" % (fmt_expr(s.target), fmt_expr(s.value))
     if isinstance(s, CallStmt):
         return "T%s = %s(%s)" % (s.t, fmt_expr(s.fn), fmt_multi(s.args))
+    if isinstance(s, Close) and s.stable:
+        return "close r%s" % (s.reg,)
     return repr(s)
 
 

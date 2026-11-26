@@ -45,6 +45,10 @@ class LuraphV15(Obfuscator):
 
     def deobfuscate(self, job):
         from obfuscators.luraph_v15 import driver
+        m = HEADER.search(job.source[:2000])
+        if m and m.group(2):
+            # (the result's header names what the file says it is: v15.2, ...)
+            job.obfuscator = "Luraph v%s.%s" % (m.group(1), m.group(2))
         fixed = restore_header_newline(job.source)
         if fixed != job.source:
             print("[*] header comment ran into the code (lost newline): split it", file=sys.stderr)

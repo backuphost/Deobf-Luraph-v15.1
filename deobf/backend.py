@@ -57,7 +57,10 @@ def lower(entry_key, order, D, link, prefix, upnames, closure):
         elif b.kind == "ret" and b.values is not None:
             b.values = CG.map_multi(b.values, conv)
 
-    nerr = sum(1 for b in blocks.values() if b.kind == "error")
+    # (a front end can end a path in an error marker that is not unlifted
+    # code: D.not_an_error(message))
+    skip = getattr(D, "not_an_error", None)
+    nerr = sum(1 for b in blocks.values() if b.kind == "error" and not (skip and skip(b.error)))
     entry, body, sr = ST.structure(entry, blocks, own)
     body = ST.cleanup(body)
     body = IDI.drop_blank_branches(body)

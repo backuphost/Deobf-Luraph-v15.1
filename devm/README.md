@@ -33,6 +33,7 @@ automatically, and the run ends with a report of what, if anything, is left unre
 | proto-table, Luraph's own one-line output, encrypted second stage | message_1 | complete, 0 lift errors, reproduced by `tests/regress.py` |
 | factory (`factory(...)(upvalues)`), decompiled bytecode | Net, TeleportGuard | complete up to a few constants in branches no run reached |
 | factory, one-line output, self-decrypting code and lazily decoded constants | 25ms_get | partial: all modules, but unlifted instructions and unstructured exits remain |
+| v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,500 lines); code that never ran keeps about 25 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
 
 There is no key that opens every Luraph v15.1 script.  Every protected file carries its own virtual
 machine: opcode numbers, operand layout and handlers are generated per script, the decryption keys
@@ -164,6 +165,87 @@ against these changes: their inputs are not in the repository.
   split loops on the script's own boolean flags).
 
 Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
+
+### Luraph v15.2 and the compressed container
+
+`examples/v15.2/sample.luau` is the reference (the only v15.2 sample so far).
+
+* **Container.**  The shipped file is a small VM object that decodes and decompresses two blobs
+  (the real VM chunk as Lua source, and its data buffer), compiles the chunk with
+  `loadstring(source, "Luraph")` and calls it with the buffer.  `container.py` recognises that by
+  running the file with a recording `loadstring` (`unwrap.lua`: pure libraries only) and builds
+  the model from the chunk.  The traced run executes the *shipped file* and the harness's
+  `loadstring` compiles the instrumented chunk in place of the original text (`carrier=`,
+  `chunksrc=`), so call depth, chunk name (`[string "Luraph"]`, line 1), the chunk's arguments and
+  the code in front of the header are those of the real thing.  The chunk and its buffer are kept
+  in the work directory (`<name>.chunk1.lua`, `<name>.chunk1.arg1.bin`).
+* **A chunk cut out earlier** (`examples/layer3.lua` + `examples/blob4.bin`):
+  `python -m devm.run chunk.lua --chunk-arg buffer.bin` runs it through a stand-in carrier with
+  the same call shape.  Without its buffer such a chunk stops at its first read.  This pair is
+  a v15.1 build whose script is mostly plain Lua kept inside the VM object: the functions the
+  payload creates from it (`native(nil, nil, upvalues, nil)`, a wrapper with four parameters)
+  are printed with their own text.  Result: about 34,000 lines, 110 functions on the VM, 2
+  unlifted instructions in code that did not run; the traced run stops in the script's GUI code
+  on a gap of the mock (`attempt to index nil with 'X'`), after two requests for a file on
+  raw.githubusercontent.com that get no reply offline.
+* **Model.**  The v15.2 chunk has four interpreters with 4 + 6 + 3 + 4 dispatch loops; a loop head
+  can be `while true do OP = CODE[PC]` with the opcode variable declared outside
+  (`vmmodel.is_dispatch_loop(assigned=True)`).  The wrapper between factory and interpreter takes
+  per-closure numbers besides the upvalue list (`function(Z,Z,Z,J,i,U)`: keys Z and J, upvalue
+  list `i`); `Model.wrapper_numbers` finds them, the lifter binds them from the traced run or from
+  the creating instruction (`FactoryLifter.wrapper_values`).  Only the interpreter the sample
+  actually runs (the last one) is exercised; the stack-machine interpreter and the two others
+  have never been lifted from.
+* **Executor API.**  In executor mode the script also gets `getrawmetatable`, `setrawmetatable`,
+  `setreadonly`, `isreadonly`, `make_writeable`, `make_readonly` and a `clonefunction` that returns
+  a new function; `request` behaves like native code (raw field reads, no metamethods, non-string
+  `Url` refused).  The first group needs natives in the CLI (`__LPH_NATIVE`, added to
+  `luau_cli.patch`): a binary built before that falls back to approximations and says so in an
+  `[env]` line of the run.  The mock's own bookkeeping fields are no longer visible as globals.
+* **The main function** is Luraph's start-up code and the script's top level in one function,
+  protected three times over:
+  1. every jump goes through a trampoline (`R219 = target; goto hub`): the lifter keeps one copy
+     of the hub per target, as before;
+  2. a state machine: one register holds the state, a binary search over it sits at one address
+     and every block jumps back there.  `ircfg._unflatten` undoes this (`run.py` switches it on
+     for this generation; it stays off for v15.1 one-line builds);
+  3. block-wise encryption: a block of instructions is decrypted when it is first reached, with
+     keys held in interpreter locals that the program itself keeps changing (`key = R[x]`
+     instructions mix the results of the environment checks in), and constants decode lazily and
+     patch their own instruction.  The traced run records 289 versions of this function's code.
+
+  The lifter walks paths and gives an instruction the code and the keys of the first path that
+  reaches it.  Here that path is often one the program never takes (garbage produced by lifting a
+  block that is still ciphertext, or a state block entered with another block's history), and
+  instructions that had run came out as garbage: enough to hide the state register from the
+  unflattener.  For this generation (`Model.keyed_wrappers`, `Lifter.defer_foreign_state`) an
+  instruction that ran is only lifted where the replayed code equals a version the run recorded
+  for it, otherwise in the recorded state of its first execution, and with the keys the run
+  recorded on entry.  The 39 MB / 78,000 lines the first v15.2 support produced became about
+  3,500 lines (the same sample, the same run).
+* **Closures** get their captured variables from the list the instruction builds; that list is
+  parked in the instruction's argument template only for the duration of the call (`PE.parked`).
+* **More than 200 locals.**  The unflattened function has about 500.  `structure.fit_scopes`
+  cuts it into `do ... end` sections side by side, only where the limit asks for one
+  (`tighten_scopes`, used for v15.1, nests one block per short-lived local).
+* **What is not recovered, and why.**  All remaining `LIFT ERROR` markers are in code that did
+  not run: there a key was computed from a value that only exists at run time, so the block or
+  constant behind it cannot be decrypted.  Branches the run did not take can therefore end in a
+  marker or, where a wrong key still produced valid operands, in nonsense statements; nothing in
+  them is confirmed by the run.  `--mark-untaken` writes `-- not reached in the traced run`
+  where such an arm starts (188 places in the sample; off by default because the comments
+  keep small arms from folding into `and`/`or` expressions).
+* **What the sample is.**  A JNKIE (jnkie.com) key-system loader.  After Luraph's start-up probes
+  it tests the executor (`PC-E01..E03`: raw metatable access, `clonefunction`; a `request` call
+  whose options carry metamethod traps) and then sends
+  `POST https://api.jnkie.com/api/v1/luascripts/precheck/<id>/<id>`.  Without a reply it warns
+  "Key verification unavailable" and stops.  The lifted code shows what a reply has to be: status
+  200 and a body of at most 10 digits (`^[1-9]%d*$`, at most 2147483647); the script then stores that number and the three
+  coordinates of a small `Attachment.WorldPosition` computation in a table.  The instructions
+  after that never ran and do not decrypt with the keys of the traced run (the output ends there
+  in a `LIFT ERROR`), so what the number is used for is not known.  devm does not forge the reply; everything behind it
+  (the protected script) is not in the output.  `examples/v15.2/sample_src.luau` shares no
+  strings or structure with what the loader does before that point.
 
 ### Names
 

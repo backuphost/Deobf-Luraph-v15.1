@@ -721,6 +721,7 @@ class PE:
         self.exposed = set()
         self.written = set()
         self.pending_closures = []
+        self.parked = None          # table an instruction built and stored where stores are dropped (setindex)
         self.path = []
         self.va_base = None
         self.pcvars = {}
@@ -1276,10 +1277,14 @@ class PE:
             if isinstance(key, float):
                 key = norm(key)
             if not obj.fresh and self.frozen and obj.path not in self.volatile and id(obj) not in self.replay_tables:
+                if isinstance(val, LuaTable) and val.fresh:
+                    self.parked = val       # (see the ProtoRef case of call)
                 return
             if not obj.fresh and self.protect is not None and key in self.protect[1] and obj.path \
                     and obj.path.startswith(self.protect[0]):
                 # an instruction that never ran must not rewrite one that did (and is in its final form)
+                if isinstance(val, LuaTable) and val.fresh:
+                    self.parked = val
                 return
             if not obj.fresh and isinstance(val, (Sym, LinSym, MultiTail)) and obj.path not in self.volatile:
                 raise PEError('self-modifying store of a run-time value into %s[%r]' % (obj.path or obj.id, key) + (' <%r was %r>' % (val, obj.h.get(key)) if os.environ.get('DEVM_PEDBG') else ''))
@@ -1473,7 +1478,20 @@ class PE:
         if isinstance(f, LFn):
             return self.call_lfn(f, args, want)
         if isinstance(f, ProtoRef):
-            return [self.make_closure([f] + list(args))]
+            a = list(args)
+            if any(is_num(x) and not isinstance(x, (bool, Sym)) for x in a):
+                # v15.2: the wrapper is called with per-closure numbers (keys) and the upvalue
+                # list among them; the lifter keeps the numbers for when it lifts that function
+                if getattr(self, 'on_wrap_args', None):
+                    self.on_wrap_args(f, a)
+                tabs = [x for x in a if isinstance(x, LuaTable)]
+                # (the instruction parks the upvalue list it built in its argument template for
+                # the call and takes it out again; where writes to the program's own tables are
+                # not replayed -- an instruction that ran -- the list is the table that store held)
+                ups = tabs[0] if tabs else self.parked
+                self.parked = None
+                return [self.make_closure([f, ups])]
+            return [self.make_closure([f] + a)]
         if isinstance(f, Sym):
             return self.emit_call(f.e, args, want)
         if f is FORITER or f is FSTATE:
@@ -1653,9 +1671,19 @@ class PE:
                 # non-virtualised function: native(upvalue_table) -> closure
                 return [self.make_closure([('native', f.func.line), args[0]])]
             ups = [a for a in args if a is not None]
-            if len(args) == 3 and len(ups) <= 1 and all(isinstance(a, LuaTable) and a.fresh for a in ups):
-                # same, called like a proto wrapper: native(nil, upvalue_table, nil)
+            if 3 <= len(args) <= 6 and len(ups) <= 1 and all(isinstance(a, LuaTable) and a.fresh for a in ups):
+                # same, called like a proto wrapper: native(nil, upvalue_table, nil); the wrapper of
+                # another build takes four parameters (examples/layer3.lua: native(nil, nil, table, nil))
                 return [self.make_closure([('native', f.func.line), ups[0] if ups else None])]
+            tabs = [a for a in ups if isinstance(a, LuaTable)]
+            if id(f.func) in self.native_ids and len(tabs) <= 1 and all(a.fresh for a in tabs) and not self.lazy_depth \
+                    and any(is_num(a) and not isinstance(a, (bool, Sym)) for a in ups) \
+                    and all(isinstance(a, LuaTable) or (is_num(a) and not isinstance(a, (bool, Sym))) for a in ups):
+                # same in v15.2, whose wrappers also take per-closure numbers: native(n1, n2, upvalue_table[, x])
+                # (the upvalue list of an instruction that ran: see the ProtoRef case of call)
+                nups = tabs[0] if tabs else self.parked
+                self.parked = None
+                return [self.make_closure([('native', f.func.line), nups])]
             raise PEError('call of foreign VM closure (line %s) with %r' % (f.line, args))
         func = f.func
         is_interp = id(func) in self.model.interp_funcs

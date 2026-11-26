@@ -332,7 +332,11 @@ removes Luraph's Path2D/Folder probe block at the top.
   (double-obfuscated) is out of scope. A script that fails the same way in
   real Studio without the harness is not an environment problem.
 - Other Luraph versions: detect() gives them 0.3 (below the 0.5 threshold,
-  so they get the generic trace); nothing has been tested.
+  so they get the generic trace); nothing has been tested. **v15.2** is
+  detected as this plugin (same header prefix): its probes pass and it gets
+  a partial lift (Luraph's start-up code and the script's own code up to
+  where the traced run stopped; `V15_2.md`). The result header names the
+  minor version the file states (`Luraph v15.2`).
 - Without the long-lived harness, constant rounds converge one nesting
   level per round. Loader VM roots can't be lifted (`storing a non-empty VM
   table into a register`).

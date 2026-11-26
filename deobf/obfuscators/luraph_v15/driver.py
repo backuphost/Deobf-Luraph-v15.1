@@ -30,13 +30,14 @@ def patch_spin(src):
                   lambda m: m.group(0) + "__SPIN.n=__SPIN.n+1;if __SPIN.n>=__SPIN.step then __SPIN.f()end;", src)
 
 
-def patch_chunk(src, tmpdir):
-    """Instrument a loadstring'd VM chunk like the main script."""
+def patch_chunk(src, tmpdir, shapes=None, hooks=True):
+    """Instrument a loadstring'd VM chunk like the main script (hooks=False:
+    only note its VM shapes)."""
     path = os.path.join(tmpdir, "_chunk_%s.luau" % harness.chunk_key(src))
     with open(path, "w", encoding="latin-1", newline="") as f:
         f.write(src)
     try:
-        return patch_entries(src, path)
+        return patch_entries(src, path, shapes, hooks)
     except Exception as e:  # not parseable by luau-ast: run it as is
         print("[!] could not instrument chunk (%s)" % e, file=sys.stderr)
         return src
@@ -44,13 +45,19 @@ def patch_chunk(src, tmpdir):
         os.remove(path)
 
 
-def patch_entries(source, path):
+def patch_entries(source, path, shapes=None, hooks=True):
     """Give every VM closure an entry hook. It only uses table operations (no
     calls, no locals), so the stack looks exactly as it would without it: it numbers
     protos in first-entry order, logs recent entries and returns early for the
-    protos listed in __SKIPP."""
+    protos listed in __SKIPP.
+    shapes (a set): gets "nested" when a VM has Luraph v15.2's nested closure
+    maker (vmmap.maker_info "scope"); hooks=False returns the source as it is."""
     from obfuscators.luraph_v15 import vmmap
     root = vmmap.load_ast(path)
+    if shapes is not None and any(info.get("scope") for info in vmmap.maker_info(root)):
+        shapes.add("nested")
+    if not hooks:
+        return source
     lines = source.split("\n")
     edits = []
     for l1, c1, pv in vmmap.closure_entries(root):
@@ -74,9 +81,30 @@ def patch_entries(source, path):
         cap = "".join("__PA[%s].%s=%s;" % (pv, nm, nm) for nm in info["captures"])
         # __PK: one closure per proto, for calls the devirtualizer asks the
         # runtime to evaluate (LPH_ENCSTR-style string decryptors)
-        code += ("if __PA and not __PA[%s] then __PA[%s]={};__PA.n=__PA.n+1;__PA[%s].__seq=__PA.n;"
-                 "__PA[%s].__maker=\"%s@%d,%d\";__PK[%s]=%s;%s end "
-                 % (pv, pv, pv, pv, tag, l2, c2, info.get("pf_key", pv), var, cap))
+        new = ("__PA[%s]={};__PA.n=__PA.n+1;__PA[%s].__seq=__PA.n;__PA[%s].__maker=\"%s@%d,%d\";"
+               % (pv, pv, pv, tag, l2, c2))
+        if info.get("outer_ret"):
+            # v15.2: the function around the maker runs once per proto, when the
+            # proto is deserialised (lazily, by the constant decoder). Its hook
+            # records maker function -> proto (__PM: a closure op calls that
+            # function) and the proto's own values under "^name" (the maker's
+            # locals can shadow them), so protos no closure was made of can be
+            # lifted too. The maker's hook then only adds what it sees.
+            ol, oc, mc, oc2 = info["outer_ret"]
+            if lines[ol][oc:mc].strip() != "return":
+                print("[!] unexpected text before a closure maker: %r" % lines[ol][oc:mc], file=sys.stderr)
+                continue
+            ocap = "".join("__PA[%s][\"^%s\"]=%s;" % (pv, nm, nm)
+                           for nm in sorted({nm for _, nm in info["outer_decls"]}))
+            edits.append((ol, oc, "__MK[2]=", mc))
+            edits.append((ol, oc2, " if __PA then __PM[__MK[2]]=%s;if not __PA[%s] then %s%s end end return __MK[2] "
+                          % (pv, pv, new, ocap), oc2))
+            code += ("if __PA and not __PK[%s] then if not __PA[%s] then %s end;__PK[%s]=%s;"
+                     "__PA[%s].__made=true;%s end "
+                     % (pv, pv, new, info.get("pf_key", pv), var, pv, cap))
+        else:
+            code += ("if __PA and not __PA[%s] then %s__PK[%s]=%s;%s end "
+                     % (pv, new, info.get("pf_key", pv), var, cap))
         if info.get("ret"):
             # v15.2: `return function...end` -> `__MK[1]=function...end;<hooks> return __MK[1]`
             rl, rc, cc = info["ret"]
@@ -88,6 +116,48 @@ def patch_entries(source, path):
             edits.append((l2, c2, code + " return __MK[1] ", c2))
         else:
             edits.append((l2, c2, code, c2))
+    if shapes is not None and "nested" in shapes:
+        # v15.2: a jump to a register's value (`pc = R[B[pc]]`) can be keyed by
+        # what Luraph's environment probes returned, which no static lift
+        # knows. Record where each one went (table operations only):
+        # __JT[proto key][pc] = the target, false once two targets were seen.
+        for info in vmmap.maker_info(root):
+            if not info.get("scope"):
+                continue
+            pk = info.get("pf_key", info["proto"])
+            if pk in vmmap._decls_in(info["vm"]).values() or any(
+                    pk in vmmap._decls_in(f).values() for f in vmmap.inner_functions(info["vm"])):
+                continue    # (the proto key's name is reused inside the interpreter)
+            # The same record for a key register set from a register (`Q =
+            # R[A[pc]]`, vmmap.key_registers): the value keys the decryption
+            # of the code behind it. (One instruction is one or the other.)
+            for jl, jc, text in vmmap.register_jumps(info["vm"]) + vmmap.key_registers(info["maker"], info["vm"])[1]:
+                edits.append((jl, jc, ("if __JT then if not __JT[{k}] then __JT[{k}]={{}} end;"
+                                       "if __JT[{k}][{pc}]==nil then __JT[{k}][{pc}]={v} "
+                                       "elseif __JT[{k}][{pc}]~={v} then __JT[{k}][{pc}]=false end end;")
+                              .format(k=pk, pc=text[0], v=text[1])))
+            # Which instruction followed which in this run (__CV[proto key]
+            # [previous pc * 65536 + pc] = true, at every dispatch loop head;
+            # table operations only). A flattened v15.2 function is full of
+            # checks whose failing side jumps into unrelated code, and of
+            # decryptors only a tamper response runs: the lifter tells them
+            # from the script's own untaken branches by what the run did.
+            for d in vmmap.find_dispatchers(info["vm"]):
+                hl, hc, _, _ = vmmap.loc(d["tree"])
+                edits.append((hl, hc, ("if __CV then if not __CV[{k}] then __CV[{k}]={{p=0}} end;"
+                                       "__CV[{k}][__CV[{k}].p*65536+{pc}]=true;__CV[{k}].p={pc} end;")
+                              .format(k=pk, pc=d["pc"])))
+        # v15.2: script functions kept as plain Lua (vmmap.plain_factories).
+        # The function a closure op calls is recorded with where it is in the
+        # source and the values of the function around it.
+        for pf in vmmap.plain_factories(root):
+            l, c, mc, c2 = pf["ret"]
+            if lines[l][c:mc].strip() != "return":
+                continue
+            ocap = "".join(",[\"^%s\"]=%s" % (nm, nm) for nm in sorted({nm for _, nm in pf["decls"]}))
+            edits.append((l, c, "__MK[3]=", mc))
+            edits.append((l, c2, " if __PA then __PM[__MK[3]]={__at=\"%s@%d,%d\"%s} end return __MK[3] "
+                          % ((tag,) + pf["at"] + (ocap,)), c2))
     edits = [e if len(e) == 4 else e + (e[1],) for e in edits]
     for l, c, code, end in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
         lines[l] = lines[l][:c] + code + lines[l][end:]
@@ -165,6 +235,14 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             break
         with open(ppath, "w", encoding="utf-8", newline="\n") as f:
             f.write(m.group(1))
+    if text is None:
+        # a request run failed before any full lift: lift what the last dump has
+        print("[*] devirtualizing with the constants decoded so far...", file=sys.stderr)
+        t1 = time.time()
+        text, stats, reqs, bufs = devirt.run_big_stack(devirt.lift_program, job.source_path, ppath, chunk_paths, None)
+        print("[*]   %d functions, %d unlifted blocks, %d unstructured jumps, %d constant requests not answered (%.1fs)"
+              % (stats["functions"], stats["errors"], stats["fallbacks"], len(reqs - requested) + len(requested & reqs),
+                 time.time() - t1), file=sys.stderr)
     header = (job.credit_header() +
               "-- Local names are inferred from use (the original names are not in the bytecode)\n")
     job.write(dpath, header + devirt.finish_text(text) + "\n")
@@ -175,11 +253,19 @@ def run(job):
     args = job.args
     devirt_on = not args.no_devirt
     source = job.source
+    # VM shapes seen in the script and its chunks: Luraph v15.2 ("nested"
+    # closure makers) measures the C stack budget of the script's thread
+    # exactly, so its runs start the thread the way Roblox does (envlog
+    # --cfg top_thread; V15_2.md)
+    shapes = set()
     try:
-        patched = source if args.no_hooks else patch_entries(source, job.source_path)
+        patched = patch_entries(source, job.source_path, shapes, not args.no_hooks)
     except SyntaxError as e:
-        sys.exit("[!] the input is %s: the file is damaged (truncated, or mangled by a paste/upload); "
-                 "nothing to run" % e)
+        if args.no_hooks:
+            patched = source    # (nothing to instrument: run it as it is, as before)
+        else:
+            sys.exit("[!] the input is %s: the file is damaged (truncated, or mangled by a paste/upload); "
+                     "nothing to run" % e)
     cache_path = harness.load_p2d_cache(job.input, args.studio)
     runner = harness.Runner(job)
     bridge = runner.bridge
@@ -207,6 +293,8 @@ def run(job):
             cfg["fold"] = False
         if devirt_on:
             cfg["devirt"] = True
+        if "nested" in shapes:
+            cfg["top_thread"] = True
         harness.user_cfg(args, cfg)
         if spin:
             cfg["spin"] = SPIN_CHECKS
@@ -228,17 +316,22 @@ def run(job):
         body = harness.take_p2d(body, cache_path, bridge is not None)
         found, body = harness.take_chunks(body)
         added = 0
+        nested = "nested" in shapes
         for key, src in found:
             if key not in chunks and args.no_hooks:
-                chunks[key] = src
+                chunks[key] = patch_chunk(src, job.outdir, shapes, False)
             elif key not in chunks:
                 raw_chunks[key] = src
-                chunks[key] = patch_chunk(src, job.outdir)
+                chunks[key] = patch_chunk(src, job.outdir, shapes)
                 if spin:
                     chunks[key] = patch_spin(chunks[key])
                 added += 1
         if added:
             print("[*] script loadstring'd %d new VM chunk(s); instrumenting and re-running" % added, file=sys.stderr)
+            continue
+        if "nested" in shapes and not nested:
+            # (--no-hooks: nothing to instrument, but this run had the wrong thread set-up)
+            print("[*] script loadstring'd a Luraph v15.2 VM chunk; re-running as a top-level thread", file=sys.stderr)
             continue
         trig = re.search(r"\x00TRIGGER (\d+)", body)
         if trapped is not None and trace.stmt_count(body) < trace.stmt_count(trapped[0]):
@@ -308,10 +401,19 @@ def run(job):
         with open(dpath, encoding="utf-8", errors="replace") as f:
             lifted = f.read()
         nil_calls = lifted.count("(nil)(")
-        if nil_calls < 50 or nil_calls * 100 < lifted.count("\n"):
+        # a main function whose lift stops on its entry path (its top-level
+        # code ends in the lifter's error marker) with less code than the
+        # trace has statements shows less than the trace does
+        code = [ln for ln in lifted.split("\n") if ln.strip() and not ln.startswith("--")]
+        stopped = bool(code) and code[-1].startswith('error("devirt: ') and len(code) < trace.stmt_count(body)
+        if not stopped and (nil_calls < 50 or nil_calls * 100 < lifted.count("\n")):
             return dpath
-        print("[!] the devirtualized output is broken (%d calls of nil); writing the behaviour trace "
-              "instead" % nil_calls, file=sys.stderr)
+        if stopped:
+            print("[!] the devirtualized output stops after %d lines (%s); the behaviour trace shows more: "
+                  "writing it instead" % (len(code) - 1, code[-1][7:-2]), file=sys.stderr)
+        else:
+            print("[!] the devirtualized output is broken (%d calls of nil); writing the behaviour trace "
+                  "instead" % nil_calls, file=sys.stderr)
         if not job.debug:
             os.remove(dpath)
         write_trace()

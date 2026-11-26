@@ -5,6 +5,16 @@
 local rawTypeof, rawType = typeof, type
 return function(G, fnames, libnames)
 	local M = {}
+	-- Every metatable the mock gives an object, by object: mock metatables are locked like the
+	-- engine's ("The metatable is locked"), and an executor's getrawmetatable / setrawmetatable
+	-- look behind that lock (harness.lua).  Only the mock's own setmetatable calls are recorded.
+	local rawMT = setmetatable({}, { __mode = "k" })
+	M.rawMT = rawMT
+	local realSetmetatable = setmetatable
+	local function setmetatable(t, mt)
+		rawMT[t] = mt
+		return realSetmetatable(t, mt)
+	end
 	local typeNames = setmetatable({}, { __mode = "k" })
 
 	-- Mock functions stand in for C functions.  They must not cost more C stack than those do
@@ -454,6 +464,14 @@ return function(G, fnames, libnames)
 	m("JSONEncode", function() return "{}" end)
 	m("JSONDecode", function() return {} end)
 	m("GetPlayers", function() return {} end)
+	-- GuiService:GetGuiInset() returns TWO Vector2 (API reference: inset from the top left corner
+	-- and from the bottom right corner); a one-value stand-in makes `local a, b = ...; b.X` fail.
+	-- 58 is the height of the current top bar (36 before the 2023 redesign): from Roblox's
+	-- announcement, not measured on a client.  Layout arithmetic of GUI scripts only.
+	m("GetGuiInset", function()
+		if not M.Vector2 then return stub("GuiService.GetGuiInset()"), stub("GuiService.GetGuiInset()") end
+		return M.Vector2.new(0, 58), M.Vector2.new(0, 0)
+	end)
 	m("BindToClose", function() end)
 	m("FireServer", function() end)
 	m("FireClient", function() end)

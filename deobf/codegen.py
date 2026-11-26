@@ -1138,6 +1138,10 @@ def fold_constants_block(b):
         if any(_has_foldable(x) for x in stmt_exprs(st)):
             st = map_stmt(st, fold_constants, lambda m: Multi([fold_constants(x) for x in m.items], m.tail))
             changed = True
+            if isinstance(st, CallS) and isinstance(st.call, Const):
+                # a call of a pure library function on constants whose result
+                # nobody uses (`bit32.band(3, 5)` as a statement): nothing is left
+                continue
         out.append(st)
     b.stmts = out
     if b.cond is not None and _has_foldable(b.cond):

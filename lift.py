@@ -10,10 +10,12 @@ lift.py —— 把抓到的 Luau 字节码反编译回 Lua 源码
 用法:
     python lift.py <字节码文件> [输出.luau]
     python lift.py --check            # 只看运行环境是否就绪
+    python lift.py --fetch <字节码文件> [输出.luau]   # 缺反编译器时联网下载
 
 前置:
-    需要 tools/luau-lifter 与 tools/glibc/ ，
-    缺失时自动从 GitHub Release 下载（和 fetch_bin.py 同一处）。
+    需要 tools/luau-lifter（Tovek，第三方二进制，只有 aarch64 版本）与 glibc loader。
+    缺失时默认只报告并说明怎么补，不联网；加 --fetch 才会从 GitHub Release 下载
+    （和 fetch_bin.py --lifter-only 同一处，超时即放弃，不会卡住）。
 """
 import os
 import sys
@@ -76,8 +78,19 @@ def glibc_loader():
     return None
 
 
-def ensure_tools():
-    """确保 luau-lifter + glibc 就位，缺就下载"""
+MANUAL_HINT = """
+手动准备：
+  1) 从 https://github.com/Kiet1308/Tovek/releases 取
+     Tovek-V2.7-linux-aarch64.tar.gz，解出 luau-lifter 放到 tools/
+  2) glibc（Alpine 跑 glibc 程序必需；Debian/Ubuntu 用系统自带的 loader）
+     apt 环境：cp -r /usr/lib/aarch64-linux-gnu/ld-* /usr/lib/aarch64-linux-gnu/libc.so.6 tools/glibc/
+  或者联网下载： python lift.py --fetch <字节码文件>
+"""
+
+
+def ensure_tools(fetch=False):
+    """确保 luau-lifter + glibc 就位。缺失时只有 fetch=True 才下载。"""
+    import platform as _pf
     need = []
     if not LIFTER.is_file():
         need.append("luau-lifter.aarch64")
@@ -86,6 +99,13 @@ def ensure_tools():
 
     if not need:
         return True
+    if LIFTER.is_file() is False and _pf.machine().lower() not in ("aarch64", "arm64"):
+        say("失败", f"luau-lifter 只有 aarch64 版本，当前架构 {_pf.machine()} 用不了")
+        return False
+    if not fetch:
+        say("失败", "缺少：" + "、".join(need))
+        print(MANUAL_HINT, flush=True)
+        return False
 
     TOOLS.mkdir(exist_ok=True)
     for name in need:
@@ -94,21 +114,19 @@ def ensure_tools():
             url = tmpl.format(repo=REPO, tag=TAG, name=name)
             dest = TOOLS / name
             say("下载", url[:70] + "…")
-            r = subprocess.run(["curl", "-fsSL", "--max-time", "600",
-                                "--retry", "2", "-o", str(dest), url],
-                               capture_output=True)
+            try:
+                r = subprocess.run(["curl", "-fsSL", "--connect-timeout", "15",
+                                    "--max-time", "300", "-o", str(dest), url],
+                                   capture_output=True, timeout=330)
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                say("失败", f"下载不了：{type(e).__name__}")
+                continue
             if r.returncode == 0 and dest.exists() and dest.stat().st_size > 10000:
                 ok = True
                 break
         if not ok:
             say("失败", f"{name} 下载不到")
-            print(f"""
-手动准备：
-  1) 从 https://github.com/Kiet1308/Tovek/releases 取
-     Tovek-V2.7-linux-aarch64.tar.gz，解出 luau-lifter 放到 tools/
-  2) glibc（Alpine 跑 glibc 程序必需）
-     apt 环境：cp -r /usr/lib/aarch64-linux-gnu/ld-* /usr/lib/aarch64-linux-gnu/libc.so.6 tools/glibc/
-""", flush=True)
+            print(MANUAL_HINT, flush=True)
             return False
         # 解包
         if name == "luau-lifter.aarch64":
@@ -143,7 +161,14 @@ def run_lifter(bc_path, out_path):
             cmd = [str(LIFTER), "decompile-folder", "--key", "1",
                    str(src), str(dst)]
 
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            say("失败", "反编译超时（600 秒）")
+            return None
+        except OSError as e:
+            say("失败", f"luau-lifter 无法执行：{e}")
+            return None
         out = (r.stdout or "") + (r.stderr or "")
         print(out.strip()[-600:], flush=True)
 
@@ -177,7 +202,7 @@ def main():
     out = args[1] if len(args) > 1 else str(Path(bc).with_suffix(".luau"))
 
     say("准备", "检查反编译器…")
-    if not ensure_tools():
+    if not ensure_tools(fetch="--fetch" in sys.argv):
         return 1
 
     say("反编译", f"{bc}（{Path(bc).stat().st_size:,} 字节字节码）…")

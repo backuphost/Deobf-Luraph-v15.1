@@ -108,9 +108,14 @@ class Lifter:
         self.constprop = False      # lift-time constant propagation (needed by factory-style VMs)
         self.oracle = {}            # (pid, loop, pc) -> what the harness saw when the instruction ran
         self.end_state = False      # the dump was taken at the end of the run (see PE.frozen)
+        # an instruction that ran is only lifted in a code state the run recorded for it (lift_proto);
+        # on for builds with keyed wrappers (Luraph v15.2), whose functions decrypt block by block
+        self.defer_foreign_state = bool(getattr(model, 'keyed_wrappers', False))
         self.journals = {}
         self.executed_pcs = {}
         self.entry_override = {}    # proto key -> (loop, pc): first instruction of the program proper
+        self.wrap_args = {}         # proto key -> arguments its creator calls the wrapper with (v15.2: numbers + upvalue list)
+        self.pe.on_wrap_args = self.on_wrap_args
 
     # ---- proto instantiation (family specific)
     def on_closure(self, proto):
@@ -119,6 +124,12 @@ class Lifter:
             self.proto_objs[key] = proto
             self.queue.append(key)
         return key
+
+    def on_wrap_args(self, proto, args):
+        try:
+            self.wrap_args.setdefault(self.proto_key(proto), list(args))
+        except PEError:
+            pass
 
     def proto_key(self, proto):
         if isinstance(proto, LuaTable):
@@ -145,6 +156,7 @@ class Lifter:
         pe.tprefix = prefix
         pe.events = []
         pe.pending_closures = []
+        pe.parked = None
         pe.path = []
         pe.dpos = 0
         pe.decisions = decisions
@@ -865,6 +877,49 @@ class Lifter:
         node_in = {}
         relifts = {}
         patched = {}
+        # Replayed code states and instructions that ran.  The walk gives every instruction the
+        # code as its own path left it, and the first path to arrive lifts it.  In a function that
+        # decrypts its blocks on first use that path can be one the run never took (garbage that
+        # jumps into a block before its decryptor, a state-machine arm explored with another
+        # arm's history): the instruction is then still ciphertext there, although the traced run
+        # executed it and recorded its operands.  Such an arrival does not lift the instruction;
+        # it waits for a path on which the code equals a recorded version (good_path), and if
+        # none turns up the instruction is lifted in the state the run recorded for its first
+        # execution (see snap_cell).
+        good_path = {}          # (loop, pc) -> path cell the instruction was lifted on
+        deferred = {}           # (loop, pc) -> [work items that arrived with code the run never saw]
+        forced = set()
+
+        def code_matches(pc, rec):
+            arrays = self.records[key - 1][1] if hasattr(self, 'records') and isinstance(key, int) else None
+            if not arrays:
+                return True
+            for _, text in rec.get('vers') or ():
+                ok = bool(text)
+                for part in text.split():
+                    name, _, val = part.partition('=')
+                    t = arrays.get(name)
+                    if not isinstance(t, LuaTable):
+                        continue
+                    try:
+                        want = float(val)
+                    except ValueError:
+                        continue
+                    cur = t.h.get(pc)
+                    if not (P.is_num(cur) and float(cur) == want) and want == want:
+                        ok = False
+                        break
+                if ok:
+                    return True
+            return not rec.get('vers')
+        # Interpreter locals that hold the closure's keys (Model.wrapper_numbers).  The program
+        # sets them from registers as it goes and decrypts blocks and constants with them, so
+        # they belong to the path like the code does; the walk only keeps the first value to
+        # arrive.  For an instruction that ran, the run's own value on entry is used.
+        key_locals = ()
+        if self.defer_foreign_state and hasattr(self, 'records') and isinstance(key, int):
+            it0 = self.model.interps[self.records[key - 1][0]]
+            key_locals = sorted({n for names in self.model.wrapper_numbers(it0).values() for n in names})
         pobj = getattr(self, 'proto_objs', {}).get(key)
         ppath = {id(v) for v in pobj.h.values() if isinstance(v, LuaTable)} if isinstance(pobj, LuaTable) else None
         self.pe.use_numknown = self.constprop
@@ -893,7 +948,14 @@ class Lifter:
             self.pe.live_table_patches = live_patches
             if root_cell is not None:
                 work[0] = work[0][:5] + (root_cell,)
-        while work:
+        while work or deferred:
+            if not work:
+                # nothing else to follow: the instructions still waiting are lifted in the code
+                # state the run recorded for them
+                k0 = next(iter(deferred))
+                forced.add(k0)
+                work.extend(deferred.pop(k0))
+                continue
             key2, snap, known, pred, pend, path = work.pop()
             if key2 in pir.nodes and self.constprop and len(key2) == 2:
                 # a pure jump whose target comes out of a register is a trampoline shared by many
@@ -972,12 +1034,33 @@ class Lifter:
                     continue
             ran = pathmode and (key, key2[0], key2[1]) in self.oracle
             replay = bool(self.pe.replay_tables)
+            rec = self.oracle.get((key, key2[0], key2[1])) if pathmode else None
             if pathmode:
                 # without recorded code versions an instruction that ran is lifted from the state
                 # at the end of the run; otherwise every instruction from the state of its path
                 switch(path if (replay or not ran) else None)
+                if replay and ran and not rec.get('p') and self.defer_foreign_state:
+                    pc2 = key2[:2]
+                    for name in key_locals:
+                        v = rec['v'].get(name)
+                        if P.is_num(v) and name in snap and not same_value(snap[name], P.norm(v)):
+                            snap = dict(snap)
+                            snap[name] = P.norm(v)
+                    if code_matches(key2[1], rec):
+                        good_path.setdefault(pc2, path)
+                        if pc2 in deferred:
+                            work[0:0] = deferred.pop(pc2)       # they join the lifted instruction
+                    else:
+                        if pc2 not in good_path:
+                            if pc2 not in forced:
+                                deferred.setdefault(pc2, []).append((key2, snap, known, pred, pend, path))
+                                continue
+                            switch(None)        # (a cell lists differences from the end state)
+                            good_path[pc2] = snap_cell(rec.get('sv') or 0)
+                            pir.foreign_state = getattr(pir, 'foreign_state', 0) + 1
+                        path = good_path[pc2]
+                        switch(path)
                 self.journals.pop(key2[:2], None)       # (its earlier writes are not part of this state)
-            rec = self.oracle.get((key, key2[0], key2[1])) if pathmode else None
             if rec and not rec.get('p'):
                 # an interpreter local that holds a run-time number here (a key taken from an opaque
                 # parameter): the traced run shows which.  Kept for the instructions that did not
@@ -1417,7 +1500,43 @@ class FactoryLifter(Lifter):
             shadowed = set(mid.body[0][1])
         cands = [i for i, p in enumerate(mid.params)
                  if p not in shadowed and p not in mid.params[i + 1:] and (p != '_' or self.model.underscore_is_name)]
+        # (v15.2: parameters that carry per-closure numbers are not the upvalue list)
+        it = next((x for x in self.model.interps if len(x.chain) >= 2 and x.chain[-2] is mid), None)
+        if it is not None:
+            nums = self.model.wrapper_numbers(it)
+            rest = [i for i in cands if i not in nums]
+            if nums and rest:
+                cands = rest
         return cands[0] if cands else None
+
+    def wrapper_values(self, key, it):
+        """{wrapper parameter index: number} for proto `key` (see Model.wrapper_numbers): what the
+        interpreter's locals held at the first instruction the closure executed in the traced
+        run, else the numbers its creator passes (seen while the creator was lifted)."""
+        nums = self.model.wrapper_numbers(it)
+        if not nums:
+            return {}
+        out = {}
+        first = None
+        for (pid, _loop, _pc), rec in (self.oracle or {}).items():
+            if pid == key and rec.get('vers') and not rec.get('p'):
+                step = rec['vers'][0][0]
+                if first is None or step < first[0]:
+                    first = (step, rec)
+        for idx, names in nums.items():
+            v = None
+            if first is not None:
+                for n in names:
+                    if P.is_num(first[1].get('v', {}).get(n)):
+                        v = first[1]['v'][n]
+                        break
+            if v is None:
+                args = self.wrap_args.get(key)
+                if args and idx < len(args) and P.is_num(args[idx]) and not isinstance(args[idx], bool):
+                    v = args[idx]
+            if v is not None:
+                out[idx] = P.norm(v)
+        return out
 
     def proto_key(self, proto):
         if isinstance(proto, P.ProtoRef):
@@ -1453,6 +1572,7 @@ class FactoryLifter(Lifter):
                 fresh.entry_override = self.entry_override
                 fresh.cap_src, fresh.cap_vals, fresh.all_up_nums = self.cap_src, self.cap_vals, self.all_up_nums
                 fresh.cap_hist = self.cap_hist
+                fresh.wrap_args = self.wrap_args
                 fresh.cap_pick = pick or {}
                 return fresh.lift_proto(k)
 
@@ -1535,6 +1655,8 @@ class FactoryLifter(Lifter):
         self.all_up_nums[key] = dict(self.up_nums)
         for i, p in enumerate(mid.params):
             sc2.vars[p] = None
+        for i, v in self.wrapper_values(key, it).items():
+            sc2.vars[mid.params[i]] = v
         if up is not None:
             sc2.vars[mid.params[up]] = UPVALS
         r = pe.exec_block(mid.body, sc2)

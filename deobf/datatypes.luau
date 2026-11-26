@@ -117,13 +117,16 @@ local function toQuat(c)
 	local s = math.sqrt(1 + m22 - m00 - m11) * 2
 	return (m02 + m20) / s, (m12 + m21) / s, s / 4, (m10 - m01) / s
 end
-local function lookAt(at, target, up)
-	local look = vnorm(target - at)
+local function lookAlong(at, dir, up)
+	local look = vnorm(dir)
 	local right = vcross(look, up)
 	if vmag(right) < 1e-6 then unsupported() end -- the engine's degenerate case isn't modelled
 	right = vnorm(right)
 	local up2 = vcross(right, look)
 	return make(at, right, up2, -look)
+end
+local function lookAt(at, target, up)
+	return lookAlong(at, target - at, up)
 end
 
 local lib = {}
@@ -161,6 +164,34 @@ end
 function lib.lookAt(at, target, up)
 	if not isVec(at) or not isVec(target) or (up ~= nil and not isVec(up)) then unsupported() end
 	return lookAt(at, target, up or Y)
+end
+function lib.lookAlong(at, dir, up)
+	if not isVec(at) or not isVec(dir) or (up ~= nil and not isVec(up)) then unsupported() end
+	return lookAlong(at, dir, up or Y)
+end
+-- order: nil (XYZ) or an Enum.RotationOrder item (envlog passes its tostring).
+-- "ABC" applies the rotations as RA * RB * RC, like the two fixed-order
+-- constructors (documented; not checked against Studio for the other orders)
+function lib.fromEulerAngles(a, b, c, order)
+	local name = "XYZ"
+	if order ~= nil then
+		name = type(order) == "string" and string.match(order, "^Enum%.RotationOrder%.(%u%u%u)$") or unsupported()
+	end
+	local m = { X = rx(num(a or 0)), Y = ry(num(b or 0)), Z = rz(num(c or 0)) }
+	local r1, r2, r3 = m[string.sub(name, 1, 1)], m[string.sub(name, 2, 2)], m[string.sub(name, 3, 3)]
+	if not (r1 and r2 and r3) or r1 == r2 or r2 == r3 or r1 == r3 then unsupported() end
+	return fromMat(O, mm(mm(r1, r2), r3))
+end
+-- the shortest rotation that turns `from` into `to` (documented; the engine's
+-- handling of opposite vectors needs its backup axis and isn't modelled)
+function lib.fromRotationBetweenVectors(from, to)
+	if not isVec(from) or not isVec(to) then unsupported() end
+	local a, b = vnorm(from), vnorm(to)
+	local d = vdot(a, b)
+	if d ~= d or d < -0.999999 then unsupported() end
+	local axis = vcross(a, b)
+	-- quaternion (axis, 1 + cos) normalised
+	return fromQuat(O, axis.x, axis.y, axis.z, 1 + d)
 end
 function lib.fromMatrix(p, vx, vy, vz)
 	if not isVec(p) or not isVec(vx) or not isVec(vy) or (vz ~= nil and not isVec(vz)) then unsupported() end
@@ -232,6 +263,31 @@ local METHODS = {
 		return fromQuat(p, ax * wa + bx * wb, ay * wa + by * wb, az * wa + bz * wb, aw * wa + bw * wb)
 	end,
 }
+-- (the four below follow the documentation; their rounding wasn't checked in Studio)
+function METHODS.Orthonormalize(self)
+	local c = get(self)
+	local x = vnorm(c.x)
+	local y = vnorm(c.y - x * vdot(x, c.y))
+	return make(c.p, x, y, vcross(x, y))
+end
+function METHODS.FuzzyEq(self, other, eps)
+	local a, b = get(self), get(other)
+	eps = eps == nil and 1e-5 or num(eps)
+	for _, k in { "p", "x", "y", "z" } do
+		local d = a[k] - b[k]
+		if math.abs(d.x) > eps or math.abs(d.y) > eps or math.abs(d.z) > eps then return false end
+	end
+	return true
+end
+function METHODS.AngleBetween(self, other)
+	local r = mul(inverse(get(self)), get(other))
+	return f32(math.acos(math.clamp((r.x.x + r.y.y + r.z.z - 1) / 2, -1, 1)))
+end
+function METHODS.ToEulerAngles(self, order)
+	if order == nil or order == "Enum.RotationOrder.XYZ" then return eulerXYZ(get(self)) end
+	if order == "Enum.RotationOrder.YXZ" then return eulerYXZ(get(self)) end
+	return unsupported()
+end
 METHODS.components = METHODS.GetComponents
 METHODS.inverse = METHODS.Inverse
 METHODS.lerp = METHODS.Lerp
@@ -448,6 +504,16 @@ local V2METHODS = {
 		return f32(ang)
 	end,
 }
+-- (same relative tolerance as envlog's Vector3:FuzzyEq)
+function V2METHODS.FuzzyEq(a, b, eps)
+	local x, y = v2val(a), v2val(b)
+	eps = eps == nil and 1e-5 or num(eps)
+	for _, c in { "x", "y" } do
+		local p, q = x[c], y[c]
+		if not (math.abs(p - q) <= eps * math.max(1, math.abs(p), math.abs(q))) then return false end
+	end
+	return true
+end
 V2METHODS.lerp = V2METHODS.Lerp
 newV2 = valueType("Vector2", function(f, k)
 	local v = f.v

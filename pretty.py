@@ -3,7 +3,10 @@
 """
 pretty.py —— 把 Luau 反汇编 dump 整理成人能读的形式
 
-输入是 /tmp/body.txt 那种格式：
+用法:
+    python pretty.py <反汇编 dump.txt> [输出.txt]
+
+输入是这种格式的文本（Luau 字节码的反汇编 dump）：
     PROTOS 153 STR 436 VER 3
     PROTO 1 name=(??) nparams=0 vararg=false sizecode=11 nk=6 line=8
       0: A=0 opmode=4 D=1 opname=GETIMPORT ...
@@ -19,7 +22,7 @@ import re
 import sys
 from collections import defaultdict, Counter
 
-IN = sys.argv[1] if len(sys.argv) > 1 else "/tmp/body.txt"
+IN = sys.argv[1] if len(sys.argv) > 1 else None
 OUT = sys.argv[2] if len(sys.argv) > 2 else "disasm_readable.txt"
 
 OPS_WITH_ABC = {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "IDIV",
@@ -162,6 +165,13 @@ def render(ins, k):
 
 
 def main():
+    import os
+    if not IN:
+        print(__doc__)
+        return 1
+    if not os.path.isfile(IN):
+        print(f"[✗] 文件不存在：{IN}")
+        return 1
     protos = parse_dump(IN)
     if not protos:
         print("没解析到 proto，检查输入格式")

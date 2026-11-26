@@ -68,6 +68,14 @@ function __LPH_F(id, fn)
 end
 local constFns = {}
 local closEnv
+-- Chunk names (as debug.info "s" gives them) of the script's own code: the file that is run and
+-- whatever it loads with loadstring.  modelSrc is the one the Python side has a model of (the
+-- functions of that chunk carry the ids and lines the dump refers to).
+local scriptSrc = { sample = true }
+local modelSrc = "sample"
+local function isScriptSrc(src)
+	return scriptSrc[src] == true or string.sub(src, 1, 5) == "layer"
+end
 function ser(v)
 	local t = type(v)
 	if t == "nil" then return "null"
@@ -95,7 +103,7 @@ function ser(v)
 			local c = constFns[v]
 			return '{"cfn":' .. (c.value ~= nil and serNum(c.value) or "null") .. ',"k":' .. c.k .. "}"
 		end
-		if debug.info(v, "s") ~= "sample" then return '{"o":"function"}' end
+		if debug.info(v, "s") ~= modelSrc then return '{"o":"function"}' end
 		local id = fidOf[v]
 		if id then
 			-- single-line scripts: closures are identified by the id injected around their definition
@@ -629,12 +637,27 @@ __LPH_X = {}
 __LPH_R = {}
 local RINGN = 4096
 local scriptPath = nil
+-- A VM chunk that the shipped file only loads at run time (Luraph's compressed container
+-- decompresses the chunk and its data buffer, loadstrings the chunk under the name "Luraph" and
+-- calls it with the buffer).  The script that runs is then the shipped file itself
+-- (carrier=<file>), unchanged; <patched_sample> is the instrumented copy of the chunk and is
+-- compiled in place of the original text (chunksrc=<file>) when the script hands that text to
+-- loadstring.  So the chunk runs at the call depth, under the chunk name, with the arguments and
+-- in front of the surrounding code it has in the real thing.  chunkarg=<file>: for a chunk that
+-- was unwrapped earlier, the bytes of its buffer argument (see __LPH_CARRY).
+local carrierPath, chunkSrcPath, chunkArgPath = nil, nil, nil
 for i = #layers, 1, -1 do
 	local sp = string.match(layers[i], "^scriptpath=(.+)$")
 	local pk = string.match(layers[i], "^poke=(.+)$")
 	local hm = string.match(layers[i], "^httpmap=(.+)$")
 	local sv = string.match(layers[i], "^serve=(.+)$")
-	if sv then
+	local ca = string.match(layers[i], "^carrier=(.+)$")
+	local cs = string.match(layers[i], "^chunksrc=(.+)$")
+	local cg = string.match(layers[i], "^chunkarg=(.+)$")
+	if ca or cs or cg then
+		carrierPath, chunkSrcPath, chunkArgPath = ca or carrierPath, cs or chunkSrcPath, cg or chunkArgPath
+		table.remove(layers, i)
+	elseif sv then
 		serveDir = sv
 		table.remove(layers, i)
 	elseif hm then
@@ -1225,12 +1248,17 @@ function populateSandbox()
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
 		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T",
-		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN" }) do
+		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN", "__LPH_CARRY" }) do
 		local v = _G[n]
 		if v ~= nil then rawset(sandbox, n, v) end
 	end
+	-- (the mock's own bookkeeping is not part of the script's world: scripts enumerate the
+	-- global table behind their environment and look at every name they find)
+	local internal = { onHttp = true, onMfp = true, onMfpExpected = true, mfpDelta = true, mfpCalls = true, ctorCalls = true,
+		enumName = true, lib = true, newInstance = true, serverSide = true, stub = true, typeNames = true,
+		vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true }
 	for k, v in pairs(mock) do
-		if type(k) == "string" and k ~= "onHttp" then rawset(sandbox, k, v) end
+		if type(k) == "string" and not internal[k] then rawset(sandbox, k, v) end
 	end
 	for _, n in ipairs({ "game", "workspace", "script", "Enum", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim",
 		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
@@ -1253,12 +1281,35 @@ function populateSandbox()
 	if executorEnv and rawget(globals, "request") == nil then
 		-- executor HTTP: nothing is sent.  Every call is logged and answered with a canned reply
 		-- (httpreply=<text>, default empty body), so the script's handling of it can be traced.
-		local function request(opts)
-			local url = type(opts) == "table" and (opts.Url or opts.url) or opts
-			local method = type(opts) == "table" and (opts.Method or opts.method) or "GET"
-			local body = mock.onHttp(tostring(method), url)
+		-- An executor's request is native code: it reads the fields of the options table itself,
+		-- without running metamethods, and refuses anything that is not a plain string where it
+		-- wants one.  Scripts check exactly that (an options table whose Url / Headers carry
+		-- __index, __tostring and __concat traps tells an HTTP spy written in Lua from the real
+		-- thing), so the stand-in must not index, convert or concatenate what it is given.
+		local function request(...)
+			local opts = ...
+			if type(opts) ~= "table" then
+				error("invalid argument #1 to 'request' (table expected, got " .. (select("#", ...) == 0 and "no value" or typeof(opts)) .. ")", 0)
+			end
+			local url = rawget(opts, "Url")
+			if type(url) ~= "string" then error("invalid 'Url' field in request options (string expected, got " .. typeof(url) .. ")", 0) end
+			local method = rawget(opts, "Method")
+			if method == nil then method = "GET" end
+			if type(method) ~= "string" then error("invalid 'Method' field in request options (string expected, got " .. typeof(method) .. ")", 0) end
+			local headers = rawget(opts, "Headers")
+			if headers ~= nil then
+				if type(headers) ~= "table" then error("invalid 'Headers' field in request options (table expected, got " .. typeof(headers) .. ")", 0) end
+				for k, v in next, headers do
+					if type(k) ~= "string" or type(v) ~= "string" then error("invalid 'Headers' field in request options (strings expected)", 0) end
+				end
+			end
+			local reqBody = rawget(opts, "Body")
+			if reqBody ~= nil and type(reqBody) ~= "string" then error("invalid 'Body' field in request options (string expected, got " .. typeof(reqBody) .. ")", 0) end
+			local body = mock.onHttp(method, url)
 			return { StatusCode = 200, StatusMessage = "OK", Success = true, Body = body, Headers = {} }
 		end
+		if cwrap then request = cwrap("request", request) end
+		fnames[request] = "request"
 		for _, n in ipairs({ "request", "http_request" }) do rawset(globals, n, request) end
 		-- other executor functions scripts expect to exist; inert stand-ins
 		if rawget(globals, "gethwid") == nil then rawset(globals, "gethwid", function() return "devm-offline-hwid" end) end
@@ -1298,6 +1349,103 @@ function populateSandbox()
 		}
 		for n, f in pairs(ex) do
 			if rawget(globals, n) == nil then rawset(globals, n, f) end
+		end
+		-- Metatable and read-only access, part of every executor's API (the "UNC" set).  They are
+		-- C closures like an executor's own (cwrap), and work on the mock's objects: mock
+		-- metatables are locked, the mock keeps the real ones in mock.rawMT.
+		do
+			local realGetmt, realSetmt = getmetatable, setmetatable
+			local roState = setmetatable({}, { __mode = "k" })
+			local function argErr(i, name, want, v, n)
+				error("invalid argument #" .. i .. " to '" .. name .. "' (" .. want .. " expected, got " ..
+					(i > n and "no value" or typeof(v)) .. ")", 0)
+			end
+			local function rawmt(o)
+				local mt = mock.rawMT and mock.rawMT[o]
+				if mt ~= nil then return mt end
+				local ok, m = pcall(realGetmt, o)
+				if ok and type(m) == "table" then return m end
+				return nil
+			end
+			local more = {
+				getrawmetatable = function(...)
+					if select("#", ...) == 0 then argErr(1, "getrawmetatable", "any", nil, 0) end
+					return rawmt((...))
+				end,
+				setrawmetatable = function(...)
+					local n = select("#", ...)
+					local o, mt = ...
+					if n == 0 then argErr(1, "setrawmetatable", "any", nil, 0) end
+					if mt ~= nil and type(mt) ~= "table" then argErr(2, "setrawmetatable", "table", mt, n) end
+					if type(o) == "table" then
+						local old = rawmt(o)
+						local lock = type(old) == "table" and rawget(old, "__metatable") or nil
+						local frozen = type(old) == "table" and table.isfrozen(old)
+						if lock ~= nil and not frozen then rawset(old, "__metatable", nil) end
+						local ok = pcall(realSetmt, o, mt)
+						if lock ~= nil and not frozen then rawset(old, "__metatable", lock) end
+						if ok and mock.rawMT then mock.rawMT[o] = mt end
+					end
+					return o
+				end,
+				setreadonly = function(...)
+					local n = select("#", ...)
+					local t, ro = ...
+					if type(t) ~= "table" then argErr(1, "setreadonly", "table", t, n) end
+					roState[t] = ro and true or false
+				end,
+				isreadonly = function(...)
+					local n = select("#", ...)
+					local t = ...
+					if type(t) ~= "table" then argErr(1, "isreadonly", "table", t, n) end
+					if roState[t] ~= nil then return roState[t] end
+					-- (Roblox freezes its library tables; here they are plain tables or copies)
+					return table.isfrozen(t) or libnames[t] ~= nil
+				end,
+			}
+			-- clonefunction: a new function object that behaves like the given one (scripts test
+			-- `clonefunction(f) ~= f`).  Lua closures are cloned by the VM (__LPH_NATIVE); a C
+			-- function gets a C trampoline.  Without the native the function itself is returned.
+			do
+				local nat = _G.__LPH_NATIVE and _G.__LPH_NATIVE.clonefunction
+				more.clonefunction = function(...)
+					local f = ...
+					if type(f) ~= "function" then argErr(1, "clonefunction", "function", f, select("#", ...)) end
+					local c = nat and nat(f)
+					-- (the VM gives the clone the thread's globals; it has to see its original's)
+					if c ~= nil then setfenv(c, getfenv(f)) end
+					if c == nil and nat and cwrap then
+						c = cwrap(debug.info(f, "n") or "", function(...) return f(...) end)
+						if fnames[f] then fnames[c] = fnames[f] end
+					end
+					if c ~= nil and protoOfFn[f] then protoOfFn[c] = protoOfFn[f] end
+					if c ~= nil and fidOf[f] then fidOf[c] = fidOf[f] end
+					return c == nil and f or c
+				end
+				if nat then
+					rawset(globals, "clonefunction", nil)       -- (replaces the identity stand-in)
+				end
+			end
+			-- A CLI built with the current luau_cli.patch has them as real C functions
+			-- (__LPH_NATIVE): only those see behind a lock the script itself put on a table
+			-- (`setmetatable({}, {__metatable = "locked"})`, which scripts use to test the
+			-- executor) and can lift table.freeze.  The Lua versions above are the fallback.
+			local native = _G.__LPH_NATIVE or {}
+			if not _G.__LPH_NATIVE then
+				ewrite("[env] this luau binary predates the executor natives of devm/luau_cli.patch (__LPH_NATIVE): " ..
+					"getrawmetatable, setrawmetatable, setreadonly and clonefunction are approximations, and a script " ..
+					"that tests them (key-system loaders do) stops in its executor check; rebuild the CLI with the patch\n")
+			end
+			local setro = native.setreadonly or more.setreadonly
+			more.make_writeable = function(t) return setro(t, false) end
+			more.make_readonly = function(t) return setro(t, true) end
+			for n, f in pairs(more) do
+				if rawget(globals, n) == nil then
+					if native[n] and n ~= "clonefunction" then f = native[n] elseif cwrap then f = cwrap(n, f) end
+					fnames[f] = n
+					rawset(globals, n, f)
+				end
+			end
 		end
 		-- executor file system: empty and read-only
 		local fs = { isfile = function() return false end, isfolder = function() return false end,
@@ -1469,7 +1617,7 @@ end
 local function foreign(f)
 	if type(f) ~= "function" then return false end
 	local src = debug.info(f, "s")
-	return src ~= "sample" and string.sub(src, 1, 5) ~= "layer"
+	return not isScriptSrc(src)
 end
 local realSetfenv, realGetfenv = setfenv, getfenv
 mock.setfenv = function(f, env)
@@ -1499,7 +1647,7 @@ do
 	local d = {}
 	for k, v in pairs(mock.debug or debug) do d[k] = v end
 	local function mockLua(src)
-		return src ~= "[C]" and src ~= "sample" and string.sub(src, 1, 5) ~= "layer"
+		return src ~= "[C]" and not isScriptSrc(src)
 	end
 	local function describe(a, b)
 		local out, n = {}, 0
@@ -1744,6 +1892,60 @@ if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
 	error("compile")
 end
+-- loadstring as the script sees it: the chunk gets the script's environment (in Roblox a loaded
+-- chunk shares the globals of the thread that loaded it) and the chunk name the script asked for
+-- (Luau turns a plain name such as "Luraph" into the source id `[string "Luraph"]`, which is what
+-- error positions and debug.info show; without a name the source text itself is the name).
+local chunkOrig, chunkPatched, chunkLoads = nil, nil, 0
+do
+	local realLoad, realInfo = loadstring, debug.info
+	local function argText(v, n, i)
+		return i > n and "no value" or typeof(v)
+	end
+	local function impl(...)
+		local n = select("#", ...)
+		local text, name = ...
+		if type(text) == "number" then text = tostring(text) end
+		if type(text) ~= "string" then
+			error("invalid argument #1 to 'loadstring' (string expected, got " .. argText(text, n, 1) .. ")", 0)
+		end
+		if type(name) == "number" then name = tostring(name) end
+		if name ~= nil and type(name) ~= "string" then
+			error("invalid argument #2 to 'loadstring' (string expected, got " .. argText(name, n, 2) .. ")", 0)
+		end
+		local subst = chunkOrig ~= nil and text == chunkOrig
+		local f, e = realLoad(subst and chunkPatched or text, name or text)
+		if not f then
+			if subst then ewrite("COMPILE ERROR (instrumented chunk): " .. tostring(e) .. "\n") end
+			return nil, e
+		end
+		setfenv(f, envTable or sandbox)
+		local short = realInfo(f, "s")
+		scriptSrc[short] = true
+		if subst then
+			modelSrc = short
+			chunkLoads += 1
+		end
+		return f
+	end
+	local f = cwrap and cwrap("loadstring", impl) or impl
+	fnames[f] = "loadstring"
+	mock.loadstring = f
+end
+function __LPH_CARRY()
+	-- for the stand-in carrier of a chunk that was unwrapped earlier (run.py --chunk-arg):
+	-- the chunk's text and its buffer argument
+	return chunkOrig, chunkArgPath and buffer.fromstring(readfile(chunkArgPath)) or nil
+end
+if carrierPath then
+	if not chunkSrcPath then error("carrier= needs chunksrc=") end
+	chunkPatched, chunkOrig = src, readfile(chunkSrcPath)
+	fn, err = loadstring(readfile(carrierPath), "=sample")
+	if not fn then
+		ewrite("COMPILE ERROR (carrier): " .. tostring(err) .. "\n")
+		error("compile")
+	end
+end
 populateSandbox()
 for k, v in pairs(sandbox) do baseGlobals[k] = v end
 setfenv(fn, sandbox)
@@ -1907,6 +2109,9 @@ local function pokePass()
 end
 
 function __LPH_AFTER(ok, message)
+	if carrierPath and chunkLoads == 0 then
+		ewrite("[carrier] the script never handed the expected chunk text to loadstring: nothing was instrumented\n")
+	end
 	if showGlobals then
 		ewrite("[globals] script " .. (ok and "returned" or "stopped: " .. tostring(message)) .. "\n")
 		for k, v in pairs(sandbox) do

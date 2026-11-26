@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-luraph_v151_deob —— Luraph v15.1 自动反混淆
+luraph_v151_deob —— Luraph v15.x 静态反混淆（明文业务函数提取）
 
 思路
 ----
@@ -13,32 +13,93 @@ Luraph v15.1 的常见形态是：
 只是被压成一行、塞进表里、外面套了加密壳。
 
 所以正确做法不是去反编译 VM，而是：
-  1. 剥外层加密壳（如果是十进制转义 / base64 / 简单 XOR）
+  1. 剥外层壳（十进制转义 / base64 / HTML，以及 Luraph 自己的压缩容器）
   2. 用 luau-ast 解析出精确的字节区间
-  3. 把大函数按区间切出来
-  4. 断行 + 修空格 + 语义重命名
-  5. 验证语法
+  3. 把没被虚拟化的明文函数按区间切出来：大函数；以及 VM 对象里更小的明文函数 ——
+     闭包工厂形态（`function(..)return function(..) ... end end`，Luraph 存放未虚拟化函数
+     的方式）、读全局变量的函数（VM 自己的代码从不直接读全局）、业务 API 密集（≥ 5 处）的
+     函数。其余没导出的函数逐项计数并说明依据（不会悄悄漏掉）
+  4. 断行 + 语义重命名（作用域取自 luau-ast）
+  5. 验证：语法、token 无损、重命名前后绑定一致
+
+脚本被整体虚拟化时（Luraph v15.2 的常见形态：容器里解出来的只有 VM 本体，没有明文业务
+函数），静态提取到剥壳为止，本工具会直接说明并指向去虚拟化器 `python3 -m devm.run`。
+
+关于「执行」：静态提取不运行脚本。唯一会运行输入的一步是 [2b] 剥 Luraph 容器。它只在
+下面三种情况之一成立时才做（unwrap_reason）：
+  · 文件带 Luraph 头注释；
+  · 文件是 `return setmetatable({...},{}):X()(...)` 这种对象形态（Luraph 容器的写法），或者是
+    `...):X(...)` 形态而且里面没有解释器分派循环（有分派循环的是 VM 本体，不是容器，不执行）；
+  · 一个字符串字面量占了文件一半以上（且 ≥ 4,096 字符）：打包的密文。
+其它文件不会被执行。注意第三条不认 Luraph：任何「一个大字符串占一半以上」的脚本都会被当作
+容器在沙箱里跑一遍。沙箱是 luasandbox.py 的环境表：只有 Luau 自带的库，没有文件读写、
+没有 require、没有网络；容器要 loadstring 的代码只被截下来，不运行。
+加 --no-run 可以完全禁止这一步（容器就剥不开了）。
 
 用法
 ----
-    python deob.py 输入.lua [-o 输出.lua] [--min-size 20000] [--no-rename]
+    python deob.py 输入.lua [-o 输出.lua] [--min-size 20000] [--no-rename] [--no-run]
 
     python deob.py 输入.lua --list       # 只列出发现的大函数，不输出
+
+给其它工具用的入口：probe(path, work_dir=None) 返回版本 / 形态 / 剥出的 chunk 与 buffer 路径。
 """
 import sys
 import os
 import re
-import json
+import bisect
 import shutil
 import tempfile
 import argparse
 import subprocess
-import platform
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE / "libs"))
-sys.path.insert(0, str(HERE))  # deobf_plus 可能在根目录
+for _p in (str(HERE / "libs"), str(HERE)):
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
+
+import luaubin          # noqa: E402
+
+# ---------------------------------------------------------------- 读写
+
+def read_source(path):
+    """File -> str without losing a byte (invalid UTF-8 survives as surrogate escapes)."""
+    return Path(path).read_bytes().decode("utf-8", errors="surrogateescape")
+
+
+def write_source(path, text):
+    Path(path).write_bytes(text.encode("utf-8", errors="surrogateescape"))
+
+
+def nbytes(text):
+    """Size in bytes of a text read with read_source (not its length in characters)."""
+    return len(text.encode("utf-8", errors="surrogateescape"))
+
+
+# ---------------------------------------------------------------- Luraph 头注释
+
+LURAPH_HEADER = re.compile(r'--[^\n]*?protected using Luraph Obfuscator v(\d+(?:\.\d+)*)')
+
+
+def luraph_header(text):
+    """The "-- This file was protected using Luraph Obfuscator vX.Y" comment.
+
+    Returns {'version': '15.2' or None, 'offset': where the comment starts or None,
+    'prelude': the text in front of it}.  Script owners put lines such as
+    `getgenv().SCRIPT_KEY = "..."` in front of the header: that is the prelude."""
+    m = LURAPH_HEADER.search(text)
+    if not m:
+        return {"version": None, "offset": None, "prelude": ""}
+    prelude = text[:m.start()]
+    return {"version": m.group(1), "offset": m.start(),
+            "prelude": prelude if prelude.strip() else ""}
+
+
+def version_label(version):
+    return f"Luraph v{version}" if version else "Luraph v15.x"
+
 
 # ---------------------------------------------------------------- 外层壳剥离
 
@@ -54,7 +115,7 @@ def strip_decimal_shell(src):
         body = bytes(int(x) for x in m.group(1).split("\\")[1:])
     except ValueError:
         return None
-    return body.decode("utf-8", errors="ignore")
+    return body.decode("utf-8", errors="surrogateescape")
 
 
 def strip_base64_shell(src):
@@ -64,48 +125,9 @@ def strip_base64_shell(src):
         return None
     import base64
     try:
-        return base64.b64decode(m.group(1)).decode("utf-8", errors="ignore")
+        return base64.b64decode(m.group(1)).decode("utf-8", errors="surrogateescape")
     except Exception:
         return None
-
-
-def strip_luraph_vm(src):
-    """Luraph 专用剥壳：用 bufemu 模拟跑一遍，dump 解码后的缓冲区。
-    返回 (layer3 源码 或 None, 说明)"""
-    print("        ↳ 正在启动剥壳引擎（bufemu 模拟执行 + buffer dump）…")
-    print("          首次运行可能需要几秒到几十秒，请稍候")
-    import tempfile
-    tmpdir = Path(tempfile.mkdtemp(prefix="lv151_"))
-    target = tmpdir / "target.lua"
-    target.write_text(src, encoding="utf-8")
-    try:
-        r = subprocess.run(
-            [sys.executable, str(HERE / "fastsolve.py"), str(target), str(tmpdir / "out")],
-            capture_output=True, text=True, timeout=600,
-        )
-    except Exception as e:
-        return None, f"剥壳执行失败: {e}"
-    log = (r.stdout or "") + (r.stderr or "")
-    outdir = tmpdir / "out"
-    if not outdir.exists():
-        return None, "剥壳未产生输出"
-    # 找最大的 lua-source 块
-    best, best_sz = None, 0
-    for f in outdir.glob("layer*.lua"):
-        if f.stat().st_size > best_sz:
-            best, best_sz = f, f.stat().st_size
-    if best is None:
-        # 退而求其次：把所有 blob 当 lua 试
-        for f in outdir.glob("blob*.bin"):
-            data = f.read_bytes()
-            txt = data.decode("utf-8", errors="ignore")
-            if "setmetatable" in txt and len(txt) > best_sz:
-                best, best_sz = f, len(txt)
-                best_txt = txt
-        if best is None:
-            return None, "未找到可用的明文层\n" + log.strip()[-500:]
-        return best_txt, f"blob 直读 {best_sz:,} 字节"
-    return best.read_text(encoding="utf-8", errors="ignore"), log.strip().split("\n")[-1]
 
 
 # 已知的 Luraph 产物语法瑕疵：少一个 end。
@@ -142,7 +164,7 @@ def strip_html_wrapper(src):
     return code
 
 
-def unwrap_shell(src, depth=0):
+def unwrap_shell(src, depth=0, say=print):
     """递归剥壳，最多 3 层"""
     if depth > 3:
         return src, depth
@@ -151,175 +173,171 @@ def unwrap_shell(src, depth=0):
     if inner_html and len(inner_html) > 1000:
         fixed, ch = repair_syntax(inner_html)
         if ch:
-            print("     ↳ 修补已知语法瑕疵（缺 1 个 end）")
-        return unwrap_shell(fixed, depth + 1)
+            say("     ↳ 修补已知语法瑕疵（缺 1 个 end）")
+        return unwrap_shell(fixed, depth + 1, say)
     for fn in (strip_decimal_shell, strip_base64_shell):
         inner = fn(src)
         if inner and len(inner) > 1000:
-            return unwrap_shell(inner, depth + 1)
+            return unwrap_shell(inner, depth + 1, say)
     return src, depth
 
 
-# ---------------------------------------------------------------- AST 定位
+# ---------------------------------------------------------------- Luraph 压缩容器
 
-def _arch_suffix():
-    """当前平台对应的二进制后缀，如 aarch64 / x86_64"""
-    m = platform.machine().lower()
-    if m in ("x86_64", "amd64"):
-        return "x86_64"
-    if m in ("aarch64", "arm64"):
-        return "aarch64"
-    return m
+PAYLOAD_MIN = 4096
+PAYLOAD_WHY = "一个字符串字面量占了文件一半以上（打包的密文）"
 
 
-def _pick(name):
-    """按优先级找二进制：架构专用名 → 通用名；
-    通用名若架构不符则跳过（避免 Exec format error）。"""
-    roots = [HERE, HERE / "bin", HERE / "libs", HERE.parent,
-             HERE.parent / "bin", HERE.parent / "libs"]
-    suf = _arch_suffix()
-    # 1) 优先架构专用文件  luau.x86_64 / luau.aarch64
-    for r in roots:
-        c = r / f"{name}.{suf}"
-        if c.is_file():
-            ensure_executable(str(c))
-            return str(c)
-    # 2) 通用名，但必须是本机架构
-    for r in roots:
-        c = r / name
-        if c.is_file():
-            ok, msg = check_elf_arch(str(c))
-            if ok:
-                ensure_executable(str(c))
-                return str(c)
-    # 3) PATH
-    found = shutil.which(name)
-    if found:
-        ok, _ = check_elf_arch(found)
-        if ok:
-            return found
+def looks_like_container(text):
+    """A container carries its payload: ONE string literal is more than half of the file
+    (and at least PAYLOAD_MIN characters).  This test does not know Luraph: any script that
+    is mostly one string passes it."""
+    from deobf_plus import tokenize
+    longest = max((len(v) for t, v in tokenize(text) if t == "s"), default=0)
+    return longest >= PAYLOAD_MIN and longest * 2 > len(text)
+
+
+def unwrap_reason(text, header):
+    """Why this text is worth running in the unwrap sandbox, or None.
+
+    Unwrapping means RUNNING the text (in the sandbox of mkfast.py, with loadstring hooked).
+    That is done for exactly three kinds of text: one with the Luraph header comment; one
+    shaped `return setmetatable({...},{}):X()(...)` (the container Luraph writes), or
+    `...):X(...)` without any interpreter dispatch loop in it (an object that only loads
+    something; one WITH dispatch loops is the VM itself, there is nothing to unwrap, and run
+    without the buffer its container passes it would only fail); one in which a single
+    string literal is more than half of the file (looks_like_container).  Any other file is
+    not executed."""
+    if header.get("version"):
+        return "Luraph 头注释"
+    feats = vm_features(text)
+    if feats["object"] and feats["loader"]:
+        return "`return setmetatable({...},{}):%s()(...)` 形态" % feats["loader"]
+    if feats["object"] and feats["entry"] and not feats["dispatch_loops"]:
+        return "`return setmetatable({...},{}):%s(...)` 形态，没有解释器分派循环" % feats["entry"]
+    if looks_like_container(text):
+        return PAYLOAD_WHY
     return None
 
 
+def unwrap_container(src, workdir, arg_files=(), call_result=True, timeout=300, say=print):
+    """Run Luraph's outer container in the bufemu sandbox (fastsolve.py / mkfast.py) and
+    collect what it decodes.  The code it wants to load is captured, not run.
+
+    Returns (result, note).  result is None when nothing usable came out, else a dict:
+      'text'         source of the chunk the container loads
+      'chunk_path'   file holding exactly those bytes
+      'buffer_path'  file holding the buffer the container starts the chunk with, or None
+      'chunk_name'   chunk name the container gives to loadstring ("Luraph"), or None
+      'via'          'loadstring' (hooked call) | 'buffer' (looked like Lua source in a dump)
+    """
+    import fastsolve
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    target = workdir / "target.lua"
+    write_source(target, src)
+    lines = []
+    try:
+        res = fastsolve.solve(str(target), str(workdir / "out"), arg_files=arg_files,
+                              call_result=call_result, timeout=timeout, say=lines.append)
+    except Exception as e:
+        return None, f"剥壳执行失败: {e}"
+    note = "; ".join(x.strip() for x in lines if x.strip().startswith("[!]")) or "无运行时错误"
+
+    chunks = sorted(res["chunks"], key=lambda c: -c["size"])
+    if chunks:
+        c = chunks[0]
+        buf = next((a for a in c["args"] if a["kind"] == "buffer" and a["path"]), None)
+        return {"text": read_source(c["path"]), "chunk_path": c["path"],
+                "buffer_path": buf["path"] if buf else None,
+                "chunk_name": c["name"], "via": "loadstring",
+                "prelude": res.get("prelude")}, note
+
+    layers = sorted((b for b in res["blobs"] if b["layer"]), key=lambda b: -b["size"])
+    if layers:
+        b = layers[0]
+        return {"text": read_source(b["layer"]), "chunk_path": b["layer"], "buffer_path": None,
+                "chunk_name": None, "via": "buffer", "prelude": res.get("prelude")}, note
+
+    # 退而求其次：把所有 blob 当 lua 试
+    best = None
+    for b in res["blobs"]:
+        txt = read_source(b["path"])
+        if "setmetatable" in txt and (best is None or len(txt) > len(best[1])):
+            best = (b, txt)
+    if best:
+        return {"text": best[1], "chunk_path": best[0]["path"], "buffer_path": None,
+                "chunk_name": None, "via": "buffer", "prelude": res.get("prelude")}, note
+    if res.get("timeout"):
+        return None, f"沙箱运行超时（{timeout} 秒），没有截到任何代码"
+    return None, "未找到可用的明文层；" + (res["error"] or "容器没有调用 loadstring，也没有解出 Lua 源码")[:300]
+
+
+def strip_luraph_vm(src):
+    """Kept for callers of the old name: (inner source or None, note)."""
+    tmp = tempfile.mkdtemp(prefix="lv151_")
+    try:
+        res, note = unwrap_container(src, tmp)
+        return (res["text"] if res else None), note
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- 二进制
+
+def _arch_suffix():
+    """当前平台对应的二进制后缀，如 aarch64 / x86_64"""
+    return luaubin.arch_suffix()
+
+
+def _pick(name):
+    """按优先级找二进制（luaubin.find）"""
+    return luaubin.find(name)
+
+
 def find_luau_ast():
-    """定位 luau-ast：优先架构专用 → 通用 → PATH"""
-    return _pick("luau-ast")
+    """定位 luau-ast：环境变量 → 架构专用 → 通用 → PATH"""
+    return luaubin.find_luau_ast()
+
+
+def find_luau_runtime():
+    """定位 luau 运行时：环境变量 → 架构专用 → 通用 → PATH"""
+    return luaubin.find_luau()
 
 
 def check_elf_arch(path):
     """检查 ELF 架构是否可执行，返回 (ok, 说明)"""
-    import struct
-    try:
-        with open(path, 'rb') as f:
-            magic = f.read(20)
-        if magic[:4] != b"\x7fELF":
-            return True, ""  # 不是 ELF，交给系统判断
-        ei_class = magic[4]
-        ei_data = magic[5]
-        e_machine = struct.unpack("<H" if ei_data == 1 else ">H", magic[18:20])[0]
-        names = {0x3e: "x86_64", 0xb7: "aarch64", 0x03: "i386", 0x28: "arm"}
-        arch = names.get(e_machine, f"0x{e_machine:x}")
-        cur = platform.machine()
-        ok = (arch == cur) or (arch == "x86_64" and cur in ("x86_64", "AMD64"))
-        if not ok:
-            return False, f"这是 {arch} 二进制，当前架构 {cur} 无法执行"
-        return True, ""
-    except Exception:
-        return True, ""
+    return luaubin.check_elf_arch(path)
 
 
 def ensure_executable(path):
     """确保有可执行权限（zip 解压后常见 644）"""
-    try:
-        if not os.access(path, os.X_OK):
-            os.chmod(path, 0o755)
-            return True
-    except OSError:
-        pass
-    return False
-
-
-def try_dynamic_lift(inp_path, args):
-    """形态 B：走动态路径，截获字节码 → 反编译 → 返回输出路径"""
-    try:
-        sys.path.insert(0, str(HERE))
-        import dynlift
-    except Exception as e:
-        print(f"     ✗ 动态模块不可用：{e}")
-        return None
-
-    bc = dynlift.extract_bc(str(inp_path))
-    if not bc:
-        return None
-
-    tmp = Path(tempfile.mkdtemp(prefix="lv151_bc_")) / "payload.bin"
-    tmp.write_bytes(bc)
-
-    stem = Path(inp_path).stem
-    out = (Path(args.output).parent if args.output else Path(".")) / f"{stem}_源码.luau"
-
-    print(f"     交给反编译器（Tovek）…")
-    r = subprocess.run([sys.executable, str(HERE / "lift.py"),
-                        str(tmp), str(out)],
-                       capture_output=True, text=True, timeout=900)
-    tail = ((r.stdout or "") + (r.stderr or "")).strip()
-    if r.returncode != 0:
-        print("     ✗ " + tail.split("\n")[-1][:150])
-        return None
-    if not out.is_file():
-        return None
-    n = out.read_text(encoding="utf-8", errors="ignore").count("\n") + 1
-    print(f"     ✓ {out.stat().st_size:,} 字节  {n:,} 行")
-    return out
-
-
-def find_luau_runtime():
-    """定位 luau 运行时：优先架构专用 → 通用 → PATH"""
-    return _pick("luau")
-
-
-def _autofetch(name, quiet=False):
-    """本地没有可用二进制时，调 fetch_bin.py 从 Release 下载。
-    失败不抛异常——交给上层给出「怎么补」的提示。"""
-    script = HERE / "fetch_bin.py"
-    if not script.is_file():
-        return None
-    if not quiet:
-        print(f"     本地没有可用的 {name}，正在从 GitHub Release 获取…", flush=True)
-    try:
-        r = subprocess.run([sys.executable, str(script), name],
-                           capture_output=True, text=True, timeout=900)
-        if not quiet:
-            print((r.stdout or "").rstrip(), flush=True)
-        if r.returncode == 0:
-            return _pick(name)
-        if not quiet:
-            print((r.stderr or "").rstrip(), flush=True)
-    except Exception as e:
-        if not quiet:
-            print(f"     ⚠ 自动获取失败：{e}", flush=True)
-    return None
+    return luaubin.ensure_executable(path)
 
 
 def find_luau_ast_or_fetch(quiet=False):
-    return find_luau_ast() or _autofetch("luau-ast", quiet)
+    """Nothing is downloaded any more (the release the old fetch pointed at does not exist
+    for this repository): a missing binary is reported with how to build it."""
+    p = find_luau_ast()
+    if not p and not quiet:
+        print("     ✗ 本地没有可用的 luau-ast；" + luaubin.MISSING_HINT, flush=True)
+    return p
 
 
 def find_luau_runtime_or_fetch(quiet=False):
-    return find_luau_runtime() or _autofetch("luau", quiet)
+    p = find_luau_runtime()
+    if not p and not quiet:
+        print("     ✗ 本地没有可用的 luau；" + luaubin.MISSING_HINT, flush=True)
+    return p
 
 
+# ---------------------------------------------------------------- AST 定位
 
 def run_ast(src_text, ast_bin):
-    """跑 luau-ast，返回 JSON"""
-    tmp = Path("/tmp/_lv151_ast_input.lua")
-    tmp.write_text(src_text, encoding="utf-8")
-    r = subprocess.run([ast_bin, str(tmp)], capture_output=True, text=True, timeout=300)
-    out = (r.stdout or "") + (r.stderr or "")
-    start = out.find("{")
-    if start < 0:
-        raise RuntimeError(f"luau-ast 无输出：{out[:300]}")
-    return json.loads(out[start:])
+    """跑 luau-ast，返回 JSON（{'root': ...}）。临时文件用完即删，文件名每次不同。"""
+    import luascope
+    root, errors = luascope.parse(src_text, ast_bin)
+    return {"root": root, "errors": errors}
 
 
 def parse_loc(loc):
@@ -331,637 +349,1378 @@ def parse_loc(loc):
 
 
 def collect_functions(node, out, depth=0):
-    if isinstance(node, dict):
-        if node.get("type") == "AstExprFunction":
-            out.append(node)
-        for v in node.values():
-            collect_functions(v, out, depth + 1)
-    elif isinstance(node, list):
-        for i in node:
-            collect_functions(i, out, depth + 1)
+    import luascope
+    luascope.collect_functions(node, out)
 
 
 def byte_offset_of(src, line, col):
-    """把 (line,col) 转成字符偏移（luau-ast 的行号从 0 开始）"""
-    if line == 0:
-        return col
-    pos = 0
-    for _ in range(line):
-        nl = src.find("\n", pos)
-        if nl < 0:
-            return len(src)
-        pos = nl + 1
-    return pos + col
+    """把 (line,col) 转成字符偏移（luau-ast 的行号从 0 开始，列按字节计）"""
+    import luascope
+    return luascope.LineIndex(src).offset(line, col)
 
 
 # ---------------------------------------------------------------- 排版
 
-HFUN = re.compile(r'function\s*\n\s*\(')
-DOT = re.compile(r'\s+\.\s+')
-COLON = re.compile(r'\s+:\s+')
-OPENP = re.compile(r'\(\s+')
-CLOSEP = re.compile(r'\s+\)')
-
-
 def tidy(text):
-    """清理排版空白的 token 级实现。
-    旧版用整文正则替换，会把字符串字面量里的 " . " / " : " / "( " 也改掉，
-    直接篡改数据。这里改为只对「非字符串、非注释」的 token 做处理。"""
-    # 只做「空白清理」，不再重新排版。
-    # 早先这里会 tokenize + format_tokens 再跑一遍，但换行在 tokenize 时
-    # 就丢了，第二遍排版把所有语句重新拼回一行（分号也被吞掉）。
-    # format_tokens 的输出已经是规整格式，无需二次处理。
-    if not text:
-        return text
-    lines = []
-    for line in text.split('\n'):
-        stripped = line.rstrip()
-        if stripped:
-            lines.append(stripped)
-    return '\n'.join(lines)
-
+    """Kept for old callers.  The formatter's output needs no clean-up; stripping lines of a
+    text, as this used to do, would also edit multi-line string literals, so it is a no-op."""
+    return text
 
 
 def verify(text):
     """用 luau 做语法验证。
 
-    只解析、不执行：luau CLI 没有 --parse，但 `--fflags` 里没有纯解析开关，
-    所以这里用一个技巧——把代码包进 `if false then ... end`，
-    运行时永远不会进入，但语法必须合法才能编译通过。
-    这样既不会真的执行被测脚本，也能可靠地捕获语法错误。
+    只编译、不执行：把代码当作字符串交给 loadstring，编译出来的函数不调用
+    （luasandbox.compile_only）。行号就是输出文件里的行号。
     """
-    luau = find_luau_runtime_or_fetch(quiet=True)
+    import luasandbox
+    luau = find_luau_runtime()
     if not luau:
         return True, "跳过（未找到 luau 二进制）"
-    tmp = Path("/tmp/_lv151_verify.lua")
-    # 包一层，避免执行副作用
-    wrapped = "if false then\n" + text + "\nend\n"
-    tmp.write_text(wrapped, encoding="utf-8")
+    ok, msg = luasandbox.compile_only(text, luau, timeout=300, chunk_name="output")
+    if ok:
+        return True, "OK"
+    return False, ("验证超时" if msg == "timeout" else msg.replace("output:", "<output>:", 1))
+
+
+# ---------------------------------------------------------------- 扫描（步骤 1 ~ 5b）
+
+VM_LOOP = re.compile(r'while true do (?:local )?\w+(?:,\w+)?=\w+\[\w+\];')
+VM_TAIL = re.compile(r'\}\s*,\s*\{[^{}]*\}\s*\)\s*:\s*(\w+)\s*\(\s*\.\.\.\s*\)\s*;?\s*$')
+# the container Luraph wraps the VM chunk in ends `},{}):A()(...)`: A() decodes and loads the
+# chunk, and what it returns is called with the script's arguments
+LOADER_TAIL = re.compile(r'\}\s*,\s*\{[^{}]*\}\s*\)\s*:\s*(\w+)\s*\(\s*\)\s*\(\s*\.\.\.\s*\)\s*;?\s*$')
+SIGNALS = (
+    ("GetService", r'GetService'),
+    ("Instance.new", r'Instance\s*[.:]\s*new'),
+    ("UDim2", r'UDim2'),
+    ("Color3", r'Color3'),
+    ("TweenService", r'TweenService'),
+)
+
+
+BUSINESS_MIN = 5        # API mentions that make a result (or one small function) business code
+
+
+def api_mentions(text):
+    """How often the business-API names of SIGNALS occur in `text`."""
+    return sum(len(re.findall(pat, text)) for _k, pat in SIGNALS)
+
+
+def part_kind(text, globals_read=None):
+    """Kind of an exported function and its business-API mention count:
+      'dispatcher'  VM dispatch loop
+      'business'    mentions business APIs
+      'script'      no business-API name, but it reads globals (`globals_read`, the result of
+                    luascope.globals_in): code of the script all the same (HttpGet, loadstring)
+      'plain'       neither: it only works on its arguments and captured variables (Luraph's
+                    own helper closures, VM methods, or logic that does not touch the
+                    environment)"""
+    api = api_mentions(text)
+    if is_dispatcher_text(text):
+        return "dispatcher", api
+    if api:
+        return "business", api
+    return ("script" if globals_read else "plain"), api
+
+
+_LEAD_COMMENT = re.compile(r'\s*(?:--\[(=*)\[[\s\S]*?\]\1\]|--[^\n]*(?:\n|\Z))')
+
+
+def code_start(src):
+    """Offset of the first code of a Luraph file: after the header comment (and whatever the
+    script's owner put in front of it), after any other leading comments and blank space."""
+    pos = 0
+    m = LURAPH_HEADER.search(src[:8192])
+    if m:
+        nl = src.find("\n", m.end())
+        pos = len(src) if nl < 0 else nl + 1
+    while True:
+        m = _LEAD_COMMENT.match(src, pos)
+        if not m:
+            break
+        pos = m.end()
+    while pos < len(src) and src[pos].isspace():
+        pos += 1
+    return pos
+
+
+def vm_features(src):
+    """What marks a chunk as Luraph's VM object: interpreter dispatch loops and the
+    `return setmetatable({...},{}):NAME(...)` shape."""
+    tail = VM_TAIL.search(src[-400:])
+    loader = LOADER_TAIL.search(src[-400:])
+    start = code_start(src)
+    return {"dispatch_loops": len(VM_LOOP.findall(src)),
+            "object": bool(re.match(r'return\s+setmetatable\s*\(', src[start:start + 64])),
+            "entry": tail.group(1) if tail else None,
+            "loader": loader.group(1) if loader else None}
+
+
+def is_statement_function(toks):
+    """True when an extracted function is a statement (`local function f()`, `function a.b()`,
+    with or without attributes) and not a function expression (`function(...) ... end`).
+    luau-ast gives the whole statement as the function's location."""
+    code = [t for t in toks if t[0] != "c"]
+    return not (len(code) >= 2 and code[0][1] == "function" and code[1][1] in ("(", "<"))
+
+
+def is_dispatcher_text(body):
+    """VM 分派器的特征：密集的「查表跳转」+ 一大串 if 比较，没有业务 API。
+    （实测 BBDHub 样本：查表 217+、if 比较 589+、业务 API 0）"""
+    if len(body) > 400000:
+        body = body[:400000]
+    jump_like = len(re.findall(r'\w+\s*=\s*\w+\[\s*\w+\s*\]', body))
+    cmp_like = len(re.findall(r'if\s+\w+\s*[<>~=]=?\s*\d+', body))
+    api = len(re.findall(r'GetService|Instance\s*\.\s*new|UDim2|Color3', body))
+    # 相对密度更可靠：字节数归一化
+    per_kb_jump = 1000.0 * jump_like / max(len(body), 1)
+    per_kb_cmp = 1000.0 * cmp_like / max(len(body), 1)
+    return (api < 5 and jump_like > 80
+            and (per_kb_cmp > 8 or per_kb_jump > 4))
+
+
+class Scan:
+    """Steps 1 to 5b: read, find the binaries, peel shells and the container, parse, size up
+    the functions, tell business code from VM code.  main() prints as it goes; probe() runs
+    the same steps silently."""
+
+    def __init__(self, inp, min_size=20000, work_dir=None, say=print, allow_run=True):
+        self.inp = Path(inp)
+        self.min_size = min_size
+        self.say = say
+        self.allow_run = allow_run  # False: never run the input (step 2b is skipped)
+        self._own_work = work_dir is None
+        self.work = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="lv151_"))
+        self.work.mkdir(parents=True, exist_ok=True)
+        self._tmp = Path(tempfile.mkdtemp(prefix="lv151_run_"))
+        self.raw = ""
+        self.header = {"version": None, "offset": None, "prelude": ""}
+        self.src = ""
+        self.layers = 0
+        self.container = None       # dict from unwrap_container + saved paths
+        self.unwrap_note = None
+        self.sandbox_run = False    # the input's code was run in the unwrap sandbox
+        self.ast_bin = None
+        self.luau_bin = None
+        self.root = None
+        self.parse_errors = []
+        self.index = None
+        self.funcs = []
+        self.all_sized = []         # outermost functions of at least min_size
+        self.outer_all = []         # outermost functions of any size
+        self.sized = []             # (start, end, size, node): what gets extracted
+        self.dropped = []           # VM dispatchers among the big functions
+        self.small_plain = []       # functions below min_size that are exported all the same:
+                                    # plain (not virtualized) functions of a VM object
+        self.small_other = []       # (item, API mentions): below min_size, not exported
+        self.api_outside = 0        # API mentions outside every function (table entries)
+        self.vm_object = False      # the layer is `return setmetatable({...},{}):X(...)`
+        self.signals = {}
+        self.score = 0
+        self.chunk_score = 0        # the same signals counted over the whole chunk
+        self.vm = {"dispatch_loops": 0, "object": False, "entry": None, "loader": None}
+        self.form = "unknown"
+        self._ast_cache = {}
+        self._facts = {}
+
+    def cleanup(self, keep_work=False):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        if self._own_work and not keep_work:
+            shutil.rmtree(self.work, ignore_errors=True)
+
+    # ---- 1
+    def load(self):
+        self.raw = read_source(self.inp)
+        self.header = luraph_header(self.raw)
+        self.src = self.raw
+
+    # ---- 1b
+    def binaries(self):
+        self.ast_bin = find_luau_ast()
+        self.luau_bin = find_luau_runtime()
+
+    # ---- AST with a one-entry cache (the same text is parsed for sizing and for scanning)
+    def _parse(self, text):
+        import luascope
+        key = id(text)
+        hit = self._ast_cache.get(key)
+        if hit is not None and hit[0] is text:
+            return hit[1], hit[2], hit[3]
+        root, errors = luascope.parse(text, self.ast_bin)
+        index = luascope.LineIndex(text)
+        self._ast_cache = {key: (text, root, errors, index)}
+        return root, errors, index
+
+    def _functions(self, text):
+        """[(start, end, size, node)] of every function, document order."""
+        import luascope
+        root, _errors, index = self._parse(text)
+        out = []
+        for f in luascope.collect_functions(root):
+            loc = f.get("location")
+            if not loc:
+                continue
+            s, e = index.span(loc)
+            out.append((s, e, e - s, f))
+        out.sort(key=lambda x: (x[0], -x[2]))
+        return out
+
+    def has_big_func(self, text):
+        try:
+            return any(n >= self.min_size for _s, _e, n, _f in self._functions(text))
+        except Exception:
+            return False
+
+    # ---- 2
+    def shells(self):
+        self.src, self.layers = unwrap_shell(self.raw, say=self.say)
+
+    # ---- 2b
+    def unwrap(self):
+        """Luraph's own container.  Unwrapping RUNS the text (sandboxed), so it is tried only
+        when the text carries a payload (one string literal is more than half of the file),
+        or when it has no big function and has the header comment or Luraph's object shape
+        (unwrap_reason); and never with allow_run=False."""
+        say = self.say
+        if not looks_like_container(self.src) and self.has_big_func(self.src):
+            return False
+        why = unwrap_reason(self.src, luraph_header(self.src))
+        if why is None:
+            feats = vm_features(self.src)
+            if feats["object"] and feats["dispatch_loops"]:
+                self.unwrap_note = ("这一层是 VM 对象本身（setmetatable 对象，里面有解释器分派循环），"
+                                    "不是容器：没有可剥的壳，没有执行它")
+            else:
+                self.unwrap_note = ("这一层没有大函数，也不像 Luraph 的容器（没有头注释、不是 setmetatable "
+                                    "容器形态、没有占文件一半以上的字符串），没有执行它")
+            say("[2b] " + self.unwrap_note)
+            return False
+        if not self.allow_run:
+            self.unwrap_note = f"这一层像 Luraph 的容器（{why}），但指定了 --no-run：没有执行它，容器没有剥开"
+            say("[2b] " + self.unwrap_note)
+            return False
+        say(f"[2b] 这一层像 Luraph 的容器（{why}），尝试剥壳（沙箱内执行，拦截 loadstring，不运行被加载的代码）…")
+        self.sandbox_run = True
+        res, note = unwrap_container(self.src, self._tmp / "c0")
+        self.unwrap_note = note
+        if not res:
+            say(f"[2b] 剥壳失败：{note}")
+            return False
+        buf = f" + 数据 buffer {os.path.getsize(res['buffer_path']):,} 字节" if res["buffer_path"] else ""
+        name = f"，loadstring 名 \"{res['chunk_name']}\"" if res["chunk_name"] else ""
+        say(f"[2b] ✓ 剥壳完成 → {os.path.getsize(res['chunk_path']):,} 字节{buf}（经由 {res['via']}{name}）")
+        self.container = res
+        self.src = res["text"]
+        # 剥出来的层可能还是壳：只有它自己带着大段密文时才继续下探
+        for depth in range(3):
+            if self.has_big_func(self.src) or not looks_like_container(self.src):
+                break
+            args = [self.container["buffer_path"]] if self.container["buffer_path"] else []
+            deeper, _n2 = unwrap_container(self.src, self._tmp / f"c{depth + 1}", arg_files=args,
+                                           call_result=False, timeout=120)
+            if not deeper or len(deeper["text"]) >= len(self.src):
+                break
+            self.container = deeper
+            self.src = deeper["text"]
+            say(f"[2b] 继续下探第 {depth + 2} 层 → {nbytes(self.src):,} 字节")
+        self._save_artifacts()
+        return True
+
+    def _save_artifacts(self):
+        stem = self.inp.stem
+        c = self.container
+        chunk = self.work / f"{stem}.chunk.lua"
+        shutil.copyfile(c["chunk_path"], chunk)
+        c["chunk_path"] = str(chunk)
+        if c["buffer_path"]:
+            buf = self.work / f"{stem}.buffer.bin"
+            shutil.copyfile(c["buffer_path"], buf)
+            c["buffer_path"] = str(buf)
+
+    # ---- 3 / 4 / 5 / 5a
+    def functions(self):
+        root, errors, index = self._parse(self.src)
+        self.root, self.parse_errors, self.index = root, errors, index
+        allf = self._functions(self.src)
+        self.funcs = allf
+        outer = []
+        for item in allf:           # sorted by (start, -size): an outer function comes first
+            if outer and item[0] >= outer[-1][0] and item[1] <= outer[-1][1]:
+                continue
+            outer.append(item)
+        self.outer_all = outer
+        big = []
+        for item in (x for x in allf if x[2] >= self.min_size):
+            if big and item[0] >= big[-1][0] and item[1] <= big[-1][1]:
+                continue            # 被上一个包含
+            big.append(item)
+        big.sort(key=lambda x: -x[2])
+        self.all_sized = big
+        self.dropped = [x for x in big if self.fact(x)["dispatcher"]]
+        kept = [x for x in big if x not in self.dropped]
+        # Functions below the size threshold are not all VM plumbing.  In Luraph's VM object
+        # (`return setmetatable({...},{}):X(...)`) a function of the script that was left as
+        # plain Lua can be small; three things mark one, and each is checked on the syntax
+        # tree or the text of the function itself:
+        #   factory   closure-factory shape `function(..)return function(..) ... end end`
+        #             (luascope.factory_leaf): how Luraph stores a function it did not
+        #             virtualize.  Its own small helper closures have this shape too.
+        #   globals   the function reads a global (game, loadstring, Instance ...).  The VM's
+        #             own code never does: it keeps every library function in a table slot.
+        #   API       at least BUSINESS_MIN business-API mentions (the threshold the tool
+        #             requires of a whole result).
+        # Such a function is exported with the big ones; every other function is counted, so
+        # that nothing is left out silently.  In a text that is not a VM object a small
+        # function is just somebody's script, and none of this applies.
+        self.small_plain, self.small_other = [], []
+        in_functions = 0
+        vm_object = self.vm_object = vm_features(self.src)["object"]
+        for item in outer:
+            f = self.fact(item)
+            in_functions += f["api"]
+            if item[2] >= self.min_size:
+                continue
+            if (vm_object and not f["dispatcher"]
+                    and (f["factory"] or f["globals"] or f["api"] >= BUSINESS_MIN)):
+                self.small_plain.append(item)
+            elif f["api"]:
+                self.small_other.append((item, f["api"]))
+        self.api_outside = api_mentions(self.src) - in_functions
+        if kept or self.small_plain:
+            # script code first (it names the environment), then closures that only work on
+            # captured variables; the bigger the earlier
+            self.sized = sorted(kept + self.small_plain,
+                                key=lambda x: (0 if self.is_script(x) else 1, -x[2], x[0]))
+        else:
+            self.sized = list(big)      # nothing but dispatchers: classify() will say so
+
+    def fact(self, item):
+        """What the tool goes by for one function (start, end, size, node):
+        {'api': business-API mentions, 'globals': {name: uses}, 'factory': depth of the
+        closure-factory shape (0 = not one), 'dispatcher': VM dispatch loop}."""
+        import luascope
+        key = (item[0], item[1])
+        f = self._facts.get(key)
+        if f is None:
+            text = self.src[item[0]:item[1]]
+            _leaf, depth = luascope.factory_leaf(item[3])
+            f = {"api": api_mentions(text), "globals": luascope.globals_in(item[3]),
+                 "factory": depth, "dispatcher": is_dispatcher_text(text)}
+            self._facts[key] = f
+        return f
+
+    def is_script(self, item):
+        """The function names the environment (reads a global or mentions a business API)
+        and is no dispatch loop: code of the script, not of the VM."""
+        f = self.fact(item)
+        return bool(f["globals"] or f["api"]) and not f["dispatcher"]
+
+    def evidence(self):
+        """What marks the input as Luraph's output (empty list: nothing does)."""
+        ev = []
+        if self.header["version"]:
+            ev.append("头注释")
+        if self.container:
+            ev.append("容器")
+        if self.vm["object"]:
+            ev.append("setmetatable VM 对象")
+        elif self.vm["entry"]:
+            ev.append("结尾的 :%s(...) 调用" % self.vm["entry"])
+        return ev
+
+    def bare_chunk(self):
+        """The input itself is a VM chunk that was cut out of its container before: Luraph's
+        VM object with dispatch loops, without the header comment a protected file starts
+        with and without a container around it.  The container starts such a chunk with a
+        data buffer (the bytecode); run alone it fails at the first read of that buffer."""
+        return bool(self.vm["object"] and self.vm["dispatch_loops"] and not self.container
+                    and not self.header["version"] and not self.layers)
+
+    def sibling_buffer(self):
+        """The buffer file this tool saves next to a chunk it unwrapped
+        (`NAME.chunk.lua` -> `NAME.buffer.bin`), if the input is such a chunk and the file
+        is there; else None."""
+        name = self.inp.name
+        for suffix in (".chunk.lua", ".chunk.luau"):
+            if name.endswith(suffix):
+                cand = self.inp.with_name(name[:-len(suffix)] + ".buffer.bin")
+                if cand.is_file():
+                    return cand
+        return None
+
+    # ---- 5b
+    def classify(self):
+        region = "".join(self.src[s:e] for s, e, _n, _f in self.sized)
+        self.signals = {k: len(re.findall(pat, region)) for k, pat in SIGNALS}
+        self.score = sum(self.signals.values())
+        self.chunk_score = api_mentions(self.src)
+        self.vm = vm_features(self.src)
+        # Every Luraph script has a virtualized part; what differs is how much of it the author
+        # left as plain Lua.  Form A = at least one plain business function of min_size or
+        # more: the static result is a substantial part of the script.  A VM object whose only
+        # plain business code is small functions is form vm (the devirtualizer's case); those
+        # functions are listed, and --force / a lower --min-size exports them.
+        # Form A is a statement about Luraph's output: a text that shows nothing of Luraph (no
+        # header comment, no container, not the VM object) is not classified, however big its
+        # functions are (an ordinary script is not "form A").
+        big_business = [x for x in self.sized if x[2] >= self.min_size and x not in self.dropped]
+        luraph = bool(self.evidence())
+        if big_business and self.score >= BUSINESS_MIN and luraph:
+            self.form = "A"
+        elif self.vm["dispatch_loops"] >= 1 and (self.vm["object"] or self.container):
+            self.form = "vm"
+        elif self.sized and self.score >= BUSINESS_MIN and luraph:
+            self.form = "A"             # plain business functions and no VM loop in sight
+        else:
+            self.form = "unknown"
+        return self.form
+
+
+def probe(path, work_dir=None, min_size=20000, allow_run=True):
+    """Static look at a protected script, for a caller that has to pick the engine.
+
+    Nothing is printed.  The outer container, if there is one, is unwrapped (its code is
+    captured from loadstring, never run) and the result is saved in `work_dir` (a new temporary
+    directory when None; the caller removes it).  allow_run=False: the input is never run,
+    so a container stays closed ('error' then says so).
+
+    Returns a dict:
+      'input'           the path given
+      'luraph_version'  '15.2', '15.1', ... from the header comment, or None (no header)
+      'prelude'         text in front of the header comment ('' if none): owner-added lines
+                        such as `getgenv().SCRIPT_KEY = "..."` that must run before the script
+      'container'       True when a Luraph container was unwrapped
+      'chunk_path'      file with the chunk the container loads (None without a container)
+      'buffer_path'     file with the buffer the container starts that chunk with, or None
+      'chunk_name'      chunk name given to loadstring ("Luraph"), or None
+      'luraph'          what marks the input as Luraph's output: a list out of "头注释",
+                        "容器", "setmetatable VM 对象", "结尾的 :X(...) 调用"; [] for a text
+                        that shows nothing of Luraph (form is then 'unknown')
+      'form'            'A'   plain-Lua business functions inside the VM object, at least one
+                              of them of min_size or more: this tool extracts them
+                              (score >= 5)
+                        'vm'  the chunk is Luraph's VM (dispatch loops) and holds no plain-Lua
+                              business function of min_size: needs the devirtualizer.  Small
+                              plain functions may exist all the same: see 'small_functions'
+                              (deob.py --force exports them)
+                        'unknown'  neither (also: not Luraph's output, binaries missing, parse
+                              error; see 'luraph' and 'error')
+      'engine'          'static' for form A, 'devm' for form vm, None otherwise
+      'score'           business-API hits in the functions that would be extracted
+      'chunk_score'     the same count over the whole chunk (library references in the VM
+                        table such as `[n]=Color3.new` and small helper functions that were
+                        left as plain Lua show up here)
+      'big_functions'   [(start, end, size)] in the chunk: functions of min_size and more
+                        that are not VM dispatchers
+      'small_functions' [(start, end, size)] plain-Lua functions of a VM object below
+                        min_size: closure-factory shape, or reads a global, or at least 5
+                        business-API mentions.  Form A extracts big_functions +
+                        small_functions
+      'script_functions' the subset of big_functions + small_functions that names the
+                        environment (reads a global or mentions a business API): code of the
+                        script for certain.  The others only work on captured variables
+                        (Luraph's own helper closures, or pure logic)
+      'dispatchers'     [(start, end, size)] big functions recognised as VM dispatch loops
+      'sandbox_run'     True when the input's own code was run in the unwrap sandbox (only
+                        done for a text that looks like Luraph's output; a plain script is
+                        never executed)
+      'vm'              {'dispatch_loops': n, 'object': bool, 'entry': 'yQ' or None,
+                         'loader': 'A' or None (the text ends `:A()(...)`: a container)}
+      'bare_chunk'      True when the input itself looks like a VM chunk that was cut out of
+                        its container before (VM object with dispatch loops, no header
+                        comment, no container around it).  A container starts its chunk with
+                        a data buffer, so the devirtualizer then needs
+                        `--chunk-arg <buffer file>`; 'sibling_buffer' is that file when the
+                        input is named NAME.chunk.lua and NAME.buffer.bin lies next to it
+                        (the names this tool saves them under), else None
+      'work_dir'        where chunk_path / buffer_path live
+      'error'           None, or why the scan stopped
+    """
+    sc = Scan(path, min_size=min_size, work_dir=work_dir, say=lambda *a, **k: None,
+              allow_run=allow_run)
+    out = {"input": str(path), "luraph_version": None, "prelude": "", "container": False,
+           "chunk_path": None, "buffer_path": None, "chunk_name": None, "luraph": [],
+           "form": "unknown", "engine": None, "score": 0, "chunk_score": 0, "big_functions": [],
+           "small_functions": [], "script_functions": [], "dispatchers": [],
+           "sandbox_run": False, "vm": dict(sc.vm), "bare_chunk": False,
+           "sibling_buffer": None, "work_dir": str(sc.work), "error": None}
     try:
-        r = subprocess.run([str(luau), str(tmp)], capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return True, "验证超时（假定语法通过）"
-    msg = ((r.stdout or "") + (r.stderr or "")).strip()
+        sc.load()
+        out["luraph_version"] = sc.header["version"]
+        out["prelude"] = sc.header["prelude"]
+        sc.binaries()
+        if not sc.ast_bin or not sc.luau_bin:
+            out["error"] = "luau / luau-ast not found: " + luaubin.MISSING_HINT
+            return out
+        sc.shells()
+        sc.unwrap()
+        out["sandbox_run"] = sc.sandbox_run
+        if sc.container:
+            out["container"] = True
+            out["chunk_path"] = sc.container["chunk_path"]
+            out["buffer_path"] = sc.container["buffer_path"]
+            out["chunk_name"] = sc.container["chunk_name"]
+        elif sc.unwrap_note and (sc.sandbox_run or "--no-run" in sc.unwrap_note):
+            out["error"] = sc.unwrap_note
+        sc.functions()
+        if sc.parse_errors:
+            out["error"] = "parse error: " + sc.parse_errors[0]
+        sc.classify()
+        out["form"] = sc.form
+        out["engine"] = {"A": "static", "vm": "devm"}.get(sc.form)
+        out["score"] = sc.score
+        out["chunk_score"] = sc.chunk_score
+        out["big_functions"] = [(s, e, n) for s, e, n, _f in sc.all_sized if (s, e, n, _f) not in sc.dropped]
+        out["small_functions"] = [(s, e, n) for s, e, n, _f in sc.small_plain]
+        exported = [x for x in sc.all_sized if x not in sc.dropped] + sc.small_plain
+        out["script_functions"] = [(x[0], x[1], x[2]) for x in exported if sc.is_script(x)]
+        out["dispatchers"] = [(s, e, n) for s, e, n, _f in sc.dropped]
+        out["vm"] = dict(sc.vm)
+        out["luraph"] = sc.evidence()
+        out["bare_chunk"] = sc.bare_chunk()
+        sib = sc.sibling_buffer() if out["bare_chunk"] else None
+        out["sibling_buffer"] = str(sib) if sib else None
+    except Exception as e:      # noqa: BLE001  a probe reports, it does not raise
+        out["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        sc.cleanup(keep_work=True)
+    return out
 
-    # 语法错误特征
-    if "Expected" in msg:
-        return False, msg.split("\n")[0]
-    if "unknown opcode" in msg.lower() or "malformed" in msg.lower():
-        return False, msg.split("\n")[0]
-    # 含 "attempt to" 说明语法通过、只是运行时缺环境 —— 这是正常结果
-    return True, msg.split("\n")[0] if msg else "OK"
 
+# ---------------------------------------------------------------- 形态 B / C（旧路径）
+
+def try_dynamic_lift(inp_path, args, out_dir):
+    """形态 B：走动态路径，截获字节码 → 反编译 → 返回输出路径"""
+    try:
+        import dynlift
+    except Exception as e:
+        print(f"     ✗ 动态模块不可用：{e}")
+        return None
+
+    bc = dynlift.extract_bc(str(inp_path))
+    if not bc:
+        return None
+
+    tmpd = Path(tempfile.mkdtemp(prefix="lv151_bc_"))
+    try:
+        tmp = tmpd / "payload.bin"
+        tmp.write_bytes(bc)
+        out = Path(out_dir) / f"{Path(inp_path).stem}_源码.luau"
+        print("     交给反编译器（Tovek）…")
+        try:
+            r = subprocess.run([sys.executable, str(HERE / "lift.py"), str(tmp), str(out)],
+                               capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            print("     ✗ 反编译超时")
+            return None
+        tail = ((r.stdout or "") + (r.stderr or "")).strip()
+        if r.returncode != 0:
+            print("     ✗ " + tail.split("\n")[-1][:150])
+            return None
+        if not out.is_file():
+            return None
+        n = out.read_text(encoding="utf-8", errors="ignore").count("\n") + 1
+        print(f"     ✓ {out.stat().st_size:,} 字节  {n:,} 行")
+        return out
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def form_c(inp, raw, args, out_dir):
+    """形态 C：内联展开 VM / 没能在 [2b] 剥开的容器。
+    静态解剖 + 生成自跑捕获脚本并在本地实跑。产物写到 out_dir（不写到样本旁边）。
+    返回退出码，或 None 表示不是这种形态。"""
+    try:
+        import inlinevm
+        is_inl, info = inlinevm.detect(raw)
+    except Exception as e:
+        is_inl, info = False, {'reasons': [f'inlinevm 不可用：{e}']}
+    if not is_inl:
+        return None
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print()
+    print("═" * 64)
+    print("  ◆ 识别为「内联展开 VM」形态（形态 C）")
+    print("═" * 64)
+    for r in info.get('reasons', []):
+        print(f"    · {r}")
+
+    print()
+    print("[6c] 静态解剖 VM 语义层…")
+    try:
+        vm = inlinevm.dissect(inp, verbose=True)
+    except Exception as e:
+        print(f"      ⚠ 解剖失败：{e}")
+        vm = None
+    if not vm:
+        return None
+
+    print()
+    print("[6d] 生成本地可执行的自跑捕获脚本…")
+    harness = out_dir / (inp.stem + '.harness.lua')
+    try:
+        p = inlinevm.make_harness(inp, vm, harness)
+        print(f"      ✓ {p.name}  {p.stat().st_size:,} 字节")
+    except Exception as e:
+        print(f"      ⚠ 生成失败：{e}")
+        return None
+
+    # ── 实跑一遍，所有统计数字都从这次执行里取 ──
+    print()
+    print("[6e] 在本地运行自跑脚本，采集实测数据…")
+    run = inlinevm.run_harness(p)
+
+    # ── 拦到明文 = 直接交付源码，不再走自跑脚本那条路 ──
+    if run.get('captured_plain') and run.get('captured_src'):
+        cp = run['captured_plain']
+        out_src = out_dir / (inp.stem + '.unpacked.lua')
+        out_src.write_text(run['captured_src'], encoding='utf-8')
+        print()
+        print("═" * 64)
+        print("  ✓ 已解出下一层源码")
+        print("═" * 64)
+        print(f"  通过 {cp['via']} 截获 {cp['bytes']:,} 字节明文")
+        print(f"  （buffer.readu8 调用 {run.get('reads', 0):,} 次，"
+              f"分配 {run.get('buffers', 0)} 个 buffer）")
+        print(f"  → {out_src}")
+        # 判断解出来的东西还能不能再剥一层
+        inner = out_src.read_text(encoding='utf-8', errors='ignore')
+        feats = vm_features(inner)
+        if feats["dispatch_loops"]:
+            print()
+            print("  注意：解出来的是 Luraph 的 VM 本体，不是业务源码。")
+            print(f"        里面有明文业务函数时：python3 deob.py {out_src}")
+            print(f"        整体虚拟化时用去虚拟化器：python3 -m devm.run {inp}")
+        print("═" * 64)
+        return 0
+
+    print()
+    print("═" * 64)
+    print("  为什么交付的是自跑脚本，而不是源码")
+    print("═" * 64)
+    print("  这个样本把业务代码编译进了 VM 自己管理的 buffer，")
+    print("  明文里只剩 handler 表和密文串。反混淆器已经做到：")
+    print(f"    · 命名了 {len(vm['prims'])} 个标准库原语（m[N] → buffer.readu8 这类）")
+    print(f"    · 还原了 {len(vm['handlers'])} 个 handler 的状态转移")
+    if vm.get('top_dispatch'):
+        print(f"    · 定位到顶层调度器 m[{vm['top_dispatch']['slot']}]"
+              f"（转发 {vm['top_dispatch']['dispatch_calls']} 个别 handler）")
+    if vm.get('main_loop'):
+        print(f"    · 定位到最大解释器 m[{vm['main_loop']['slot']}]"
+              f"（{vm['main_loop']['comparisons']} 个状态比较）")
+    if vm.get('decoys'):
+        print(f"    · 识别出 {len(vm['decoys'])} 个诱饵槽位（定义了但从不被引用）")
+    print()
+    if run.get('ok'):
+        print("  在本地实际跑了一遍（数字全部来自这次运行）：")
+        print(f"    · buffer.readu8 调用 {run.get('reads', 0):,} 次")
+        print(f"    · 分配 {run.get('buffers', 0)} 个 buffer："
+              + ", ".join(f"{n:,}" for n in run.get('buffer_sizes', [])))
+        print(f"    · writeu8 {run.get('writes', 0)} 次 / "
+              f"writestring {run.get('strings', 0)} 次")
+        if run.get('captured_plain'):
+            cp = run['captured_plain']
+            print(f"    · ★ 通过 {cp['via']} 拦到 {cp['bytes']:,} 字节明文")
+        else:
+            print(f"    · 拦到 {run.get('loads', 0)} 次加载调用")
+            print("      （没拦到明文，说明 VM 是解释执行而非解出字节码再加载）")
+        print()
+        if run.get('exec_ok'):
+            print("  VM 完整跑完了。")
+        else:
+            err = (run.get('exec_err') or '')
+            print(f"  执行未跑完：{err[:110]}")
+            # 分情况说明，不要一律套「解密成功但缺 Roblox」的模板
+            low = err.lower()
+            if 'buffer expected' in low or 'got nil' in low:
+                print()
+                print("  这是「缺少输入」而不是「缺 Roblox 运行时」：")
+                print("  VM 的入口要一段字节码 buffer，而这个样本的字节码")
+                print("  由外层供给（双层混淆）。单独跑内层必然拿到 nil。")
+                print("  正确做法是连外层一起跑。")
+            elif 'cancel' in low or "with 'new'" in low or 'index nil' in low:
+                print()
+                print("  这是「缺 Roblox 运行时」：解密后的业务代码要调 tween /")
+                print("  instance 这类真实对象。这个错误词在整份源码里搜不到，")
+                print("  只可能来自解密后的字节码 —— 说明解密本身是成功的。")
+            else:
+                print()
+                print("  错误原因见上。")
+    else:
+        print(f"  本地实跑失败：{run.get('error', '未知原因')}")
+    print()
+    print("  → 把自跑脚本放到有 Roblox 的机器上运行，它会自己：")
+    print("      1. dump VM 分配的每一个 buffer")
+    print("      2. 记录每一次 buffer.readu8（可重放）")
+    print("      3. 挂 loadstring / setfenv / luau_load，谁拿到明文就拦谁")
+    print("    输出用 markdown 包起来，直接粘回来就行。")
+    print("  → 或者直接用去虚拟化器（带 Roblox 模拟环境）：")
+    print(f"      python3 -m devm.run {inp} -o 输出.lua")
+    print("═" * 64)
+    print()
+    print(f"  产物：{p}")
+    if run.get('log'):
+        print(f"  实跑日志：{run['log']}")
+    if args.vm_report:
+        rp = out_dir / (inp.stem + '.vm_anatomy.md')
+        inlinevm.write_report(vm, rp)
+        print(f"  解剖报告：{rp}")
+    else:
+        print("  解剖报告：加 --vm-report 可导出 vm_anatomy.md")
+    return 7
+
+
+# ---------------------------------------------------------------- 提取（形态 A）
+
+def normalize_literals(toks):
+    """Decimal numbers; "\\229\\141\\141"-style escapes back to readable UTF-8 text.
+    Every literal keeps its value (checked by the caller with same_values).
+    Returns (tokens, number of strings decoded)."""
+    from deobf_plus import norm_num, decode_string
+    fixed = []
+    decoded = 0
+    for t, v in toks:
+        if t == "n":
+            fixed.append((t, norm_num(v)))
+        elif t == "s" and "\\" in v and v[0] in "\"'":
+            # 十进制转义 "\229\141\141" = 中文，还原成真字符，
+            # 否则产物里全是 \xxx\xxx，读不了也搜不到
+            new = v
+            try:
+                raw = decode_string(v)
+                u = raw.decode("utf-8") if raw is not None else None
+            except UnicodeDecodeError:
+                u = None
+            # 含任何控制字符（换行/制表/回车）、反斜杠或引号就保留原样
+            if (u is not None and not any(ord(ch) < 32 or ord(ch) == 127 for ch in u)
+                    and "\\" not in u and '"' not in u and "'" not in u):
+                new = f'"{u}"'
+                decoded += 1
+            fixed.append((t, new))
+        else:
+            fixed.append((t, v))
+    return fixed, decoded
+
+
+def build_part(scan, item, all_ptoks, offsets, rename, slots, inline_slots, wrap, ast_bin):
+    """One extracted function -> (text, info).  Every step is checked:
+      layout   the formatted text lexes back to the tokens it was made from
+      literals normalised numbers / strings keep their values
+      tree     the text is parsed again by luau-ast and compared with the tree of the input
+               function: with renaming it must be the same up to a consistent renaming of
+               locals (and the recorded slot substitutions) = `binding`; without renaming it
+               must be the same tree outright
+    If the renamed version fails `binding`, the part is rebuilt with the original names (and
+    that text goes through the tree comparison too)."""
+    import luascope
+    import reslot
+    from deobf_plus import format_checked, same_values
+    s, e, _n, node = item
+    a = bisect.bisect_left(offsets, s)
+    b = bisect.bisect_left(offsets, e)
+    ptoks = all_ptoks[a:b]
+    orig = [(t, v) for t, v, _o in ptoks]
+    kind, api = part_kind(scan.src[s:e], scan.fact(item)["globals"])
+    stmt = is_statement_function(orig)
+    info = {"renamed": 0, "slots": {}, "slot_comment": 0, "slot_inline": 0, "decoded": 0,
+            "layout": False, "literals": False, "binding": None, "tree": None, "note": None,
+            "fallback": None, "kind": kind, "api": api, "statement": stmt,
+            "label": describe_function(scan, item)}
+    # text that parses on its own: an expression needs something in front of it
+    lead = "" if stmt else "return "
+
+    def finish(toks):
+        fixed, decoded = normalize_literals(toks)
+        lay = {}
+        text, ok = format_checked(fixed, wrap=wrap, info=lay)
+        info["decoded"] = decoded
+        info["layout"] = ok
+        # the indented layout failed its own check and the one-statement-per-line layout was
+        # used instead: still the same tokens, but the caller has to say so
+        info["fallback"] = lay.get("reason") if lay.get("fallback") else None
+        info["literals"] = same_values(fixed, toks)
+        return text
+
+    def tree_same(text, inlined=None):
+        """The text, parsed by luau-ast, against the input function's tree."""
+        whole = lead + text
+        root2, errors2 = luascope.parse(whole, ast_bin)
+        if errors2:
+            return False, "输出解析失败: " + errors2[0]
+        fns = luascope.collect_functions(root2)
+        if not fns:
+            return False, "输出里没有函数"
+        idx2 = luascope.LineIndex(whole)
+        fns.sort(key=lambda f: (idx2.span(f["location"])[0], -idx2.span(f["location"])[1]))
+        return luascope.alpha_equal(node, fns[0], inlined)
+
+    if rename:
+        try:
+            analysis = luascope.Analysis(node, scan.index, ptoks)
+            ren = luascope.Renamer(analysis)
+            toks = ren.apply(ptoks)
+            inlined = {}
+            stats = {"slots": {}, "comment": 0, "inline": 0}
+            if slots:
+                hints = luascope.slot_hints(analysis)
+                toks, stats, inlined = reslot.apply_hints(toks, hints, inline=inline_slots)
+            text = finish(toks)
+            # binding check: parse the result and compare it with the original function
+            ok, why = tree_same(text, inlined)
+            if ok:
+                info.update(renamed=ren.renamed, slots=stats["slots"], binding=True, tree=True,
+                            slot_comment=stats["comment"], slot_inline=stats["inline"])
+                return text, info
+            info["note"] = "重命名结果未通过绑定校验，已改用原变量名：" + why[:160]
+        except Exception as ex:     # noqa: BLE001  fall back to the unrenamed text
+            info["note"] = f"重命名跳过（{type(ex).__name__}: {str(ex)[:140]}），保留原变量名"
+        info["binding"] = False
+    text = finish(orig)
+    try:
+        ok, why = tree_same(text)
+    except Exception as ex:         # noqa: BLE001
+        ok, why = False, f"{type(ex).__name__}: {str(ex)[:140]}"
+    info["tree"] = ok
+    if not ok:
+        note = "输出与原函数的语法树不一致：" + why[:160]
+        info["note"] = (info["note"] + "；" + note) if info["note"] else note
+    return text, info
+
+
+def handler_table(src_toks):
+    """`[n] = value` entries of the top-level setmetatable({...}) table, as comment lines."""
+    from deobf_plus import extract_handlers, format_tokens
+    start = None
+    for i, (t, v) in enumerate(src_toks):
+        if t == "w" and v == "setmetatable":
+            start = i
+            break
+    if start is None:
+        return []
+    brace = None
+    for i in range(start, min(start + 6, len(src_toks))):
+        if src_toks[i] == ("o", "{"):
+            brace = i
+            break
+    if brace is None:
+        return []
+    depth = 0
+    endb = None
+    for i in range(brace, len(src_toks)):
+        t, v = src_toks[i]
+        if t == "o" and v in ("(", "[", "{"):
+            depth += 1
+        elif t == "o" and v in (")", "]", "}"):
+            depth -= 1
+            if depth == 0:
+                endb = i
+                break
+    if endb is None:
+        return []
+    lines = []
+    for key, _raw, valtoks, _ in extract_handlers(src_toks, brace + 1, endb):
+        desc = " ".join(format_tokens(valtoks[:40], wrap=False).split())[:70]
+        lines.append(f"-- [{key}] = {desc}")
+    return lines
 
 
 # ---------------------------------------------------------------- 主流程
 
+def describe_function(scan, item, limit=4):
+    """One short label for a function, from what Scan.fact() found."""
+    f = scan.fact(item)
+    if f["dispatcher"]:
+        return "VM 分派器（查表跳转），不是业务源码"
+    if f["api"]:
+        return f"业务 API {f['api']} 处"
+    if f["globals"]:
+        names = sorted(f["globals"], key=lambda k: (-f["globals"][k], k))
+        more = f" 等 {len(names)} 个" if len(names) > limit else ""
+        return "读全局 " + ", ".join(names[:limit]) + more + "（未见业务 API 名）"
+    if f["factory"]:
+        return "闭包工厂形态，不读全局（只操作捕获的变量）"
+    return "未见业务 API，不读全局"
+
+
+def small_plain_summary(scan):
+    """'闭包工厂形态 a 个 … 其中读全局或调用业务 API 的 b 个' for scan.small_plain."""
+    sp = scan.small_plain
+    fac = sum(1 for x in sp if scan.fact(x)["factory"])
+    script = sum(1 for x in sp if scan.is_script(x))
+    bits = []
+    if fac:
+        bits.append(f"闭包工厂形态 {fac} 个")
+    if len(sp) - fac:
+        bits.append(f"其它形态 {len(sp) - fac} 个")
+    return "，".join(bits) + f"；其中读全局或调用业务 API 的（脚本代码）{script} 个"
+
+
+def devm_advice(scan, inp):
+    """Lines that tell how to hand this input to the devirtualizer."""
+    out = []
+    if scan.bare_chunk():
+        buf = scan.sibling_buffer()
+        out.append("  这个文件看起来是已经从容器里剥出来的 VM chunk（VM 对象，没有头注释，外面没有容器）。")
+        out.append("  容器启动 chunk 时会传入一块数据 buffer（字节码在里面）；不带 buffer 单独运行，")
+        out.append("  chunk 会在第一次读 buffer 时出错。两种做法：")
+        out.append("")
+        out.append("      python3 -m devm.run <带容器的原始文件> -o 输出.lua")
+        out.append("          （推荐：devm 自己剥容器，buffer 一并带上）")
+        if buf:
+            out.append(f"      python3 -m devm.run {inp} --chunk-arg {buf} -o 输出.lua")
+            out.append("          （同目录下找到了本工具剥壳时存的 buffer 文件）")
+        else:
+            out.append(f"      python3 -m devm.run {inp} --chunk-arg <数据 buffer 文件> -o 输出.lua")
+            out.append("          （buffer 文件：deob.py 剥容器时存成 <名字>.buffer.bin，见 --work）")
+    else:
+        out.append(f"      python3 -m devm.run {inp} -o 输出.lua")
+    return out
+
+
+def print_vm_block(scan, inp, kept_work):
+    label = version_label(scan.header["version"])
+    c = scan.container
+    print()
+    print("═" * 64)
+    print(f"  ◆ {label} 虚拟机：脚本主体已被虚拟化（virtualized）")
+    print("═" * 64)
+    if c:
+        size = os.path.getsize(c["chunk_path"])
+        buf = (f" + 数据 buffer {os.path.getsize(c['buffer_path']):,} 字节"
+               if c["buffer_path"] else "")
+        print(f"  · 外层压缩容器已剥除：VM chunk {size:,} 字节{buf}")
+    entry = f"，入口 :{scan.vm['entry']}(...)" if scan.vm["entry"] else ""
+    print(f"  · 这一层是 Luraph 的 VM 对象：{scan.vm['dispatch_loops']} 个解释器分派循环{entry}")
+    in_big = sum(api_mentions(scan.src[s:e]) for s, e, _n, _f in scan.all_sized)
+    if scan.all_sized:
+        print(f"  · {len(scan.all_sized)} 个大函数全是 VM 分派器，没有 ≥ {scan.min_size:,} 字节的明文业务函数"
+              f"（大函数里的业务 API 名：{in_big} 处）")
+    else:
+        print(f"  · 没有 ≥ {scan.min_size:,} 字节的函数")
+    if scan.small_plain:
+        sp = scan.small_plain
+        print(f"  · 有 {len(sp)} 个没被虚拟化的小函数（明文 Lua，共 {sum(x[2] for x in sp):,} 字节，业务 API "
+              f"{sum(scan.fact(x)['api'] for x in sp)} 处）：{small_plain_summary(scan)}")
+        print(f"    加 --force 可以导出它们；最大的 {max(x[2] for x in sp):,} 字节，"
+              f"小于阈值 {scan.min_size:,}，所以不算作脚本主体")
+    small = sum(a for _it, a in scan.small_other)
+    if small or scan.api_outside:
+        where = []
+        if small:
+            where.append(f"{small} 处在 {len(scan.small_other)} 个不导出的小函数里")
+        if scan.api_outside:
+            where.append(f"{scan.api_outside} 处是 VM 表里的库函数引用（`[n]=Color3.new` 这类）")
+        print(f"  · chunk 里其它出现业务 API 名的地方：" + "，".join(where))
+    print("  · 脚本主体以字节码形式由 VM 解释执行（数据在 buffer 里），不在这些明文里")
+    print()
+    print("  静态提取到此为止。还原这类脚本要用去虚拟化器：")
+    print()
+    for line in devm_advice(scan, inp):
+        print(line)
+    if c:
+        print()
+        if kept_work:
+            print("  已剥出的文件：")
+            print(f"      VM chunk     {c['chunk_path']}")
+            if c["buffer_path"]:
+                print(f"      数据 buffer  {c['buffer_path']}")
+        else:
+            print("  剥出的 VM chunk / 数据 buffer 没有保存（临时目录已清理）；"
+                  "要保存：加 --work 目录，或用 -o 指定输出路径（存到它旁边）")
+    print("═" * 64)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Luraph v15.1 自动反混淆")
+    ap = argparse.ArgumentParser(
+        description="Luraph v15.x 静态反混淆：剥壳 + 提取明文业务函数（整体虚拟化的脚本请用 python3 -m devm.run）")
     ap.add_argument("input", help="输入的 .lua / .txt 文件")
     ap.add_argument("-o", "--output", help="输出文件")
-    ap.add_argument("--min-size", type=int, default=20000, help="最小函数长度（字节），默认 20000")
+    ap.add_argument("--min-size", type=int, default=20000,
+                    help="「大函数」的最小长度（字节），默认 20000；VM 对象里更小的函数只导出明文的："
+                         "闭包工厂形态、读全局、或业务 API ≥ 5 处")
     ap.add_argument("--list", action="store_true", help="只列出大函数，不输出")
-    ap.add_argument("--no-rename", action="store_true", help="不做语义重命名")
+    ap.add_argument("--no-rename", action="store_true", help="不做语义重命名（输出与输入逐 token 相同）")
     ap.add_argument("--no-humanize", action="store_true",
-                    help="不做人类化排版（保留逐 token 原样）")
+                    help="不折行（保留每条语句一行）")
+    ap.add_argument("--no-slots", action="store_true", help="不标注 VM 槽位名（tbl[60 --[[RunService]]]）")
+    ap.add_argument("--inline-slots", action="store_true",
+                    help="能证明只赋值一次的槽位直接替换成变量名（默认只加注释，不改代码）")
     ap.add_argument("--no-lift", action="store_true", help="不尝试动态反编译（形态 B 时跳过）")
-    ap.add_argument("--force", action="store_true", help="即使判定为 VM 字节码，也强制导出骨架")
+    ap.add_argument("--force", action="store_true",
+                    help="判定为 VM 时也导出：有没被虚拟化的小函数就导出它们，否则导出 VM 函数骨架；"
+                         "输入不像 Luraph 产物时，仍把其中的函数切出来")
+    ap.add_argument("--no-run", action="store_true",
+                    help="完全不执行输入：跳过 [2b] 剥容器（那一步在沙箱里运行容器代码）")
     ap.add_argument("--vm-report", action="store_true",
                     help="形态 C（内联 VM）时导出 vm_anatomy.md 解剖报告")
+    ap.add_argument("--work", help="保存剥壳得到的 VM chunk / 数据 buffer 的目录"
+                                   "（默认：-o 所在目录；两者都没给就不保存）")
     args = ap.parse_args()
 
     inp = Path(args.input)
-    if not inp.exists():
+    if not inp.is_file():
         print(f"[✗] 文件不存在：{inp}")
         return 1
 
-    raw = inp.read_text(encoding="utf-8", errors="ignore")
-    print(f"[1] 读取：{inp.name}  {len(raw):,} 字节")
+    out_path = Path(args.output) if args.output else inp.with_name(inp.stem + "_反混淆.lua")
+    work_dir = args.work or (str(out_path.parent) if args.output else None)
+    scan = Scan(inp, min_size=args.min_size, work_dir=work_dir, allow_run=not args.no_run)
+    try:
+        rc, _keep = run(scan, args, inp, out_path, kept_work=work_dir is not None)
+        return rc
+    finally:
+        # a work directory the tool made itself is temporary and always removed: what was
+        # unwrapped is only kept where the user asked for it (--work, or next to -o)
+        scan.cleanup(keep_work=False)
 
-    # 前置检查：确认解析器与运行时可用
+
+def run(scan, args, inp, out_path, kept_work):
+    """Returns (exit code, False).  The second value used to say "keep the temporary work
+    directory"; nothing is kept there any more."""
+    scan.load()
+    raw = scan.raw
+    print(f"[1] 读取：{inp.name}  {len(raw.encode('utf-8', 'surrogateescape')):,} 字节")
+    if scan.header["version"]:
+        pre = scan.header["prelude"]
+        extra = f"（头注释前有 {len(pre.strip().splitlines())} 行附加代码）" if pre else ""
+        print(f"     头注释：Luraph Obfuscator v{scan.header['version']}{extra}")
+
+    # 前置检查：确认解析器与运行时可用（不联网）
     print("[1b] 检查解析器（luau-ast / luau）…")
-    _ast = find_luau_ast_or_fetch()
-    _run = find_luau_runtime_or_fetch(quiet=True)
-    if _ast:
-        ensure_executable(_ast)
-        print(f"     ✓ luau-ast  {Path(_ast).name}  {Path(_ast).stat().st_size:,} 字节")
-    else:
-        print("     ✗ 未找到 luau-ast")
-    if _run:
-        ensure_executable(_run)
-        print(f"     ✓ luau      {Path(_run).name}  {Path(_run).stat().st_size:,} 字节")
-    else:
-        print("     ✗ 未找到 luau（语法验证将跳过）")
+    scan.binaries()
+    for name, p in (("luau-ast", scan.ast_bin), ("luau", scan.luau_bin)):
+        if p:
+            print(f"     ✓ {name:<9} {Path(p).name}  {Path(p).stat().st_size:,} 字节")
+        else:
+            print(f"     ✗ 未找到 {name}")
+    if not scan.ast_bin or not scan.luau_bin:
+        print("[✗] 缺少 Luau 二进制，无法继续。")
+        print("    " + luaubin.MISSING_HINT)
+        print("    也可以用环境变量 LUAU_BIN / LUAU_AST_BIN 指向已有的二进制。")
+        return 1, False
+    ok_arch, arch_msg = check_elf_arch(scan.ast_bin)
+    if not ok_arch:
+        print(f"[✗] {Path(scan.ast_bin).name}: {arch_msg}")
+        print("    " + luaubin.MISSING_HINT)
+        return 5, False
 
     # 剥壳
-    src, layers = unwrap_shell(raw)
-    if layers:
-        print(f"[2] 剥除外层壳 {layers} 层 → {len(src):,} 字节")
+    scan.shells()
+    if scan.layers:
+        print(f"[2] 剥除外层壳 {scan.layers} 层 → {nbytes(scan.src):,} 字节")
     else:
         print("[2] 未检测到简单外层壳")
-
-    # Luraph 专用剥壳：如果 AST 里找不到大函数，就走 bufemu 流程
-    ast_bin = find_luau_ast_or_fetch(quiet=True)
-    if not ast_bin:
-        print("[✗] 找不到 luau-ast")
-        print("    手动下载： python fetch_bin.py")
-        print("    或放到 bin/ 目录，或安装到 PATH")
-        return 1
-
-    # 权限 + 架构检查
-    if ensure_executable(ast_bin):
-        print(f"[2a] 已为 {Path(ast_bin).name} 添加可执行权限（zip 解压后常见为 644）")
-    ok_arch, arch_msg = check_elf_arch(ast_bin)
-    if not ok_arch:
-        print(f"[✗] {Path(ast_bin).name}: {arch_msg}")
-        print("    请构建对应架构的 luau-ast：")
-        print("    https://github.com/luau-lang/luau  （编译 luau-ast 目标）")
-        return 5
-
-    def has_big_func(text):
-        try:
-            a = run_ast(text, ast_bin)
-        except Exception:
-            return False
-        fs = []
-        collect_functions(a, fs)
-        for f in fs:
-            loc = f.get("location")
-            if not loc:
-                continue
-            l1, c1, l2, c2 = parse_loc(loc)
-            s = byte_offset_of(text, l1, c1)
-            e = byte_offset_of(text, l2, c2)
-            if e - s >= args.min_size:
-                return True
-        return False
-
-    if not has_big_func(src):
-        print("[2b] 当前层无业务函数，尝试 Luraph 专用剥壳…")
-        inner, note = strip_luraph_vm(src)
-        if inner:
-            src = inner
-            print(f"[2b] ✓ 剥壳完成 → {len(src):,} 字节   ({note})")
-            # 剥出来的层可能还是壳，继续下探
-            for depth in range(3):
-                if has_big_func(src):
-                    break
-                deeper, note2 = strip_luraph_vm(src)
-                if not deeper or len(deeper) >= len(src):
-                    break
-                src = deeper
-                print(f"[2b] 继续下探第 {depth + 2} 层 → {len(src):,} 字节")
-        else:
-            print(f"[2b] 剥壳失败：{note}")
+    scan.unwrap()
+    keep = False
+    keep_vm = False
 
     # 解析 AST
     try:
-        ast = run_ast(src, ast_bin)
-        print("[3] AST 解析成功")
+        scan.functions()
     except Exception as e:
         print(f"[✗] AST 解析失败：{e}")
-        return 1
-
-    funcs = []
-    collect_functions(ast, funcs)
-    print(f"[4] 发现 {len(funcs)} 个函数")
-
-    # 按长度排序，挑大的
-    sized = []
-    for f in funcs:
-        loc = f.get("location")
-        if not loc:
-            continue
-        l1, c1, l2, c2 = parse_loc(loc)
-        s = byte_offset_of(src, l1, c1)
-        e = byte_offset_of(src, l2, c2)
-        if e - s >= args.min_size:
-            sized.append((s, e, e - s))
-
-    # 去嵌套：只保留「不被其他函数包含」的最外层函数
-    sized.sort(key=lambda x: (x[0], -x[2]))
-    outer = []
-    for s, e, n in sized:
-        if outer and s >= outer[-1][0] and e <= outer[-1][1]:
-            continue  # 被上一个包含
-        outer.append((s, e, n))
-    sized = outer
-    sized.sort(key=lambda x: -x[2])
-    print(f"[5] 长度 ≥ {args.min_size:,} 的函数：{len(sized)} 个")
-    for s, e, n in sized:
+        return 1, keep
+    if scan.parse_errors:
+        print(f"[✗] AST 解析失败：{scan.parse_errors[0]}")
+        return 1, keep
+    scan.classify()
+    print("[3] AST 解析成功")
+    print(f"[4] 发现 {len(scan.funcs)} 个函数")
+    print(f"[5] 长度 ≥ {args.min_size:,} 的函数：{len(scan.all_sized)} 个")
+    for s, e, n, _f in scan.all_sized:
         print(f"      {s:>8} - {e:<8}  {n:>8,} 字节")
+    if scan.small_plain:
+        sp = scan.small_plain
+        how = "一并导出" if scan.form == "A" else \
+            "没有更大的明文业务函数，整体按 VM 形态处理：加 --force 才导出，见下"
+        print(f"    + VM 对象里小于 {args.min_size:,} 字节、没被虚拟化的明文函数：{len(sp)} 个"
+              f"（共 {sum(x[2] for x in sp):,} 字节；{how}）")
+        print(f"      {small_plain_summary(scan)}")
+        shown = sorted(sp, key=lambda x: (0 if scan.is_script(x) else 1, -x[2], x[0]))
+        for x in shown[:8]:
+            print(f"      {x[0]:>8} - {x[1]:<8}  {x[2]:>8,} 字节  {describe_function(scan, x)}")
+        if len(shown) > 8:
+            print(f"      … 其余 {len(shown) - 8} 个略（都不大于 {shown[8][2]:,} 字节）"
+                  if all(not scan.is_script(x) for x in shown[8:]) else
+                  f"      … 其余 {len(shown) - 8} 个略")
+    left = sum(a for _it, a in scan.small_other)
+    if left or scan.api_outside:
+        bits = []
+        if left:
+            bits.append(f"{len(scan.small_other)} 个小于阈值的函数里共 {left} 处"
+                        + ("（不读全局、不是闭包工厂形态，每个不足 "
+                           f"{BUSINESS_MIN} 处）" if scan.vm_object else ""))
+        if scan.api_outside:
+            bits.append(f"函数之外 {scan.api_outside} 处"
+                        + ("（VM 表里的库函数引用，如 `[n]=Color3.new`）" if scan.vm_object else ""))
+        print("    · 不导出、但出现业务 API 名的地方：" + "；".join(bits)
+              + ("。小函数可用 --min-size 调低阈值导出" if left and scan.vm_object else ""))
+    if scan.vm_object:
+        # the rest of the VM object's functions, so that the list above is the whole picture
+        named = set(id(x) for x in scan.all_sized) | set(id(x) for x in scan.small_plain) \
+            | set(id(it) for it, _a in scan.small_other)
+        rest = [x for x in scan.outer_all if id(x) not in named]
+        loops = [x for x in rest if scan.fact(x)["dispatcher"]]
+        rest = [x for x in rest if not scan.fact(x)["dispatcher"]]
+        if rest:
+            # what is left after the tests of Scan.functions(): none of these reads a global,
+            # has the closure-factory shape or mentions a business API.  The basis is printed
+            # so that the reader can check it.
+            print(f"    · 其余 {len(rest)} 个小于阈值的函数不导出"
+                  f"（共 {sum(x[2] for x in rest):,} 字节，最大 {max(x[2] for x in rest):,} 字节）："
+                  "它们不读任何全局、不是闭包工厂形态、没有业务 API 名 —— VM 对象自己的方法"
+                  "（解码器 / 状态机片段）；要看可用 --min-size 调低阈值导出")
+        if loops:
+            print(f"    · 另有 {len(loops)} 个小于阈值的函数是查表跳转循环（VM 分派器的形态），不导出"
+                  f"（共 {sum(x[2] for x in loops):,} 字节）")
 
-    if not sized:
-        print("[!] 没有找到大函数。可能不是 Luraph v15.1，或业务代码被编译进字节码。")
+    if scan.dropped and len(scan.dropped) < len(scan.all_sized):
+        print(f"[5a] 剔除 VM 分派器 {len(scan.dropped)} 个：")
+        for s, e, n, _f in scan.dropped:
+            print(f"      {s:>8} - {e:<8}  {n:>8,} 字节  （查表跳转，非业务代码）")
+    elif scan.dropped:
+        print(f"[5a] {len(scan.dropped)} 个大函数全部是 VM 分派器（查表跳转），没有业务函数")
+    if args.list:
+        return 0, keep
+
+    label = version_label(scan.header["version"])
+    out_dir = Path(args.work) if args.work else (out_path.parent if args.output else Path("."))
+
+    forced_all = False          # --force on a layer without any candidate: export every function
+    if not scan.sized:
+        if scan.form == "vm":
+            print_vm_block(scan, inp, kept_work)
+            if not args.force:
+                return 4, keep_vm
+            keep = keep_vm
+        elif scan.evidence():
+            print(f"[!] 没有找到 ≥ {args.min_size:,} 字节的函数。这是 {label} 的产物"
+                  f"（依据：{'、'.join(scan.evidence())}），但这一层没有明文业务函数。")
+        else:
+            print("[!] 没有找到大函数，输入也没有 Luraph 的特征（没有头注释、没有容器、不是 "
+                  "setmetatable VM 对象）：它可能不是 Luraph 的产物。")
+        if not scan.allow_run and scan.unwrap_note and "--no-run" in scan.unwrap_note:
+            print("    容器没有剥开（--no-run）：里面的 VM chunk 没有看到。去掉 --no-run 再试。")
         if not args.force:
             print("    加 --force 可导出最佳猜测的骨架（跳过大小阈值）。")
-            return 2
-        # --force：阈值降到 0，把所有函数都当候选
+            return 2, keep
+        forced_all = True
+        # --force：阈值降到 0，把所有最外层函数都当候选
         print("    --force 已指定，跳过大小阈值，重新收集候选…")
-        sized = [(s, e, n) for s, e, n in outer if n > 0]
-        if not sized:
-            print("[✗] 连非空函数都没有，这个文件不像是 Luraph v15.1 产物。")
-            return 2
-        print(f"    收集到 {len(sized)} 个函数（不再限制大小）")
-
-    import re as _re0
-
-    # ---- 剔除 VM 分派器 ----
-    # 分派器也是个大函数，会被当成业务代码切出来。
-    # 特征是密集的「查表跳转」：argN[reg] 取值后接一大串 if 比较。
-    def is_dispatcher(start, end):
-        body = src[start:end + 1]
-        if len(body) > 400000:
-            body = body[:400000]
-        # 分派器的三条特征（实测 BBDHub 样本：查表 217+、if 比较 589+、业务 API 0）
-        jump_like = len(_re0.findall(r'\w+\s*=\s*\w+\[\s*\w+\s*\]', body))
-        cmp_like = len(_re0.findall(r'if\s+\w+\s*[<>~=]=?\s*\d+', body))
-        api = len(_re0.findall(r'GetService|Instance\s*\.\s*new|UDim2|Color3', body))
-        # 相对密度更可靠：字节数归一化
-        per_kb_jump = 1000.0 * jump_like / max(len(body), 1)
-        per_kb_cmp = 1000.0 * cmp_like / max(len(body), 1)
-        return (api < 5 and jump_like > 80
-                and (per_kb_cmp > 8 or per_kb_jump > 4))
-
-    dropped = []
-    kept = []
-    for s0, e0, n0 in sized:
-        if is_dispatcher(s0, e0):
-            dropped.append((s0, e0, n0))
-        else:
-            kept.append((s0, e0, n0))
-    if dropped and kept:
-        sized = kept
-        print(f"[5a] 剔除 VM 分派器 {len(dropped)} 个：")
-        for s0, e0, n0 in dropped:
-            print(f"      {s0:>8} - {e0:<8}  {n0:>8,} 字节  （查表跳转，非业务代码）")
-
-    if args.list:
-        return 0
+        scan.sized = [x for x in scan.outer_all if x[2] > 0]
+        if not scan.sized:
+            print("[✗] 连非空函数都没有，这个文件不像是 Luraph 产物。")
+            return 2, keep
+        print(f"    收集到 {len(scan.sized)} 个函数（不再限制大小）")
+        form_before = scan.form
+        scan.classify()
+        scan.form = form_before if form_before == "vm" else scan.form
 
     # ---- 形态识别：判断是真明文业务代码，还是纯 VM 字节码 ----
-    import re as _re
-    region = "".join(src[s:e + 1] for s, e, n in sized)
-    # 业务特征：可读的 Roblox API / UI / 功能名字符串
     # 只看结构化信号（真实 API 调用），不看字符串。
-    # 原因：随机标识符形如 "YmhpVeGpVQ" 全大写开头+无空格+长度 11，
-    # 会被 [A-Z][A-Za-z ]{8,} 大量误判成 UI 文案（实测 4,421 个）；
-    # 而 demo2 里 74.7% 的长字符串其实是明文 Lua 片段（反篡改自检），
-    # 一旦要求「含空格」反而得分暴涨到 4,362。两侧都不安全 → 整段移除。
-    signals = {
-        "GetService": len(_re.findall(r'GetService', region)),
-        "Instance.new": len(_re.findall(r'Instance\s*[.:]\s*new', region)),
-        "UDim2": len(_re.findall(r'UDim2', region)),
-        "Color3": len(_re.findall(r'Color3', region)),
-        "TweenService": len(_re.findall(r'TweenService', region)),
-    }
-    # 不做任何字符串信号。
-    # 实测：要求「含空格」会命中 demo2 的明文 Lua 片段（" end local ttisstring = ..."），
-    # 要求「全大写无空格」会命中随机标识符（"YmhpVeGpVQ"）。
-    # 两条路都不可靠 → 只用对 VM 字节码不可能出现的 API 结构名。
-    score = sum(signals.values())
+    # 原因：随机标识符形如 "YmhpVeGpVQ" 会被误判成 UI 文案；明文 Lua 片段（反篡改自检）
+    # 又会让「含空格」的规则得分暴涨。两侧都不安全 → 只用 VM 字节码里不可能出现的 API 结构名。
     print("[5b] 业务特征扫描：")
-    for k, v in signals.items():
+    for k, v in scan.signals.items():
         print(f"      {k:<22} {v}")
-    print(f"      综合得分 = {score}")
+    print(f"      综合得分 = {scan.score}")
 
-    if score < 5:
-        print()
-        print("═" * 64)
-        print("  ⚠ 业务代码已编译进 VM 字节码（静态提取拿不到源码）")
-        print("═" * 64)
-        print("  大函数内部全是 VM 寄存器操作，没有可读的业务 API 调用。")
-        print("  静态路径到此为止 —— 但字节码本身是可解的。")
-        print("═" * 64)
-        print()
-
-        if args.no_lift:
-            print("  --no-lift 已指定，跳过动态反编译。")
-            return 4
-
-        # 动态路径：加载桩环境 → hook luau_load → 反编译
-        # 反编译器可能还没下载，先确保就位
-        lifter = HERE / "tools" / "luau-lifter"
-        if not lifter.is_file():
-            print("[6b] 反编译器未就位，尝试自动获取…")
-            try:
-                r = subprocess.run([sys.executable, str(HERE / "fetch_bin.py"),
-                                    "--lifter-only"],
-                                   capture_output=True, text=True, timeout=900)
-                print((r.stdout or "").strip()[-400:], flush=True)
-            except Exception as e:
-                print(f"     ⚠ {e}")
-            if not lifter.is_file():
-                print("     ✗ 反编译器不可用，跳过动态路径")
-                print("       手动跑： python fetch_bin.py")
-                return 4
-
-        # 先诊断能不能走动态路径，不能就直说
-        try:
-            sys.path.insert(0, str(HERE))
-            import dynlift
-            raw_for_probe = inp.read_text(encoding="utf-8", errors="ignore")
-            ok, why = dynlift.probe_loader(raw_for_probe)
-            if not ok:
-                print()
-                print("  ⚠ 动态路径不适用于这个样本")
-                print("        " + why)
-
-                # ── 形态 C：内联展开 VM ──
-                # dynlift 锚定 luau_load 这个调用点，内联 VM 没有它。
-                # 但内联 VM 能静态解剖到很深：槽位表、handler 状态转移、
-                # 字符串表结构全部可还原，而且本地能把 VM 跑起来。
-                # 所以这里不是「无解」，而是「产出形态不同」：
-                # 生成一个自跑捕获脚本，交给有 Roblox 运行时的机器完成最后一跳。
-                try:
-                    sys.path.insert(0, str(HERE))
-                    import inlinevm
-                    is_inl, info = inlinevm.detect(raw_for_probe)
-                except Exception as e:
-                    is_inl, info = False, {'reasons': [f'inlinevm 不可用：{e}']}
-
-                if is_inl:
-                    print()
-                    print("═" * 64)
-                    print("  ◆ 识别为「内联展开 VM」形态（形态 C）")
-                    print("═" * 64)
-                    for r in info.get('reasons', []):
-                        print(f"    · {r}")
-
-                    print()
-                    print("[6c] 静态解剖 VM 语义层…")
-                    try:
-                        vm = inlinevm.dissect(inp, verbose=True)
-                    except Exception as e:
-                        print(f"      ⚠ 解剖失败：{e}")
-                        vm = None
-
-                    if vm:
-                        print()
-                        print("[6d] 生成本地可执行的自跑捕获脚本…")
-                        harness = inp.with_name(inp.stem + '.harness.lua')
-                        try:
-                            p = inlinevm.make_harness(inp, vm, harness)
-                            print(f"      ✓ {p.name}  {p.stat().st_size:,} 字节")
-                        except Exception as e:
-                            print(f"      ⚠ 生成失败：{e}")
-                            p = None
-
-                        if p:
-                            # ── 实跑一遍，所有统计数字都从这次执行里取 ──
-                            print()
-                            print("[6e] 在本地运行自跑脚本，采集实测数据…")
-                            run = inlinevm.run_harness(p)
-
-                            # ── 拦到明文 = 直接交付源码，不再走自跑脚本那条路 ──
-                            if run.get('captured_plain') and run.get('captured_src'):
-                                cp = run['captured_plain']
-                                out_src = inp.with_name(inp.stem + '.unpacked.lua')
-                                out_src.write_text(run['captured_src'], encoding='utf-8')
-                                print()
-                                print("═" * 64)
-                                print("  ✓ 已解出源码")
-                                print("═" * 64)
-                                print(f"  通过 {cp['via']} 截获 {cp['bytes']:,} 字节明文")
-                                print(f"  （buffer.readu8 调用 {run.get('reads', 0):,} 次，"
-                                      f"分配 {run.get('buffers', 0)} 个 buffer）")
-                                print(f"  → {out_src}")
-                                # 判断解出来的东西还能不能再剥一层
-                                try:
-                                    inner = out_src.read_text(encoding='utf-8', errors='ignore')
-                                    is_inl, _ = inlinevm.detect(inner)
-                                    if is_inl:
-                                        print()
-                                        print("  注意：解出来的还是 Luraph 混淆（双层样本）。")
-                                        print(f"        再跑一次即可下一层：python deob.py {out_src.name}")
-                                except Exception:
-                                    pass
-                                print("═" * 64)
-                                return 0
-
-                            print()
-                            print("═" * 64)
-                            print("  为什么交付的是自跑脚本，而不是源码")
-                            print("═" * 64)
-                            print("  这个样本把业务代码编译进了 VM 自己管理的 buffer，")
-                            print("  明文里只剩 handler 表和密文串。反混淆器已经做到：")
-                            print(f"    · 命名了 {len(vm['prims'])} 个标准库原语（m[N] → buffer.readu8 这类）")
-                            print(f"    · 还原了 {len(vm['handlers'])} 个 handler 的状态转移")
-                            if vm.get('top_dispatch'):
-                                print(f"    · 定位到顶层调度器 m[{vm['top_dispatch']['slot']}]"
-                                      f"（转发 {vm['top_dispatch']['dispatch_calls']} 个别 handler）")
-                            if vm.get('main_loop'):
-                                print(f"    · 定位到最大解释器 m[{vm['main_loop']['slot']}]"
-                                      f"（{vm['main_loop']['comparisons']} 个状态比较）")
-                            if vm.get('decoys'):
-                                print(f"    · 识别出 {len(vm['decoys'])} 个诱饵槽位（定义了但从不被引用）")
-                            print()
-                            if run.get('ok'):
-                                print("  在本地实际跑了一遍（数字全部来自这次运行）：")
-                                print(f"    · buffer.readu8 调用 {run.get('reads', 0):,} 次")
-                                print(f"    · 分配 {run.get('buffers', 0)} 个 buffer："
-                                      + ", ".join(f"{n:,}" for n in run.get('buffer_sizes', [])))
-                                print(f"    · writeu8 {run.get('writes', 0)} 次 / "
-                                      f"writestring {run.get('strings', 0)} 次")
-                                if run.get('captured_plain'):
-                                    cp = run['captured_plain']
-                                    print(f"    · ★ 通过 {cp['via']} 拦到 {cp['bytes']:,} 字节明文")
-                                else:
-                                    print(f"    · 拦到 {run.get('loads', 0)} 次加载调用")
-                                    print("      （没拦到明文，说明 VM 是解释执行而非解出字节码再加载）")
-                                print()
-                                if run.get('exec_ok'):
-                                    print("  VM 完整跑完了。")
-                                else:
-                                    err = (run.get('exec_err') or '')
-                                    print(f"  执行未跑完：{err[:110]}")
-                                    # 分情况说明，不要一律套「解密成功但缺 Roblox」的模板
-                                    low = err.lower()
-                                    if 'buffer expected' in low or 'got nil' in low:
-                                        print()
-                                        print("  这是「缺少输入」而不是「缺 Roblox 运行时」：")
-                                        print("  VM 的入口要一段字节码 buffer，而这个样本的字节码")
-                                        print("  由外层供给（双层混淆）。单独跑内层必然拿到 nil。")
-                                        print("  正确做法是连外层一起跑。")
-                                    elif 'cancel' in low or "with 'new'" in low or 'index nil' in low:
-                                        print()
-                                        print("  这是「缺 Roblox 运行时」：解密后的业务代码要调 tween /")
-                                        print("  instance 这类真实对象。这个错误词在整份源码里搜不到，")
-                                        print("  只可能来自解密后的字节码 —— 说明解密本身是成功的。")
-                                    else:
-                                        print()
-                                        print("  错误原因见上。")
-                            print()
-                            print("  → 把自跑脚本放到有 Roblox 的机器上运行，它会自己：")
-                            print("      1. dump VM 分配的每一个 buffer")
-                            print("      2. 记录每一次 buffer.readu8（可重放）")
-                            print("      3. 挂 loadstring / setfenv / luau_load，谁拿到明文就拦谁")
-                            print("    输出用 markdown 包起来，直接粘回来就行。")
-                            print("═" * 64)
-                            print()
-                            print(f"  产物：{p}")
-                            if run.get('log'):
-                                print(f"  实跑日志：{run['log']}")
-                            if args.vm_report:
-                                rp = inp.with_name(inp.stem + '.vm_anatomy.md')
-                                inlinevm.write_report(vm, rp)
-                                print(f"  解剖报告：{rp}")
-                            else:
-                                print(f"  解剖报告：加 --vm-report 可导出 vm_anatomy.md")
-                            return 7
-                    if not args.force:
-                        return 4
-        except Exception:
-            pass
-
-        print("[6b] 尝试动态路径：在桩环境里截获字节码并反编译…")
-        print("     注意：会在隔离的本地桩环境中执行样本的 VM 加载器，")
-        print("           不联网、不接触真实 Roblox 环境。")
-        lifted = try_dynamic_lift(inp, args)
-        if lifted:
-            print(f"[✓] 已还原源码 → {lifted}")
-            return 0
-
-        print()
-        print("  动态路径未成功。可用的替代产出：")
-        print("    · handler 映射表（VM 索引 → math.random 这类）")
-        print("    · 函数结构骨架（不含业务逻辑），加 --force 导出")
-        if not args.force:
+    if forced_all:
+        pass                    # the user asked for everything; said so above
+    elif scan.form != "A":
+        if scan.form == "vm":
+            print_vm_block(scan, inp, kept_work)
+            keep = keep_vm
+            if not args.force:
+                return 4, keep
+            if scan.small_plain:
+                print(f"  --force 已指定：导出 {len(scan.small_plain)} 个没被虚拟化的小函数"
+                      "（脚本主体仍在 VM 里，不在输出中）…")
+            else:
+                print("  --force 已指定，继续导出 VM 函数骨架（不是业务源码）…")
             print()
-            print("  已停止输出。")
-            return 4
-        print("  --force 已指定，继续导出骨架…")
-        print("")
+        elif not scan.evidence():
+            # big functions, API calls, and nothing of Luraph: an ordinary script.  It is not
+            # "form A" (that is a statement about Luraph's VM object), and cutting single
+            # functions out of it would drop the rest of the script without a word.
+            print()
+            print("[!] 输入没有 Luraph 的特征（没有头注释、没有容器、不是 setmetatable VM 对象）："
+                  "看起来是一份普通脚本，不是 Luraph 的产物。没有做提取。")
+            print("    只想把整份文件排版 / 重命名： python3 libs/deobf_plus.py 输入.lua -o 输出.lua")
+            if not args.force:
+                print(f"    加 --force 仍可把其中 ≥ {args.min_size:,} 字节的函数单独切出来"
+                      "（输出只有这些函数，不是整份脚本）。")
+                return 2, keep
+            print(f"    --force 已指定：只导出 ≥ {args.min_size:,} 字节的 {len(scan.sized)} 个函数；"
+                  "函数之外的代码（顶层语句、其它函数）不在输出里。")
+            print()
+        else:
+            print()
+            print("═" * 64)
+            print("  ⚠ 业务代码已编译进 VM 字节码（静态提取拿不到源码）")
+            print("═" * 64)
+            print("  大函数内部全是 VM 寄存器操作，没有可读的业务 API 调用。")
+            print("  静态路径到此为止 —— 但字节码本身是可解的。")
+            print("═" * 64)
+            print()
 
-    # 切出来，合并
-    parts = []
-    for idx, (s, e, n) in enumerate(sized, 1):
-        frag = src[s:e + 1].rstrip().rstrip(",")
-        parts.append((idx, n, frag))
+            if args.no_lift:
+                print("  --no-lift 已指定，跳过动态反编译。")
+                return 4, keep
 
-    # 断行（用能处理 0b/0x/下划线的词法器）
-    from deobf_plus import tokenize, format_tokens, norm_num, decode_string
-    bodies = []
-    for idx, n, frag in parts:
-        try:
-            toks = tokenize(frag)
-            fixed = []
-            decoded = 0
-            for t, v in toks:
-                if t == "n":
-                    try:
-                        fixed.append((t, str(norm_num(v))))
-                    except Exception:
-                        fixed.append((t, v))
-                elif t == "s" and "\\" in v:
-                    # 十进制转义 "\229\141\141" = 中文，还原成真字符，
-                    # 否则产物里全是 \xxx\xxx，读不了也搜不到
-                    try:
-                        raw = decode_string(v)
-                        if isinstance(raw, bytes):
-                            u = raw.decode("utf-8")
-                        else:
-                            u = str(raw)
-                        # 含任何控制字符（换行/制表/回车）就不能直接内联，
-                        # 否则会把一行拆断，语法直接废掉
-                        if any(ord(ch) < 32 or ord(ch) == 127 for ch in u):
-                            fixed.append((t, v))
-                        elif "\\" in u or '"' in u or "'" in u:
-                            fixed.append((t, v))
-                        else:
-                            fixed.append((t, f'"{u}"'))
-                            decoded += 1
-                    except Exception:
-                        fixed.append((t, v))
-                else:
-                    fixed.append((t, v))
-            if not args.no_rename:
-                try:
-                    from readable3 import rename
-                    fixed = rename(fixed)
-                except Exception:
-                    pass
-            text = format_tokens(fixed)
-            if decoded:
-                print(f"     ↳ 第 {idx} 段还原 {decoded} 个转义字符串")
-        except Exception as ex:
-            print(f"[!] 第 {idx} 段处理失败：{ex}，改用原文")
-            text = frag
+            # 形态 B 才需要 luau_load 截获 + 反编译器；先诊断，不是就别去找反编译器
+            is_b, why = False, ""
+            try:
+                import dynlift
+                is_b, why = dynlift.probe_loader(raw)
+            except Exception as e:
+                why = f"动态模块不可用：{e}"
+            if not is_b:
+                print("  ⚠ 动态路径（截获 luau_load）不适用于这个样本")
+                print("        " + why)
+                rc = form_c(inp, raw, args, out_dir)
+                if rc is not None:
+                    return rc, keep
+                print()
+                print("  可以改用去虚拟化器（带 Roblox 模拟环境）：")
+                print(f"      python3 -m devm.run {inp} -o 输出.lua")
+                if not args.force:
+                    return 4, keep
+            else:
+                lifter = HERE / "tools" / "luau-lifter"
+                if not lifter.is_file():
+                    print("[6b] 形态 B 需要反编译器 tools/luau-lifter（Tovek，第三方，仅 aarch64），本地没有。")
+                    print("     需要时手动获取： python fetch_bin.py --lifter-only   （会联网）")
+                    return 4, keep
+                print("[6b] 尝试动态路径：在桩环境里截获字节码并反编译…")
+                print("     注意：会在隔离的本地桩环境中执行样本的 VM 加载器，")
+                print("           不联网、不接触真实 Roblox 环境。")
+                lifted = try_dynamic_lift(inp, args, out_dir)
+                if lifted:
+                    print(f"[✓] 已还原源码 → {lifted}")
+                    return 0, keep
+                print()
+                print("  动态路径未成功。可用的替代产出：")
+                print("    · handler 映射表（VM 索引 → math.random 这类）")
+                print("    · 函数结构骨架（不含业务逻辑），加 --force 导出")
+                if not args.force:
+                    print()
+                    print("  已停止输出。")
+                    return 4, keep
+            print("  --force 已指定，继续导出骨架…")
+            print("")
+
+    # ---- 切出来 → 重命名 → 断行，逐段校验 ----
+    from deobf_plus import tokenize_pos
+    all_ptoks = tokenize_pos(scan.src)
+    offsets = [o for _t, _v, o in all_ptoks]
+    rename = not args.no_rename
+    bodies, infos = [], []
+    for idx, item in enumerate(scan.sized, 1):
+        text, info = build_part(scan, item, all_ptoks, offsets, rename=rename,
+                                slots=rename and not args.no_slots,
+                                inline_slots=args.inline_slots, wrap=not args.no_humanize,
+                                ast_bin=scan.ast_bin)
         bodies.append(text)
-        print(f"[6.{idx}] 断行完成  {len(text):,} 字节  {text.count(chr(10)) + 1:,} 行")
+        infos.append(info)
+        if info["decoded"]:
+            print(f"     ↳ 第 {idx} 段还原 {info['decoded']} 个转义字符串")
+        if info["note"]:
+            print(f"[!] 第 {idx} 段：{info['note']}")
+        if info["fallback"]:
+            print(f"[!] 第 {idx} 段：缩进排版没有通过校验（{str(info['fallback'])[:120]}），"
+                  "这一段改用保守排版（每条语句一行、token 之间一个空格）")
+        checks = "排版无损 " + ("✓" if info["layout"] else "✗") + \
+                 ("（保守排版）" if info["fallback"] else "") + "，字面量取值 " + \
+                 ("✓" if info["literals"] else "✗")
+        if info["binding"]:
+            checks += f"，重命名 {info['renamed']:,} 个局部变量、绑定一致 ✓"
+        else:
+            checks += "，语法树与原函数一致 " + ("✓" if info["tree"] else "✗")
+        print(f"[6.{idx}] 断行完成  {nbytes(text):,} 字节  {text.count(chr(10)) + 1:,} 行  （{checks}）")
 
-    if not args.no_rename:
-        print("[7] 语义重命名完成（已随断行一并处理）")
+    if rename:
+        done = sum(1 for i in infos if i["binding"])
+        print(f"[7] 语义重命名：{done}/{len(infos)} 段（作用域取自 luau-ast，逐段与原函数比对）")
+    else:
+        print("[7] 按参数跳过重命名：输出与输入逐 token 相同（数字 / 字符串写法除外），"
+              "每段重新解析后语法树与原函数一致")
 
-    # 修空格
-    bodies = [tidy(b) for b in bodies]
-
-    # 还原 VM 槽位：tbl[6] -> conns（1,598 处），tbl[7] -> sprint
-    try:
-        from reslot import find_slots, apply_slots
-        joined = "\n".join(bodies)
-        slots = find_slots(joined)
-        if slots:
-            new_bodies = []
-            total = 0
-            for b in bodies:
-                nb, c = apply_slots(b, slots)
-                new_bodies.append(nb)
-                total += c
-            if total:
-                bodies = new_bodies
-                print(f"[7c] 还原 VM 槽位 {len(slots)} 个映射，替换 {total:,} 处引用")
-                for (tab, idx), name in sorted(slots.items(),
-                                               key=lambda x: -x[0][1])[:5]:
-                    print(f"        {tab}[{idx}] → {name}")
-    except Exception as ex:
-        print(f"[!] 槽位还原跳过：{ex}")
+    slot_map = {}
+    for i in infos:
+        slot_map.update(i["slots"])
+    if slot_map:
+        nc = sum(i["slot_comment"] for i in infos)
+        ni = sum(i["slot_inline"] for i in infos)
+        how = f"注释标注 {nc:,} 处" + (f"，直接替换 {ni:,} 处" if args.inline_slots else "")
+        if args.inline_slots and not ni:
+            how += "（没有一处读取能证明只看得到那一个值：槽位表被交给了 VM 创建的闭包，或读取不在赋值之后的同一块里；全部保留为注释）"
+        print(f"[7c] VM 槽位：{len(slot_map)} 个只赋值一次的槽位，{how}")
+        for (tab, n), name in sorted(slot_map.items(), key=lambda x: (x[0][0], -x[0][1]))[:5]:
+            print(f"        {tab}[{n}] → {name}")
 
     # 提取 handler 表（[n] = math.random 这类）
     handler_lines = []
     try:
-        from deobf_plus import extract_handlers
-        toks_all = tokenize(src)
-        # 定位 setmetatable( { ... } )
-        start = None
-        for i, (t, v) in enumerate(toks_all):
-            if t == "w" and v == "setmetatable":
-                start = i
-                break
-        if start is not None:
-            brace = None
-            for i in range(start, min(start + 6, len(toks_all))):
-                if toks_all[i] == ("o", "{"):
-                    brace = i
-                    break
-            if brace is not None:
-                depth = 0
-                endb = None
-                for i in range(brace, len(toks_all)):
-                    t, v = toks_all[i]
-                    if t == "o" and v in ("(", "[", "{"):
-                        depth += 1
-                    elif t == "o" and v in (")", "]", "}"):
-                        depth -= 1
-                        if depth == 0:
-                            endb = i
-                            break
-                hs = extract_handlers(toks_all, brace + 1, endb)
-                for key, raw, valtoks, _ in hs:
-                    desc = tidy(format_tokens(valtoks))[:70]
-                    desc = desc.replace("\n", " ")
-                    handler_lines.append(f"-- [{key}] = {desc}")
-                print(f"[7b] handler 表：{len(hs)} 条")
+        handler_lines = handler_table([(t, v) for t, v, _o in all_ptoks])
+        print(f"[7b] handler 表：{len(handler_lines)} 条")
     except Exception as ex:
         print(f"[!] handler 提取跳过：{ex}")
 
     # 组装
+    all_ok = all(i["layout"] and i["literals"] and i["tree"] for i in infos)
     out_lines = []
-    out_lines.append("--[[")
-    out_lines.append("  Luraph v15.1 自动反混淆输出")
-    out_lines.append(f"  源文件：{inp.name}")
-    out_lines.append(f"  共提取 {len(bodies)} 个业务函数")
-    out_lines.append("]]")
+    luraph = scan.evidence()
+    if luraph:
+        out_lines.append(f"-- {label} 静态反混淆输出（deob.py）")
+    else:
+        out_lines.append("-- 静态提取输出（deob.py --force）：输入没有被识别为 Luraph 的产物")
+    out_lines.append("-- 源文件：" + " ".join(inp.name.split()))    # one line, whatever the name
+    kinds = [i["kind"] for i in infos]
+    n_bus, n_script = kinds.count("business"), kinds.count("script")
+    n_plain, n_disp = kinds.count("plain"), kinds.count("dispatcher")
+    what = []
+    if n_bus:
+        what.append(f"业务函数 {n_bus} 个（含业务 API 调用）")
+    if n_script:
+        what.append(f"读全局、未见业务 API 名的脚本函数 {n_script} 个")
+    if n_plain:
+        what.append(f"不读全局的函数 {n_plain} 个（只操作参数和捕获的变量："
+                    "Luraph 运行时的辅助闭包、VM 方法，或不碰环境的纯逻辑）")
+    if n_disp:
+        what.append(f"VM 分派器 {n_disp} 个（解释器骨架，不是业务源码）")
+    not_exported = [x for x in scan.dropped if x not in scan.sized]
+    out_lines.append(f"-- 共导出 {len(bodies)} 个函数：" + "，".join(what)
+                     + (f"；另有 VM 分派器 {len(not_exported)} 个未导出" if not_exported else ""))
+    if not luraph:
+        out_lines.append("-- 注意：这里只有从文件里切出来的函数；函数之外的代码（顶层语句等）不在这份输出里")
+    elif scan.form == "vm" and (n_bus or n_script):
+        out_lines.append("-- 注意：这里只有没被虚拟化的小函数。脚本主体由 VM 以字节码形式解释执行，不在这份输出里；"
+                         "要用去虚拟化器（python3 -m devm.run）")
+    elif n_bus + n_script == 0:
+        out_lines.append("-- 注意：这份输出里没有业务源码。"
+                         + ("脚本主体由 VM 以字节码形式解释执行，要用去虚拟化器（python3 -m devm.run）"
+                            if scan.form == "vm" else "导出的函数里没有业务 API 调用，也不读全局"))
+    elif scan.vm["dispatch_loops"]:
+        out_lines.append("-- 注意：这里是脚本里没被虚拟化的明文函数。被虚拟化的部分（主流程，以及这些函数通过 "
+                         "VM 对象创建的闭包）不在这份输出里；要还原它们用去虚拟化器（python3 -m devm.run）")
+    if any(i["fallback"] for i in infos):
+        out_lines.append("-- 部分段落使用了保守排版（每条语句一行）：缩进排版没有通过 token 校验")
+    if rename:
+        out_lines.append("-- 局部变量已重命名（作用域取自 luau-ast；每段都与原函数做过语法树比对）")
+    n_comment = sum(i["slot_comment"] for i in infos)
+    n_inline = sum(i["slot_inline"] for i in infos)
+    if n_comment:
+        out_lines.append("-- tbl[N --[[name]]]：该槽位在可见代码里只被赋值一次，值是局部变量 name（注释，仅供阅读；"
+                         "槽位表交给 VM 创建的闭包后，那些闭包里的改写这里看不到）")
+    if n_inline:
+        out_lines.append(f"-- {n_inline:,} 处 tbl[N] 已替换为赋给它的局部变量名（--inline-slots；"
+                         "只在可见代码能证明读到的就是那个值的地方）")
+    elif args.inline_slots and slot_map:
+        out_lines.append("-- --inline-slots：没有一处槽位读取满足替换条件，代码未改动（槽位名只以注释给出）")
     out_lines.append("")
     if handler_lines:
         out_lines.append("-- ============================================================")
@@ -969,40 +1728,40 @@ def main():
         out_lines.append("-- ============================================================")
         out_lines.extend(handler_lines)
         out_lines.append("")
-    for i, (text, (s, e, n)) in enumerate(zip(bodies, sized), 1):
-        body = text
-        if body.startswith("return "):
-            body = body[7:]
-        out_lines.append(f"-- ============================================================")
-        out_lines.append(f"-- 第 {i} 段  原始偏移 {s} - {e}  ({n:,} 字节)")
-        out_lines.append(f"-- ============================================================")
-        out_lines.append(f"local __part{i} = {body}")
+    for i, (text, (s, e, n, _f)) in enumerate(zip(bodies, scan.sized), 1):
+        out_lines.append("-- ============================================================")
+        k = infos[i - 1]
+        out_lines.append(f"-- 第 {i} 段  原始偏移 {s} - {e}  ({n:,} 字节)  {k['label']}")
+        out_lines.append("-- ============================================================")
+        if k["statement"]:
+            # `local function f()` / `function a.b()`: already a statement, written as it is
+            out_lines.append(text)
+        else:
+            out_lines.append(f"local __part{i} = {text}")
         out_lines.append("")
-    rets = ", ".join(f"__part{i}" for i in range(1, len(bodies) + 1))
+    rets = ", ".join(f"__part{i}" for i in range(1, len(bodies) + 1) if not infos[i - 1]["statement"])
     out_lines.append(f"return {{ {rets} }}")
-    out_text = "\n".join(out_lines)
-
-    # 人类化排版：长行折行、关键字空格、函数间空行
-    if not args.no_humanize:
-        try:
-            from humanize import process as humanize
-            before = out_text.count("\n")
-            out_text = humanize(out_text)
-            after = out_text.count("\n")
-            if after != before:
-                print(f"[7d] 排版整理 {before:,} 行 → {after:,} 行")
-        except Exception as ex:
-            print(f"[!] 排版整理跳过：{ex}")
+    out_text = "\n".join(out_lines) + "\n"
 
     # 验证
     ok, msg = verify(out_text)
-    print(f"[8] 语法验证：{'✓ 通过' if ok else '✗ 失败'}  {msg}")
+    print(f"[8] 语法验证：{'✓ 通过' if ok else '✗ 失败'}  {msg if not ok else ''}".rstrip())
+    if not all_ok:
+        print("[8] ✗ 内部校验未通过：有段落的排版、字面量或语法树与输入不一致（见上）")
 
     # 输出
-    out_path = Path(args.output) if args.output else inp.with_name(inp.stem + "_反混淆.lua")
-    out_path.write_text(out_text, encoding="utf-8")
-    print(f"[9] 输出：{out_path}  {len(out_text):,} 字节  {out_text.count(chr(10)) + 1:,} 行")
-    return 0 if ok else 3
+    write_source(out_path, out_text)
+    print(f"[9] 输出：{out_path}  {len(out_text.encode('utf-8', 'surrogateescape')):,} 字节  "
+          f"{out_text.count(chr(10)):,} 行")
+    if scan.container and kept_work:
+        print(f"     剥壳得到的 chunk：{scan.container['chunk_path']}")
+    if luraph and scan.form == "A" and scan.vm["dispatch_loops"]:
+        # form A is never the whole script: say what is missing and which tool recovers it
+        print("[i] 输出是脚本里没被虚拟化的明文函数。被虚拟化的部分（主流程，以及这些函数通过 VM 对象"
+              "创建的闭包）不在里面；要还原它们用去虚拟化器：")
+        for line in devm_advice(scan, inp):
+            print(line)
+    return (0 if (ok and all_ok) else 3), keep
 
 
 if __name__ == "__main__":

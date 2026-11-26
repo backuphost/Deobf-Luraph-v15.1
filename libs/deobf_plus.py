@@ -2,153 +2,171 @@
 # -*- coding: utf-8 -*-
 """
 Luraph v15.1 静态反混淆 · 增强版 (deobf_plus)
-基于本仓库原工具 (beautify2.tokenize / readable3.rename / build_tokens) 的思路重写，
-修正并补强了原工具对 v15.1 无效的地方：
 
-  1. 正确的 Luau 词法：支持 0b/0B/0x/0X + 下划线数字分隔符。
-     原 tokenizer 会把 0B110001_1_1_111 切成 ("n","0") + ("w","B110001_1_1_111")，
-     排版后变成 `0 B110001_1_1_111`，直接破坏语法。
+This is the ONE implementation of the static tool's lexer and formatter.  The file
+deobf_plus.py in the repository root only forwards to this module (it used to be an older
+copy that shadowed this one on sys.path).
+
+  1. Luau 词法：0b/0x 前缀、下划线分隔符、长括号字符串/注释、\\z、插值字符串。
   2. 字符串转义解码：\\xNN / \\NNN / \\u{XXXX} / \\z 还原成明文，
      例如 math["\\x72\\x61\\110\\100\\x6f\\x6d"] -> math["random"]（语义等价、无损）。
-  3. 常量算术折叠：((0b1100+0b1)+(0B101111-0b100001)) -> 60。
+  3. 常量算术折叠：((0b1100+0b1)+(0B101111-0b100001)) -> 27。只折叠 Luau 在任何机器上
+     都算出同一个值的表达式（libs/luaunum.py），有 luau 时逐条交给解释器复核。
   4. handler 表语义标注：抽取 [key]=value 映射，写入代码注释并导出 handler_map.md。
-  5. 变量语义重命名（复用 libs/readable3.py）+ 语句级缩进排版。
+  5. 变量语义重命名：作用域取自 luau-ast（libs/luascope.py），命名规则沿用 libs/readable3.py。
+  6. 排版只改空白：format_checked() 把结果重新词法化并与输入逐 token 比较。
 
 只做静态等价变换，不执行任何被分析脚本。业务层源码需要动态执行 VM 解密桩才能拿到，
 本工具不负责这一步。
 
-用法: python3 deobf_plus.py <input.lua|.txt> -o <output.lua> [--no-rename] [--map <map.md>]
+用法: python3 deobf_plus.py <input.lua|.txt> -o <output.lua> [--no-rename] [--no-fold] [--map <map.md>]
 """
 import sys
 import re
+import math
 import argparse
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "libs"))
+_LIBS = Path(__file__).resolve().parent
+for _p in (str(_LIBS), str(_LIBS.parent)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # ---------------------------------------------------------------- 词法分析
-OPS = (
-    '...', '..=', '===', '==', '~=', '<=', '>=', '<<=', '>>=',
-    '..', '::', '->', '//', '+=', '-=', '*=', '/=', '%=', '^=', '&=', '|=',
-    '<<', '>>', '^', '&', '|', '~',
-)
+# Token types: w = identifier/keyword, n = number, s = string, o = operator/punctuation,
+# c = comment.  The lexer follows Luau's rules where they decide what is ONE token
+# (long brackets, `--` comments, greedy numbers, compound operators), because every later
+# stage is checked by lexing its output again and comparing the two token lists.
+#
+# Numbers are Luau's Lexer::readNumber to the letter: a digit (or a dot before a digit), then
+# digits / dots / underscores, an optional `e` with an optional sign, then every letter,
+# digit and underscore that follows.  So `0x10`, `1e+5`, `1_000` and the integer literals of
+# newer Luau (`5i`, `0x10i`) are one token each, exactly as Luau reads them; whether the
+# token is a VALID number is Luau's business, not the formatter's.
+_TOKEN_RE = re.compile(r'''
+  (?P<ws>[ \t\r\n\f\v]+)
+ |(?P<c>--(?:\[(?P<ceq>=*)\[[\s\S]*?(?:\](?P=ceq)\]|\Z)|[^\n]*))
+ |(?P<s>\[(?P<seq>=*)\[[\s\S]*?(?:\](?P=seq)\]|\Z)
+       |"(?:[^"\\\n]|\\z[ \t\r\n\f\v]*|\\\r\n|\\[\s\S])*(?:"|(?=\n)|\Z)
+       |'(?:[^'\\\n]|\\z[ \t\r\n\f\v]*|\\\r\n|\\[\s\S])*(?:'|(?=\n)|\Z)
+       |`(?:[^`\\]|\\[\s\S])*(?:`|\Z))
+ |(?P<n>(?:[0-9]|\.(?=[0-9]))[0-9._]*(?:[eE][+-]?)?[A-Za-z0-9_]*)
+ |(?P<w>[A-Za-z_][A-Za-z0-9_]*)
+ |(?P<o>\.\.\.|\.\.=|//=|==|~=|<=|>=|\.\.|::|->|//|\+=|-=|\*=|/=|%=|\^=|[\s\S])
+''', re.X)
+
+OPS = ('...', '..=', '//=', '==', '~=', '<=', '>=', '..', '::', '->', '//',
+       '+=', '-=', '*=', '/=', '%=', '^=')
+
+
+def _interp_end(s, i):
+    """s[i] is the backtick that opens an interpolated string; returns the offset just after
+    the backtick that closes it.  The `{expression}` parts are skipped token by token, so a
+    brace or a backtick inside a nested string or comment, and nested interpolated strings,
+    do not end it early.  (Luau's lexer cuts such a string into begin / mid / end pieces
+    around the expressions; here the whole string is ONE token that no later stage looks
+    into, which is the safe reading for a tool that only moves whitespace.)"""
+    n = len(s)
+    i += 1
+    while i < n:
+        ch = s[i]
+        if ch == '\\':
+            i += 2
+        elif ch == '`':
+            return i + 1
+        elif ch == '{':
+            i += 1
+            depth = 0
+            while i < n:
+                if s[i] == '`':
+                    i = _interp_end(s, i)
+                    continue
+                m = _TOKEN_RE.match(s, i)
+                if m is None:
+                    return n
+                if m.lastgroup == 'o':
+                    v = m.group()
+                    if v == '{':
+                        depth += 1
+                    elif v == '}':
+                        if depth == 0:
+                            i = m.end()
+                            break
+                        depth -= 1
+                i = m.end()
+        else:
+            i += 1
+    return n
+
+
+def tokenize_pos(s):
+    """[(type, text, start offset)] for every token of `s` (whitespace dropped)."""
+    out = []
+    add = out.append
+    pos = 0
+    if s.startswith('#!'):                   # a shebang line: Luau skips it like a comment
+        end = s.find('\n')
+        end = len(s) if end < 0 else end
+        add(('c', s[:end], 0))
+        pos = end
+    if '`' not in s:
+        for m in _TOKEN_RE.finditer(s, pos):
+            k = m.lastgroup
+            if k == 'ws':
+                continue
+            if k in ('ceq', 'seq'):          # the long-bracket level groups close last
+                k = 'c' if m.group('c') is not None else 's'
+            add((k, m.group(k), m.start()))
+        return out
+    # the text has backticks: interpolated strings need the scanner above
+    match = _TOKEN_RE.match
+    n = len(s)
+    while pos < n:
+        if s[pos] == '`':
+            end = _interp_end(s, pos)
+            add(('s', s[pos:end], pos))
+            pos = end
+            continue
+        m = match(s, pos)
+        if m is None:
+            break
+        k = m.lastgroup
+        if k in ('ceq', 'seq'):
+            k = 'c' if m.group('c') is not None else 's'
+        if k != 'ws':
+            add((k, m.group(k), pos))
+        pos = m.end()
+    return out
 
 
 def tokenize(s):
     """返回 [(type, text)]，type ∈ w(标识符) n(数字) s(字符串) o(运算符/标点) c(注释)"""
-    i, n = 0, len(s)
-    out = []
-    while i < n:
-        c = s[i]
+    return [(t, v) for t, v, _ in tokenize_pos(s)]
 
-        if c in ' \t\r\n':
-            i += 1
-            continue
 
-        # ---- 注释 ----
-        if s.startswith('--', i):
-            j = i + 2
-            if j < n and s[j] == '[':
-                k = j + 1
-                while k < n and s[k] == '=':
-                    k += 1
-                if k < n and s[k] == '[':
-                    eq = s[j + 1:k]
-                    close = ']' + eq + ']'
-                    e = s.find(close, k + 1)
-                    e = n if e < 0 else e + len(close)
-                    out.append(('c', s[i:e]))
-                    i = e
-                    continue
-            e = s.find('\n', i)
-            e = n if e < 0 else e
-            out.append(('c', s[i:e]))
-            i = e
-            continue
+def same_tokens(a, b, comments=False):
+    """True when two token lists are the same program text apart from whitespace
+    (and, unless `comments`, apart from comments)."""
+    if not comments:
+        a = [(x[0], x[1]) for x in a if x[0] != 'c']
+        b = [(x[0], x[1]) for x in b if x[0] != 'c']
+    else:
+        a = [(x[0], x[1]) for x in a]
+        b = [(x[0], x[1]) for x in b]
+    return a == b
 
-        # ---- 长字符串 [=[...]=] ----
-        if c == '[':
-            k = i + 1
-            while k < n and s[k] == '=':
-                k += 1
-            if k < n and s[k] == '[':
-                eq = s[i + 1:k]
-                close = ']' + eq + ']'
-                e = s.find(close, k + 1)
-                e = n if e < 0 else e + len(close)
-                out.append(('s', s[i:e]))
-                i = e
-                continue
 
-        # ---- 短字符串 ----
-        if c in '"\'':
-            j = i + 1
-            buf = [c]
-            while j < n:
-                d = s[j]
-                buf.append(d)
-                if d == '\\':
-                    if j + 1 < n:
-                        buf.append(s[j + 1])
-                    j += 2
-                    continue
-                j += 1
-                if d == c:
-                    break
-            lit = ''.join(buf)
-            out.append(('s', lit))
-            i = j
-            continue
-
-        # ---- 数字（含 0b/0x 前缀与 _ 分隔符） ----
-        if c.isdigit() or (c == '.' and i + 1 < n and s[i + 1].isdigit()):
-            j = i
-            if c == '0' and i + 1 < n and s[i + 1] in 'xXbB':
-                prefix = s[i + 1].lower()
-                valid = '0123456789abcdefABCDEF_' if prefix == 'x' else '01_'
-                j = i + 2
-                while j < n and s[j] in valid:
-                    j += 1
-            else:
-                while j < n and (s[j].isdigit() or s[j] == '_'):
-                    j += 1
-                # 小数点：排除 `..` 连接符
-                if j < n and s[j] == '.' and (j + 1 >= n or s[j + 1] != '.'):
-                    j += 1
-                    while j < n and (s[j].isdigit() or s[j] == '_'):
-                        j += 1
-                # 指数
-                if j < n and s[j] in 'eE':
-                    k = j + 1
-                    if k < n and s[k] in '+-':
-                        k += 1
-                    if k < n and s[k].isdigit():
-                        j = k
-                        while j < n and (s[j].isdigit() or s[j] == '_'):
-                            j += 1
-            out.append(('n', s[i:j]))
-            i = j
-            continue
-
-        # ---- 标识符 ----
-        if c.isalpha() or c == '_':
-            j = i
-            while j < n and (s[j].isalnum() or s[j] == '_'):
-                j += 1
-            out.append(('w', s[i:j]))
-            i = j
-            continue
-
-        # ---- 运算符 ----
-        for op in OPS:
-            if s.startswith(op, i):
-                out.append(('o', op))
-                i += len(op)
-                break
-        else:
-            out.append(('o', c))
-            i += 1
-    return out
+def first_token_difference(a, b):
+    """(index, token of a, token of b) of the first difference between two token lists
+    (comments ignored), or None."""
+    a = [(x[0], x[1]) for x in a if x[0] != 'c']
+    b = [(x[0], x[1]) for x in b if x[0] != 'c']
+    for i in range(max(len(a), len(b))):
+        x = a[i] if i < len(a) else None
+        y = b[i] if i < len(b) else None
+        if x != y:
+            return i, x, y
+    return None
 
 
 # ---------------------------------------------------------------- 数字归一化
@@ -167,12 +185,29 @@ def parse_num(lit):
 
 
 def norm_num(lit):
+    """Decimal spelling of a number literal with the same value, or the literal itself when
+    there is none (1e999 is infinity: repr() would print `inf`, an identifier)."""
     v = parse_num(lit)
     if v is None:
         return lit
     if isinstance(v, int):
+        if v >= 2 ** 64:
+            return lit                # Luau wraps or rejects these; keep what was written
         return str(v)
+    if not math.isfinite(v):
+        return lit
     return repr(v)
+
+
+def num_value(lit):
+    """The double a number literal stands for (None when it cannot be parsed)."""
+    v = parse_num(lit)
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except OverflowError:
+        return float('inf')
 
 
 # ---------------------------------------------------------------- 字符串解码
@@ -192,7 +227,7 @@ def decode_string(lit):
     while i < len(body):
         ch = body[i]
         if ch != '\\':
-            out.extend(ch.encode('utf-8'))
+            out.extend(ch.encode('utf-8', 'surrogateescape'))
             i += 1
             continue
         i += 1
@@ -249,62 +284,151 @@ def reencode_string(lit):
 
 
 # ---------------------------------------------------------------- 常量折叠
-ALLOWED_EXPR = re.compile(r'^[\d\s+\-*/%^~&|().]+$')
+# tokens after which a run of numbers and arithmetic operators is a complete operand:
+# folding `1 + 2` in `x - 1 + 2` or in `x * 1 + 2` would change the result
+_FOLD_AFTER_OPS = frozenset(('(', '[', '{', ',', ';', '=', '==', '~=', '<', '<=', '>', '>=', '..',
+                             '+=', '-=', '*=', '/=', '//=', '%=', '^=', '..='))
+_FOLD_AFTER_WORDS = frozenset(('and', 'or', 'return', 'if', 'elseif', 'while', 'until', 'then',
+                               'else', 'in', 'do'))
+# tokens that must not follow a folded run: a higher-priority operator, or something that
+# applies to the parenthesised value (`(1 + 2):f()`, `(1 + 2)"s"`)
+_FOLD_BEFORE_BAD = frozenset(('^', '*', '/', '//', '%', '.', ':', '[', '(', '{'))
+_FOLD_OPS = frozenset(('+', '-', '*', '/', '//', '%', '^', '(', ')'))
+_FOLD_MAX_RUN = 512     # tokens; a longer run of numbers and operators is left alone
 
 
-def fold_consts(toks):
-    """把连续「纯数字+算术运算符」（可含括号/一元符号）段折叠为一个数字 token。
+def _fold_literal(lit):
+    """Double of a number literal as Luau reads it, or None when Luau rejects or truncates it
+    (hexadecimal / binary literals of 2^64 and more)."""
+    v = parse_num(lit)
+    if v is None:
+        return None
+    if isinstance(v, int) and v >= 2 ** 64 and lit[:2].lower() in ('0x', '0b'):
+        return None
+    try:
+        return float(v)
+    except OverflowError:
+        return None
 
-    只折叠结果为非负整数的情况：负数写成 '-1' 会被重新词法化成两个 token，
-    会破坏等价性，故跳过。
-    """
-    ok_ops = {'+', '-', '*', '/', '//', '%', '^', '~', '&', '|', '<<', '>>', '(', ')'}
-    starts = {'(', '-', '~', '+'}
+
+def fold_consts(toks, report=None):
+    """把连续「纯数字+算术运算符」（可含括号/一元负号）段折叠为一个数字 token。
+
+    A run is folded only when
+      (1) it is one complete operand: what stands in front of it is not an operator that binds
+          tighter, and what follows does not continue it;
+      (2) every operation in it has the same result in every Luau (libs/luaunum.py: IEEE
+          `+ - * /`, `//` = floor(a / b), `%` = a - floor(a / b) * b and `^` only when exact;
+          nothing that leaves the finite numbers);
+      (3) the result is an integer in 0 .. 2^53-1 and not negative zero: such a value has one
+          decimal spelling that is a single token.  (-1 would lex as two tokens, and `0` for
+          -0 changes `1 / x` and `x .. ""`.)
+    Everything else is left exactly as written.
+
+    `report`: a list that receives (first token index in `toks`, end index, folded literal)
+    for every fold, so a caller can check the folds against the interpreter."""
+    import luaunum
 
     def can_start(i):
         if i == 0:
             return True
         pt, pv = toks[i - 1]
-        if pt in ('w', 'n', 's') or pv in (')', ']', '}'):
-            return False
-        return True
+        if pt == 'o':
+            return pv in _FOLD_AFTER_OPS
+        if pt == 'w':
+            return pv in _FOLD_AFTER_WORDS
+        return False
 
     out = []
     i, n = 0, len(toks)
     while i < n:
         t, v = toks[i]
-        is_start = (t == 'n') or (t == 'o' and v in starts and can_start(i))
+        is_start = (t == 'n' or (t == 'o' and v in ('(', '-'))) and can_start(i)
         if not is_start:
             out.append(toks[i])
             i += 1
             continue
         j = i
-        while j < n and (toks[j][0] == 'n' or
-                         (toks[j][0] == 'o' and toks[j][1] in ok_ops)):
+        depth = 0
+        limit = i + _FOLD_MAX_RUN       # keeps the scan linear on a very long chain
+        while j < n and j < limit and (toks[j][0] == 'n' or
+                                       (toks[j][0] == 'o' and toks[j][1] in _FOLD_OPS)):
+            if toks[j][1] == '(':
+                depth += 1
+            elif toks[j][1] == ')':
+                if depth == 0:
+                    break             # closes a bracket opened before the run
+                depth -= 1
             j += 1
         seg = toks[i:j]
-        folded = False
-        if (len(seg) >= 3 and any(tt == 'n' for tt, _ in seg) and
-                any(tt == 'o' and vv not in ('(', ')') for tt, vv in seg)):
-            expr = ''.join(norm_num(x) if tt == 'n' else x for tt, x in seg)
-            if ALLOWED_EXPR.fullmatch(expr):
-                try:
-                    val = eval(expr.replace('^', '**'), {'__builtins__': {}}, {})  # noqa: S307
-                    if isinstance(val, (int, float)) and 0 <= val < 2 ** 53:
-                        if isinstance(val, float):
-                            if val.is_integer():
-                                val = int(val)
-                            else:
-                                val = None
-                        if val is not None:
-                            out.append(('n', str(val)))
-                            folded = True
-                except Exception:
-                    pass
-        if not folded:
-            out.extend(seg)
+        folded = None
+        nxt = toks[j] if j < n else (None, None)
+        if (len(seg) >= 3 and depth == 0 and j < limit
+                and nxt[1] not in _FOLD_BEFORE_BAD and nxt[0] != 's'
+                and any(tt == 'o' and vv not in ('(', ')') for tt, vv in seg)):
+            try:
+                val = luaunum.eval_tokens(seg, _fold_literal)
+            except luaunum.Unfoldable:
+                val = None
+            if (val is not None and math.isfinite(val) and val == int(val)
+                    and 0 <= val < 2 ** 53 and not luaunum.is_negative_zero(val)):
+                folded = str(int(val))
+        if folded is None:
+            out.append(toks[i])
+            i += 1
+            continue
+        if report is not None:
+            report.append((i, j, folded))
+        out.append(('n', folded))
         i = j
     return out
+
+
+def check_folds(toks, report, luau_bin, timeout=120):
+    """Ask the interpreter: is every folded run equal to the literal that replaced it (the sign
+    of zero included)?  Only number literals, arithmetic operators and parentheses are run.
+
+    Returns (number of distinct folds checked, [(expression text, folded literal), ...] that
+    the interpreter computes differently)."""
+    import os
+    import subprocess
+    import tempfile
+    cases = []
+    seen = set()
+    for i, j, lit in report:
+        seg = toks[i:j]
+        if not all(t == 'n' or (t == 'o' and v in _FOLD_OPS) for t, v in seg):
+            raise ValueError('fold report does not match the token list')
+        expr = ' '.join(v for _t, v in seg)
+        if (expr, lit) not in seen:
+            seen.add((expr, lit))
+            cases.append((expr, lit))
+    if not cases:
+        return 0, []
+    lines = ['local function same(a, b) return a == b and 1 / a == 1 / b end']
+    for start in range(0, len(cases), 100):          # small functions: no register limits
+        lines.append('do')
+        for k in range(start, min(start + 100, len(cases))):
+            expr, lit = cases[k]
+            lines.append('  if not same(%s, %s) then print("FOLDBAD %d") end' % (expr, lit, k))
+        lines.append('end')
+    lines.append('print("FOLDDONE %d")' % len(cases))
+    fd, path = tempfile.mkstemp(prefix='lv151_fold_', suffix='.lua')
+    try:
+        with os.fdopen(fd, 'w', encoding='ascii') as fh:
+            fh.write('\n'.join(lines) + '\n')
+        r = subprocess.run([str(luau_bin), path], capture_output=True, timeout=timeout)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    text = r.stdout.decode('utf-8', 'replace')
+    if ('FOLDDONE %d' % len(cases)) not in text:
+        raise RuntimeError('luau did not run the fold check: '
+                           + (text + r.stderr.decode('utf-8', 'replace')).strip()[:200])
+    bad = [cases[int(m)] for m in re.findall(r'FOLDBAD (\d+)', text)]
+    return len(cases), bad
 
 
 # ---------------------------------------------------------------- handler 表解析
@@ -326,25 +450,28 @@ NUM_KEY_RE = re.compile(r'^(?:0[xXbB][0-9a-fA-F_]+|[0-9][0-9_]*)$')
 
 
 def extract_handlers(toks, body_start, body_end):
-    """抽取顶层 [数字键] = value 元素，返回 [(key_int, key_raw, value_tokens, elem_start_idx)]"""
-    # 找顶层逗号后的 [数字]= 作为元素边界
+    """抽取顶层 [数字键] = value 元素，返回 [(key_int, key_raw, value_tokens, elem_start_idx)]
+
+    The table is split at EVERY top-level `,` / `;`, so the value of `[1] = string.byte`
+    ends there.  (It used to end only at the next `[number] =` entry, and a named field that
+    followed, `c = function...`, was glued onto the value before it.)"""
     bounds = [body_start]
     depth = 0
     for k in range(body_start, body_end):
         t, v = toks[k]
-        if t == 'o' and v in ('(', '[', '{'):
+        if t != 'o':
+            continue
+        if v in ('(', '[', '{'):
             depth += 1
-        elif t == 'o' and v in (')', ']', '}'):
+        elif v in (')', ']', '}'):
             depth -= 1
-        elif t == 'o' and v == ',' and depth == 0:
-            # 逗号后紧跟 [ 数字 ]
-            if (k + 3 < body_end and toks[k + 1] == ('o', '[') and
-                    toks[k + 2][0] == 'n' and NUM_KEY_RE.fullmatch(toks[k + 2][1]) and
-                    toks[k + 3] == ('o', ']')):
-                bounds.append(k + 1)
+        elif v in (',', ';') and depth == 0:
+            bounds.append(k + 1)
     elems = []
     for bi, st in enumerate(bounds):
-        en = bounds[bi + 1] - 1 if bi + 1 < len(bounds) else body_end  # 减去分隔逗号
+        en = bounds[bi + 1] - 1 if bi + 1 < len(bounds) else body_end  # 减去分隔符
+        while st < en and toks[st][0] == 'c':
+            st += 1
         if st + 3 > en:
             continue
         if not (toks[st] == ('o', '[') and toks[st + 1][0] == 'n' and
@@ -396,155 +523,476 @@ def describe_value(vt):
 
 
 # ---------------------------------------------------------------- 排版
+# The formatter only decides WHITESPACE between tokens: it never drops, adds, reorders or
+# rewrites a token (semicolons included).  Two things in Luau depend on whitespace and are
+# respected here:
+#   * tokens that would lex differently when glued (`R2` `then`, `-` `-`, `[` `[[x]]`,
+#     `1` `..`): see _must_space;
+#   * a `(` that starts a line after an expression is an "ambiguous syntax" error, so a line
+#     is only ever broken after `;`, `,`, a binary operator or a block keyword, never
+#     before a call's `(`.
+# format_checked() lexes the result again and compares it with the input tokens.
+KEYWORDS = frozenset((
+    'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'if', 'in',
+    'local', 'nil', 'not', 'or', 'repeat', 'return', 'then', 'true', 'until', 'while',
+))
 BLOCK_OPEN = {'function', 'then', 'do', 'repeat'}
 BLOCK_CLOSE = {'end', 'until'}
 STMT_START = {'local', 'return', 'if', 'for', 'while', 'break', 'continue'}
-TIGHT = {'(', ')', '[', ']', '{', '}', '.', ':', '::', ','}
+_VALUE_KW = frozenset(('end', 'nil', 'true', 'false'))      # keywords that end an expression
+_BINOPS = frozenset((
+    '+', '-', '*', '/', '//', '%', '^', '..', '==', '~=', '<', '<=', '>', '>=', '=',
+    '+=', '-=', '*=', '/=', '//=', '%=', '^=', '..=', '->', '::', '|', '&',
+))
+_OPENERS = {'(': 'p', '[': 'b', '{': 't'}
+_INDENTING = frozenset(('func', 'if', 'block', 'repeat'))
+_LONG_OPEN = re.compile(r'--\[(=*)\[')
+MAX_INDENT = 16
+_pair_cache = {}
 
 
-def format_tokens(toks):
-    lines = []
+def _is_word_char(ch):
+    return ch == '_' or ('0' <= ch <= '9') or ('a' <= ch <= 'z') or ('A' <= ch <= 'Z')
+
+
+def _must_space(ta, va, tb, vb):
+    """True when the two tokens cannot be written next to each other without changing how
+    Luau lexes them."""
+    if ta == 'c' or tb == 'c':
+        return True
+    x, y = va[-1], vb[0]
+    if _is_word_char(x) and _is_word_char(y):
+        return True
+    if ta == 'n' and y == '.':
+        return True                       # Luau numbers swallow every following dot
+    if x == '.' and (y == '.' or '0' <= y <= '9'):
+        return True
+    if ta == 'o' and tb == 'o':
+        key = (va, vb)
+        ok = _pair_cache.get(key)
+        if ok is None:
+            ok = tokenize(va + vb) == [('o', va), ('o', vb)]
+            _pair_cache[key] = ok
+        return not ok
+    if x == '[' and y == '[':
+        return True                       # `[` + `[[long string]]`
+    if x == '-' and y == '-':
+        return True
+    return False
+
+
+def _block_comment(v):
+    """True for a closed --[[ ]] comment (one that does not swallow the rest of its line)."""
+    m = _LONG_OPEN.match(v)
+    if not m:
+        return False
+    close = ']' + m.group(1) + ']'
+    return v.endswith(close) and len(v) >= len(m.group(0)) + len(close)
+
+
+def format_tokens(toks, max_len=100, wrap=True, blank_lines=False):
+    """Lay out a token list as indented, line-broken Luau.  Whitespace only.
+
+    wrap         break lines longer than max_len after `,` / binary operators
+    blank_lines  put an empty line between top-level functions"""
+    toks = [(t[0], t[1]) for t in toks]
+    n = len(toks)
+
+    # ---- which table constructors get one field per line
+    multiline = {}
+    plen = [0] * (n + 1)
+    pfn = [0] * (n + 1)
+    for i, (t, v) in enumerate(toks):
+        plen[i + 1] = plen[i] + len(v) + 1
+        pfn[i + 1] = pfn[i] + (1 if (t == 'w' and v == 'function') or
+                               (t == 'c' and not _block_comment(v)) else 0)
+    opens = []
+    for i, (t, v) in enumerate(toks):
+        if t != 'o':
+            continue
+        if v in _OPENERS:
+            opens.append(i)
+        elif v in (')', ']', '}') and opens:
+            j = opens.pop()
+            if toks[j][1] == '{' and v == '}' and i > j + 1:
+                multiline[j] = (plen[i] - plen[j] > 60) or (pfn[i] - pfn[j] > 0)
+    nextcode = [None] * n               # index of the next non-comment token
+    nx = None
+    for i in range(n - 1, -1, -1):
+        nextcode[i] = nx
+        if toks[i][0] != 'c':
+            nx = i
+
+    lines = []              # (indent, [[text, space_before, break_after, depth], ...])
     cur = []
-    indent = 0
-    depth = 0            # 括号深度
-    pending_fn = False   # function 参数列表尚未闭合
-    fn_paren = 0
-    force_break = [False]   # 上一个 token 是分号 → 下一个 token 必须新起一行
-    brace = 0               # 花括号深度（只算 {}，不算 ()/[]）
-    cur_indent = [0]        # 当前行的缩进级别（行首锁定）
+    cur_indent = [0]
+    stack = []              # [kind, flag]
+    level = [0]
 
-    def flush(ind=None):
+    def newline():
         nonlocal cur
-        t = ''.join(cur).strip()
-        if t:
-            use = cur_indent[0] if ind is None else ind
-            lines.append('    ' * min(max(use, 0), 16) + t)
-        cur = []
+        if cur:
+            lines.append((cur_indent[0], cur))
+            cur = []
 
-    prev = None
-    cur_indent[0] = 0
+    def emit(text, space, brk=False, indent=None):
+        if not cur:
+            cur_indent[0] = level[0] if indent is None else indent
+            space = False
+        cur.append([text, space, brk, len(stack)])
 
-    for typ, v in toks:
-        # 行首锁定缩进：cur 为空 = 即将开始新行
-        if not cur and typ != 'c':
-            # 块结束关键字（end/until）要先减一级
-            lv = indent - 1 if (typ == 'w' and v in BLOCK_CLOSE) else indent
-            cur_indent[0] = max(0, lv + max(0, brace))
-        if force_break[0] and typ != 'c':
-            flush()
-            force_break[0] = False
+    def push(kind, flag=False):
+        stack.append([kind, flag])
+        if kind in _INDENTING or (kind == 't' and flag):
+            level[0] += 1
+
+    def pop_to(kinds):
+        """Close everything down to the innermost entry of one of `kinds`."""
+        for k in range(len(stack) - 1, -1, -1):
+            if stack[k][0] in kinds:
+                found = stack[k]
+                for kind, flag in stack[k:]:
+                    if kind in _INDENTING or (kind == 't' and flag):
+                        level[0] -= 1
+                del stack[k:]
+                return found
+        return None
+
+    def innermost(kinds):
+        for k in range(len(stack) - 1, -1, -1):
+            if stack[k][0] in kinds:
+                return stack[k]
+        return None
+
+    prev = None             # previous code token
+    prev_unary = False
+    prev_ifx = False        # previous token was `then`/`else`/`elseif` of an if-EXPRESSION
+    last_typ = None         # type of the last piece put on the current line
+    need_break = False
+    soft_break = False      # after `end`: break unless the next token continues the expression
+    fn_pending = False
+
+    for i, (typ, v) in enumerate(toks):
+        # ------------------------------------------------------------ comments
         if typ == 'c':
-            flush()
-            lines.append('    ' * min(max(indent, 0), 16) + v)
-            prev = None
+            if need_break or soft_break:
+                newline()
+                need_break = soft_break = False
+            emit(v, True)
+            last_typ = 'c'
+            if not _block_comment(v):
+                newline()                # a line comment ends its line
             continue
 
-        if typ == 'o':
-            if v in ('(', '[', '{'):
-                depth += 1
-                if v == '{':
-                    brace += 1
-                if pending_fn and v == '(':
-                    fn_paren += 1
-            elif v in (')', ']', '}'):
-                depth -= 1
-                if v == '}':
-                    brace = max(0, brace - 1)
-            if v in TIGHT and v != ',':
-                cur.append(v)
-                prev = 'tight'
-                # function 参数列表闭合 -> 换行并进入块
-                if pending_fn and v == ')':
-                    fn_paren -= 1
-                    if fn_paren == 0:
-                        flush()
-                        indent += 1
-                        pending_fn = False
-                continue
-            if v == ',':
-                cur.append(',')
-                # 表/参数列表里每个元素一行。depth 跟踪的是所有括号，
-                # 这里只在「当前行已经有内容」时断行，避免空行。
-                if brace >= 1 and cur:
-                    flush()
-                prev = 'tight'
-                continue
-            if v == ';':
-                # 分号在 Lua 里只是可选语句分隔符。改成断行（语义等价）。
-                # 注意 flush() 只把累积内容推成一行，若此时 cur 为空
-                # （例如前一个 token 刚闭合大括号），就必须补一个空标记，
-                # 否则下一个 token 会接着上一次的 flush 结果拼在同一行。
-                flush()
-                force_break[0] = True
-                prev = None
-                continue
-            # 单目运算符：不加右侧空格
-            if v in ('#', '-', '~') and prev in (None, 'op', 'tight', 'stmt', '('):
-                cur.append(v)
-                prev = 'op'
-                continue
-            cur.append(' ' + v + ' ')
-            prev = 'op'
-            continue
+        kw = v if (typ == 'w' and v in KEYWORDS) else None
+        top = stack[-1][0] if stack else None
 
-        # word / number / string
-        if typ == 'w' and v in BLOCK_CLOSE:
-            flush()
-            indent -= 1
-            cur_indent[0] = max(0, indent + max(0, brace))
-            cur.append(v)
-            flush()
-            prev = 'w'
-            continue
-        if typ == 'w' and v in ('else', 'elseif'):
-            flush()
-            indent -= 1
-            cur_indent[0] = max(0, indent + max(0, brace))
-            cur.append(v + ' ')
-            if v == 'else':
-                flush()
-                indent += 1
-            prev = 'stmt'
-            continue
-        if typ == 'w' and v in STMT_START:
-            # Luau 支持 if 表达式，关键字可能出现在表达式中间；
-            # 这里只保证与前一个 token 有分隔，绝不强行断行（断行会丢 token）。
-            if cur and not cur[-1].endswith(' '):
-                cur.append(' ')
-            cur.append(v + ' ')
-            prev = 'stmt'
-            continue
-        if typ == 'w' and v == 'function':
-            if prev in ('w', 'n', 's'):
-                cur.append(' ')
-            cur.append(v)
-            pending_fn = True
-            fn_paren = 0
-            prev = 'w'
-            continue
-        if typ == 'w' and v in BLOCK_OPEN:
-            if prev in ('w', 'n', 's'):
-                cur.append(' ')
-            cur.append(v)
-            flush()
-            indent += 1
-            prev = 'w'
-            continue
+        # ------------------------------------------------------------ pending breaks
+        if need_break:
+            newline()
+            need_break = soft_break = False
+        elif soft_break:
+            glue = (typ == 'o') or kw in ('and', 'or', 'then', 'do')
+            if not glue:
+                newline()
+            soft_break = False
 
-        if prev in ('w', 'n', 's', 'stmt') and (not cur or not cur[-1].endswith(' ')):
-            cur.append(' ')
-        cur.append(v)
-        prev = typ
+        # ------------------------------------------------------------ unary minus
+        unary = False
+        if typ == 'o' and v in ('-', '#'):
+            if v == '#':
+                unary = True
+            elif prev is None:
+                unary = True
+            elif prev[0] == 'o':
+                unary = prev[1] not in (')', ']', '}', '...')
+            elif prev[0] == 'w':
+                unary = prev[1] in KEYWORDS and prev[1] not in _VALUE_KW
 
-    flush()
-    # 把独占一行的分隔逗号并回上一行，避免 `end` / `,` 分成两行
-    merged = []
-    for line in lines:
-        if line.strip() == ',' and merged:
-            merged[-1] += ','
+        # ------------------------------------------------------------ structure
+        line_indent = None
+        after_break = False
+        is_ifx_kw = False
+        if kw == 'end':
+            pop_to(_INDENTING | {'head'})
+            newline()
+        elif kw == 'until':
+            pop_to(('repeat',))
+            newline()
+        elif kw in ('else', 'elseif', 'then'):
+            ent = innermost(('if', 'ifx'))
+            if ent is not None and ent[0] == 'if':
+                if kw != 'then':
+                    # close anything left open inside the previous branch
+                    while stack and stack[-1] is not ent:
+                        pop_to((stack[-1][0],))
+                    newline()
+                    line_indent = level[0] - 1
+                if kw != 'elseif':
+                    after_break = True
+            elif ent is not None:
+                is_ifx_kw = True
+                if kw == 'else':
+                    pop_to(('ifx',))
+        elif kw == 'if':
+            if prev is None:
+                stmt = True
+            elif prev[0] == 'o':
+                stmt = prev[1] in (';', ')', ']', '}')
+            elif prev[0] == 'w' and prev[1] in KEYWORDS:
+                stmt = (prev[1] in ('then', 'else', 'do', 'repeat', 'end', 'nil', 'true',
+                                    'false', 'break') and not prev_ifx)
+            else:
+                stmt = True
+            if stmt:
+                newline()
+        elif kw in ('while', 'for', 'repeat', 'local', 'return', 'break'):
+            newline()
+        elif kw == 'do':
+            if top != 'head':
+                newline()            # a `do ... end` block of its own
+        elif kw == 'function':
+            nx = nextcode[i]
+            named = nx is not None and toks[nx][0] == 'w' and toks[nx][1] not in KEYWORDS
+            if named and not (prev is not None and prev == ('w', 'local')):
+                newline()
+        elif typ == 'w' and kw is None:
+            # A name right after something that ends an expression can only be the start of
+            # the next statement (`f() g()`, `x = 1 y = 2`): Lua has no other place where two
+            # such tokens meet, except Luau's `export type Name`.
+            if cur and prev is not None and top not in ('p', 'b', 't'):
+                pt, pv = prev
+                ends = (pt in ('n', 's')
+                        or (pt == 'w' and (pv not in KEYWORDS or pv in _VALUE_KW)
+                            and pv not in ('export', 'type'))
+                        or (pt == 'o' and pv in (')', ']', '}', '...')))
+                if ends:
+                    newline()
+        elif typ == 'o' and v == '}':
+            ent = pop_to(('t',))
+            if ent is not None and ent[1]:
+                newline()
+        elif typ == 'o' and v in (')', ']'):
+            ent = pop_to(('p',) if v == ')' else ('b',))
+            if ent is not None and v == ')' and ent[1]:
+                after_break = True       # end of a function's parameter list
+
+        # ------------------------------------------------------------ spacing
+        if not cur:
+            space = False
+        elif last_typ == 'c':
+            # after an inline --[[ ]] comment: closers and separators stay attached
+            space = not (typ == 'o' and v in (',', ';', ')', ']', '}'))
         else:
-            merged.append(line)
-    return '\n'.join(merged)
+            ta, va = prev if prev is not None else ('c', '--')
+            if typ == 'o' and not unary and v != '...':
+                if v in (',', ';', ')', ']', '}', '.', ':'):
+                    space = False
+                elif v in ('(', '['):
+                    if ta == 'w':
+                        space = va in KEYWORDS and va != 'function'
+                    elif ta in ('s', 'n'):
+                        space = False
+                    elif va in (')', ']', '}', '(', '[', '{', '.', ':', '...'):
+                        space = False
+                    elif prev_unary:
+                        space = False
+                    else:
+                        space = va in _BINOPS or va in (',', ';')
+                elif v == '{':
+                    space = not (va in ('(', '[', '{') or prev_unary)
+                elif v in _BINOPS:
+                    space = True
+                else:
+                    space = False        # other punctuation (`@`, `?`, ...) stays attached
+            else:                        # a name, keyword, number, string, `...` or unary op
+                if ta in ('w', 'n', 's'):
+                    space = True
+                elif va in ('(', '[', '{', '.', ':'):
+                    space = False
+                elif prev_unary:
+                    space = False
+                elif va in (')', ']', '}', '...', ',', ';') or va in _BINOPS:
+                    space = True
+                else:
+                    space = False
+            if not space and _must_space(ta, va, typ, v):
+                space = True
+
+        brk = False
+        if typ == 'o' and not unary:
+            brk = v == ',' or (v in _BINOPS and v not in ('=', '::', '->'))
+        elif kw in ('and', 'or'):
+            brk = True
+        emit(v, space, brk, line_indent)
+        last_typ = typ
+
+        # ------------------------------------------------------------ after the token
+        if kw == 'end':
+            soft_break = True
+        elif kw == 'if':
+            if stmt:
+                push('if')
+            else:
+                push('ifx')
+        elif kw in ('while', 'for'):
+            push('head')
+        elif kw == 'repeat':
+            push('repeat')
+            need_break = True
+        elif kw == 'do':
+            if top == 'head':
+                pop_to(('head',))
+            push('block')
+            need_break = True
+        elif kw == 'function':
+            fn_pending = True
+        elif kw in ('then', 'else'):
+            if after_break:
+                need_break = True
+        elif typ == 'o':
+            if v in _OPENERS:
+                if v == '(':
+                    push('p', fn_pending)
+                    fn_pending = False
+                elif v == '{':
+                    ml = multiline.get(i, False)
+                    push('t', ml)
+                    if ml:
+                        need_break = True
+                else:
+                    push('b')
+            elif v == ')' and after_break:
+                push('func')
+                need_break = True
+            elif v in (',', ';'):
+                if top == 't':
+                    if stack[-1][1]:
+                        need_break = True
+                elif v == ';' and top not in ('p', 'b'):
+                    need_break = True
+
+        prev = (typ, v)
+        prev_unary = unary
+        prev_ifx = is_ifx_kw
+
+    newline()
+
+    # ---- render, wrapping long lines after `,` / binary operators
+    def text_of(seg):
+        return ''.join((' ' if (sp and q > 0) else '') + tx
+                       for q, (tx, sp, _b, _d) in enumerate(seg))
+
+    out = []
+    prev_end = False
+    for indent, pieces in lines:
+        ind = min(max(indent, 0), MAX_INDENT)
+        if blank_lines:
+            words = [p[0] for p in pieces[:3]]
+            starts_fn = bool(words) and (words[0] == 'function' or
+                                         (words[0] == 'local' and len(words) > 1))
+            if prev_end and starts_fn and indent <= 1 and out:
+                out.append('')
+            prev_end = indent <= 1 and [p[0] for p in pieces] in (['end'], ['end', ';'])
+        if not wrap:
+            out.append('    ' * ind + text_of(pieces))
+            continue
+        start = 0
+        while True:
+            pad = '    ' * (ind if start == 0 else ind + 1)
+            width = len(pad)
+            cands = []                   # (piece index, width after it, bracket depth)
+            overflow = False
+            for k in range(start, len(pieces)):
+                text, space, brk, depth = pieces[k]
+                w = len(text) + (1 if (space and k > start) else 0)
+                if width + w > max_len and cands:
+                    overflow = True
+                    break
+                width += w
+                if brk and k + 1 < len(pieces) and width >= max_len * 0.4:
+                    cands.append((k, width, depth))
+            if not overflow:
+                out.append(pad + text_of(pieces[start:]))
+                break
+            shallow = min(c[2] for c in cands)
+            cut = max(c[0] for c in cands if c[2] == shallow)
+            out.append(pad + text_of(pieces[start:cut + 1]))
+            start = cut + 1
+    return '\n'.join(out)
+
+
+def safe_join(toks):
+    """Fallback layout that cannot glue anything: one space between tokens, a new line
+    after every `;` and every comment."""
+    out, cur = [], []
+    for t in toks:
+        typ, v = t[0], t[1]
+        cur.append(v)
+        if typ == 'c' or (typ == 'o' and v == ';'):
+            out.append(' '.join(cur))
+            cur = []
+    if cur:
+        out.append(' '.join(cur))
+    return '\n'.join(out)
+
+
+def format_checked(toks, max_len=100, wrap=True, blank_lines=False, info=None):
+    """format_tokens + proof: the result lexes back to exactly `toks` (comments included).
+    Returns (text, ok).
+
+    When the indented layout raises or fails that check, the fallback layout (safe_join: one
+    statement per line, single spaces) is returned instead; ok is False only if even that one
+    does not round-trip.  `info`, a dict, is then told so: info['fallback'] = True and
+    info['reason'] = why the indented layout was rejected.  A caller that reports "layout
+    checked" should also report the fallback, the two outputs look very different."""
+    toks = [(t[0], t[1]) for t in toks]
+    reason = None
+    try:
+        text = format_tokens(toks, max_len=max_len, wrap=wrap, blank_lines=blank_lines)
+        back = tokenize(text)
+        if same_tokens(back, toks, comments=True):
+            if info is not None:
+                info['fallback'] = False
+                info['reason'] = None
+            return text, True
+        diff = None
+        for k in range(max(len(back), len(toks))):
+            x = back[k] if k < len(back) else None
+            y = toks[k] if k < len(toks) else None
+            if x != y:
+                diff = (k, y, x)
+                break
+        reason = 'token %d: %r came back as %r' % diff if diff else 'token lists differ'
+    except Exception as e:                      # noqa: BLE001  reported through `info`
+        reason = '%s: %s' % (type(e).__name__, e)
+    text = safe_join(toks)
+    if info is not None:
+        info['fallback'] = True
+        info['reason'] = reason
+    return text, same_tokens(tokenize(text), toks, comments=True)
+
+
+# ---------------------------------------------------------------- 等价性
+def canon(tok):
+    """Value of a token: numbers by the double they denote, short strings by their bytes.
+    Two token lists with equal canon() values are the same program text up to the spelling
+    of literals (0x10 / 16, "\65" / "A")."""
+    t, v = tok[0], tok[1]
+    if t == 'n':
+        x = num_value(v)
+        return ('n', v) if x is None else ('n', x)
+    if t == 's':
+        raw = decode_string(v)
+        return ('s', v) if raw is None else ('s', raw)
+    return (t, v)
+
+
+def same_values(a, b):
+    """same_tokens, but literals are compared by value."""
+    a = [canon(x) for x in a if x[0] != 'c']
+    b = [canon(x) for x in b if x[0] != 'c']
+    return a == b
 
 
 # ---------------------------------------------------------------- 主流程
@@ -554,30 +1002,87 @@ def main():
     ap.add_argument('-o', '--output', required=True)
     ap.add_argument('--map', default=None, help='导出 handler 映射表 (markdown)')
     ap.add_argument('--no-rename', action='store_true', help='不做变量语义重命名')
+    ap.add_argument('--no-fold', action='store_true', help='不做常量折叠')
     args = ap.parse_args()
 
-    src = Path(args.input).read_text(encoding='utf-8', errors='ignore')
-    toks = tokenize(src)
+    src = Path(args.input).read_bytes().decode('utf-8', errors='surrogateescape')
+    ptoks = tokenize_pos(src)
+    toks = [(t, v) for t, v, _ in ptoks]
     print(f'[1] 词法: {len(toks):,} tokens')
+
+    import luaubin
+    import luascope
+    ast_bin = luaubin.find_luau_ast()
+    luau_bin = luaubin.find_luau()
+    root = None
+    if ast_bin:
+        try:
+            root, errors = luascope.parse(src, ast_bin)
+            if errors:
+                print(f'[!] 输入有语法错误（{errors[0][:100]}）：不重命名，不做语法树复核')
+                root = None
+        except Exception as e:                  # noqa: BLE001
+            print(f'[!] luau-ast 解析失败（{e}）：不重命名，不做语法树复核')
+            root = None
+    else:
+        print('[!] 找不到 luau-ast：不重命名，不做语法树复核。' + luaubin.MISSING_HINT)
+
+    # 变量重命名：作用域来自 luau-ast，命名规则来自 readable3.derive
+    renamed = False
+    if args.no_rename:
+        print('[2] 按参数跳过重命名')
+    elif root is None:
+        print('[2] 重命名跳过（没有语法树）')
+    else:
+        try:
+            analysis = luascope.Analysis(root, luascope.LineIndex(src), ptoks)
+            ren = luascope.Renamer(analysis)
+            cand = ren.apply(toks)
+            # 校验：重命名后的文本重新解析，语法树必须与原文一致（只差局部变量名）
+            root2, errors2 = luascope.parse(format_tokens(cand, wrap=False), ast_bin)
+            same, why = (False, errors2[0]) if errors2 else luascope.alpha_equal(root, root2)
+            if not same:
+                raise RuntimeError('重命名结果未通过绑定校验（' + why[:120] + '），保留原名')
+            toks = cand
+            renamed = True
+            print(f'[2] 语义重命名完成: {ren.renamed:,} 个局部变量 (作用域取自 luau-ast，绑定校验 ✓)')
+        except Exception as e:                  # noqa: BLE001
+            print(f'[2] 重命名跳过: {e}')
+    named = list(toks)
 
     # 数字归一化 + 字符串解码
     toks = [(t, norm_num(v) if t == 'n' else (reencode_string(v) if t == 's' else v))
             for t, v in toks]
-    print('[2] 数字归一化 + 字符串转义解码完成')
+    lossless = same_values(toks, named)
+    print('[3] 数字归一化 + 字符串转义解码完成')
 
-    toks = fold_consts(toks)
-    print(f'[3] 常量折叠完成: {len(toks):,} tokens')
-
-    # 变量重命名（复用仓库 readable3）
-    if not args.no_rename:
-        try:
-            from libs.readable3 import rename as do_rename
-            toks = do_rename(toks)
-            print('[4] 语义重命名完成 (libs/readable3.py)')
-        except Exception as e:
-            print(f'[4] 重命名跳过: {e}')
+    # 常量折叠：每一处都是 Luau 自己会算出的值（libs/luaunum.py），有 luau 时再交给解释器复核
+    folds_checked = None
+    n_folds = 0
+    if args.no_fold:
+        print('[4] 按参数跳过常量折叠')
     else:
-        print('[4] 按参数跳过重命名')
+        report = []
+        folded = fold_consts(toks, report)
+        n_folds = len(report)
+        if report and luau_bin:
+            try:
+                n_cases, bad = check_folds(toks, report, luau_bin)
+            except Exception as e:              # noqa: BLE001
+                n_cases, bad = 0, None
+                print(f'[!] 折叠复核没有跑成（{e}）')
+            if bad:
+                print(f'[!] luau 对 {len(bad)} 处折叠算出了不同的值（例如 {bad[0][0]} ≠ {bad[0][1]}），'
+                      '已放弃全部折叠')
+                folded, n_folds = toks, 0
+            elif bad is not None:
+                folds_checked = n_cases
+        toks = folded
+        how = ''
+        if n_folds:
+            how = (f'，{folds_checked} 种表达式已由 luau 复核' if folds_checked is not None
+                   else '（没有 luau，未经解释器复核）')
+        print(f'[4] 常量折叠: {n_folds:,} 处{how} → {len(toks):,} tokens')
 
     # 定位顶层 setmetatable({...}, {}) 的 handler 表
     tbl_start = None
@@ -609,24 +1114,52 @@ def main():
         # 由后往前插入注释，避免索引偏移
         inserts = []
         for key_int, key_raw, vt, st in handlers:
-            desc = describe_value(vt)
+            # one line: a string token in the value may contain a line break
+            desc = ' '.join(describe_value(vt).split())
             inserts.append((st, ('c', f'-- [{key_int}] = {desc}')))
         for st, ct in sorted(inserts, key=lambda x: -x[0]):
             toks.insert(st, ct)
     else:
         print('[5] 未定位到顶层 handler 表，跳过映射标注')
 
-    out_text = format_tokens(toks)
-    Path(args.output).write_text(out_text + '\n', encoding='utf-8')
-    print(f'[6] 输出: {args.output}  ({len(out_text):,} 字节, {len(out_text.splitlines()):,} 行)')
+    layout = {}
+    out_text, ok = format_checked(toks, info=layout)
+    out_bytes = (out_text + '\n').encode('utf-8', errors='surrogateescape')
+    Path(args.output).write_bytes(out_bytes)
+    print(f'[6] 输出: {args.output}  ({len(out_bytes):,} 字节, {len(out_text.splitlines()):,} 行)')
+    if layout.get('fallback'):
+        print(f'[!] 缩进排版没有通过校验（{str(layout.get("reason"))[:120]}），'
+              '输出改用保守排版：每条语句一行、token 之间一个空格')
 
-    # 无损性校验：重新词法化，比较非注释 token
-    re_toks = [x for x in tokenize(out_text) if x[0] != 'c']
-    orig_toks = [x for x in toks if x[0] != 'c']
-    if re_toks == orig_toks:
-        print('[7] 无损性校验通过：token 序列与变换后完全一致（未破坏语法）')
+    # 校验
+    #   排版    输出重新词法化后与排版前逐 token 相同（注释也算）
+    #   字面量  数字 / 字符串改写前后按值相同
+    #   语法树  输出重新解析，与输入的语法树只差：局部变量名、被折叠的常量子表达式（其值
+    #           按 Luau 的算术重新算一遍，必须等于写进去的数字）
+    tree = None
+    if root is not None:
+        try:
+            root3, errors3 = luascope.parse(out_text, ast_bin)
+            tree, why = (False, '输出有语法错误: ' + errors3[0]) if errors3 else \
+                luascope.alpha_equal(root, root3, folds=True)
+        except Exception as e:                  # noqa: BLE001
+            tree, why = False, f'{type(e).__name__}: {e}'
+    good = ok and lossless and tree is not False
+    if good:
+        parts = ['排版只改了空白', '字面量取值不变']
+        if tree:
+            parts.append('语法树与输入一致' + ('（局部变量名、已折叠的常量除外）' if (renamed or n_folds)
+                                         else ''))
+        else:
+            parts.append('语法树未复核（没有 luau-ast 或输入有语法错误）')
+        print('[7] 校验通过：' + '，'.join(parts))
     else:
-        print(f'[7] 警告: token 数 {len(re_toks)} vs {len(orig_toks)}，请人工检查')
+        print('[7] 警告: 输出与输入不等价，请人工检查：'
+              + ('' if ok else ' 排版后的 token 序列变了；')
+              + ('' if lossless else ' 字面量取值变了；')
+              + ('' if tree is not False else f' 语法树不一致（{why[:160]}）'))
+    if not args.no_rename and not renamed:
+        print('    （未重命名：输出仍是原变量名）')
 
     if args.map and handlers:
         rows = ['# Luraph v15.1 handler 映射表', '',
@@ -639,7 +1172,8 @@ def main():
             rows.append(f'| {key_int} | `{key_raw}` | {desc} | {ref.get(key_int, 0)} |')
         Path(args.map).write_text('\n'.join(rows) + '\n', encoding='utf-8')
         print(f'[8] 映射表: {args.map}')
+    return 0 if good else 3
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
