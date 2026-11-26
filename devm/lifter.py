@@ -1686,6 +1686,11 @@ class TableProtoLifter(Lifter):
         r = pe.exec_block(self.wrap.body, sc)
         if not r or r[0] != 'return' or not isinstance(r[1][0], LFn):
             raise PEError('wrap did not return the interpreter closure')
+        # A closure maker with several interpreters picks one by the proto's kind: the names of
+        # its state variables (loop state, open upvalues) are those of that interpreter.
+        it = self.model.interp_funcs.get(id(r[1][0].func)) if r[1][0].func is not None else None
+        if it is not None and it is not pe.cur_interp:
+            pe.set_interp(it)
         return r[1][0]
 
 

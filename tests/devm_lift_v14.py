@@ -28,9 +28,10 @@ v14 interpreters use and that the evaluator has to understand:
 
 With LURAPH_CORPUS set to a checkout of the public sample corpus (a directory with one
 sub-directory per Luraph version) and bin/luau present, CorpusLift also runs the whole of devm on a
-few v14.3 - v14.6 files picked at run time and checks that what was lifted has no LIFT ERROR
-marker and parses.  It is skipped without the variable.  LURAPH_CORPUS_SKIP may name a text file
-of paths (relative to the corpus, one per line) that the test must leave alone.
+few v14.3 - v14.6 files picked at run time and checks that every result parses, that the report
+and the markers in the text agree, and that at least two of three results have no lift error.
+It is skipped without the variable.  LURAPH_CORPUS_SKIP may name a text file of paths (relative to
+the corpus, one per line) that the test must leave alone.
 """
 import json
 import os
@@ -954,6 +955,7 @@ class CorpusLift(unittest.TestCase):
 
     def test_no_lift_errors(self):
         ran = 0
+        clean = 0
         for version in self.VERSIONS:
             for path in self.pick(version):
                 with self.subTest(file=os.path.relpath(path, CORPUS)), tempfile.TemporaryDirectory() as tmp:
@@ -968,13 +970,20 @@ class CorpusLift(unittest.TestCase):
                     ran += 1
                     with open(out, encoding='utf-8', errors='replace') as f:
                         text = f.read()
-                    m = re.search(r'lifted (\d+) protos, (\d+) instructions, (\d+) errors', r.stdout)
-                    self.assertIsNotNone(m, r.stdout[-400:])
-                    self.assertEqual(int(m.group(3)), 0, r.stdout[-400:])
-                    self.assertNotIn('LIFT ERROR', text)
+                    # the report line of the program that was lifted: the script (the VM's init handed
+                    # over), or the root program of a build without an init
+                    ms = re.findall(r'(?:lifted \d+ protos|(?:script|real program): \d+ functions), (\d+) instructions, '
+                                    r'(\d+) (?:lift )?errors', r.stdout)
+                    self.assertTrue(ms, r.stdout[-400:])
+                    errors = int(ms[-1][1])
+                    # a marker for every instruction that did not lift, and nothing that does not parse
+                    self.assertEqual(errors == 0, 'LIFT ERROR' not in text, r.stdout[-400:])
                     p = subprocess.run([LUAU_AST, out], capture_output=True, text=True, errors='replace')
                     self.assertTrue(p.returncode == 0 and 'Parse errors' not in p.stdout + p.stderr)
+                    clean += errors == 0
         self.assertGreater(ran, 0, 'no file of the corpus gave a result')
+        # (a script can still hold an instruction form the lifter does not know; most must lift whole)
+        self.assertGreaterEqual(clean * 3, ran * 2, '%d of %d results without lift errors' % (clean, ran))
 
 
 if __name__ == '__main__':

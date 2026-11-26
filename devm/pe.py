@@ -561,6 +561,28 @@ def fold_pure(name, args):
     return None
 
 
+def closes_cells(st):
+    """`for k, cell in MAP do ... cell[A] = <x>; cell[B] = <y>; MAP[k] = nil ... end`: the loop that
+    closes open upvalues (each cell gets its own storage and leaves the map)."""
+    if st[0] != 'forin' or len(st[1]) != 2 or len(st[2]) != 1 or st[2][0][0] != 'name':
+        return False
+    key, cell, mp = ('name', st[1][0]), ('name', st[1][1]), st[2][0]
+    seen = {'cell': 0, 'gone': False}
+
+    def scan(block):
+        for s in block:
+            if s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and s[1][0][0] == 'index':
+                base, k = _unparen(s[1][0][1]), _unparen(s[1][0][2])
+                if base == cell and k[0] == 'num':
+                    seen['cell'] += 1
+                elif base == mp and k == key and _unparen(s[2][0]) == ('nil',):
+                    seen['gone'] = True
+            for b in subblocks(s):
+                scan(b)
+    scan(st[3])
+    return seen['gone'] and seen['cell'] >= 2
+
+
 def nested_close(st):
     """The close-upvalues loop of Luraph v14.0.x:
 
@@ -836,8 +858,15 @@ class PE:
         self.inject = None          # (loop_idx, snapshot)
         self.seeking = False
         self.interp_scope = None
-        self.cell_lists = set()     # names of per-closure lists of capture lists (see nested_close)
-        self.state_sets = {it.index: self._classify_state_vars(it.loops) for it in model.interps}
+        # names of per-closure lists of capture lists (see nested_close), per interpreter: the
+        # same name is something else in the closure maker of another interpreter
+        self.state_sets = {}
+        self.cell_lists_of = {}
+        for it in model.interps:
+            self.cell_lists = set()
+            self.state_sets[it.index] = self._classify_state_vars(it.loops)
+            self.cell_lists_of[it.index] = self.cell_lists
+        self.cell_lists = set().union(*self.cell_lists_of.values()) if self.cell_lists_of else set()
         self.set_interp(model.interp_funcs[id(model.interp)])
         self.events = []
         self.wrap_func = None
@@ -971,6 +1000,9 @@ class PE:
         """Select which interpreter's variable classification applies (names clash between interpreters)."""
         self.cur_interp = it
         self.fvars, self.fstack, self.openups = self.state_sets[it.index]
+        self.cell_lists = self.cell_lists_of.get(it.index, set())
+        # (the closure maker of this interpreter: the function right around it)
+        self.maker_id = it.chain[-2].id if it.chain and len(it.chain) >= 2 else None
 
     def _classify_state_vars(self, loops):
         """Find interpreter-level locals used as for-loop state / open-upvalue map.
@@ -1048,6 +1080,10 @@ class PE:
                 cell = repr(('name', st[1][1]))
                 if "('num', 3)" in txt and "('num', 2)" in txt \
                         and ("('index', " + cell in txt or "('index', ('paren', " + cell in txt):
+                    add(openups, st[2][0][1], scopes)
+                elif not getattr(self.model, 'factory_style', False) and closes_cells(st) \
+                        and res(st[2][0][1], scopes) is not None:
+                    # the same loop whatever the cell's field numbers are (v14.1: 1 and 2)
                     add(openups, st[2][0][1], scopes)
                 if nested_close(st) is not None and res(st[2][0][1], scopes) == st[2][0][1]:
                     # v14.0.x keeps, per closure, a list of the capture lists it made, in a local
@@ -1205,8 +1241,10 @@ class PE:
                 # Roblox datatypes and executor functions (gethui, fireproximityprompt, ...)
                 return GlobalPath(name)
             raise PEError('unbound name %s' % name)
-        if self.cell_lists and name in self.cell_lists and s.owner != self.cur_interp.func.id:
-            return OPENUPS      # (a local of the closure maker: see nested_close)
+        if self.cell_lists and name in self.cell_lists and (s.owner is None or s.owner == self.maker_id):
+            # a local of the closure maker (see nested_close): the scope the dump describes, or the
+            # maker's own when the evaluator instantiated the closure; not a local of some helper
+            return OPENUPS
         if s.owner == self.cur_interp.func.id and (self.state_scopes is None or id(s) in self.state_scopes):
             # interpreter-level state variables (names are only meaningful inside the interpreter)
             if name in self.openups:
