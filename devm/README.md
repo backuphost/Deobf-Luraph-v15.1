@@ -35,6 +35,8 @@ automatically, and the run ends with a report of what, if anything, is left unre
 | factory, one-line output, self-decrypting code and lazily decoded constants | 25ms_get | partial: all modules, but unlifted instructions and unstructured exits remain |
 | v15.2: compressed container, four interpreters, per-closure keys, flattened and block-wise encrypted main function | examples/v15.2/sample.luau | runs to the key-server request of the loader it contains; everything that ran lifts and structures (about 3,200 lines); code that never ran keeps about 20 unlifted instructions; what the server's reply would unlock is not recoverable offline (see "Luraph v15.2") |
 | v15.1 chunk cut out of its container, script mostly plain Lua kept in the VM object | examples/layer3.lua + examples/blob4.bin (`--chunk-arg`) | the script runs to its end; about 38,600 lines, 1 unlifted instruction in code that did not run |
+| v15.1 of the v15.2 generation (no wrapper keys; the script on a second interpreter whose dispatch tests go through locals) | the `v15.1` directory of the public sample corpus (not in the repository) | small test scripts come out whole and `complete`; larger scripts lift every instruction that ran, see "The v15.x files of the public sample corpus" for what is open |
+| v15.0: the closure maker is a method of the VM object, a state machine | the `v15.0` directory of that corpus | not modelled: refused at once with `no model: Luraph v15.0 method-wrap layout ...` (the second engine lifts these) |
 
 There is no key that opens every Luraph v15.1 script.  Every protected file carries its own virtual
 machine: opcode numbers, operand layout and handlers are generated per script, the decryption keys
