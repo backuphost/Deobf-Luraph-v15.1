@@ -16,6 +16,8 @@ computes every test into a local first.
 * a traced run that created no VM function ends in `run failed: the VM never started: ...`;
 * the `--root` hint is given for a helper function (arithmetic only), not for every small script;
 * `vmmodel.is_dispatch_loop`: `local OP = CODE[PC]; local T = OP >= 10; if T then` is a dispatch loop;
+* `pe._classify_state_vars`: the open-upvalue map is found through a handler's local copy of it, and a
+  dispatch test is not taken for it;
 * `opaque._fold_call_keys`: Luraph's per-call key (a parameter that only comes back xor-ed as an extra
   first result) is removed where every caller is in view, and `run.report` does not say `complete`
   where it is left;
@@ -318,6 +320,34 @@ class OutlinedDispatch(unittest.TestCase):
                      'local V=S[H];\nlocal j=V+10;\nif j then x=1 end',          # not a comparison
                      'local V=S[H];\nlocal j=V>=10;\nx=1'):
             self.assertFalse(vmmodel.is_dispatch_loop(self.loop('while true do ' + body + ' end')), body)
+
+
+class OpenUpvalueMap(unittest.TestCase):
+    """pe._classify_state_vars names the interpreter-level variable that holds the open-upvalue map.
+    The interpreter that runs the script in the v15.1 corpus builds tests and indexes it through a
+    handler-local copy whose name is often also the name of an unrelated interpreter variable (the
+    dispatch mode in one file: the lifter then could not even enter the interpreter), and its dispatch
+    tests look like the pattern too."""
+    CLOSE = 'if %s then local T=%s[W];\nif T then T[4]=T;\nT[5]=R[W];\nT[6]=5;\n%s[W]=nil;\nend;\nend;\n'
+
+    def openups(self, body):
+        from devm import luparse
+        loop = luparse.parse('while true do ' + body + ' end')[0][0]
+        return pe.PE._classify_state_vars(pe.PE.__new__(pe.PE), [loop])[2]
+
+    def test_interpreter_variable(self):
+        self.assertEqual(self.openups('local V=S[H];\nif V>=10 then local W=A[H];\n' + self.CLOSE % ('Y', 'Y', 'Y') + 'end;\nH+=1;'), {'Y'})
+
+    def test_through_a_local_copy(self):
+        body = ('local V=S[H];\nlocal j=V>=10;\nif j then local j=V>=15;\nx[6]=4;\nx[5]=nil;\n'       # a dispatch test, not the map
+                'else local C,W=e,A[H];\n' + self.CLOSE % ('C', 'C', 'C') + 'end;\nH+=1;')
+        self.assertEqual(self.openups(body), {'e'})
+        # a copy of a copy, and a local with a value of its own
+        body = 'local V=S[H];\nlocal C,W=e,A[H];\ndo local D=C;\n' + self.CLOSE % ('D', 'D', 'D') + 'end;\nlocal Q=A[H];\n' + self.CLOSE % ('Q', 'Q', 'Q')
+        self.assertEqual(self.openups(body), {'e'})
+
+    def test_test_stored_by_assignment(self):
+        self.assertEqual(self.openups('local V=S[H];\nW=V==208;\nif W then local T=1;\nx[6]=4;\nx[5]=nil;\nend;'), set())
 
 
 class CallKeys(unittest.TestCase):

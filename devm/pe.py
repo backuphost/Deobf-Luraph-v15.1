@@ -828,6 +828,26 @@ class PE:
         fvars = set()
         fstack = set()
         openups = set()
+        # Locals the blocks of a handler declare, innermost last: name -> the interpreter-level
+        # variable it is a copy of (`local a, r = open, operand[pc]`), None for any other value.
+        # Some interpreters test and index the open-upvalue map through such a copy, and the
+        # copy's name is often also the name of an unrelated interpreter-level variable.
+        scopes = [{}]
+
+        def source(nm):
+            for sc in reversed(scopes):
+                if nm in sc:
+                    return sc[nm]
+            return nm
+
+        def declare(st):
+            t = st[0]
+            if t == 'local':
+                vals = [source(e[1]) if e[0] == 'name' else None for e in st[2]]
+                for i, nm in enumerate(st[1]):
+                    scopes[-1][nm] = vals[i] if i < len(vals) else None
+            elif t == 'localfunc':
+                scopes[-1][st[1]] = None
 
         def visit(st, prev=None):
             t = st[0]
@@ -863,21 +883,37 @@ class PE:
             if t == 'forin' and len(st[2]) == 1 and st[2][0][0] == 'name' and len(st[1]) == 2:
                 body = st[3]
                 txt = repr(body)
-                if "('num', 3)" in txt and "('num', 2)" in txt:
-                    openups.add(st[2][0][1])
+                if "('num', 3)" in txt and "('num', 2)" in txt and source(st[2][0][1]):
+                    openups.add(source(st[2][0][1]))
             if t == 'if':
                 # `if open then local c = open[r]; if c then c[4] = c; c[5] = R[r]; c[6] = 5;
                 # open[r] = nil end end`: handlers that end the scope of single registers
+                # (not a test that was computed into a local just before, `local t = OP >= 10; if t
+                # then local ...`: the dispatch tree of some interpreters is written that way)
+                tested = None       # the variable a comparison was just stored in
+                if prev is not None and prev[0] in ('local', 'assign') and len(prev[1]) == 1 and len(prev[2]) == 1 \
+                        and prev[2][0][0] == 'bin' and prev[2][0][1] in CMP:
+                    tested = prev[1][0] if prev[0] == 'local' else prev[1][0][1] if prev[1][0][0] == 'name' else None
                 for c, body in st[1]:
+                    if c[0] == 'name' and c[1] == tested:
+                        continue
                     if c[0] == 'name' and body and body[0][0] == 'local':
                         txt = repr(body[:3])
-                        if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt:
-                            openups.add(c[1])
+                        if "('num', 6)" in txt and "('num', 5)" in txt and "('num', 4)" in txt and "[('nil',)]" in txt \
+                                and source(c[1]):
+                            openups.add(source(c[1]))
             for blk in subblocks(st):
+                scopes.append({})
+                if t in ('fornum', 'forin'):
+                    for nm in ([st[1]] if isinstance(st[1], str) else st[1]):
+                        scopes[-1][nm] = None
                 for i, sub in enumerate(blk):
                     visit(sub, blk[i - 1] if i else None)
+                scopes.pop()
+            declare(st)
 
         for l in loops:
+            scopes[:] = [{}]
             for i, st in enumerate(l[2]):
                 visit(st, l[2][i - 1] if i else None)
         return fvars, fstack, openups
