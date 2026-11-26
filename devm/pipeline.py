@@ -142,7 +142,7 @@ def startup_note(notes, forced, first_root, interps):
     if forced:
         return ('[startup] --root %d: the result is the VM\'s first program, which begins with Luraph\'s start-up code; '
                 'the script is not separated from it' % first_root)
-    said = [n for n in notes if n.startswith('[script] ') and re.match(r'\[script\] (?:print|warn|said)\b', n)]
+    said = [n for n in notes if n.startswith('[script] ') and re.match(r'\[script\] (?:print|warn):', n)]
     asked = [n for n in notes if n.startswith('[http]')]
     shown = ', '.join(x for x in (
         '%d line(s) of output' % len(said) if said else '',

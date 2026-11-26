@@ -302,6 +302,11 @@ def _const_value(e, multi=False):
             x, y = _const_value(e[2]), _const_value(e[3])
             if op in ('==', '~='):
                 v = (x == y and type(x) is type(y) or _lua_number(x) and _lua_number(y) and x == y) == (op == '==')
+            elif op == '..':
+                if not all(isinstance(z, str) or _lua_number(z) and math.isfinite(z) for z in (x, y)):
+                    raise _NotConst()
+                v = ''.join(z if isinstance(z, str) else str(z) if isinstance(z, int) or z == int(z) and abs(z) < 1e15
+                            else '%.14g' % z for z in (x, y))
             elif op in ('<', '<=', '>', '>='):
                 if not (_lua_number(x) and _lua_number(y) or isinstance(x, str) and isinstance(y, str)):
                     raise _NotConst()

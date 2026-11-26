@@ -285,7 +285,8 @@ class DeadConstants(unittest.TestCase):
             'local v5 = -150 <= string.byte("\\017\\201Q", 2, nil)\n'
             'local v6 = 4321 + math.modf(2.5) + -4320\n'
             'local v7 = bit32.bxor(77, 13, (string.byte("\\009", 1, nil))) > 999 and 1 or 2\n'
-            'local v9 = 1200 + string.byte("x\u00e9", 3) + -1400\n'           # (characters written as themselves: their UTF-8 bytes)
+            'local v9 = 1200 + string.byte("x\u00e9", 3) + -1400\n'
+            'local v10 = #("ab" .. 12 .. "c") * 3 - string.len(string.rep("z", 4))\n'           # (characters written as themselves: their UTF-8 bytes)
             'while true do\n'
             '\tlocal v8 = 9000 + bit32.countrz(640) + -8990\n'
             '\tv1.Workspace.Part:Destroy()\n'
