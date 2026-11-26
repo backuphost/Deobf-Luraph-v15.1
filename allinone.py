@@ -98,12 +98,24 @@ def _kill_tree(proc):
             pass
 
 
+def _on_term(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 def _stream(cmd, timeout, cwd=HERE, env=None):
     """Run cmd, pass its output through line by line, return (exit status or None on timeout,
     the output as text).  A Python traceback of the engine is not passed through line by
     line: its last line (the exception) is printed, marked as such; the full text is in the
     returned output."""
     lines = []
+    # SIGTERM to the front end must not leave the engine (and the interpreter it started) behind:
+    # turn it into an exception, so that the clean-up below runs.  (SIGKILL cannot be caught.)
+    import signal
+    old_term = None
+    try:
+        old_term = signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError, AttributeError):      # not the main thread / no such signal
+        old_term = None
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace", bufsize=1)
     timer = None
@@ -140,6 +152,11 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
     finally:
         if timer:
             timer.cancel()
+        if old_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, old_term)
+            except (ValueError, OSError):
+                pass
     return (None if timed_out else proc.returncode), "".join(lines)
 
 

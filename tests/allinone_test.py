@@ -47,8 +47,12 @@ def parses(path):
 class FakeScan:
     """What allinone.after_static reads from deob.Scan."""
 
-    def __init__(self, inp, form, bare=False, buffer=None, evidence=("头注释",)):
+    def __init__(self, inp, form, bare=False, buffer=None, evidence=("头注释",), layout=None, version=None):
         self.inp, self.form, self._bare, self._buffer, self._evidence = Path(inp), form, bare, buffer, list(evidence)
+        self._layout, self.header = layout, {"version": version}
+
+    def layout(self):
+        return self._layout
 
     def bare_chunk(self):
         return self._bare
@@ -78,6 +82,22 @@ class Decide(unittest.TestCase):
 
     def test_vm_goes_to_devm(self):
         self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm"), 4, flags()), ("devm", []))
+
+    def test_v14_vm_goes_to_devm_only(self):
+        for layout in ("fn-args", "table"):
+            self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", layout=layout, version="14.3"), 4, flags()),
+                             (("devm",), []))
+        # a v14 container that did not open in the front end: the layout follows the version
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", version="14.7"), 4, flags()), (("devm",), []))
+
+    def test_v150_goes_to_the_second_engine_first(self):
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", layout="setmt", version="15.0"), 4, flags()),
+                         (("deobf", "devm"), []))
+        self.assertEqual(allinone.after_static(FakeScan(SAMPLE, "vm", layout="setmt", version="15.2"), 4, flags()),
+                         ("devm", []))
+
+    def test_exit_8_is_final(self):
+        self.assertIsNone(allinone.after_static(FakeScan(SAMPLE, "vm"), allinone.UNPROCESSABLE, flags()))
 
     def test_static_result_stands(self):
         self.assertIsNone(allinone.after_static(FakeScan(LAYER3, "A"), 0, flags()))
