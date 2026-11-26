@@ -14,7 +14,15 @@ Without a corpus (hand-written text only):
   first-program call is found; every interpreter gets the entry hook;
 * the harness runs that VM, sees its first program return a proto and dumps when that proto is
   entered (`[handover]`, `[dumpnew]`); a first program that never returns ends by the instruction
-  budget with a `[budget]` line and no dump.
+  budget with a `[budget]` line and no dump; key functions the init installed (closures of the VM
+  that return a fixed number) are in the dump with their values;
+* `normalize.foreign_dialect` names builds for Lua 5.3/5.4 and LuaJIT and passes Luau text (type
+  annotations, strings, truncated text); `run.main` ends with one line `devm: unsupported target:`
+  or `devm: damaged input:` for them, without a traceback;
+* `luparse`: interpolated strings and a backslash-u escape without a brace;
+* `Model.regs_name` for an allocator called through the loader's state table;
+* `bootstrap.patch`: a tamper routine in a local, in a table slot and as a table-constructor item;
+* `container.may_be_container`: only container-shaped text is probed.
 
 With a corpus (LURAPH_CORPUS=<directory with one sub-directory per Luraph version>; skipped
 otherwise).  Files are picked at run time by directory and size, never by name:
@@ -31,7 +39,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.setrecursionlimit(100000)
 
-from devm import normalize, vmmodel, run       # noqa: E402
+from devm import bootstrap, container, luparse, luprint, normalize, vmmodel, run       # noqa: E402
 
 CORPUS = os.environ.get('LURAPH_CORPUS')
 HAVE_LUAU = os.path.exists(os.path.join(ROOT, 'bin', 'luau'))
@@ -190,6 +198,143 @@ class Harness(unittest.TestCase):
         data, notes = self.dump(spin, budget=5000, timeout=60)
         self.assertIsNone(data)
         self.assertTrue(any(n.startswith('[budget]') and 'has not returned' in n for n in notes), notes)
+
+
+# the same VM with two more opcodes: 5 = the init installs two key functions in the shared table,
+# 6 = a key function returns its operand
+KEYFN_VM = ('return(function(E,S,U)local W;W=function(p,u)local c,a=p[1],p[2];local f;f=function(...)local pc=1;'
+            'local r=S("#",...);while true do local o=c[pc];if o==1 then pc=pc+1;elseif o==5 then '
+            'u[7]={W(p[4],u),W(p[5],u)};pc=pc+1;elseif o==6 then return a[pc];else return p[3];end;end;end;return f;end;'
+            'local P={{5,1,3},{0,0,0},{{9,8,7},{0,0,0}},{{6},{41}},{{6},{97}}};'
+            'P=W(P,U)(E,S,U,1,2,W);return W(P,U);end)(getfenv,select,{})(...)')
+
+
+@unittest.skipUnless(HAVE_LUAU, 'bin/luau is not built')
+class KeyFunctions(unittest.TestCase):
+    def test_values_at_the_handover(self):
+        m = vmmodel.Model(normalize.reflow(normalize.normalise_heads(KEYFN_VM)[0]), oneline=True)
+        with tempfile.TemporaryDirectory() as work:
+            data, notes = vmmodel.run_dump_script(m, work, 'vm', ['executor=1'])
+        self.assertIsNotNone(data, notes)
+        self.assertIn('[keyfn] 1=41 2=97', notes)
+        self.assertIn('{"cfn":41,"k":1}', data)
+        self.assertIn('{"cfn":97,"k":2}', data)
+
+
+class Dialect(unittest.TestCase):
+    LUAU = ('local a = b ~= c; local s = "a ~ b << | &" -- x ~ y\nlocal t = [[ ~ ]]',
+            'type T = A | B & C\nlocal x: Array<Array<number>> = {}\nlocal y = 1',
+            'local goto = 1; print(goto)',
+            'local x = 0xFFp',
+            'return(function()local s="LPH~<<|&',                 # cut off inside a string
+            'local s = `{a} ~ {b}`')
+
+    def test_luau_passes(self):
+        for text in self.LUAU:
+            self.assertIsNone(normalize.foreign_dialect(text), text)
+
+    def test_other_targets(self):
+        one_line = 'function f() end function g() end function h() end function i() end function j() end '
+        for text, target in (('local x = ~y', 'Lua 5.3/5.4'),
+                             ('local x = 1 << 4', 'Lua 5.3/5.4'),
+                             (one_line + 'local x = a & b | c >> 2', 'Lua 5.3/5.4'),
+                             ('goto done; ::done::', 'Lua 5.2 or later'),
+                             ('local x = 0x1p4', 'Lua 5.2 or later'),
+                             ('local x = 12ULL', 'LuaJIT')):
+            why = normalize.foreign_dialect(text)
+            self.assertIsNotNone(why, text)
+            self.assertIn(target, why)
+
+    def run_main(self, text):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as work:
+            path = os.path.join(work, 'in.lua')
+            with open(path, 'w') as f:
+                f.write(text)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                with self.assertRaises(SystemExit) as cm:
+                    run.main([path, '-o', os.path.join(work, 'out.lua'), '--work', os.path.join(work, 'w')])
+            self.assertFalse(os.path.exists(os.path.join(work, 'out.lua')))
+        return cm.exception.code, out.getvalue()
+
+    def test_one_line_failures(self):
+        code, out = self.run_main('return(function(a)local x=a~1;return x<<2 end)(...)')
+        self.assertEqual(code, 1)
+        self.assertRegex(out.strip().split('\n')[-1], r'^devm: unsupported target: the file is built for Lua 5\.3/5\.4')
+        self.assertNotIn('Traceback', out)
+        code, out = self.run_main('return(function(a)local x={1,2')
+        self.assertEqual(code, 1)
+        self.assertRegex(out.strip().split('\n')[-1], r'^devm: damaged input: the text does not parse as Luau')
+        self.assertNotIn('Traceback', out)
+        code, out = self.run_main('return(function(a)return a+1 end)(...)')
+        self.assertEqual(code, 1)
+        self.assertRegex(out.strip().split('\n')[-1], r'^devm: no model: ')
+        self.assertNotIn('Traceback', out)
+
+
+class Parser(unittest.TestCase):
+    def test_interpolated_strings(self):
+        src = 'local a = `x{1+2}y`; local b = `{ {1,2}[1] } and {"}`"} \\` {f("a{b")}`; print(`hi {a}`) f`z`'
+        toks = [t[1] for t in luparse.tokenize(src) if t[0] == 'istr']
+        self.assertEqual(toks, ['`x{1+2}y`', '`{ {1,2}[1] } and {"}`"} \\` {f("a{b")}`', '`hi {a}`', '`z`'])
+        ast = luparse.parse(src)
+        body = ast[0]
+        self.assertEqual(body[0], ('local', ['a'], [('istr', '`x{1+2}y`')]))
+        self.assertEqual(luprint.SrcPrinter().expr(body[0][2][0]), '`x{1+2}y`')
+        self.assertEqual(normalize.unflow(normalize.reflow(src)), src)
+
+    def test_u_escape(self):
+        toks = [t[1] for t in luparse.tokenize('x("\\u0041", "\\u{41}", \'\\u\')') if t[0] == 'str']
+        self.assertEqual(toks, ['u0041', 'A', 'u'])
+
+
+class Regs(unittest.TestCase):
+    def test_allocator_forms(self):
+        for alloc, want in (('local R=T(r);', 'R'), ('local R=U[2][15](r);', 'R'), ('local R=(U[4](r));', 'R'),
+                            ('local R=U[2][15](r,1);', 'nil'), ('local R=U[k](r);', 'nil')):
+            text = vm_text().replace('local r=S("#",...);', 'local r=S("#",...);' + alloc)
+            m, _ = model_of(text)
+            self.assertEqual(m.regs_name(m.interps[0]), want, alloc)
+
+
+class Bootstrap(unittest.TestCase):
+    TEXT = ('local t = {\n\t[5] = function()\n\tlocal v = string.rep(" ", 8)\n\twhile true do\n\tend\nend,\n'
+            '\t[6] = function(a)\n\treturn a\nend,\n}\n'
+            'p1[22] = function()\n\tlocal v = string.rep(" ", 8)\n\t;(function()\n\t\tx()\n\tend)()\n\twhile true do\n\tend\nend\n'
+            'local crash = function()\n\tlocal v = string.rep(" ", 8)\n\twhile true do\n\tend\nend\n'
+            'local other = function()\n\treturn 1\nend\n'
+            'local open = function()\n\tlocal v = string.rep(" ", 8)\n')
+
+    def test_tamper_routine_forms(self):
+        out, info = bootstrap.patch(self.TEXT)
+        self.assertEqual(info['crash'], 3)
+        self.assertIn('\t[5] = function()\n\t\t__LPH_CRASH()\nend,', out)
+        self.assertIn('p1[22] = function()\n\t__LPH_CRASH()\nend', out)
+        self.assertIn('local crash = function()\n\t__LPH_CRASH()\nend', out)
+        self.assertIn('local other = function()\n\treturn 1\nend', out)
+
+
+class Containers(unittest.TestCase):
+    def test_probe_only_for_container_shapes(self):
+        loop = 'while true do local M=b[o];if M<1 then x() end;o=o+1;end'
+        for text, want in (('return(function()local a=loadstring;return a("x") end)()(...)', True),
+                           ('return setmetatable({A=function(z)return loadstring(z.o) end},{}):A()(...)', True),
+                           ('return({A=function(z)return loadstring(z.o) end}):A()(...)', False),      # a plain table VM
+                           ('return(function(a,b)return loadstring(a) end)(1,2)(...)', False),         # fn-args VM
+                           ('return(function()local a=1;return a end)()(...)', False),                 # loads nothing
+                           ('return(function()local a=loadstring;' + loop + ' end)()(...)', False)):   # holds its loop itself
+            self.assertEqual(container.may_be_container(text), want, text)
+
+    def test_stand_in_name(self):
+        with tempfile.TemporaryDirectory() as work:
+            c = container.stand_in(os.path.join(work, 'chunk.lua'), None, work, 't', 'Luraph   ')
+            with open(c.carrier) as f:
+                self.assertIn('pcall(loadstring,s,"Luraph   ",nil)', f.read())
+            c = container.stand_in(os.path.join(work, 'chunk.lua'), None, work, 't', 'x")os.exit(')
+            with open(c.carrier) as f:
+                self.assertIn('pcall(loadstring,s,"Luraph",nil)', f.read())
 
 
 def smallest(version, pred, limit=40):
