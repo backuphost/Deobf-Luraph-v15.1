@@ -1230,8 +1230,10 @@ local function clike(impl)
 end
 _G.__LPH_CLIKE = clike
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
-local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
+local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames, { here = here, readfile = readfile })
 mockRef = mock
+if executorEnv then mock.priv.executorLibs() end
+if _G.__LPH_CALLLOG then mock.priv.live = true end
 if scriptPath then mock.placeScript(scriptPath) end
 mock.serverSide = serverSide
 mock.mfpDelta = mfpDelta
@@ -1340,6 +1342,10 @@ local function rbxLib(name)
 	rbxLibs[name] = lib
 	return lib
 end
+-- Names the script read that nothing defines.  Roblox answers nil for them, and so does the mock:
+-- only the datatype libraries Roblox really has are made on demand (a table for every capitalised
+-- name let a key-system loader post `SCRIPT_KEY`, a table, as its request body).
+local undefinedRead = {}
 -- The script's environment is a plain table, as in Roblox: reading an existing global must not run
 -- a metamethod (scripts measure the remaining C stack, and a Lua __index handler costs a level).
 -- Only names that are not predefined fall through to the lazy Roblox-library fallback.
@@ -1348,8 +1354,12 @@ local fallback = setmetatable({}, {
 		if traceMode and string.sub(tostring(k), 1, 5) ~= "__LPH" then ewrite("[global] " .. tostring(k) .. "\n") end
 		local v = mock[k]
 		if v == nil then v = _G[k] end
-		if v == nil and type(k) == "string" and string.match(k, "^%u") and k ~= "LPH_NO_VIRTUALIZE" and string.sub(k, 1, 4) ~= "LPH_" then
+		if v == nil and type(k) == "string" and mock.priv.knownLib(k) then
 			v = rbxLib(k)
+		end
+		if v == nil and type(k) == "string" and string.sub(k, 1, 5) ~= "__LPH" and not undefinedRead[k] then
+			undefinedRead[k] = true
+			mock.priv.note("script", "undefined global read: " .. string.sub(k, 1, 60))
 		end
 		return v
 	end,
@@ -1386,7 +1396,8 @@ function populateSandbox()
 	-- global table behind their environment and look at every name they find)
 	local internal = { onHttp = true, onMfp = true, onMfpExpected = true, mfpDelta = true, mfpCalls = true, ctorCalls = true,
 		enumName = true, lib = true, newInstance = true, serverSide = true, stub = true, typeNames = true,
-		vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true }
+		vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true,
+		priv = true }
 	for k, v in pairs(mock) do
 		if type(k) == "string" and not internal[k] then rawset(sandbox, k, v) end
 	end
@@ -1480,6 +1491,8 @@ function populateSandbox()
 		for n, f in pairs(ex) do
 			if rawget(globals, n) == nil then rawset(globals, n, f) end
 		end
+		-- (the other usual name of identifyexecutor)
+		if rawget(globals, "getexecutorname") == nil then rawset(globals, "getexecutorname", rawget(globals, "identifyexecutor")) end
 		-- Metatable and read-only access, part of every executor's API (the "UNC" set).  They are
 		-- C closures like an executor's own (cwrap), and work on the mock's objects: mock
 		-- metatables are locked, the mock keeps the real ones in mock.rawMT.
@@ -2017,7 +2030,16 @@ function _G.__LPH_CRASH()
 end
 
 local src = readfile(samplePath)
-local fn, err = loadstring(src, "=sample")
+-- The mock has to know the script's main thread: task.wait / signal:Wait() suspend every other
+-- thread of the script (rbxmock.lua), and Luraph's start-up code (v15.x) checks that a spawned
+-- thread that waits is suspended.  A copy instrumented for a factory VM says so at its first proto
+-- (__LPH_PROTO).  Every other text (an unmodified file, a recovered script, a copy with the
+-- proto-table hooks, which do not mark the thread) is given a call of __LPH_MAIN in front of its
+-- first token: same line, no frame left on the stack, and the answers are the same in every kind of run.
+local fn, err
+local markMain = not string.find(src, "__LPH_PROTO", 1, true) and not string.find(src, "__LPH_MAIN", 1, true)
+if markMain then fn = loadstring("__LPH_MAIN();" .. src, "=sample") end
+if not fn then fn, err = loadstring(src, "=sample") end
 if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
 	error("compile")
@@ -2070,7 +2092,8 @@ end
 if carrierPath then
 	if not chunkSrcPath then error("carrier= needs chunksrc=") end
 	chunkPatched, chunkOrig = src, readfile(chunkSrcPath)
-	fn, err = loadstring(readfile(carrierPath), "=sample")
+	-- (the carrier starts the chunk in its own thread: the same mark, unless the chunk's hooks set it)
+	fn, err = loadstring((markMain and "__LPH_MAIN();" or "") .. readfile(carrierPath), "=sample")
 	if not fn then
 		ewrite("COMPILE ERROR (carrier): " .. tostring(err) .. "\n")
 		error("compile")
@@ -2239,6 +2262,7 @@ local function pokePass()
 end
 
 function __LPH_AFTER(ok, message)
+	if mock.priv and mock.priv.flush then mock.priv.flush() end       -- what the script printed, read and was handed (rbxmock.lua)
 	if carrierPath and chunkLoads == 0 then
 		ewrite("[carrier] the script never handed the expected chunk text to loadstring: nothing was instrumented\n")
 	end

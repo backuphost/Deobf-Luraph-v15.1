@@ -781,6 +781,15 @@ def run_report(notes):
             out.append('  ' + n[len('[env] '):])
         elif n.startswith('[hint]'):
             out.append('  ' + n[len('[hint] '):])
+    # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
+    said = [n for n in notes if n.startswith('[script]')]
+    for n in said[:12]:
+        out.append('  script: ' + n[len('[script] '):])
+    if len(said) > 12:
+        out.append('  script: ... %d more lines of its output in the run log' % (len(said) - 12))
+    for n in notes:
+        if n.startswith('[stub] permissive'):
+            out.append('  mock: ' + n[len('[stub] '):])
     return out
 
 

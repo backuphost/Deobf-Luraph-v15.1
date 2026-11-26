@@ -1106,7 +1106,7 @@ def run_oracle(model, workdir, tag, options=()):
         pass
     r.stderr = stderr
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
-    note += [l for l in r.stderr.split('\n') if l.startswith('[http]') or l.startswith('[env]')]
+    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive'))]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
         raise RuntimeError('oracle run failed: ' + r.stderr[-2000:])
     with open(outjson + '.oracle') as f:

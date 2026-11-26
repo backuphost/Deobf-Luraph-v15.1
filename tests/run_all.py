@@ -12,6 +12,7 @@
   devm-v14      devm's loop-head normaliser, v14 model and hand-over route (tests/devm_v14.py; with
                 LURAPH_CORPUS set also one file per v14 layout of the sample corpus)
   devm-v15      devm's traced-run snapshots and jump hubs for the v15.1 corpus builds (tests/devm_v15_corpus.py)
+  mock          the mock Roblox environment answers like Roblox (tests/mock_test.py)
   structurer    deobf's structurer against random control-flow graphs (research/structure_fuzz.py)
   frontend      deob.py picks the right engine and reports truthfully (tests/allinone_test.py)
   codecs        the static container decoder and the Zstandard decoders (tests/codecs_test.py)
@@ -42,6 +43,7 @@ def checks(full):
         ("devm-lift", [PY, "-B", "tests/devm_lift_v14.py"], {}, 1800),
         ("devm-v14", [PY, "-B", "tests/devm_v14.py"], {}, 900),
         ("devm-v15", [PY, "-B", "tests/devm_v15_corpus.py"], {}, 600),
+        ("mock", [PY, "-B", "tests/mock_test.py"], {}, 600),
         ("structurer", [PY, "-B", "deobf/research/structure_fuzz.py", "0", "3000" if full else "500"], {}, 1800),
         ("frontend", [PY, "-B", "tests/allinone_test.py"], {"ALLINONE_FULL": "1"} if full else {}, 3600),
         ("codecs", [PY, "-B", "tests/codecs_test.py"], {}, 1800),
