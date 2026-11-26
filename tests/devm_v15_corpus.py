@@ -10,7 +10,8 @@ wrapper keys: one interpreter, the main function behind jump-register hubs and b
   name), never to a proto's own code array, and entries of runs recorded without identities keep the
   old test;
 * `lifter.hub_line`: the instructions without effect in front of a jump through a register belong to
-  that jump (one copy per jump target), and nothing else does.
+  that jump (one copy per jump target), and nothing else does;
+* a traced run that created no VM function ends in `run failed: the VM never started: ...`.
 
     LURAPH_CORPUS=/path/to/obfuscator-samples/Luraph DEVM_V15_CORPUS_FULL=1 python3 tests/devm_v15_corpus.py Corpus
 
@@ -203,6 +204,31 @@ class HubLine(unittest.TestCase):
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 57)))
         self.nodes[(2, 59)] = node((2, 59), (2, 60), error='register 11850 out of range')
         self.assertIsNone(lifter.hub_line(self.nodes, self.node_in, {}, (2, 57)))
+
+
+LAYER3 = os.path.join(ROOT, 'examples', 'layer3.lua')
+
+
+@unittest.skipUnless(os.path.exists(LAYER3), 'needs examples/layer3.lua')
+class VmNeverStarted(unittest.TestCase):
+    def test_no_protos_is_a_message(self):
+        """A traced run in which no VM function was created (a chunk without its buffer) ends with one
+        line that says so, not with an IndexError."""
+        from devm import normalize, pipeline
+        with open(LAYER3, encoding='latin-1') as f:
+            src = f.read()
+        src, _n = normalize.inline_protected_raw(src)
+        stage = pipeline.Stage(normalize.reflow(src), tempfile.gettempdir(), 'never', log=lambda *a: None, oneline=True)
+        how = "script stopped: sample:3: invalid argument #1 to 'readu8' (buffer expected, got nil) after 0 instructions"
+        keep = vmmodel.run_oracle
+        vmmodel.run_oracle = lambda *a, **k: ({'root': {'t': 1}, 'protos': [], 'tables': {}}, {}, ['[oracle] ' + how])
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                stage.run_traced()
+        finally:
+            vmmodel.run_oracle = keep
+        self.assertTrue(str(cm.exception).startswith('run failed: the VM never started: ' + how), str(cm.exception))
+        self.assertIn('--chunk-arg', str(cm.exception))
 
 
 def corpus_file():

@@ -59,6 +59,11 @@ def _run_traced(self):
     self.run_notes = notes
     for n in notes:
         self.log('[%s]   %s' % (self.tag, n))
+    if not raw['protos']:
+        # no function of the VM was ever created: the script stopped inside Luraph's loader (a VM
+        # chunk run without the buffer its container passes to it stops at its first read)
+        how = next((n[len('[oracle] '):] for n in notes if n.startswith('[oracle] ')), 'the run recorded nothing')
+        raise RuntimeError('run failed: the VM never started: %s (a chunk cut out of a container needs its data: --chunk-arg)' % how)
     self.dump = pe.Dump(raw, m)
     self.dump.server = vmmodel.SERVER
     if vmmodel.SERVER is not None:
