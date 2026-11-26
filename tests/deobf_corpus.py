@@ -261,6 +261,62 @@ def check_run_once_forin():
     assert not any(isinstance(s, D.CallStmt) and isinstance(s.fn, Pseudo) for s in blocks[1].stmts)
 
 
+INSTANCE_SCRIPT = """
+local f = Instance.new("Folder")
+print("t1", f:HasTag("a"))
+f:AddTag("a"); f:AddTag("b"); f:AddTag("a"); f:AddTag(7)
+print("t2", f:HasTag("a"), #f:GetTags(), f:GetTags()[1], f:GetTags()[2], f:GetTags()[3], f:HasTag("7"))
+f:RemoveTag("a")
+print("t3", f:HasTag("a"), #f:GetTags(), f:GetTags()[1])
+local cs = game:GetService("CollectionService")
+cs:AddTag(f, "z")
+print("t4", cs:HasTag(f, "z"), f:HasTag("z"), #cs:GetTags(f), cs:HasTag(f, "nope"))
+print("t5", pcall(f.AddTag, f))
+print("t6", workspace:HasTag("x") and "guess" or "no")
+workspace:AddTag("mine")
+print("t7", workspace:HasTag("mine"), type(f:GetTags()), rawequal(f:GetTags(), f:GetTags()))
+print("a1", f:GetAttribute("k"), type(f:GetAttributes()), next(f:GetAttributes()))
+f:SetAttribute("k", 5)
+print("a2", f:GetAttribute("k"), next(f:GetAttributes()))
+f:SetAttribute("k", nil)
+print("a3", f:GetAttribute("k"), next(f:GetAttributes()))
+print("c1", f:FindFirstChildOfClass("Part"), f:FindFirstChildWhichIsA("BasePart"))
+local p = Instance.new("Part", f)
+print("c2", f:FindFirstChildOfClass("Part") == p, f:FindFirstChildWhichIsA("BasePart") == p,
+	f:FindFirstChildOfClass("BasePart"), f:FindFirstChildOfClass("Folder"))
+"""
+
+INSTANCE_WANT = [
+    'print("t1", false)',
+    'print("t2", true, 3, "a", "b", "7", true)',
+    'print("t3", false, 2, "b")',
+    'print("t4", true, true, 3, false)',
+    'print("t5", false, "Argument 1 missing or nil")',
+    'print("t6", "guess")',
+    'print("t7", true, "table", false)',
+    'print("a1", nil, "table", nil)',
+    'print("a2", 5, "k", 5)',
+    'print("a3", nil, nil)',
+    'print("c1", nil, nil)',
+    'print("c2", true, true, nil, nil)',
+]
+
+
+def check_instance_model():
+    """What a script did to an instance it made is what it reads back (tags, attributes, children by
+    class): Luraph v15.1/v15.2 probe exactly this, and a stand-in answer sends them into their tamper loop.
+    On an instance of the place an unknown answer stays the usual guess."""
+    with tempfile.TemporaryDirectory() as d:
+        src = write(d, "own.luau", INSTANCE_SCRIPT)
+        out = os.path.join(d, "out.luau")
+        rc, so, se = engine([src, "--obfuscator", "generic", "--no-devirt", "-o", out])
+        assert rc == 0 and os.path.exists(out), (rc, so[-1:], se[-1:])
+        with open(out, encoding="utf-8") as f:
+            got = [l.strip() for l in f if l.strip().startswith("print(")]
+        assert got == INSTANCE_WANT, [g for g in got if g not in INSTANCE_WANT] + ["missing:"] + \
+            [w for w in INSTANCE_WANT if w not in got]
+
+
 def _block(stmts, values=None):
     import structure
     b = structure.Block(1)
@@ -355,6 +411,49 @@ def check_table_constructors():
     assert len(b.stmts) == 3 and [k.v for k, _ in b.stmts[0].values.items[0].items] == [b"x"], len(b.stmts)
     b = _block([new(), store(b"x", Const(1)), store(b"f", plain)], Multi([Reg(1)]))
     assert CG.fold_tables(b) is True and len(b.stmts) == 1
+
+
+def check_shifted_pack():
+    """`f(a, g())` on a pack the front end stopped tracking: the handler's `P.n = 2 + P.n - 1;
+    table.move(P, 1, P.n, 2, P); P[1] = a; f(table.unpack(P, 1, P.n))` becomes the call again."""
+    import codegen as CG
+    from luasym import Const, Reg, Global, Index, Bin, TempVal, TempTail, Multi
+
+    def call(fn, *args, tail=None):
+        return CG.CallE(fn, Multi(list(args), tail))
+
+    def n(p):
+        return Index(Reg(p), Const(b"n"))
+
+    def graph(k=2, extra_read=False):
+        pack = CG.AssignS([Reg(5)], Multi([call(Global("table.pack"), tail=TempTail("T1", 1))]))
+        pack.pack = True
+        st = [CG.TempDef("T1", call(Global("g"))), pack,
+              CG.AssignS([Reg(6)], Multi([Global("f")])),
+              CG.AssignS([n(5)], Multi([Bin("Sub", Bin("Add", Const(k), n(5)), Const(1))])),
+              CG.TempDef("T2", call(Global("table.move"), Reg(5), Const(1), n(5), Const(k), Reg(5)))]
+        if k == 2:
+            st.append(CG.AssignS([Index(Reg(5), Const(1))], Multi([Reg(7)])))
+        st += [CG.TempDef("T3", call(Global("table.unpack"), Reg(5), Const(1), n(5))),
+               CG.TempDef("T4", call(Reg(6), tail=TempTail("T3", 1))),
+               CG.AssignS([Reg(8)], Multi([TempVal("T4", 1)]))]
+        if extra_read:
+            st.append(CG.CallS(call(Global("use"), Reg(5))))
+        return {1: _block(st, Multi([Reg(8)]))}
+
+    for k in (1, 2):
+        blocks = graph(k)
+        assert CG.fold_shifted_packs(blocks) is True, k
+        b = blocks[1]
+        calls = [s for s in b.stmts if isinstance(s, CG.TempDef)]
+        assert [s.t for s in calls] == ["T1", "T4"], [s.t for s in calls]
+        args = calls[1].call.args
+        assert isinstance(args.tail, TempTail) and args.tail.t == "T1", args.tail
+        assert [type(x).__name__ for x in args.items] == (["Reg"] if k == 2 else []), args.items
+        assert not any(isinstance(s, CG.AssignS) and isinstance(s.targets[0], Index) for s in b.stmts)
+    # the pack table is read afterwards: it must keep what the handler did to it
+    blocks = graph(2, extra_read=True)
+    assert CG.fold_shifted_packs(blocks) is False and len(blocks[1].stmts) == 10
 
 
 def check_declarations():
@@ -498,7 +597,9 @@ CHECKS = [
     ("run-once-forin", check_run_once_forin),
     ("operand-order", check_operand_order),
     ("table-constructors", check_table_constructors),
+    ("shifted-pack", check_shifted_pack),
     ("declarations", check_declarations),
+    ("instance-model", check_instance_model),
     ("result-line", check_result_line_trace),
     ("failure-line", check_failure_line),
     ("time-limit-lift", check_time_limit_lift),

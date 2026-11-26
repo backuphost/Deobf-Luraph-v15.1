@@ -1251,6 +1251,7 @@ def simplify_blocks(blocks, D):
             b.cond = conv(b.cond, D)
         if b.kind == "ret" and b.values is not None:
             b.values = conv_multi(b.values, D)
+    fold_shifted_packs(blocks)
     for i in range(12):
         if i >= 3:
             # only continue while constant folding opens up more folding
@@ -1391,6 +1392,148 @@ def merge_setlist_items(b):
                 st[j:i + 1] = [SetListS(s.tbl, s.start - len(items), Multi(items + list(s.values.items), s.values.tail))]
                 i = j
         i += 1
+
+
+def _int_const(e):
+    if isinstance(e, Const) and isinstance(e.v, (int, float)) and not isinstance(e.v, bool) and e.v == int(e.v):
+        return int(e.v)
+    return None
+
+
+def _pack_n(e, p):
+    """Is e `P.n` of the pack in register p?"""
+    return isinstance(e, Index) and isinstance(e.obj, Reg) and e.obj.n == p and isinstance(e.key, Const) \
+        and e.key.v == b"n"
+
+
+def fold_shifted_packs(blocks):
+    """Luraph's call handler for `f(a, g())` / `f(a, ...)` works on the pack of
+    the last argument's values: `P.n = K + P.n - 1; table.move(P, 1, P.n, K, P);
+    P[1] = a ...; f(table.unpack(P, 1, P.n))`. The front end follows that
+    symbolically; for a pack it stopped tracking (devirt's pack_unstable) the
+    statements are real code. Folded back here: the call takes `a ...` and
+    the pack's values directly, when the pack table is used for nothing else."""
+    live_out = liveness(blocks)
+    tu = count_temp_uses(blocks)
+    changed = False
+    for b in blocks.values():
+        i = 0
+        while i < len(b.stmts):
+            if _fold_shifted_pack(b, i, live_out[b.id], tu):
+                changed = True
+                continue
+            i += 1
+    return changed
+
+
+def _fold_shifted_pack(b, i, live, tu):
+    st = b.stmts
+    s = st[i]
+    # P.n = (K + P.n) - 1
+    if not (isinstance(s, AssignS) and len(s.targets) == 1 and isinstance(s.targets[0], Index)
+            and isinstance(s.targets[0].obj, Reg) and len(s.values.items) == 1 and s.values.tail is None):
+        return False
+    p = s.targets[0].obj.n
+    v = s.values.items[0]
+    if not (_pack_n(s.targets[0], p) and isinstance(v, Bin) and v.op == "Sub" and _int_const(v.b) == 1
+            and isinstance(v.a, Bin) and v.a.op == "Add"):
+        return False
+    k = _int_const(v.a.a) if _pack_n(v.a.b, p) else _int_const(v.a.b) if _pack_n(v.a.a, p) else None
+    if k is None or k < 1:
+        return False
+    # P = table.pack(...) before it, only register moves in between
+    d = i - 1
+    while d >= 0 and p not in stmt_defs(st[d]):
+        if not pure_stmt(st[d]) or p in stmt_regs(st[d]):
+            return False
+        d -= 1
+    if d < 0 or not (getattr(st[d], "pack", False) and len(st[d].targets) == 1
+                     and isinstance(st[d].values.items[0], CallE)):
+        return False
+    packed = st[d].values.items[0].args
+    # table.move(P, 1, P.n, K, P)
+    j = i + 1
+    mv = st[j] if j < len(st) else None
+    if not (isinstance(mv, TempDef) and tu.get(mv.t, 0) == 0 and isinstance(mv.call, CallE)
+            and isinstance(mv.call.fn, Global) and mv.call.fn.name == "table.move"
+            and mv.call.args.tail is None and len(mv.call.args.items) == 5):
+        return False
+    a = mv.call.args.items
+    if not (isinstance(a[0], Reg) and a[0].n == p and _int_const(a[1]) == 1 and _pack_n(a[2], p)
+            and _int_const(a[3]) == k and isinstance(a[4], Reg) and a[4].n == p):
+        return False
+    # P[1 .. K-1] = the arguments in front
+    j += 1
+    front = {}
+    while len(front) < k - 1:
+        x = st[j] if j < len(st) else None
+        if not (isinstance(x, AssignS) and len(x.targets) == 1 and isinstance(x.targets[0], Index)
+                and isinstance(x.targets[0].obj, Reg) and x.targets[0].obj.n == p
+                and len(x.values.items) == 1 and x.values.tail is None
+                and isinstance(x.values.items[0], (Reg, Const))
+                and not (isinstance(x.values.items[0], Reg) and x.values.items[0].n == p)):
+            return False
+        q = _int_const(x.targets[0].key)
+        if q is None or not 1 <= q <= k - 1 or q in front:
+            return False
+        front[q] = x.values.items[0]
+        j += 1
+    # T = table.unpack(P, 1, P.n), read once
+    up = st[j] if j < len(st) else None
+    if not (isinstance(up, TempDef) and tu.get(up.t, 0) == 1 and isinstance(up.call, CallE)
+            and isinstance(up.call.fn, Global) and up.call.fn.name == "table.unpack"
+            and up.call.args.tail is None and len(up.call.args.items) == 3):
+        return False
+    a = up.call.args.items
+    if not (isinstance(a[0], Reg) and a[0].n == p and _int_const(a[1]) == 1 and _pack_n(a[2], p)):
+        return False
+    # ... as the tail of one argument list in a later statement of the block
+    extra = [front[q] for q in range(1, k)] + list(packed.items)
+    fixed = set()
+    for e in extra:
+        fixed |= set(regs_read(e))
+    for m in st[d + 1:i]:
+        if fixed & set(stmt_defs(m)):
+            return False
+    c = j + 1
+    while c < len(st) and up.t not in stmt_uses(st[c])[1]:
+        if p in stmt_regs(st[c]) or p in stmt_defs(st[c]) or fixed & set(stmt_defs(st[c])):
+            return False
+        c += 1
+    if c >= len(st) or isinstance(st[c], ForPrepS):
+        return False
+    hits = []
+
+    def is_tail(t):
+        return isinstance(t, TempTail) and t.t == up.t and t.start == 1
+
+    def fn(x):
+        if isinstance(x, CallE) and is_tail(x.args.tail):
+            hits.append(x)
+            return CallE(map_expr(x.fn, fn), Multi([map_expr(y, fn) for y in x.args.items] + extra, packed.tail),
+                         x.method)
+        return None
+
+    def fm(m):
+        if is_tail(m.tail):
+            hits.append(m)
+            return Multi([map_expr(y, fn) for y in m.items] + extra, packed.tail)
+        return Multi([map_expr(y, fn) for y in m.items], m.tail)
+    new = map_stmt(st[c], lambda e: map_expr(e, fn), fm)
+    if len(hits) != 1 or p in stmt_regs(new) or up.t in stmt_uses(new)[1]:
+        return False
+    # the pack table itself must be dead afterwards (it was changed in place)
+    for m in st[c + 1:]:
+        if p in stmt_regs(m) or p in ref_captures(stmt_eval_order(m, b)):
+            return False
+        if p in stmt_defs(m):
+            break
+    else:
+        if p in live or p in term_uses(b)[0] or p in ref_captures(stmt_eval_order(None, b)):
+            return False
+    st[c] = new
+    del st[i:j + 1]
+    return True
 
 
 def table_self_ref(st, start, r, b):

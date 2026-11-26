@@ -1602,6 +1602,71 @@ local function onCall(p, ...)
 	if self and RUNSERVICE_BOOL[name] ~= nil then
 		return RUNSERVICE_BOOL[name]
 	end
+	-- Instance tags are a real set: a tag is there after AddTag and gone after
+	-- RemoveTag, in the order they were added; a number is a tag name too
+	-- (Luraph v15.1/v15.2 tag a Folder they made and ask for the tag back: a
+	-- truthy stand-in for a tag that was never added fails that probe). On
+	-- an instance the script made every answer is known; on an instance of
+	-- the place only the tags the script added are (else the usual guess).
+	-- The CollectionService forms take the instance first.
+	-- (Argument errors as devm/rbxmock.lua has them; not checked in Studio.)
+	if sinfo and isMethod and (name == "AddTag" or name == "RemoveTag" or name == "HasTag" or name == "GetTags") then
+		local inst, tag, argn = self, a1, 1
+		if sinfo.className == "CollectionService" then inst, tag, argn = a1, args[2], 2 end
+		local iinfo = isP(inst) and INFO[inst]
+		if iinfo and (name == "GetTags" or tag == nil or R.type(tag) == "string" or R.type(tag) == "number") then
+			if name ~= "GetTags" then
+				if tag == nil then R.error("Argument " .. argn .. " missing or nil", 0) end
+				tag = R.tostring(tag)
+			end
+			local tags = iinfo.tags
+			if name == "AddTag" or name == "RemoveTag" then
+				emit({ text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")" })
+				if not tags then tags = {}; iinfo.tags = tags end
+				local at = table.find(tags, tag)
+				if name == "AddTag" and not at then R.insert(tags, tag) end
+				if name == "RemoveTag" and at then R.remove(tags, at) end
+				return
+			elseif name == "HasTag" then
+				if tags and table.find(tags, tag) then return true end
+				if iinfo.created then return false end
+			elseif iinfo.created then
+				return tags and table.clone(tags) or {}
+			end
+		end
+	end
+	-- Attributes likewise: what the script set is there; an instance the
+	-- script made has no other attribute.
+	if sinfo and isMethod and sinfo.tname == "Instance"
+		and ((name == "SetAttribute" or name == "GetAttribute") and R.type(a1) == "string" or name == "GetAttributes") then
+		local attrs = sinfo.attrs
+		if name == "SetAttribute" then
+			emit({ text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")" })
+			if not attrs then attrs = {}; sinfo.attrs = attrs end
+			attrs[a1] = args[2]
+			return
+		elseif name == "GetAttribute" then
+			if attrs and attrs[a1] ~= nil then return attrs[a1] end
+			if sinfo.created then return nil end
+		elseif sinfo.created then
+			return attrs and table.clone(attrs) or {}
+		end
+	end
+	if sinfo and sinfo.created and (name == "FindFirstChildOfClass" or name == "FindFirstChildWhichIsA")
+		and R.type(a1) == "string" then
+		-- an instance the script made has exactly the children it was given
+		-- (FindFirstChildOfClass: that class itself; WhichIsA: the class tree)
+		local found = nil
+		for _, c in (name == "FindFirstChildWhichIsA" and args[2] == true) and descendants(self, {}) or kidsOf(self) do
+			local cn = INFO[c].className
+			if cn == a1 or (name == "FindFirstChildWhichIsA" and cn and API.classes[cn] and classIsA(cn, a1)) then
+				found = c
+				break
+			end
+		end
+		emit({ text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")" })
+		return found
+	end
 	if sinfo and (sinfo.created or sinfo.kids) then
 		if name == "GetChildren" then
 			emit({ text = calleeText .. "()" })
