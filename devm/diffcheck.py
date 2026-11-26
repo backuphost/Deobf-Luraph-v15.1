@@ -730,11 +730,55 @@ def check(original, result, workdir=None, timeout=120.0, max_events=20000, optio
             own.cleanup()
 
 
+def show_log(path, workdir=None, timeout=120.0, max_events=20000, options=('executor=1',), everything=False):
+    """Run one file and print its log for people.  Returns 0 when the run ended, 2 when it did not start."""
+    own = None
+    if workdir is None:
+        own = tempfile.TemporaryDirectory(prefix='diffcheck-')
+        workdir = own.name
+    try:
+        run = run_script(path, workdir, 'log', 1, timeout, max_events, options)
+    finally:
+        if own:
+            own.cleanup()
+    if run.fatal:
+        print('diffcheck: did not run: ' + run.fatal)
+        return NOT_COMPARABLE
+    notes = collections.defaultdict(list)
+    for at, line in run.notes:
+        notes[at].append(line)
+    holes = collections.defaultdict(list)
+    for at, name in run.placeholders:
+        holes[at].append(name)
+    n = 0
+    for i, e in enumerate(run.events):
+        for name in holes.get(i, ()):
+            print('        (reads the placeholder %s)' % name)
+        for line in notes.get(i, ()):
+            print('        ' + line)
+        if e.kind == 'C' and e.name in NOISE_CALLS:
+            if everything:
+                print('      . %s' % e.text())
+            continue
+        n += 1
+        print('%6d  %s%s' % (n, e.text(), '   -> raised ' + run.errors[i][:120] if i in run.errors else ''))
+    for line in notes.get(len(run.events), ()):
+        print('        ' + line)
+    for name, val in run.globals:
+        print('global  %s = %s' % (name, ID_RE.sub(lambda m: '#' + m.group(1), val)[:200]))
+    print('diffcheck: %s: %d calls and property writes (and %d of getfenv/setfenv/type/typeof), %s, %.1f s' % (
+        os.path.basename(path), n, len(run.events) - n, run.how_ended(), run.seconds))
+    return SAME
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python3 -m devm.diffcheck', description=__doc__.split('\n\n')[0],
                                  epilog='exit status: 0 same, 1 different, 2 not comparable')
-    ap.add_argument('original', help='the protected file')
-    ap.add_argument('result', help='the recovered script')
+    ap.add_argument('original', nargs='?', help='the protected file')
+    ap.add_argument('result', nargs='?', help='the recovered script')
+    ap.add_argument('--log', metavar='FILE', help='no comparison: run FILE alone and print what it does in the mock '
+                    '(one line per call or property write, its requests, how it ended)')
+    ap.add_argument('--all', action='store_true', help='with --log: also the calls that are never compared (getfenv, type, ...)')
     ap.add_argument('--work', help='directory for the logs of the runs (default: a temporary one)')
     ap.add_argument('--timeout', type=float, default=120.0, help='time limit for the whole check in seconds (default 120)')
     ap.add_argument('--max-events', type=int, default=20000, help='compare at most this many calls of the script (default 20000)')
@@ -743,6 +787,10 @@ def main(argv=None):
     ap.add_argument('-v', '--verbose', action='store_true')
     a = ap.parse_args(argv)
     options = [] if a.no_executor else ['executor=1']
+    if a.log:
+        return show_log(a.log, a.work, a.timeout, a.max_events, options, a.all)
+    if not a.original or not a.result:
+        ap.error('ORIGINAL and RESULT are required (or --log FILE)')
     try:
         v = check(a.original, a.result, a.work, a.timeout, a.max_events, options,
                   log=(lambda s: print('[diffcheck] ' + s, file=sys.stderr)) if a.verbose else None)

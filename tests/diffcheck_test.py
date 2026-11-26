@@ -412,6 +412,34 @@ print("end")
         self.assertEqual(run.events[0].text(), 'GetService(Instance<DataModel "Game">#1, "Players")')
 
 
+class CommandLine(Base):
+    def run_tool(self, *args):
+        r = subprocess.run([sys.executable, '-m', 'devm.diffcheck'] + list(args), cwd=ROOT, capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout
+
+    def test_exit_status_and_json(self):
+        import json
+        a, b = self.write(GUI), self.write(mutate(GUI, 'print("done")', 'print("Done")'))
+        code, out = self.run_tool(a, a)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.startswith('diffcheck: SAME: '), out)
+        code, out = self.run_tool(a, b, '--json', '--work', os.path.join(self.dir, 'cli'))
+        self.assertEqual(code, 1, out)
+        d = json.loads(out)
+        self.assertEqual((d['verdict'], d['code'], d['matched'], d['both_ended']), ('different', 1, 38, True))
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, 'cli', 'original.salt1.log')))
+        code, out = self.run_tool(a, self.write('print("a"\n'))
+        self.assertEqual(code, 2, out)
+        self.assertTrue(out.startswith('diffcheck: NOT COMPARABLE: '), out)
+
+    def test_log_of_one_file(self):
+        code, out = self.run_tool('--log', self.write('print("a", 1)\nlocal x = REG_3\nwarn("b")\nerror("stop")\n'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('     1  print("a", 1)', out)
+        self.assertIn('(reads the placeholder REG_3)', out)
+        self.assertRegex(out, r'2 calls and property writes .*stopped with an error: sample:4: stop')
+
+
 class Corpus(Base):
     def test_results_against_their_originals(self):
         corpus, results = os.environ.get('LURAPH_CORPUS'), os.environ.get('DIFFCHECK_RESULTS')
