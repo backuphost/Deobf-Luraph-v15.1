@@ -601,6 +601,7 @@ class Lifter:
                             # (a number stays known until something is called: see below)
                             if not (P.is_num(known.get(r)) and not isinstance(known.get(r), bool)):
                                 known.pop(r, None)
+                            known.pop(('V', r), None)
                 if st[0] == 'call' and any(a == ('regs',) for a in st[3]):
                     # the register array itself escaped into a call: anything may have changed
                     known = {CAP: known[CAP]} if CAP in known else {}

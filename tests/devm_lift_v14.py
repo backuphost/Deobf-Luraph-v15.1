@@ -772,6 +772,24 @@ R[A[pc]] = R[B[pc]] < R[C[pc]]
         self.assertNotIn('print(7)', text)
         self.assertNotIn('print(8)', text)
 
+    def test_a_register_a_closure_shares_is_not_a_constant(self):
+        # x = "A"; f = function() ... x ... end (x captured by reference); g(); <operand> = string.byte(x, 1):
+        # the call of g can have changed x through the closure
+        m = Mini(self.HANDLERS)
+        cells, base = m.model.cells, m.model.up_base
+        m = Mini(self.HANDLERS + """elseif op == 37 then
+R[A[pc]] = wrap(B[pc], {[%d] = {[%d] = R, [%d] = C[pc]}})
+""" % (base, cells[0], cells[1]))
+        inner = proto([(2, 1, 0, 0)])
+        head = [(1, 2, 'A', 0), (37, 6, inner, 2), (3, 7, 'g', 0), (5, 7, 0, 0),
+                (3, 1, 'string', 0), (30, 1, 1, 'byte'), (1, 3, 1, 0), (31, 1, 0, 0), (32, 1, 0, 11)]
+        text = m.lift(proto(head + self.TAIL))
+        caps = [st[2][2] for p in m.protos.values() for n in p.nodes.values() if n.tree
+                for st in n.tree[0] if st[0] == 'set' and st[2][0] == 'closure']
+        self.assertEqual([tuple(c) for c in caps], [(('ref', 2),)])
+        self.assertTrue(any('self-modifying store of a run-time value' in e[1] for e in m.errors), m.errors)
+        self.assertNotIn('print(65)', text)
+
     def test_run_time_value_is_still_an_error(self):
         m, text = self.lift([(3, 1, 'f', 0), (32, 1, 0, 4)])
         self.assertTrue(any('self-modifying store of a run-time value' in e[1] for e in m.errors), m.errors)
