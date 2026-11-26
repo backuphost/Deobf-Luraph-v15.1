@@ -331,6 +331,8 @@ class Judging(unittest.TestCase):
             (allinone.TRACE_HEADER + "\n" + code, "result: complete\n", "partial"),
             ("-- a\n-- b\n-- c\n", "[*]   0 functions, 0 unlifted blocks, 0 unstructured jumps\n", "nothing"),
             ("--[[ only\na comment ]]\n\n", "", "nothing"),
+            ("-- x\nlocal v1 = function(p1, p2, p3)\n\t-- LIFT ERROR: runaway loop\nend\n-- LIFT ERROR: y\n", "", "nothing"),
+            ("local v1 = function(p1)\n\tprint(p1)\nend\n", "", "complete"),
         )
         for text, log, want in cases:
             verdict, why = allinone.judge_deobf(self.result(text), log)

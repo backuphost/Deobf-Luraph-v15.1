@@ -1832,10 +1832,10 @@ def front_exit(scan):
         return allinone_code("UNPROCESSABLE")
     if v == "not-luraph" and scan.front_decisive() and not scan.layers:
         print(f"[✗] {VERDICT_TEXT[v]}")
-        print("    " + f["reason"])
         if f["header"]:
             print("    （文件带着 Luraph 的头注释，但头注释后面不是 Luraph 的产物 / the file carries a Luraph "
                   "header comment, but what follows is not Luraph's output）")
+        print("    " + f["reason"])         # the reason is the last line
         return 2
     return 0
 
@@ -1967,6 +1967,12 @@ def classify_file(path, work_dir=None, allow_run=True):
             if f["wrapper"] != "none" and not ci["opened"] and out["verdict"] != "not-luraph":
                 # `platform` is that of the VM text, which nobody saw
                 out["container_platform"], out["platform"] = f["platform"], "unknown"
+        if out["wrapper"] != "none" and not (out["container"] or {}).get("opened") and "container_platform" not in out:
+            # a container that was not opened (damaged, or a build for another Lua): `platform` is
+            # that of the VM text, which nobody saw
+            out["container_platform"] = out["platform"]
+            if out["verdict"] != "unsupported-target":      # (a Lua 5.3 container holds a Lua 5.3 VM)
+                out["platform"] = "unknown"
         if out["verdict"] == "luraph":
             if out["layout"] in V14_LAYOUTS:
                 out["route"] = "devm"

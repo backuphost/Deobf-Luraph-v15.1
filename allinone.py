@@ -165,8 +165,16 @@ def last_reason(text, engine):
     return "%s: %s" % (engine, lines[-1] if lines else "no output")
 
 
-def code_lines(path):
-    """Number of lines of a result file that are code (not blank, not a `--` comment)."""
+# a line that is only the frame of a function or block: no statement of the script
+_SHELL_LINE = re.compile(r"^(?:(?:local\s+)?(?:function\b[^()]*|[\w.]+\s*=\s*function\s*)\([^()]*\)|end[);,]*|do|else|"
+                         r"repeat|return|then)$")
+
+
+def code_lines(path, substance=False):
+    """Number of lines of a result file that are code (not blank, not a `--` comment).
+    substance=True: lines that are only the frame of a function or block (`local v1 =
+    function(p1, p2)`, `end`, `return`) do not count either: a result made of empty function
+    shells around "could not be lifted" comments has no line of the script in it."""
     n = 0
     in_long = None
     try:
@@ -183,6 +191,8 @@ def code_lines(path):
                     m = re.match(r"--\[(=*)\[", t)
                     if m and ("]" + m.group(1) + "]") not in t:
                         in_long = "]" + m.group(1) + "]"
+                    continue
+                if substance and _SHELL_LINE.match(t.split("--", 1)[0].strip() or t):
                     continue
                 n += 1
     except OSError:
@@ -239,9 +249,9 @@ def run_devm(inp, out, work=None, timeout=None, extra=()):
     result = [l for l in text.splitlines() if l.startswith("result: ")]
     complete = ok and bool(result) and result[-1].startswith("result: complete")
     why = []
-    if ok and code_lines(out) == 0:
+    if ok and code_lines(out, substance=True) == 0:
         ok, complete = False, False
-        why.append("devm: the result file holds no code (comments only)")
+        why.append("devm: the result file holds no code of the script (comments and empty function shells only)")
     elif ok and complete and parses(out) is False:
         complete = False
         why.append("the result does not parse (bin/luau-ast)")
@@ -266,9 +276,9 @@ def judge_deobf(out, text):
     result that does not parse is partial; a file without a line of code is nothing."""
     if not (os.path.isfile(out) and os.path.getsize(out) > 0):
         return "nothing", []
-    n = code_lines(out)
+    n = code_lines(out, substance=True)
     if n == 0:
-        return "nothing", ["the result file holds no code (comments only)"]
+        return "nothing", ["the result file holds no code of the script (comments and empty function shells only)"]
     why = []
     with open(out, encoding="utf-8", errors="replace") as f:
         head = f.read(400)
@@ -494,21 +504,25 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=()):
         shutil.copyfile(cand, out)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    # the last line is the front end's own verdict, in the engines' `result:` form
     if res["complete"]:
         say("[✓] devirtualized → %s" % out)
+        say("result: complete (%s)" % res["engine"])
         return OK
     if res.get("kind") == "trace":
         say("[!] behaviour trace → %s" % out)
         say("    A trace shows what the script did in the mock environment on this run: branches that")
         say("    were not taken are missing.  It is not the script's source.")
+        say("result: PARTIAL: a behaviour trace, not the script's source (deobf)")
         return PARTIAL
+    why = "; ".join(res.get("why") or ())
     if res["engine"] == "devm":
         say("[!] devirtualized, PARTIAL → %s  (the report above says what is missing)" % out)
-    else:
-        say("[!] devirtualized, PARTIAL → %s  (%s)" % (out, "; ".join(res["why"]) or "see the engine's report"))
-    for r in res.get("why") or ():
-        if res["engine"] == "devm":
+        for r in res.get("why") or ():
             say("    " + r)
+    else:
+        say("[!] devirtualized, PARTIAL → %s  (%s)" % (out, why or "see the engine's report"))
+    say("result: PARTIAL: %s (%s)" % (why or "see the engine's report above", res["engine"]))
     return PARTIAL
 
 
