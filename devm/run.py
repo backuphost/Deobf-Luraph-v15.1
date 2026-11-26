@@ -137,6 +137,17 @@ def method_wrap_layout(model):
     return any(st[0] == 'while' and holds(st[2]) for st in maker.body)
 
 
+def v152_generation(model):
+    """Builds of the v15.2 generation: start-up code and (in some builds) the script's top level in
+    one flattened main function behind trampolines, tamper traps, numeric loops kept in tables.
+    v15.2 itself is known by its wrapper keys.  The v15.1 builds of this generation have none; they
+    are known by the interpreter that runs their script, whose dispatch tree computes every test
+    into a local first (vmmodel._outlined_test).  Earlier v15.1 builds have neither."""
+    if model.keyed_wrappers:
+        return True
+    return any(l[2][0][0] == 'local' and vmmodel._outlined_test(l[2], l[2][0]) for l in model.loops)
+
+
 def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, mark_untaken=False):
     os.makedirs(workdir, exist_ok=True)
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -190,15 +201,16 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # (a script in its shipped layout keeps its source's control flow: nothing to unflatten.
         # Luraph v15.2 does flatten: its start-up code and the script's main function share one
         # state machine, see README "Luraph v15.2")
-        ircfg.UNFLATTEN = not oneline or stage.model.keyed_wrappers
+        gen152 = v152_generation(stage.model)
+        ircfg.UNFLATTEN = not oneline or gen152
         ircfg.DROP_OPAQUE = oneline
         # (... and that function has several hundred locals once it is unflattened)
-        structure.FIT_SCOPES = stage.model.keyed_wrappers
+        structure.FIT_SCOPES = gen152
         # (layout and and/or rewrites that came with v15.2 support; the committed v15.1 results
         # were written without them and tests/regress.py compares text for text)
-        structure.NEST_ITEMS = beautify.MERGE_ARMS = stage.model.keyed_wrappers
+        structure.NEST_ITEMS = beautify.MERGE_ARMS = gen152
         # (v15.2 forms of table-state `for` loops and of repeated key checks, see ircfg.V152)
-        ircfg.V152 = structure.NOTE_TRAPS = stage.model.keyed_wrappers
+        ircfg.V152 = structure.NOTE_TRAPS = gen152
         structure.MARK_COLD = ircfg.KEEP_COLD = bool(mark_untaken)
         try:
             text = stage.run_traced()

@@ -299,6 +299,19 @@ class OutlinedDispatch(unittest.TestCase):
         self.assertTrue(vmmodel.is_dispatch_loop(self.loop(usual)))
         self.assertTrue(vmmodel.LOOP_HEAD_RE.search(usual))
 
+    def test_marks_the_generation(self):
+        """run.py switches the structuring passes of the v15.2 generation on for these builds too."""
+        import types
+        from devm import run
+        usual = 'while true do local V=S[H];\nif V>=10 then x=1 else x=3 end;\nH+=1;\nend'
+        late = 'while true do V=S[H];\nif V>=10 then x=1 else x=3 end;\nH+=1;\nend'
+        model = types.SimpleNamespace(keyed_wrappers=False, loops=[self.loop(usual), self.loop(late), self.loop(self.LOOP)])
+        self.assertTrue(run.v152_generation(model))
+        model.loops.pop()
+        self.assertFalse(run.v152_generation(model))
+        model.keyed_wrappers = True
+        self.assertTrue(run.v152_generation(model))
+
     def test_other_loops_are_not(self):
         for body in ('local V=S[H];\nlocal j=W>=10;\nif j then x=1 end',         # the test is not of the opcode
                      'local V=S[H];\nlocal j=V>=10;\nif k then x=1 end',         # the `if` is not on that local
