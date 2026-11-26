@@ -1461,6 +1461,10 @@ class TableProtoLifter(Lifter):
         self.pe.slot_policy = True
         self.slot_rounds = 0
 
+    # attributes a caller sets between making the lifter and lift_all (kept when lift_all starts over)
+    SETTINGS = ('blocked', 'entry_override', 'param_vals', 'constprop', 'end_state', 'oracle',
+                'defer_foreign_state', 'slot_rounds')
+
     def mark_program(self, proto):
         """Everything reachable from a proto is program data (code and constant arrays, nested
         protos): the evaluator keeps it concrete and refuses run-time values stored into it."""
@@ -1490,11 +1494,14 @@ class TableProtoLifter(Lifter):
                 # (not seen in any file: stop telling slots apart, every loader table read from
                 # the dump so far is run-time state as a whole)
                 unstable |= {(path, None) for path, _ in self.pe.stable_reads}
-            keep = (self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server,
-                    self.slot_rounds)
+            # (what a caller may have set on the lifter before lifting stays; the evaluator, the
+            # dump's tables and everything lifted so far are made anew: `self.pe` and `self.dump`
+            # are other objects afterwards)
+            keep = {k: getattr(self, k) for k in self.SETTINGS}
+            overrides, server = self.pe.keyfn_override, self.dump.server
             self.__init__(self.model, P.Dump(self.dump.data, self.model), self.log)
-            (self.pe.keyfn_override, self.blocked, self.entry_override, self.param_vals, self.dump.server,
-             self.slot_rounds) = keep
+            self.__dict__.update(keep)
+            self.pe.keyfn_override, self.dump.server = overrides, server
             self.pe.unstable = unstable
             if root_key not in self.proto_objs:
                 self.register(root_key)
