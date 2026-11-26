@@ -164,8 +164,12 @@ def check_no_orphan():
             tag = "own_spin_%d_%d" % (os.getpid(), int(sig))
             # (a busy loop: the harness process never ends by itself within the test)
             src = write(d, tag + ".lua", "while true do end\n")
+            # (TMPDIR: the engine's work directory is made in here; a SIGKILL leaves it behind)
+            work = os.path.join(d, "tmp")
+            os.mkdir(work)
             proc = subprocess.Popen([PY, "-B", DEOB, src, "-o", os.path.join(d, "out.lua")], cwd=ROOT,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                    env=dict(os.environ, TMPDIR=work))
             try:
                 deadline = time.time() + 15 * SLOW
                 while not _harness_pids(tag) and time.time() < deadline and proc.poll() is None:
@@ -181,6 +185,7 @@ def check_no_orphan():
                 if sig == signal.SIGTERM:
                     assert proc.returncode == 128 + sig, proc.returncode
                     assert err.strip().split("\n")[-1] == "deobf: terminated by signal %d" % sig, err[-200:]
+                    assert os.listdir(work) == [], "work directory left after SIGTERM: %s" % os.listdir(work)
             finally:
                 if proc.poll() is None:
                     proc.kill()

@@ -7,19 +7,24 @@ the lift runs in (backend.run_big_stack) raise TimeLimit, and the plugin then
 writes what it has (normally the behaviour trace) instead of the lifted text.
 
 Child processes (the Luau harness runs) are started with spawn(): they die
-with this process, also when it is killed.
+with this process, also when it is killed. Work directories made with
+temp_dir() are removed when the engine exits or is terminated (after a
+SIGKILL they stay: set TMPDIR to choose where they are made).
 """
 import atexit
 import ctypes
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 DEADLINE = [None]       # time.time() value, or None: no limit
 LIMIT = [0]             # the limit in seconds as given (for messages)
 CHILDREN = []           # running child processes (subprocess.Popen)
+TEMP_DIRS = []          # work directories to remove at the end
 
 
 class TimeLimit(Exception):
@@ -102,8 +107,25 @@ def kill_children():
     del CHILDREN[:]
 
 
+def temp_dir(prefix):
+    """tempfile.mkdtemp() for a work directory that is removed when the
+    engine ends, also when it is terminated by a signal."""
+    d = tempfile.mkdtemp(prefix=prefix)
+    TEMP_DIRS.append(d)
+    return d
+
+
+def remove_temp(path=None):
+    """Remove one work directory (or all of them)."""
+    for d in ([path] if path else list(TEMP_DIRS)):
+        shutil.rmtree(d, ignore_errors=True)
+        if d in TEMP_DIRS:
+            TEMP_DIRS.remove(d)
+
+
 def _on_signal(signum, frame):
     kill_children()
+    remove_temp()
     try:
         sys.stderr.write("deobf: terminated by signal %d\n" % signum)
         sys.stderr.flush()
@@ -115,6 +137,7 @@ def _on_signal(signum, frame):
 def install():
     """Kill the children at exit and when the engine is asked to stop."""
     atexit.register(kill_children)
+    atexit.register(remove_temp)
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):
         sig = getattr(signal, name, None)
         if sig is not None:

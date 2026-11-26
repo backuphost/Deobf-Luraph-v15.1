@@ -167,8 +167,7 @@ def main():
     else:
         # one input -> one output file (<input folder>/output/<input file name>);
         # intermediate files live in a temporary folder
-        import tempfile
-        workdir = tempfile.mkdtemp(prefix="deobf_")
+        workdir = limits.temp_dir("deobf_")
         trace_path = os.path.join(workdir, tracename)
         final = args.output or os.path.join(outdir, os.path.basename(args.input))
     os.makedirs(os.path.dirname(os.path.abspath(final or trace_path)), exist_ok=True)
@@ -184,8 +183,7 @@ def main():
         return report(job, result)
     finally:
         if workdir:
-            import shutil
-            shutil.rmtree(workdir, ignore_errors=True)
+            limits.remove_temp(workdir)
 
 
 def report(job, result):
@@ -228,6 +226,7 @@ def run():
             traceback.print_exc()
         status, reason = 1, "internal error: %s: %s" % (type(e).__name__, e)
     limits.kill_children()
+    limits.remove_temp()
     if reason is not None:
         reason = re.sub(r"^\[!\]\s*", "", reason.strip())
         lines = [ln for ln in reason.split("\n") if ln.strip()]

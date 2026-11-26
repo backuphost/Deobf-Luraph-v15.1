@@ -435,6 +435,11 @@ class OpaqueFn:
         self.pf_tid = None      # a VM closure: table id of its proto
         self.mk_tid = None      # a v15.2 per-proto closure maker: table id of its proto key
 
+    def __repr__(self):
+        # (one object per function of the dump; no address: the text reaches
+        # the output in error markers and must be the same in every run)
+        return "<VM function lf%s>" % (self.lfid,)
+
 
 def operand_array(t):
     """The operand array a lazily decoded constant array reads a slot's

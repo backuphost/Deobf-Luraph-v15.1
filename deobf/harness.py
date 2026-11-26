@@ -284,8 +284,7 @@ class HarnessServer:
     END = b"\x00ENVLOG-END"
 
     def __init__(self, luau, source, cfg, chunks):
-        import tempfile
-        self.dir = tempfile.mkdtemp(prefix="deobf_serve_")
+        self.dir = limits.temp_dir("deobf_serve_")
         with open(os.path.join(self.dir, "harness.luau"), "w", encoding="latin-1", newline="\n") as f:
             f.write(build_harness(source, dict(cfg, serve=True), chunks))
         self.proc = limits.spawn([luau], cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -372,8 +371,7 @@ class HarnessServer:
 
     def close(self):
         limits.reap(self.proc)
-        import shutil
-        shutil.rmtree(self.dir, ignore_errors=True)
+        limits.remove_temp(self.dir)
 
 
 def trace_text(body):
