@@ -1490,28 +1490,43 @@ function populateSandbox()
 		libnames[mathCopy] = "math"
 		rawset(sandbox, "math", mathCopy)
 	end
+	-- require: the CLI's own loader reads and runs files from disk.  The script gets Roblox's
+	-- require instead: the game's ModuleScripts do not exist here, so a module is a permissive
+	-- stand-in (as any member the mock has no answer for), and a string is refused as Roblox does.
+	local require
+	do
+		local function impl(m)
+			if type(m) == "string" then error("Attempted to call require with invalid argument(s).", cwrap and 0 or 2) end
+			return mock.stub("require(" .. tostring(m) .. ")")
+		end
+		require = cwrap and cwrap("require", impl) or impl
+		fnames[require] = "require"
+	end
+	-- (the names go in in this order: scripts walk the table behind their environment, and the
+	-- order next() gives depends on the order the keys came in)
 	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
 		"rawset", "rawlen", "select", "setmetatable", "tonumber", "tostring", "type", "typeof", "ipairs", "pairs",
-		"pcall", "xpcall", "unpack", "string", "table", "bit32", "buffer", "coroutine", "os",
+		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
 		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T", "__LPH_MARK", "__LPH_OVER", "__LPH_PID", "__LPH_ENTER",
 		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN", "__LPH_CARRY" }) do
 		local v = _G[n]
+		if n == "require" then v = require end
 		if v ~= nil then rawset(sandbox, n, v) end
 	end
 	for k, v in pairs(mock) do
 		if type(k) == "string" and not mockInternal[k] then rawset(sandbox, k, v) end
 	end
 	for _, n in ipairs({ "game", "workspace", "script", "Enum", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim",
-		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared",
+		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
 		"TweenInfo", "NumberRange", "NumberSequence", "ColorSequence", "BrickColor", "Ray", "Region3", "Font",
 		"Path2DControlPoint", "DateTime", "PhysicalProperties", "Axes", "Faces", "Vector3int16", "Vector2int16",
 		"NumberSequenceKeypoint", "ColorSequenceKeypoint", "OverlapParams", "RaycastParams", "SharedTable",
 		-- executor-specific globals probed by environment-fingerprinting scripts
 		"math_floor_precision" }) do
 		if rawget(sandbox, n) == nil then
-			local v = fallback[n]
+			local v = n == "_G" and {} or fallback[n]
 			if v ~= nil then rawset(sandbox, n, v) end
 		end
 	end
@@ -1521,18 +1536,6 @@ function populateSandbox()
 	-- anti-cheat code treats an environment that only inherits _G / shared as an executor's.
 	local globals = sandbox
 	rawset(globals, "_G", {})       -- the scripts' shared table, not the CLI's own globals
-	-- require: the CLI's own loader reads and runs files from disk.  The script gets Roblox's
-	-- require instead: the game's ModuleScripts do not exist here, so a module is a permissive
-	-- stand-in (as any member the mock has no answer for), and a string is refused as Roblox does.
-	do
-		local function impl(m)
-			if type(m) == "string" then error("Attempted to call require with invalid argument(s).", cwrap and 0 or 2) end
-			return mock.stub("require(" .. tostring(m) .. ")")
-		end
-		local f = cwrap and cwrap("require", impl) or impl
-		fnames[f] = "require"
-		rawset(globals, "require", f)
-	end
 	if executorEnv and rawget(globals, "request") == nil then
 		-- executor HTTP: nothing is sent.  Every call is logged and answered with a canned reply
 		-- (httpreply=<text>, default empty body), so the script's handling of it can be traced.
