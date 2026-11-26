@@ -505,13 +505,20 @@ local function codeVersion(pid)
 		local p = protos[pid]
 		if not p or type(p.vars) ~= "table" then return 0 end
 		cs = { names = {}, tabs = {}, shadow = {}, base = {}, vers = {}, cur = 0 }
+		-- The proto's own tables.  A lazy view of one of them (`P = setmetatable({[0] = K}, decode)`:
+		-- key 0 holds the proto's own operand array) is not a table of the loader: that array is
+		-- followed below under its own name, per proto.
+		local direct = {}
+		for _, v in next, p.vars do
+			if type(v) == "table" then direct[v] = true end
+		end
 		for name, v in next, p.vars do
 			if type(name) == "string" and type(v) == "table" and not libnames[v] and v ~= envTable then
 				-- (not a constant table's {[-1] = pool, [-2] = index array}: that array is the
 				-- proto's own and is followed as one of its code arrays)
 				local own = rawget(v, -1) ~= nil or rawget(v, -2) ~= nil
 				for k2, w in next, v do
-					if type(w) == "table" and not own and not sharedBase[w] and (type(k2) == "number" or type(k2) == "string") then
+					if type(w) == "table" and not own and not direct[w] and not sharedBase[w] and (type(k2) == "number" or type(k2) == "string") then
 						local copy, n = {}, 0
 						for k, x in next, w do
 							if type(k) == "number" and type(x) == "number" then
@@ -587,8 +594,12 @@ local function writeSnaps()
 			end
 		end
 		if #ent > 0 then
-			sh[#sh + 1] = string.format('{"name":"%s","key":%s,"base":{%s}}', e.name,
-				type(e.key) == "number" and string.format("%d", e.key) or '"' .. e.key .. '"', table.concat(ent, ","))
+			-- "tid": the table's id in the dump that follows (the lifter matches the entry by it:
+			-- the same name and key lead to a different table in every proto)
+			local tid = string.match(ser(e.tbl), '^{"t":(%d+)}$')
+			sh[#sh + 1] = string.format('{"name":"%s","key":%s,%s"base":{%s}}', e.name,
+				type(e.key) == "number" and string.format("%d", e.key) or '"' .. e.key .. '"',
+				tid and '"tid":' .. tid .. "," or "", table.concat(ent, ","))
 		end
 	end
 	parts[#parts + 1] = '"shared":[' .. table.concat(sh, ",") .. "]"

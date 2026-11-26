@@ -807,8 +807,22 @@ class Lifter:
             for ent in snaps.get('shared') or ():
                 holder = env.get(ent['name'])
                 obj = holder.h.get(ent['key']) if isinstance(holder, LuaTable) else None
-                # (two interpreters can each have a table under the same name: the entry belongs
-                # to this one only if its keys are this table's keys)
+                if not isinstance(obj, LuaTable) or not ent['base']:
+                    continue
+                if any(obj is v for v in env.values()):
+                    # one of this proto's own code arrays seen through a lazy view of it
+                    # (`P = setmetatable({[0] = K}, decode)`): followed per proto, under its own name
+                    continue
+                if 'tid' in ent:
+                    # the entry names its table (its id in the dump): every proto can have a
+                    # table under the same name and key
+                    if obj.id != ent['tid']:
+                        continue
+                    shared_ids.add(id(obj))
+                    shared.append((obj, ent['base']))
+                    continue
+                # (a run recorded without table ids.  Two interpreters can each have a table under
+                # the same name: the entry belongs to this one only if its keys are this table's keys)
                 if isinstance(obj, LuaTable) and ent['base'] and \
                         sum(1 for k in ent['base'] if P.is_num(obj.h.get(int(k)))) >= 0.95 * len(ent['base']):
                     shared_ids.add(id(obj))
