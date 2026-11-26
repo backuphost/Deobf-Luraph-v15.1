@@ -1277,6 +1277,13 @@ class Lifter:
                         stack.append(e[1])
             pir.nodes = {k: n for k, n in pir.nodes.items() if k in seen}
             pir.errors = [(k, n.error) for k, n in pir.nodes.items() if n.error]
+        if pir.entry not in pir.nodes:
+            # nothing was lifted, not even the first instruction (it waited for a code state that
+            # no path brought): the function is a marked stub, not a graph without an entry
+            node = pir.nodes[pir.entry] = Node(pir.entry)
+            node.error = 'the first instruction of the function could not be lifted'
+            node.tree = ([('error', node.error)], ('ret', [], None))
+            pir.errors.append((pir.entry, node.error))
         pir.children = self.queue[nq0:]
         self.check_conflicts(pir)
         if self.end_state and isinstance(key, int):
