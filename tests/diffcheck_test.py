@@ -274,7 +274,7 @@ class Limits(Base):
         self.expect(DIFFERENT, b, mutate(b, '"1" }', '"2" }'), r'request')
 
     def test_not_comparable(self):
-        self.expect(NOT_COMPARABLE, GUI, 'print("a"\n', r'the result did not run')
+        self.expect(NOT_COMPARABLE, GUI, 'print("a"\n', r'the result did not run: it does not compile: sample:2: ')
         self.expect(NOT_COMPARABLE, 'print("a"\n', GUI, r'the original did not run')
         self.expect(NOT_COMPARABLE, GUI, '\n', r'empty')
         self.expect(NOT_COMPARABLE, 'local x = 1\n', 'local y = 2\n', r'nothing to compare')

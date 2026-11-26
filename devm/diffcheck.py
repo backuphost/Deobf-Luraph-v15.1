@@ -316,6 +316,10 @@ def run_script(path, workdir, tag, salt=1, timeout=60.0, max_events=20000, optio
         run.cut = 'time limit'
     if run.end is not None:
         run.cut = None
+    if run.fatal:
+        ce = [line for _, line in run.notes if line.startswith('COMPILE ERROR')]
+        if ce:
+            run.fatal = 'it does not compile: ' + re.sub(r'^COMPILE ERROR[^:]*: ', '', ce[0])[:300]
     if not run.started and not run.fatal:
         text = '; '.join(line for _, line in run.notes[-3:]) or 'no output'
         run.fatal = ('time limit before the script started' if timed_out else 'the harness did not start the script') + ': ' + text
