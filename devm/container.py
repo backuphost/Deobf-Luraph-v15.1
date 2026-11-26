@@ -27,12 +27,15 @@ import os
 import re
 import subprocess
 
-from . import vmmodel
+from . import normalize, vmmodel
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# `while true do [local] OP[, X] = CODE[PC]; if`: the head of a dispatch loop in Luraph's own layout
-_HEAD = vmmodel.LOOP_HEAD_RE
+
+def has_dispatch_loop(text):
+    """True when the text holds a Luraph dispatch loop: the canonical head (a regex, cheap) or any
+    other spelling of it (normalize.find_heads, the one place that knows them)."""
+    return vmmodel.LOOP_HEAD_RE.search(text) is not None or normalize.count_heads(text) > 0
 
 
 class Carrier:
@@ -54,7 +57,7 @@ class Carrier:
 
 def may_be_container(src):
     """Cheap test before running anything: the file can load code, and holds no dispatch loop itself."""
-    return re.search(r'\bloadstring\b', src) is not None and _HEAD.search(src) is None
+    return re.search(r'\bloadstring\b', src) is not None and not has_dispatch_loop(src)
 
 
 def unwrap(path, workdir, tag, log=print, timeout=120):
@@ -82,7 +85,7 @@ def unwrap(path, workdir, tag, log=print, timeout=120):
         chunk = '%s.chunk%s.lua' % (prefix, n)
         with open(chunk, encoding='latin-1') as f:
             text = f.read()
-        if not _HEAD.search(text):
+        if not has_dispatch_loop(text):
             continue
         arg = None
         kinds = args.split(',') if args else []

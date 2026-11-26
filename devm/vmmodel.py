@@ -34,10 +34,30 @@ def is_dispatch_loop(st, assigned=False):
     e = s0[2][0]
     if e[0] != 'index' or e[1][0] != 'name' or e[2][0] != 'name':
         return False
-    return body[1][0] == 'if'
+    if body[1][0] == 'if':
+        return True
+    # one table per instruction (Luraph v14.0 - v14.2): local I = CODE[PC]; local OP = I[n]; PC = PC + 1; if
+    # (normalize.normalise_heads writes every spelling of the head in this form)
+    if assigned or len(body) < 4 or len(s0[1]) != 1:
+        return False
+    s1, s2 = body[1], body[2]
+    if s1[0] != 'local' or len(s1[1]) != 1 or len(s1[2]) != 1:
+        return False
+    e1 = s1[2][0]
+    if e1[0] != 'index' or e1[1] != ('name', s0[1][0]) or e1[2][0] != 'num':
+        return False
+    if s2[0] != 'assign' or len(s2[1]) != 1 or s2[1][0] != e[2]:
+        return False
+    return body[3][0] == 'if'
 
 
-LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)(?:local\s+)?\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*if\b')
+def is_insn_table_loop(st):
+    """True for a dispatch loop of the one-table-per-instruction form (see is_dispatch_loop)."""
+    return st[2][1][0] != 'if'
+
+
+LOOP_HEAD_RE = re.compile(r'\bwhile\s+true\s+do(\s+)(?:local\s+)?\w+(?:\s*,\s*\w+)*\s*=\s*\w+\[\w+\]\s*;?\s*'
+                          r'(?:local\s+\w+\s*=\s*\w+\[\w+\]\s*;?\s*\w+\s*=\s*\w+\s*\+\s*1\s*;?\s*)?if\b')
 _NUM = r'(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*)'
 CELL_RE = re.compile(r'\b(\w+)\[' + _NUM + r'\]\[(\w+)\[' + _NUM + r'\]\]')
 
@@ -380,26 +400,70 @@ class Model:
         """True when there is a closure layer between the proto-level function and the interpreter."""
         return len(self.chain) >= 3 and not self._is_proto_table_style()
 
-    def _is_proto_table_style(self):
-        parent = self.chain[-2]
-        if len([p for p in parent.params if p != '_']) != 2 or not parent.body or parent.body[-1][0] != 'return' \
-                or not parent.body[-1][1]:
+    @staticmethod
+    def _maker_body(parent):
+        """Statements of a closure maker, looking through a junk test around its tail
+        (`if J == 230 then else <unpack>; ...; return F end`): the body plus the arms of a
+        trailing `if`, as one list."""
+        out = list(parent.body)
+        for _ in range(3):
+            if not out or out[-1][0] != 'if':
+                break
+            st = out.pop()
+            arms = [b for _c, b in st[1]] + ([st[2]] if st[2] else [])
+            arms = [b for b in arms if b]
+            if not arms:
+                break
+            # the arm that does the work is the longest one
+            out.extend(max(arms, key=len))
+        return out
+
+    def _is_proto_table_style(self, it=None):
+        """wrap(proto, upvalues[, junk ...]) -> function(...): the closure maker of the proto-table
+        layout (every Luraph v14 build).  It unpacks the fields of the proto into locals and
+        returns the interpreter closure; a junk third parameter, a junk constant among the
+        unpacked values, a junk test around the body and `return (name)` are decoration."""
+        chain = it.chain if it is not None else self.chain
+        interp = chain[-1]
+        parent = chain[-2]
+        body = self._maker_body(parent)
+        if len(parent.params) < 2 or not body or body[-1][0] != 'return' or not body[-1][1]:
             return False
-        ret = parent.body[-1][1][0]
+        ret = body[-1][1][0]
+        while ret[0] == 'paren':
+            ret = ret[1]
         if ret[0] == 'func':
-            if ret[1] is not self.interp:
+            if ret[1] is not interp:
                 return False
         elif ret[0] != 'name':
             # raw layout: `Z = (function(...) ... end); return Z`
             return False
         # wrap(proto, upvalues) unpacks the proto table into locals; a factory's upvalue closure that
         # happens to take two parameters (function(H, d) local d, p, ... = L, D, ...) does not
-        for st in parent.body:
-            if st[0] == 'local' and st[2] and all(
-                    e[0] == 'paren' and e[1][0] == 'index' and e[1][1][0] == 'name' and e[1][1][1] in parent.params
-                    or e[0] == 'index' and e[1][0] == 'name' and e[1][1] in parent.params for e in st[2]):
-                return True
-        return False
+        return self._unpacked_param(parent, body) is not None
+
+    @staticmethod
+    def _unpacked_param(parent, body):
+        """The parameter whose fields a `local a, b, ... = P[1], P[2], ...` statement of the closure
+        maker reads, or None.  Other values in the statement are decoration or per-closure state
+        (a junk constant, a fresh table); the fields of the parameter must be the majority."""
+        counts = {}
+        for st in body:
+            if st[0] != 'local' or not st[2]:
+                continue
+            hits = {}
+            other = 0
+            for e in st[2]:
+                while e[0] == 'paren':
+                    e = e[1]
+                if e[0] == 'index' and e[1][0] == 'name' and e[1][1] in parent.params:
+                    hits[e[1][1]] = hits.get(e[1][1], 0) + 1
+                elif e[0] != 'num':
+                    other += 1
+            if hits and (other == 0 or max(hits.values()) >= 2 and max(hits.values()) > other):
+                for k, v in hits.items():
+                    counts[k] = counts.get(k, 0) + v
+        return max(counts, key=counts.get) if counts else None
 
     def wrapper_numbers(self, it):
         """{index of a wrapper parameter: [interpreter locals it is copied into]}.
@@ -537,21 +601,95 @@ class Model:
                     out.append((start, pos, k))
         return out
 
-    def proto_param(self):
+    def proto_param(self, it=None):
         """Proto-table layout: the wrap parameter that receives the proto table."""
-        wrap = self.chain[-2]
+        wrap = (it.chain if it is not None else self.chain)[-2]
         counts = {}
-        for st in wrap.body:
+        for st in self._maker_body(wrap):
             if st[0] != 'local':
                 continue
             for e in st[2]:
-                if e[0] == 'paren':
+                while e[0] == 'paren':
                     e = e[1]
                 if e[0] == 'index' and e[1][0] == 'name' and e[1][1] in wrap.params:
                     counts[e[1][1]] = counts.get(e[1][1], 0) + 1
         return max(counts, key=counts.get) if counts else None
 
-    def patched_source(self, step=False, conds=False, flow=False, stepvars=None, newproto=False):
+    @property
+    def insn_tables(self):
+        """True when the dispatch loops fetch one table per instruction (Luraph v14.0 - v14.2)."""
+        return any(is_insn_table_loop(l) for l in self.loops)
+
+    def first_program_call(self):
+        """Proto-table layout: where the loader runs the VM's first program.
+
+        Luraph v14 loaders end with `P = WRAP(P, U)(<ten or more arguments>); return WRAP(P, U)`: the
+        first program is Luraph's own init (environment checks, lazy-constant set-up); it gets
+        the deserializer, the stream readers and the closure maker itself as arguments and returns
+        the proto of the script.  Returns (start, end) source offsets of the call
+        `WRAP(P, U)(...)`, or None when the text has no such statement or more than one."""
+        toks = [t for t in luparse.tokenize(self.src) if t[0] != 'eof']
+        n = len(toks)
+
+        def tv(j):
+            return toks[j][1] if j < n else None
+
+        def tk(j):
+            return toks[j][0] if j < n else None
+
+        def ref(j):
+            """`name` or `name[<number>]` at j: (key, next index)"""
+            if tk(j) != 'name':
+                return None, j
+            if tk(j + 1) == 'op' and tv(j + 1) == '[' and tk(j + 2) == 'num' and tk(j + 3) == 'op' and tv(j + 3) == ']':
+                return (tv(j), toks[j + 2][1]), j + 4
+            return (tv(j), None), j + 1
+
+        found = []
+        for i in range(1, n - 8):
+            if not (tk(i) == 'op' and tv(i) == '=' and tk(i - 1) == 'name'):
+                continue
+            if i >= 2 and tk(i - 2) == 'op' and tv(i - 2) in ('.', ',', ':'):
+                continue
+            target = tv(i - 1)
+            j = i + 1
+            while tk(j) == 'op' and tv(j) == '(':
+                j += 1
+            start = j
+            wrap, j = ref(j)
+            if wrap is None or not (tk(j) == 'op' and tv(j) == '(' and tk(j + 1) == 'name' and tv(j + 1) == target
+                                    and tk(j + 2) == 'op' and tv(j + 2) == ','):
+                continue
+            ups, j = ref(j + 3)
+            if ups is None or not (tk(j) == 'op' and tv(j) == ')' and tk(j + 1) == 'op' and tv(j + 1) == '('):
+                continue
+            # the argument list: balanced up to its closing parenthesis
+            j += 2
+            depth = 0
+            commas = 0
+            has_wrap = False
+            while j < n:
+                k, v = tk(j), tv(j)
+                if k == 'op' and v in ('(', '[', '{'):
+                    depth += 1
+                elif k == 'op' and v in (')', ']', '}'):
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif k == 'op' and v == ',' and depth == 0:
+                    commas += 1
+                elif k == 'kw' and v in ('function', 'end', 'do', 'then', 'local', 'return') or k == 'op' and v == ';':
+                    commas = -100
+                    break
+                if depth == 0 and k == 'name' and ref(j)[0] == wrap:
+                    has_wrap = True
+                j += 1
+            if commas < 5 or not has_wrap or j >= n:
+                continue
+            found.append((toks[start][3], toks[j][3] + 1))
+        return found[0] if len(found) == 1 else None
+
+    def patched_source(self, step=False, conds=False, flow=False, stepvars=None, newproto=False, count=False):
         """The script with hooks inserted.
 
         Always: the interpreter-entry hook (inlined counter; __LPH_RUN is only called for stubbed
@@ -560,9 +698,19 @@ class Model:
                 flag, all inlined (no calls).
         conds:  with flow, the discovery variant: branch conditions additionally go through __LPH_C.
         step:   debugging aid, calls __LPH_STEP(pid, loop, pc, registers) for every instruction.
+        newproto: proto-table layout, route A: the loader's first-program call goes through
+                __LPH_MARK, which learns the proto that program returns; the entry hook of every
+                interpreter calls __LPH_RUN when exactly that proto is entered (a comparison, no
+                call: the init measures its own call stack).
+        count:  every dispatch loop counts its instructions in __LPH_N.s and calls __LPH_OVER once
+                the budget __LPH_N.b is used up (inlined; used with newproto).
         """
         src = self.src
         edits = []   # (pos, text)
+        factory = self.factory_style
+        if count and not (step or flow):
+            for p in self.loop_positions():
+                edits.append((p, '__LPH_N.s=__LPH_N.s+1;if __LPH_N.s>__LPH_N.b then __LPH_OVER() end;'))
         if flow:
             for start, end, k in self.cond_sites():
                 if conds:
@@ -590,7 +738,16 @@ class Model:
                             text += '__LPH_STEP(__pid,%d,%s,%s);' % (li, pcv, regs)
                     edits.append((pos[li], text))
                     li += 1
-        if self.factory_style:
+        if not factory and (step or flow):
+            # proto-table layout: the proto id the step hook reports is given out per closure made
+            done = set()
+            for it in self.interps:
+                wrap = it.chain[-2] if len(it.chain) >= 2 else None
+                if wrap is None or id(wrap) in done:
+                    continue
+                done.add(id(wrap))
+                edits.append((wrap.body_pos, 'local __pid=__LPH_PID(%s);' % (self.proto_param(it) or 'nil')))
+        if factory:
             for it in self.interps:
                 outer, mid = it.chain[-3], it.chain[-2]
                 names = it.visible + ['__pid']
@@ -610,15 +767,31 @@ class Model:
                               'local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
                                   lst, len(names), ','.join(names))))
         else:
-            names = self.visible
-            lst = '{' + ','.join('"%s"' % n for n in names) + '}'
-            if newproto:
-                # hook only closures of protos the harness has not seen (a table lookup, no call:
-                # the bootstrap measures its own call stack)
-                edits.append((self.interp.body_pos, 'if not __LPH_T[%s] then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
-                    self.proto_param(), lst, len(names), ','.join(names))))
-            else:
-                edits.append((self.interp.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
+            # every interpreter of the closure maker gets the entry hook: a proto runs on the
+            # interpreter its kind field selects, not necessarily on the largest one
+            mark = self.first_program_call() if newproto else None
+            if mark:
+                edits.append((mark[0], '__LPH_MARK('))
+                edits.append((mark[1], ')'))
+            captured = set()
+            for it in self.interps:
+                names = it.visible
+                lst = '{' + ','.join('"%s"' % n for n in names) + '}'
+                if newproto:
+                    pp = self.proto_param(it) if len(it.chain) >= 2 else None
+                    if pp is None:
+                        continue
+                    wrap = it.chain[-2]
+                    if any(st[0] == 'local' and pp in st[1] for st in self._maker_body(wrap)):
+                        # the closure maker redeclares the name of its proto parameter
+                        if id(wrap) not in captured:
+                            captured.add(id(wrap))
+                            edits.append((wrap.body_pos, 'local __lph_p=%s;' % pp))
+                        pp = '__lph_p'
+                    edits.append((it.func.body_pos, 'if %s==__LPH_N.w then local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (
+                        pp, lst, len(names), ','.join(names))))
+                else:
+                    edits.append((it.func.body_pos, 'do local __r = __LPH_RUN(%s,%d,%s) if __r then return __r(...) end end;' % (lst, len(names), ','.join(names))))
         for f in self.meta_closures():
             names = [n for n in self._visible_names(f) if n != '...'][:200]
             lst = '{' + ','.join('"%s"' % n for n in names) + '}'
@@ -837,30 +1010,50 @@ def run_oracle(model, workdir, tag, options=()):
     return dump, out, note
 
 
-def run_dump_script(model, workdir, tag, options=()):
-    """Proto-table layout whose bootstrap passes its checks under the harness: let the VM run the
-    bootstrap and dump the state when the first closure of a proto that did not exist at the start
-    is entered, i.e. when the decrypted script starts.  Returns the dump or None."""
+def run_dump_script(model, workdir, tag, options=(), budget=40000000, timeout=600):
+    """Proto-table layout, route A: let the VM run its own first program (Luraph's init) under the
+    harness and dump the state when the proto that program returned is entered, i.e. when the
+    script's main function starts (patched_source(newproto=True), harness dumpnew=1).
+
+    Returns (dump or None, notes): notes are the harness's lines about the run ([handover],
+    [dumpnew], [budget], [http], ...) plus one line of ours when the run had to be stopped."""
     patched = os.path.join(workdir, tag + '.newproto.lua')
     outjson = os.path.join(workdir, tag + '.script.json')
     with open(patched, 'w', encoding='latin-1') as f:
-        f.write(model.patched_source(newproto=True))
+        f.write(model.patched_source(newproto=True, count=True))
     if os.path.exists(outjson):
         os.remove(outjson)
     nf = os.path.join(workdir, 'nfdata.lua')
     if not os.path.exists(nf):
         from . import unidata
         unidata.generate(nf)
-    try:
-        r = subprocess.run([find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1'] + list(options)
-                           + list(getattr(model, 'run_options', ())),
-                           capture_output=True, text=True, errors='replace', timeout=900)
-    except subprocess.TimeoutExpired:
-        return None
+    cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'dumpnew=1', 'budget=%d' % budget]
+    if model.insn_tables:
+        cmd.append('lazyinsn=1')
+    cmd += list(options) + list(getattr(model, 'run_options', ()))
+    errpath = os.path.join(workdir, tag + '.newproto.err')
+    notes = []
+    with open(errpath, 'w') as ef:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=ef)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            notes.append('[timeout] the run was stopped after %d s' % timeout)
+        except BaseException:
+            proc.kill()
+            raise
+    with open(errpath, errors='replace') as f:
+        stderr = f.read()
+    keep = ('[handover]', '[dumpnew]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
+    notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
     if not os.path.exists(outjson):
-        return None
+        if not notes:
+            notes = ['[stderr] ' + l for l in stderr.strip().split('\n')[-3:] if l]
+        return None, notes
     with open(outjson) as f:
-        return json.load(f)
+        return f.read(), notes
 
 
 def run_dump(model, workdir, tag, layers=()):

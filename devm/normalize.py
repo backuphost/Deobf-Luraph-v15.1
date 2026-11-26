@@ -143,17 +143,9 @@ def inline_protected(src):
     return '\n'.join(lines), count
 
 
-def inline_protected_raw(src):
-    """The same rewrite as inline_protected for a script in Luraph's own minified layout:
-
-        local ok, a, b, c = pcall(function() local ...; repeat local op = code[pc]; if ... until false; end);
-        if ok then <act on a, b, c> else <re-raise> end
-
-    The dispatch loop becomes `while true do ... end` in the interpreter function itself and every
-    `return x, y, z` of the protected closure becomes the success branch with those values bound.
-    Works on tokens, so the layout of the rest of the file is untouched.
-    Returns (new source, number of interpreters rewritten)."""
-    toks = [t for t in luparse.tokenize(src) if t[0] != 'eof']
+def _expr_ifs(toks):
+    """Token indices of the `if` keywords that start a Luau if-expression (`x = if a then b else c`:
+    no `end`)."""
     n = len(toks)
 
     def is_(i, kind, val):
@@ -194,6 +186,36 @@ def inline_protected_raw(src):
             st.append(None)
         elif v in ('end', 'until') and st:
             st.pop()
+    # (`else if` inside an expression: the marker makes the following `if` an expression too)
+    return exprif
+
+
+def inline_protected_raw(src):
+    """inline_protected_raw_info without the list of dissolved closures."""
+    out, count, _removed = inline_protected_raw_info(src)
+    return out, count
+
+
+def inline_protected_raw_info(src):
+    """The same rewrite as inline_protected for a script in Luraph's own minified layout:
+
+        local ok, a, b, c = pcall(function() local ...; repeat local op = code[pc]; if ... until false; end);
+        if ok then <act on a, b, c> else <re-raise> end
+
+    The dispatch loop becomes `while true do ... end` in the interpreter function itself and every
+    `return x, y, z` of the protected closure becomes the success branch with those values bound.
+    Works on tokens, so the layout of the rest of the file is untouched.
+    Returns (new source, number of interpreters rewritten, the dissolved closures as positions in
+    the source-order list of the text's `function` keywords: a model of the rewritten text numbers
+    its functions like a model of the original text with those left out)."""
+    toks = [t for t in luparse.tokenize(src) if t[0] != 'eof']
+    n = len(toks)
+    removed = []
+
+    def is_(i, kind, val):
+        return 0 <= i < n and toks[i][0] == kind and toks[i][1] == val
+
+    exprif = _expr_ifs(toks)
     # (`else if` inside an expression: the marker makes the following `if` an expression too)
 
     def match_block(i):
@@ -297,8 +319,21 @@ def inline_protected_raw(src):
         j = after
         if is_(j, 'op', ';'):
             j += 1
-        if not (is_(j, 'kw', 'if') and toks[j + 1] [1] == ok and is_(j + 2, 'kw', 'then')):
+        # (also `if not OK then <failure> else <success> end`, and OK in parentheses)
+        if not is_(j, 'kw', 'if'):
             continue
+        q = j + 1
+        neg = is_(q, 'kw', 'not')
+        if neg:
+            q += 1
+        par = 0
+        while is_(q, 'op', '('):
+            par += 1
+            q += 1
+        if not (q < n and toks[q][0] == 'name' and toks[q][1] == ok and all(is_(q + 1 + x, 'op', ')') for x in range(par))
+                and is_(q + 1 + par, 'kw', 'then')):
+            continue
+        then = q + 1 + par
         done.add(f)
         ifend = match_block(j)
         depth = 0
@@ -315,8 +350,17 @@ def inline_protected_raw(src):
                 elif vv in ('else', 'elseif') and depth == 1:
                     els = q
                     break
-        succ_end = toks[els][3] if els is not None else toks[ifend][3]
-        success = src[toks[j + 3][3]:succ_end].rstrip().rstrip(';')
+        if neg:
+            if els is None:
+                done.discard(f)
+                continue
+            if toks[els][1] == 'else':
+                success = src[toks[els + 1][3]:toks[ifend][3]].rstrip().rstrip(';')
+            else:
+                success = 'if ' + src[toks[els + 1][3]:toks[ifend][3]] + ' end'
+        else:
+            succ_end = toks[els][3] if els is not None else toks[ifend][3]
+            success = src[toks[then + 1][3]:succ_end].rstrip().rstrip(';')
         # rewrite the closure body
         edits.append((toks[s][3], toks[body0][3], 'local %s;' % ','.join(vals)))
         depth = 0
@@ -356,8 +400,11 @@ def inline_protected_raw(src):
             tail = toks[ifend + 1][3] + 1
         edits.append((toks[fend][3], tail, ''))
         count += 1
+        removed.append(f)
     if not count:
-        return src, 0
+        return src, 0, []
+    fkw = [q for q in range(n) if toks[q][0] == 'kw' and toks[q][1] == 'function']
+    removed = sorted(fkw.index(f) for f in removed)
     edits.sort()
     out = []
     last = 0
@@ -368,4 +415,296 @@ def inline_protected_raw(src):
         out.append(text)
         last = b
     out.append(src[last:])
-    return ''.join(out), count
+    return ''.join(out), count, removed
+
+
+# ---------------------------------------------------------------------------------------------
+# Dispatch-loop heads.
+#
+# Every Luraph file spells the head of its interpreter loops a little differently: the fetch in
+# parentheses, `repeat ... until false` for `while true do ... end`, a truthy literal for `true`,
+# junk constant locals declared with the opcode or right after it.  The spellings are accepted
+# HERE and nowhere else: match_head() is the one predicate, normalise_heads() rewrites what it
+# accepts to the two canonical forms the model (vmmodel.is_dispatch_loop / LOOP_HEAD_RE), the
+# partial evaluator and inline_protected_raw know:
+#
+#     while true do local OP=CODE[PC];if ...                                   parallel code arrays
+#     while true do local I=CODE[PC];local OP=I[n];PC=PC+1;if ...              one table per instruction
+#
+# Junk constants move in front of the loop (they are never assigned; opaque tests in the dispatch
+# tree compare with them).
+
+class Head:
+    """One dispatch-loop head found in a token list."""
+    __slots__ = ('start', 'if_tok', 'until', 'last', 'op', 'code', 'pc', 'insn', 'field', 'junk', 'plain', 'tail')
+
+
+def _head_fetch(toks, q):
+    """toks[q] is the first token inside the loop.  Returns a Head (start/until/last unset) when
+    the loop begins with an instruction fetch followed by the dispatch `if`, else None."""
+    n = len(toks)
+
+    def tv(j):
+        return toks[j][1] if j < n else None
+
+    def tk(j):
+        return toks[j][0] if j < n else None
+
+    def number(j):
+        """(text of an optionally parenthesised, optionally negative number at j, next index)"""
+        par = 0
+        while tv(j) == '(' and tk(j) == 'op':
+            par += 1
+            j += 1
+        neg = ''
+        if tk(j) == 'op' and tv(j) == '-':
+            neg = '-'
+            j += 1
+        if tk(j) != 'num':
+            return None, j
+        text = neg + repr(toks[j][1])
+        j += 1
+        for _ in range(par):
+            if not (tk(j) == 'op' and tv(j) == ')'):
+                return None, j
+            j += 1
+        return text, j
+
+    plain = True
+    j = q
+    if not (tk(j) == 'kw' and tv(j) == 'local') or tk(j + 1) != 'name':
+        return None
+    names = [tv(j + 1)]
+    j += 2
+    while tk(j) == 'op' and tv(j) == ',' and tk(j + 1) == 'name':
+        names.append(tv(j + 1))
+        j += 2
+    if not (tk(j) == 'op' and tv(j) == '='):
+        return None
+    j += 1
+    par = 0
+    while tk(j) == 'op' and tv(j) == '(':
+        par += 1
+        j += 1
+    if not (tk(j) == 'name' and tk(j + 1) == 'op' and tv(j + 1) == '[' and tk(j + 2) == 'name'
+            and tk(j + 3) == 'op' and tv(j + 3) == ']'):
+        return None
+    code, pc = tv(j), tv(j + 2)
+    j += 4
+    for _ in range(par):
+        if not (tk(j) == 'op' and tv(j) == ')'):
+            return None
+        j += 1
+    if par:
+        plain = False
+    junk = []
+    consts = []
+    while tk(j) == 'op' and tv(j) == ',':
+        text, k = number(j + 1)
+        if text is None:
+            return None
+        consts.append(text)
+        j = k
+    if consts:
+        if len(consts) != len(names) - 1:
+            return None
+        junk.append('local %s=%s;' % (','.join(names[1:]), ','.join(consts)))
+        names = names[:1]
+        plain = False
+    if tk(j) == 'op' and tv(j) == ';':
+        j += 1
+    h = Head()
+    h.op, h.code, h.pc, h.insn, h.field = names[0], code, pc, None, None
+    h.start = h.until = h.last = None
+    h.tail = False
+    h.plain = plain
+    # the names declared with the opcode and given no value (`local OP, X = CODE[PC]`) stay
+    h.junk = ''
+    extra = names[1:]
+    # T form: local OP = I[n]; PC = PC + 1   (also `PC += 1`)
+    if tk(j) == 'kw' and tv(j) == 'local' and tk(j + 1) == 'name' and tk(j + 2) == 'op' and tv(j + 2) == '=' and not extra:
+        k = j + 3
+        par = 0
+        while tk(k) == 'op' and tv(k) == '(':
+            par += 1
+            k += 1
+        if tk(k) == 'name' and tv(k) == names[0] and tk(k + 1) == 'op' and tv(k + 1) == '[' and tk(k + 2) == 'num' \
+                and tk(k + 3) == 'op' and tv(k + 3) == ']':
+            field = toks[k + 2][1]
+            opname = tv(j + 1)
+            k += 4
+            ok = True
+            for _ in range(par):
+                if not (tk(k) == 'op' and tv(k) == ')'):
+                    ok = False
+                k += 1
+            if ok and tk(k) == 'op' and tv(k) == ';':
+                k += 1
+            # the pc increment
+            if ok and tk(k) == 'name' and tv(k) == pc:
+                if tk(k + 1) == 'op' and tv(k + 1) == '+=' and tk(k + 2) == 'num' and toks[k + 2][1] == 1:
+                    k += 3
+                elif tk(k + 1) == 'op' and tv(k + 1) == '=':
+                    k += 2
+                    p2 = 0
+                    while tk(k) == 'op' and tv(k) == '(':
+                        p2 += 1
+                        k += 1
+                    if tk(k) == 'name' and tv(k) == pc and tk(k + 1) == 'op' and tv(k + 1) == '+' and tk(k + 2) == 'num' \
+                            and toks[k + 2][1] == 1:
+                        k += 3
+                        for _ in range(p2):
+                            if not (tk(k) == 'op' and tv(k) == ')'):
+                                ok = False
+                            k += 1
+                    else:
+                        ok = False
+                else:
+                    ok = False
+                if ok:
+                    if tk(k) == 'op' and tv(k) == ';':
+                        k += 1
+                    h.insn, h.op, h.field = names[0], opname, field
+                    h.plain = h.plain and not par and src_is_plain_t(toks, j, k)
+                    j = k
+    # junk statements between the fetch and the `if`: local J = <number>
+    while h.insn is None and tk(j) == 'kw' and tv(j) == 'local' and tk(j + 1) == 'name' and tk(j + 2) == 'op' and tv(j + 2) == '=':
+        text, k = number(j + 3)
+        if text is None:
+            break
+        junk.append('local %s=%s;' % (tv(j + 1), text))
+        if tk(k) == 'op' and tv(k) == ';':
+            k += 1
+        j = k
+        h.plain = False
+    if not (tk(j) == 'kw' and tv(j) == 'if'):
+        return None
+    h.if_tok = j
+    h.junk = ''.join(junk)
+    if extra:
+        h.op = ','.join(names)
+    return h
+
+
+def src_is_plain_t(toks, a, b):
+    """True when tokens a..b-1 are exactly `local OP = I [ n ] ; PC = PC + 1 ;` (already canonical)."""
+    kinds = [(t[0], t[1]) for t in toks[a:b]]
+    return len(kinds) == 14 and kinds[7] == ('op', ';') and kinds[9] == ('op', '=') and kinds[11] == ('op', '+')
+
+
+def find_heads(toks):
+    """Every dispatch-loop head in a token list (luparse.tokenize without the eof token), in
+    source order.  A loop qualifies when it never ends by its condition (`while <truthy literal>`
+    / `repeat ... until false`) and starts with the instruction fetch."""
+    n = len(toks)
+    exprif = _expr_ifs(toks)
+
+    def is_(i, kind, val):
+        return 0 <= i < n and toks[i][0] == kind and toks[i][1] == val
+
+    def truthy(a, b):
+        """tokens a..b-1 are a literal that is always true, possibly in parentheses"""
+        while b - a >= 3 and is_(a, 'op', '(') and is_(b - 1, 'op', ')'):
+            a, b = a + 1, b - 1
+        return b - a == 1 and (is_(a, 'kw', 'true') or toks[a][0] in ('str', 'num'))
+
+    def after(j):
+        """True when a statement follows in the block of the loop that ends in front of token j"""
+        while is_(j, 'op', ';'):
+            j += 1
+        return j < n and not (toks[j][0] == 'kw' and toks[j][1] in ('end', 'until', 'else', 'elseif'))
+
+    out = []
+    stack = []      # open blocks: None or a Head waiting for its `end` / `until`
+    wh = []         # indices of `while` / `for` keywords waiting for their `do`
+    for i in range(n):
+        k, v = toks[i][0], toks[i][1]
+        if k != 'kw' or i in exprif:
+            continue
+        if v in ('while', 'for'):
+            wh.append(i)
+        elif v == 'do':
+            w = wh.pop() if wh else None
+            if w is not None and toks[w][1] == 'while' and truthy(w + 1, i):
+                h = _head_fetch(toks, i + 1)
+                if h is not None:
+                    h.start, h.until, h.last = w, None, None
+                    h.plain = h.plain and i == w + 2 and is_(w + 1, 'kw', 'true')
+                    out.append(h)
+                stack.append(h)
+            else:
+                stack.append(None)
+        elif v in ('function', 'if'):
+            stack.append(None)
+        elif v == 'repeat':
+            h = _head_fetch(toks, i + 1)
+            if h is not None:
+                h.start = i
+            stack.append(h)
+        elif v == 'end':
+            h = stack.pop() if stack else None
+            if h is not None and h.until is None:
+                h.last = i
+                h.tail = after(i + 1)
+        elif v == 'until':
+            h = stack.pop() if stack else None
+            if h is not None and h.last is None:
+                a = i + 1
+                par = 0
+                while is_(a, 'op', '('):
+                    par += 1
+                    a += 1
+                if is_(a, 'kw', 'false') and all(is_(a + 1 + x, 'op', ')') for x in range(par)):
+                    h.until, h.last = i, a + par
+                    h.plain = False
+                    h.tail = after(a + par + 1)
+                    out.append(h)
+    out.sort(key=lambda h: h.start)
+    return out
+
+
+def count_heads(src):
+    """Number of Luraph dispatch-loop heads in a text, in any spelling (0: no interpreter in it)."""
+    try:
+        toks = [t for t in luparse.tokenize(src) if t[0] != 'eof']
+    except SyntaxError:
+        return 0
+    return len(find_heads(toks))
+
+
+def normalise_heads(src):
+    """Rewrite every dispatch-loop head to its canonical form (see above).
+    Returns (new source, number of heads found, number rewritten)."""
+    toks = [t for t in luparse.tokenize(src) if t[0] != 'eof']
+    heads = find_heads(toks)
+    edits = []
+    for h in heads:
+        if h.plain:
+            continue
+        if h.insn is not None:
+            fetch = 'local %s=%s[%s];local %s=%s[%s];%s=%s+1;' % (h.insn, h.code, h.pc, h.op, h.insn, luparse_num(h.field), h.pc, h.pc)
+        else:
+            fetch = 'local %s=%s[%s];' % (h.op, h.code, h.pc)
+        # (a junk local hoisted in front of the loop must not capture a name the code after the
+        # loop uses: such a loop gets a block of its own)
+        scope = bool(h.junk) and h.tail
+        edits.append((toks[h.start][3], toks[h.if_tok][3], '%s%swhile true do %s' % ('do ' if scope else '', h.junk, fetch)))
+        if h.until is not None:
+            edits.append((toks[h.until][3], toks[h.last][3] + (5 if toks[h.last][1] == 'false' else 1), 'end end' if scope else 'end'))
+        elif scope:
+            edits.append((toks[h.last][3], toks[h.last][3] + 3, 'end end'))
+    edits.sort()
+    out = []
+    last = 0
+    for a, b, text in edits:
+        if a < last:
+            raise ValueError('overlapping edits')
+        out.append(src[last:a])
+        out.append(text)
+        last = b
+    out.append(src[last:])
+    return ''.join(out), len(heads), len(edits and [h for h in heads if not h.plain])
+
+
+def luparse_num(v):
+    return repr(int(v)) if float(v).is_integer() else repr(v)
