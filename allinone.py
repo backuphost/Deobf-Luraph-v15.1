@@ -459,6 +459,31 @@ def run_deobf(inp, out, timeout=None, trace_only=False, extra=()):
             "reason": reason, "engine": "deobf"}
 
 
+DIFFCHECK = os.path.join(HERE, "devm", "diffcheck.py")
+
+
+def check_result(inp, out, work=None, timeout=None, cmd=None):
+    """Compare what the protected file and the recovered script do in the same mock
+    (`python3 -m devm.diffcheck ORIGINAL RESULT [--work DIR]`, another part of the tree: exit 0
+    same, 1 different, 2 not comparable).  Returns (how, line): how is 'same', 'different',
+    'not-comparable', 'unavailable' (the tree has no devm/diffcheck.py) or 'timeout'; line is
+    the checker's last line (what differs, or why the two cannot be compared)."""
+    if cmd is None:
+        if not os.path.isfile(DIFFCHECK):
+            return "unavailable", "devm/diffcheck.py is not in this tree"
+        cmd = [sys.executable, "-u", "-m", "devm.diffcheck"]
+    cmd = list(cmd) + [os.path.abspath(inp), os.path.abspath(out)]
+    if work:
+        cmd += ["--work", os.path.abspath(work)]
+    say("[verify] comparing the result with the protected file in the mock (python3 -m devm.diffcheck)")
+    status, text = _stream(cmd, timeout or DEFAULT_TIMEOUT)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    last = lines[-1] if lines else "no output"
+    if status is None:
+        return "timeout", "the comparison was stopped after %d s" % (timeout or DEFAULT_TIMEOUT)
+    return {0: "same", 1: "different"}.get(status, "not-comparable"), last
+
+
 def detect_other(inp):
     """What the deobf engine's detector makes of the input: (plugin name, confidence, label).
     ('generic', 0.0, ...) for something it does not recognise."""
@@ -560,7 +585,7 @@ ENGINE_TEXT = {
 DEFAULT_TIMEOUT = 3600      # seconds per engine when --timeout is not given
 
 
-def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None):
+def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None, verify=False):
     """Run the engines for `engine` in order and print what came of it.  `engine`: 'devm'
     (devm, then the deobf engine as fallback), 'deobf', 'trace', or a tuple of engine names to
     try in that order.  Returns the front end's exit code:
@@ -574,8 +599,12 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None):
     engine still gets its turn (and its result is taken only when it is complete); a partial
     result of devm stands, since devm's report says exactly what is missing.
 
-    `post(out)`, when given, is called once the result file is in place and before the final
-    `result:` line is printed (deob.py uses it to put the owner's own statements in front)."""
+    `post(out, res)`, when given, is called once the result file is in place and before the
+    final `result:` line is printed (`res`: the engine's result dict; deob.py uses the hook
+    to put the owner's own statements in front of a lifted result).
+
+    verify=True: a lifted result is then compared with the protected file (check_result);
+    a result that behaves differently is not reported complete."""
     out = out or default_output(inp)
     order = {"devm": ("devm", "deobf"), "deobf": ("deobf",), "trace": ("trace",)}.get(engine, engine)
     if isinstance(order, str) or not order or any(e not in ("devm", "deobf", "trace") for e in order):
@@ -620,7 +649,18 @@ def hand_over(inp, out, engine, work=None, timeout=None, extra=(), post=None):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     if post is not None:
-        post(out)
+        post(out, res)
+    if verify and res.get("kind") != "trace":
+        how, line = check_result(inp, out, work=os.path.join(work, "diffcheck") if work else None, timeout=timeout)
+        if how == "same":
+            say("[✓] 对比通过 / verified: the result does what the protected file does in the mock (devm.diffcheck)")
+        elif how == "different":
+            say("[!] 对比不一致 / the result does NOT do what the protected file does in the mock: " + line)
+            res["complete"] = False
+            res["why"] = list(res.get("why") or ()) + ["behaves differently from the protected file in the mock "
+                                                      "(devm.diffcheck): " + line[:200]]
+        else:
+            say("[i] 没有对比 / not verified (%s): %s" % (how, line))
     # the last line is the front end's own verdict, in the engines' `result:` form
     if res["complete"]:
         say("[✓] devirtualized → %s" % out)
@@ -652,11 +692,14 @@ def main(argv=None):
     ap.add_argument("--work", help="directory for intermediate files (default: a temporary one)")
     ap.add_argument("--timeout", type=int, help="seconds before an engine is stopped (default: %d)" % DEFAULT_TIMEOUT)
     ap.add_argument("--engine-args", default="", help="extra options for the engine, as one string")
+    ap.add_argument("--verify", action="store_true",
+                    help="compare the result with the protected file in the mock (needs devm/diffcheck.py)")
     a = ap.parse_args(argv)
     if not os.path.isfile(a.input):
         say("[✗] no such file: %s" % a.input)
         return FAILED
-    return hand_over(a.input, a.output, a.engine, work=a.work, timeout=a.timeout, extra=shlex.split(a.engine_args))
+    return hand_over(a.input, a.output, a.engine, work=a.work, timeout=a.timeout, extra=shlex.split(a.engine_args),
+                     verify=a.verify)
 
 
 if __name__ == "__main__":

@@ -657,6 +657,9 @@ def is_statement_function(toks):
     return not (len(code) >= 2 and code[0][1] == "function" and code[1][1] in ("(", "<"))
 
 
+GUARD_MARK = "--[[ Luarmor loader guard (left out) ]]"
+
+
 class Scan:
     """Steps 1 to 5b: read, find the binaries, peel shells and the container, parse, size up
     the functions, tell business code from VM code.  main() prints as it goes; probe() runs
@@ -715,6 +718,7 @@ class Scan:
         self.container_info = None  # {'opened': bool, 'via': ..., 'why': ...} for a container
         self._pre_unwrap = ""       # the text as it was before the container was opened
         self.peeked = None          # what a container that stays closed holds (Scan.peek)
+        self.guard_text = None      # the Luarmor loader guard front_check took out of the text
 
     def cleanup(self, keep_work=False):
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -804,9 +808,10 @@ class Scan:
         text = self.src
         if "luarmor-guard" in f["prefix"] and self.fx.main_return is not None:
             head = text[:self.fx.main_return]
-            cut = lphfront.LUARMOR_GUARD.sub("--[[ Luarmor loader guard (left out) ]]", head, count=1)
-            if cut != head:
-                text = cut + text[self.fx.main_return:]
+            m = lphfront.LUARMOR_GUARD.search(head)
+            if m:
+                self.guard_text = m.group(0)
+                text = head[:m.start()] + GUARD_MARK + head[m.end():] + text[self.fx.main_return:]
                 self.repairs.append("luarmor-guard-left-out")
         ok, msg = luau_compiles(text, self.luau_bin)
         if not ok and self.fx.feats.get("esc_lua51_only"):
@@ -846,8 +851,9 @@ class Scan:
         comment.  '' when there is no statement there (comments alone are not copied), or for
         a chunk taken out of a container (what precedes its `return` is the chunk's own).
         The engines' results hold the protected program only; main() puts this text in front
-        of them.  A Luarmor loader guard that front_check left out appears as the comment it
-        was replaced by."""
+        of them.  A Luarmor loader guard that front_check left out of the runs is given as
+        comment lines (as code it would end the recovered script at once, as it ends the
+        file outside Luarmor's loader)."""
         fx, f = self.fx, self.front
         text = self._pre_unwrap or self.src
         if fx is None or not f or f["verdict"] != "luraph" or f["bare_chunk"] \
@@ -858,13 +864,21 @@ class Scan:
         else:
             code = fx.pre_code
         import lphfront
-        if not code.strip() or lphfront._LOCAL_VARARG.match(code):
+        if lphfront._LOCAL_VARARG.match(code):
             return ""       # (`local B=...;` in front of a chunk's `return` is the chunk's own text)
+        guard = self.guard_text if (self.guard_text and GUARD_MARK in text[:fx.main_return]) else None
+        if not code.strip() and not guard:
+            return ""
         head = text[:fx.main_return]
         for h in sorted((h for h in fx.headers if h["offset"] < fx.main_return),
                         key=lambda h: -h["offset"]):
             end = head.find("\n", h["offset"])
             head = head[:h["offset"]] + ("" if end < 0 else head[end + 1:])
+        if guard:
+            shown = "\n".join("-- " + line for line in guard.strip().split("\n"))
+            head = head.replace(GUARD_MARK, "-- (Luarmor loader guard of the input file, as a comment: it is not part of the "
+                                            "protected program and ends the file at once outside the loader)\n"
+                                + shown + "\n", 1)
         return head.strip("\n")
 
     def engine_text(self):
@@ -2128,6 +2142,11 @@ def main():
     ap.add_argument("--timeout", type=int, default=None,
                     help="交给 devm / deobf 引擎时每个引擎的超时秒数（默认 %d；大脚本要跑几分钟）；"
                          "超时后引擎连同它启动的进程一起结束" % allinone.DEFAULT_TIMEOUT)
+    ap.add_argument("--verify", action="store_true",
+                    help="引擎给出结果后，在同一个模拟环境里对比原文件和结果的行为（python3 -m devm.diffcheck；"
+                         "树里没有这个模块时只提示）。行为不一致的结果不会报告为 complete / compare what the "
+                         "protected file and the result do in the mock; a result that behaves differently is "
+                         "not reported complete")
     ap.add_argument("--engine-args", default="",
                     help="原样传给 devm / deobf 引擎的额外参数，写成一个字符串，例如 \"--http-map replies.txt\"")
     args = ap.parse_args()
@@ -2174,7 +2193,7 @@ def main():
         try:
             return allinone.hand_over(src_path, str(out_path), engine, work=engine_work,
                                       timeout=args.timeout, extra=engine_extra,
-                                      post=lambda out: put_owner_text(out, owner))
+                                      post=lambda out, res: put_owner_text(out, owner, res), verify=args.verify)
         finally:
             if tmp_in:
                 shutil.rmtree(tmp_in, ignore_errors=True)
@@ -2210,7 +2229,7 @@ def main():
     try:
         return allinone.hand_over(src_path, str(out_path), engine, work=engine_work,
                                   timeout=args.timeout, extra=extra + engine_extra,
-                                  post=lambda out: put_owner_text(out, owner))
+                                  post=lambda out, res: put_owner_text(out, owner, res), verify=args.verify)
     finally:
         if tmp_in:
             shutil.rmtree(tmp_in, ignore_errors=True)
@@ -2221,14 +2240,16 @@ OWNER_NOTE = ("-- The input file has the following text of its owner's in front 
 OWNER_END = "-- (end of the owner's text; the recovered program follows)"
 
 
-def put_owner_text(out_path, owner):
-    """Put the owner's own statements (Scan.owner_text) in front of an engine's result.  When
-    the result does not parse any more with them (a statement that cannot stand in front of
-    other statements), they go in as comment lines instead.  Returns 'code', 'comment' or None
-    (nothing to add, no result file)."""
+def put_owner_text(out_path, owner, res=None):
+    """Put the owner's own statements (Scan.owner_text) in front of an engine's result (`res`:
+    the engine's result dict when hand_over calls this).  When the result does not parse any
+    more with them (a statement that cannot stand in front of other statements), they go in
+    as comment lines instead.  Returns 'code', 'comment' or None (nothing to add; no result
+    file; a behaviour trace, which is a record of one run of the whole file and not the
+    program's text)."""
     import allinone
     out_path = Path(out_path)
-    if not owner or not out_path.is_file():
+    if not owner or not out_path.is_file() or (res or {}).get("kind") == "trace":
         return None
     body = read_source(out_path)
     before = allinone.parses(str(out_path))

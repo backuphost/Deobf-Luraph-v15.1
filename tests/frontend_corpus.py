@@ -335,11 +335,15 @@ class OwnerText(unittest.TestCase):
         self.assertEqual(self.scan("-- counts runs\nping() --note\n" + HEADER + "\n" + TABLE),
                          "-- counts runs\nping() --note")
         self.assertEqual(self.scan('_VERSION = "Luau";\n' + FN_ARGS), '_VERSION = "Luau";')   # no header at all
-        # the guard is not copied as code: its place is marked
-        got = self.scan("if not is_from_loader then warn('x') return end;\n" + HEADER + 'getgenv().k = 1\n' + FN_ARGS)
-        self.assertNotIn("is_from_loader", got)
-        self.assertIn("Luarmor loader guard", got)
-        self.assertIn("getgenv().k = 1", got)
+        # the guard is not copied as code: it is given as a comment
+        guard = "if not is_from_loader then warn('x') return end;"
+        got = self.scan(guard + "\n" + HEADER + 'getgenv().k = 1\n' + FN_ARGS)
+        self.assertIn("-- " + guard, got)
+        self.assertNotIn("\n" + guard, "\n" + got)
+        self.assertIn("\ngetgenv().k = 1", got)
+        got = self.scan("-- This file is licensed with Luarmor.\n" + guard + "\n" + HEADER + FN_ARGS)   # the guard alone
+        self.assertIn("-- " + guard, got)
+        self.assertTrue(all(l.startswith("--") for l in got.split("\n") if l.strip()), got)
         # a chunk taken out of a container: `local B=...` is the chunk's own text
         self.assertEqual(self.scan("local B=...;" + TABLE.replace(":A()(...)", ":A()")), "")
 
@@ -379,12 +383,99 @@ class OwnerText(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = allinone.hand_over(src, out, "trace", timeout=120, extra=["--no-pypy"],
-                                    post=lambda o: (seen.append(os.path.getsize(o)), print("POST")))
+                                    post=lambda o, res: (seen.append((os.path.getsize(o), res["kind"])), print("POST")))
         log = buf.getvalue().strip().splitlines()
         self.assertEqual(rc, allinone.PARTIAL, log[-5:])
-        self.assertTrue(seen and seen[0] > 0)
+        self.assertTrue(seen and seen[0][0] > 0)
+        self.assertEqual(seen[0][1], "trace")
         self.assertTrue(log[-1].startswith("result: PARTIAL"), log[-3:])
         self.assertLess(log.index("POST"), len(log) - 1)
+        # a trace is a record of one run of the whole file: the owner's text is not put in front of it
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(deob.put_owner_text(out, "x = 1", {"kind": "trace"}))
+        with open(out) as f:
+            self.assertNotIn(deob.OWNER_NOTE, f.read())
+
+
+# A stand-in for `python3 -m devm.diffcheck ORIGINAL RESULT` (another part of the tree): it ends
+# with the exit status it is told to and prints one line.
+FAKE_DIFFCHECK = r"""
+import sys, time
+code = sys.argv[1]
+if code == "hang":
+    while True:
+        time.sleep(0.2)
+print("comparing %s with %s" % (sys.argv[2].rsplit("/", 1)[-1], sys.argv[3].rsplit("/", 1)[-1]))
+print({"0": "same: 12 calls, 3 prints", "1": "different at call 4: print('a') / print('b')",
+       "2": "not comparable: the protected file did not run to an end"}[code])
+sys.exit(int(code))
+"""
+
+
+class Verify(unittest.TestCase):
+    """--verify: the result is compared with the protected file by devm.diffcheck (hand-over
+    point: exit 0 same, 1 different, 2 not comparable); a stand-in takes its place here."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake = os.path.join(self.tmp.name, "fake_diffcheck.py")
+        with open(self.fake, "w") as f:
+            f.write(FAKE_DIFFCHECK)
+        self.inp = os.path.join(self.tmp.name, "in.lua")
+        self.out = os.path.join(self.tmp.name, "out.lua")
+        for p in (self.inp, self.out):
+            with open(p, "w") as f:
+                f.write('print("x")\n')
+        self.say, allinone.say = allinone.say, lambda *a: None
+        self._saved = (allinone.run_devm, allinone.check_result, allinone.DIFFCHECK)
+
+    def tearDown(self):
+        allinone.say = self.say
+        allinone.run_devm, allinone.check_result, allinone.DIFFCHECK = self._saved
+        self.tmp.cleanup()
+
+    def check(self, code, timeout=60):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            return allinone.check_result(self.inp, self.out, timeout=timeout, cmd=[sys.executable, self.fake, code])
+
+    def test_exit_status_of_the_checker(self):
+        self.assertEqual(self.check("0"), ("same", "same: 12 calls, 3 prints"))
+        self.assertEqual(self.check("1"), ("different", "different at call 4: print('a') / print('b')"))
+        self.assertEqual(self.check("2")[0], "not-comparable")
+        self.assertEqual(self.check("hang", timeout=2)[0], "timeout")
+
+    def test_tree_without_the_checker_says_so(self):
+        allinone.DIFFCHECK = os.path.join(self.tmp.name, "nope.py")
+        self.assertEqual(allinone.check_result(self.inp, self.out)[0], "unavailable")
+
+    def hand_over(self, how):
+        """hand_over with a stand-in engine that reports a complete result, and a stand-in checker."""
+        def engine(inp, out, work=None, timeout=None, extra=()):
+            with open(out, "w") as f:
+                f.write('print("x")\n')
+            return {"ok": True, "complete": True, "report": [], "status": 0, "reason": None, "why": [], "engine": "devm"}
+        allinone.run_devm = engine
+        allinone.check_result = lambda *a, **k: (how, "line of the checker")
+        lines = []
+        allinone.say = lambda msg="": lines.append(msg)
+        rc = allinone.hand_over(self.inp, self.out, ("devm",), verify=True)
+        return rc, lines
+
+    def test_a_result_that_behaves_differently_is_not_complete(self):
+        rc, lines = self.hand_over("different")
+        self.assertEqual(rc, allinone.PARTIAL)
+        self.assertTrue(lines[-1].startswith("result: PARTIAL"), lines[-2:])
+        self.assertIn("behaves differently", lines[-1])
+
+    def test_same_and_not_comparable_leave_the_verdict(self):
+        for how in ("same", "not-comparable", "unavailable", "timeout"):
+            rc, lines = self.hand_over(how)
+            self.assertEqual(rc, allinone.OK, (how, lines))
+            self.assertEqual(lines[-1], "result: complete (devm)")
+            want = "/ verified:" if how == "same" else "not verified (%s): line of the checker" % how
+            self.assertTrue(any(want in l for l in lines), lines)
 
 
 class _StandInDecoder:
