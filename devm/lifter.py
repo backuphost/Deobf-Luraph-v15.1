@@ -669,6 +669,13 @@ class Lifter:
                 raise PEError('bad numeric for loop op')
             return (([], ('forbr', 'num', min(writes) - 3, ([], endT), ([], endF)))), ex, wr
         if 'fcall' in kinds:
+            writesF = [s[1][1] for s in irF if s[0] == 'set' and s[1][0] == 'r']
+            if not writes and writesF and endF[0] == 'goto':
+                # the handler tests the negated condition (`a, b, c = iter(); if not a then else
+                # R[A+1] = b; R[A+2] = c; pc = target end`): as in the numeric case, the
+                # permissive "false" run is the one that stays in the loop
+                endT, endF = endF, endT
+                writes = writesF
             if endF[0] != 'goto' or not writes:
                 raise PEError('bad generic for loop op')
             return (([], ('forbr', 'gen', tuple(sorted(writes)), ([], endT), ([], endF)))), ex, wr

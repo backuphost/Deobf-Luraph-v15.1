@@ -1084,6 +1084,11 @@ class PE:
                         vals = self.evalmulti(v, scope)
                         if vals and isinstance(vals[-1], MultiTail):
                             if n == 0 and len(vals) == 1:
+                                if vals[0].id == 'args':
+                                    # `{...}` of the closure's own arguments is the argument pack
+                                    # the vararg packer gives: `local h = {...}; R[i] = h[i]`
+                                    # copies parameters
+                                    return VARARG_TBL
                                 return PackedTbl(vals[0].id)
                             raise PEError('table constructor with open tail')
                         for x in vals:
@@ -1366,6 +1371,8 @@ class PE:
                 return LinSym(v.id, 0)
             if isinstance(v, PackedList):
                 return len(v.vals)
+            if v is VARARG_TBL:
+                return LinSym('args', 0)
         if isinstance(v, (Special, UpRef, LinSym)):
             return self.emit_expr(('un', op, self.atom(v)))
         raise PEError('unop %s on %r' % (op, v))
@@ -1865,6 +1872,8 @@ class PE:
                         if isinstance(r, int):
                             self.emit(('close', r, r))
                         return None
+            if len(st[1]) == 1 and self.clamp_stmt(st, scope):
+                return None
             for c, body in st[1]:
                 if self.cond(self.eval1(c, scope)):
                     return self.exec_block(body, scope)
@@ -1884,6 +1893,14 @@ class PE:
                         return None
                     if nm in self.openups and self.is_state(scope, nm):
                         return None
+                    if nm in self.fvars and self.is_state(scope, nm):
+                        # the step of a numeric for loop spelled out, `i = (i + step)`
+                        # (the compound form `i += step` is the opassign case below)
+                        rhs = _unparen(st[2][0])
+                        if rhs[0] == 'bin' and rhs[1] == '+' and ('name', nm) in (_unparen(rhs[2]), _unparen(rhs[3])):
+                            if self.perm is None:
+                                raise ForOp()
+                            self.events.append(('fop',))
                     self.setvar(scope, nm, self.eval1(st[2][0], scope))
                 else:
                     obj = self.eval1(tg[1], scope)
@@ -2037,6 +2054,8 @@ class PE:
                         if r[0] == 'return':
                             return r
                 return None
+            if it and it[0] is REGS and len(it) == 1 and self.clears_regs(st, scope):
+                return None
             if it and it[0] is None:
                 raise PEError('for-in over nil')
             if it and isinstance(it[0], Builtin) and it[0].name == 'next' and len(it) >= 2:
@@ -2057,6 +2076,66 @@ class PE:
             scope.vars[st[1]] = LFn(st[2], scope)
             return None
         raise PEError('exec: unknown stmt %s' % t)
+
+    def clamp_stmt(self, st, scope):
+        """The VARARG instruction's count of extra arguments, clamped by a statement:
+        `n = nargs - nparams - 1; if n < 0 then n = -1 end` (also spelled `if not (n < 0) then else
+        n = -1 end`, `if n >= 0 then else n = -1 end`).  n becomes the symbolic count the
+        if-expression form gives (see eval1, 'ifexpr').  True when the statement was that."""
+        c, body = st[1][0]
+        other = st[2] or []
+        neg = False
+        c = _unparen(c)
+        while c[0] == 'un' and c[1] == 'not':
+            neg = not neg
+            c = _unparen(c[2])
+        if c[0] != 'bin' or c[1] not in CMP:
+            return False
+        op, a, b = c[1], _unparen(c[2]), _unparen(c[3])
+        if a[0] == 'num':
+            a, b = b, a
+            op = {'<': '>', '>': '<', '<=': '>=', '>=': '<='}[op]
+        if a[0] != 'name' or b[0] != 'num' or b[1] != 0 or op not in ('<', '>='):
+            return False
+        if op == '>=':
+            neg = not neg
+        if neg:
+            body, other = other, body
+        if other or len(body) != 1:
+            return False
+        s = body[0]
+        if not (s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and s[1][0] == ('name', a[1])):
+            return False
+        v = _unparen(s[2][0])
+        if not ((v[0] == 'num' and v[1] == -1) or (v[0] == 'un' and v[1] == '-' and _unparen(v[2]) == ('num', 1))):
+            return False
+        sc = scope.lookup(a[1])
+        cur = sc.vars[a[1]] if sc is not None else None
+        if not (isinstance(cur, LinSym) and cur.id == 'args'):
+            return False
+        self.setvar(scope, a[1], LinSym('va', -1))
+        return True
+
+    def clears_regs(self, st, scope):
+        """`for k in REGS do if k > top then REGS[k] = nil end end`: the interpreter dropping the
+        registers above the top of the stack (after a call, a return of several values).  The
+        lifted code has no counterpart: registers are variables there."""
+        kname = st[1][0]
+
+        def ok(block):
+            for s in block:
+                if s[0] == 'if':
+                    if not all(ok(b) for _, b in s[1]) or (s[2] and not ok(s[2])):
+                        return False
+                elif s[0] == 'assign' and len(s[1]) == 1 and len(s[2]) == 1 and _unparen(s[2][0]) == ('nil',):
+                    tg = s[1][0]
+                    if not (tg[0] == 'index' and _unparen(tg[2]) == ('name', kname) and _unparen(tg[1])[0] == 'name'
+                            and self.eval1(tg[1], scope) is REGS):
+                        return False
+                else:
+                    return False
+            return True
+        return ok(st[3])
 
     def close_base(self, st, scope):
         """for k, v in openups do if k >= X then ... -> X"""
