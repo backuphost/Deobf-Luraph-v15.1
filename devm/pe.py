@@ -739,6 +739,7 @@ class PE:
         self.model_writes = 0
         self.keyfn_used = set()
         self.lazy_depth = 0         # >0 while a lazy-constant __index handler of the loader runs
+        self.lazy_loop_limit = 200000   # rounds one loop of such a handler may take (lowered by the traced lifter)
         # Lifting a dump taken at the end of a run: instructions that were executed have already
         # left their mark on the VM state (decrypted code, decoded constants), so their writes to
         # that state are dropped (frozen).  Writes of the other instructions are applied and
@@ -1953,7 +1954,7 @@ class PE:
                     if r[0] == 'return':
                         return r
                 n += 1
-                if n > 200000:
+                if n > 200000 or (self.lazy_depth and n > self.lazy_loop_limit):
                     raise PEError('runaway loop')
         if t == 'repeat':
             n = 0
