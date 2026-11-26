@@ -386,7 +386,9 @@ def run_report(notes):
     return out
 
 
-KEY_LEFT = re.compile(r'(?m)^[ \t]*(?:return bit32\.bxor\(\w+, \d{7,}\)(?:,.*)?|(?:local )?\w+ = bit32\.bxor\((?:\w+, \d{7,}|\d{7,}, \w+)\))$')
+# (by the lifter's own names for parameters and locals: a checksum routine of the script, or a
+# plain-Lua helper printed with its own text, also ends in `return bit32.bxor(x, 4294967295)`)
+KEY_LEFT = re.compile(r'(?m)^[ \t]*return bit32\.bxor\(p\d+, \d{7,}\)(?:,.*)?$')
 
 
 def report(text, returned=None):
@@ -417,7 +419,7 @@ def report(text, returned=None):
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
     preps = sum(1 for ln in lines if '-- for-loop setup:' in ln)
     # Luraph's per-call keys (opaque._fold_call_keys) where they could not be folded: a parameter
-    # xor-ed with a literal into an extra first result, or such a result xor-ed on
+    # xor-ed with a literal into an extra first result
     keys = len(KEY_LEFT.findall(code))
     # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
     # protection's own checks, which a reader should not take for the script's
@@ -456,9 +458,10 @@ def report(text, returned=None):
     if stubs:
         out.append('  %d functions printed as a stub (their body was not recovered)' % stubs)
     if keys:
-        out.append('  %d lines xor a value with a large literal (`return bit32.bxor(p, K), ...`): this is how Luraph\'s per-call '
-                   'keys look, a number every caller passes and gets back changed.  They are folded away where every caller '
-                   'is in the result; these were left because that could not be shown (or the script does such arithmetic itself)' % keys)
+        out.append('  %d functions return a parameter xor-ed with a large literal as their first result (`return bit32.bxor(p, K), ...`): '
+                   'this is how Luraph\'s per-call keys look, a number every caller passes and gets back changed.  They are folded '
+                   'away where every caller is in the result; these were left because that could not be shown (or the script does '
+                   'such arithmetic itself)' % keys)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '

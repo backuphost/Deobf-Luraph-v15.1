@@ -71,6 +71,7 @@ line per kind of thing that is missing:
 | `lines use UPVAL_n` | a captured variable of a function whose creation was not lifted |
 | `values printed as nil --[[...]]` | a loop variable, argument or operand without a known source |
 | `for loops without their loop statement`, `functions printed as a stub` | what the words say |
+| `functions return a parameter xor-ed with a large literal` | Luraph's per-call keys (`return bit32.bxor(p, K), ...`) where they could not be folded because a caller is not in the result |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 
 `run.report(text)` gives the second part for any result file (it skips a head written earlier).
@@ -338,6 +339,62 @@ Result: 131 functions, no lift errors (`deobfuscated/message_1.lua`).
   in a `LIFT ERROR`), so what the number is used for is not known.  devm does not forge the reply; everything behind it
   (the protected script) is not in the output.  `examples/v15.2/sample_src.luau` shares no
   strings or structure with what the loader does before that point.
+
+### The v15.x files of the public sample corpus
+
+Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sample corpus
+(`tests/devm_v15_corpus.py`; the corpus is not part of the repository, `LURAPH_CORPUS` names it).
+
+* **v15.1 builds are the v15.2 generation without wrapper keys.**  Luraph's start-up code (35
+  functions, the same in every file) runs on one interpreter, the script on a second one.  That
+  second interpreter writes its dispatch tree with every test computed into a local first,
+  `while true do local OP = CODE[PC]; local t = OP >= 10; if t then local t = OP >= 15; if t then`.
+  `vmmodel.is_dispatch_loop` accepts that form (`_outlined_test`); before, the model saw one
+  interpreter, the harness never hooked the one that runs the script, and the result was a few
+  lines of start-up code with a `LIFT ERROR`.  With it the usual two-interpreter route applies
+  (`payload: proto 36 is the script`).
+* **The structuring passes of the generation** (`ircfg.UNFLATTEN`, `ircfg.V152`,
+  `structure.FIT_SCOPES`, `NEST_ITEMS`, `NOTE_TRAPS`, `beautify.MERGE_ARMS`) are switched on by
+  `run.v152_generation(model)`: wrapper keys, or an interpreter in the spelling above.  The older
+  v15.1 builds (`examples/layer3.lua`, the committed results) have neither and keep their results.
+* **Builds without a payload.**  Where the script's top level is part of Luraph's main function (as
+  in the repository's v15.2 sample; a key-system loader of the corpus is built that way) all
+  functions are on the first interpreter and the main function is what gets lifted.  For that, and
+  for `--root 1` on any of these files, the lift of the main function had to be made whole:
+  - the traced run's snapshots of tables that instructions change in place carry the table's
+    identity (`tid`), and a proto's own operand array seen through its lazy view
+    (`P = setmetatable({[0] = K}, decode)`) is not a shared table (`harness.lua` `codeVersion`,
+    `lifter.shared_snapshot_tables`): other functions' snapshot bases used to overwrite the main
+    function's code;
+  - trampolines land a few retired instructions in front of the jump hub; the whole line is kept
+    once per jump target (`lifter.hub_line`), also when it is reached through a jump that was
+    already specialised or through the hub's copy for arrivals without a target (`NO_TARGET`);
+  - an executed instruction is lifted in a code state the run recorded when the run recorded
+    versions for its function (not only for keyed wrappers), with the interpreter-local numbers
+    the run recorded for it (instructions that decrypt themselves with a key held in an
+    interpreter local);
+  - lazy constant decoders of these builds are state machines the evaluator runs itself: on
+    ciphertext they are cut off after `lifter.LAZY_LOOP_LIMIT` rounds.
+* **Luraph's per-call key** (v15.2 test scripts): a function takes one more parameter, every caller
+  passes a literal, the function returns `bit32.bxor(key, C)` as an extra first result and the
+  caller compares it with the number it must be.  `opaque._fold_call_keys` removes parameter,
+  argument and result where every caller is in the result and decides the test; where a caller is
+  missing the arithmetic stays and the report says so (`functions return a parameter xor-ed with a
+  large literal`, never `complete`).
+* **Key arithmetic on an interpreter local the lifter has no value for** shows as
+  `local v = nil --[[OPENUPS]] % 4294967296; local w = bit32.bxor(v - v % 1, 283475159)` in a v15.1
+  result (in v15.2 the wrapper keys make these constants).  `opaque._drop_blind_key_arith` removes
+  such a chain when nothing reads it, `opaque._fold_type_tests` decides the opaque test
+  `type(0) == "buffer"` in front of a junk arm.  The lifter still does not know that local.
+* **v15.0** is a third layout: the function that makes a VM closure is a method of the VM object,
+  written as a state machine that assigns the interpreter closure in one of its states.  devm does
+  not model it and says so at once (`no model: Luraph v15.0 method-wrap layout is not supported by
+  this engine`, `run.method_wrap_layout`); the second engine (`deobf/`) lifts these files.
+* **A VM chunk without its buffer** creates no VM function: `run failed: the VM never started:
+  <how the run stopped> (a chunk cut out of a container needs its data: --chunk-arg)`.
+* **The `--root` hint** ("the script is probably the first program") is only given when the
+  function taken for the script calls nothing but pure library functions (a helper of the build);
+  it used to be printed for every small script.
 
 ### Names
 
