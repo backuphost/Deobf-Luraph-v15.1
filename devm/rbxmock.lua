@@ -1,10 +1,38 @@
 -- Minimal Roblox runtime mock for the devm harness.
 -- It only has to be faithful enough for Luraph's bootstrap (environment checks) to run through
 -- without throwing or hanging; it is not a general purpose emulator.
--- usage: local globals = mock(realGlobals, fnames, libnames)
+-- usage: local globals = mock(realGlobals, fnames, libnames, opts)
+--   opts.here      directory of this file (the Roblox API table is read from <here>/../deobf/roblox_api.luau,
+--                  the Zstandard decoder from <here>/zstd.lua when a script asks for it)
+--   opts.readfile  how to read them (the CLI's readfile)
 local rawTypeof, rawType = typeof, type
-return function(G, fnames, libnames)
+return function(G, fnames, libnames, opts)
 	local M = {}
+	opts = opts or {}
+	-- What the run's log gets to know about the environment: one line per fact, each fact once.
+	--   [env]   something about the mock itself (a missing data file)
+	--   [stub]  a permissive stand-in handed out where the mock cannot know Roblox's answer
+	--   [script] what the script itself said or asked for (print / warn texts, undefined globals)
+	-- [stub] and [script] lines are kept in P.notes and written at the end of the run (harness.lua);
+	-- with P.live set (calls=1) they are also written as they happen.
+	-- P: the mock's own bookkeeping, kept in ONE field so that it stays out of the script's globals
+	-- (harness.lua copies every other field of M into them).
+	local P = { notes = {}, live = false, counts = {} }
+	M.priv = P
+	local noted = {}
+	local ewrite = G.ewrite
+	local function note(tag, text)
+		local line = "[" .. tag .. "] " .. text
+		if noted[line] then
+			P.counts[line] += 1
+			return
+		end
+		noted[line] = true
+		P.counts[line] = 1
+		if #P.notes < 400 then P.notes[#P.notes + 1] = line end
+		if ewrite and (tag == "env" or P.live) then ewrite(line .. "\n") end
+	end
+	P.note = note
 	-- Every metatable the mock gives an object, by object: mock metatables are locked like the
 	-- engine's ("The metatable is locked"), and an executor's getrawmetatable / setrawmetatable
 	-- look behind that lock (harness.lua).  Only the mock's own setmetatable calls are recorded.
@@ -84,6 +112,78 @@ return function(G, fnames, libnames)
 		end
 		return mt
 	end
+
+	-- ------------------------------------------------------------ the Roblox API table
+	-- deobf/roblox_api.luau, generated from Roblox's API dump: every enum with its items and values,
+	-- and per class its superclass and the names of its methods, events and properties.  With it the
+	-- mock answers member lookups the way the engine does (an enum item that does not exist is an
+	-- error, not a new item; a method exists on every class that has it and nowhere else).  Without
+	-- the file the mock falls back to permissive answers and says so once.
+	local API = { loaded = false, enums = {}, enumOrder = {}, classes = {} }
+	do
+		local text
+		if opts.readfile and opts.here then
+			local okr, t = pcall(opts.readfile, opts.here .. "/../deobf/roblox_api.luau")
+			if okr and rawType(t) == "string" then text = t end
+		end
+		local tbl
+		if text then
+			local f = loadstring(text, "=roblox_api")
+			local okc, t = pcall(f or error)
+			if okc and rawType(t) == "table" and rawType(t.enums) == "string" and rawType(t.classes) == "string" then tbl = t end
+		end
+		if tbl then
+			for ename, items in string.gmatch(tbl.enums, "([%w_]+):([^;]*)") do
+				API.enums[ename] = items
+				API.enumOrder[#API.enumOrder + 1] = ename
+			end
+			for cname, super, fns, evs, props in string.gmatch(tbl.classes, "([%w_]+)<([%w_]*)|([^|]*)|([^|]*)|([^;]*)") do
+				API.classes[cname] = { super = super ~= "" and super or nil, raw = { fns, evs, props } }
+			end
+			API.loaded = true
+		else
+			note("env", "the Roblox API table (deobf/roblox_api.luau) could not be read: enum items and instance members " ..
+				"are answered permissively, which Luraph's start-up probes can tell from Roblox")
+		end
+	end
+	-- (members are parsed when a class is first asked about)
+	local function classInfo(cls)
+		local c = API.classes[cls]
+		if c and c.raw then
+			c.m, c.e, c.p = {}, {}, {}
+			for x in string.gmatch(c.raw[1], "[^,]+") do c.m[x] = true end
+			for x in string.gmatch(c.raw[2], "[^,]+") do c.e[x] = true end
+			for x in string.gmatch(c.raw[3], "[^,]+") do
+				local pname, vt = string.match(x, "^([^:]+):?(.*)$")
+				c.p[pname] = vt ~= "" and vt or true
+			end
+			c.raw = nil
+		end
+		return c
+	end
+	-- "method" | "event" | "prop" (plus the property's value type) for a member of the class or of
+	-- one it inherits from; nil when the class has no such member or is not in the table
+	local function memberKind(cls, k)
+		for _ = 1, 32 do
+			local c = cls and classInfo(cls)
+			if not c then return nil end
+			if c.m[k] then return "method" end
+			if c.e[k] then return "event" end
+			if c.p[k] then return "prop", c.p[k] ~= true and c.p[k] or nil end
+			cls = c.super
+		end
+		return nil
+	end
+	local function classIsA(cls, name)
+		for _ = 1, 32 do
+			if cls == name then return true end
+			local c = cls and API.classes[cls]
+			if not c then return false end
+			cls = c.super
+		end
+		return false
+	end
+	P.api = API
 
 	-- ------------------------------------------------------------ permissive value stub
 	local stubMT = {}
@@ -247,24 +347,87 @@ return function(G, fnames, libnames)
 	local vec2Props = { ViewportSize = { 1920, 1080 }, AbsoluteSize = { 100, 100 }, AbsolutePosition = { 0, 0 },
 		AbsoluteContentSize = { 100, 100 }, AbsoluteWindowSize = { 100, 100 }, CanvasPosition = { 0, 0 },
 		TextBounds = { 50, 14 } }
-	function newInstance(class, name)
+	-- properties whose value the mock derives on every read (GUI layout results): name -> f(instance)
+	local computed = {}
+	-- properties with a fixed engine default that depends on the class: class -> { name -> f() }
+	local classDefaults = {}
+	local function fullName(inst)
+		local parts = {}
+		local x = inst
+		while x and data[x] and data[x].props.ClassName ~= "DataModel" do
+			table.insert(parts, 1, tostring(data[x].props.Name))
+			x = data[x].props.Parent
+		end
+		return table.concat(parts, ".")
+	end
+	-- An engine method the mock has no model for: it exists, insists on an Instance as `self` like
+	-- every method, and answers with a permissive stand-in (the run's log names each one used).
+	local unmodelledFns = {}
+	local function unmodelled(k)
+		local f = unmodelledFns[k]
+		if not f then
+			f = named(k, function(self, ...)
+				if not data[self] then error("Expected ':' not '.' calling member function " .. k, 2) end
+				local cls = data[self].props.ClassName
+				note("stub", cls .. ":" .. k .. "() has no model in the mock: answered with a permissive stand-in")
+				return stub(cls .. ":" .. k .. "()")
+			end)
+			unmodelledFns[k] = f
+		end
+		return f
+	end
+	-- (methods executors add to the DataModel; not in Roblox's API table)
+	local dataModelExtras = { HttpGet = true, HttpPost = true }
+	-- created: made by the script (Instance.new, Clone of such), so the mock knows every child it
+	-- has; an instance of the place (services, the player, ...) may have children the mock lacks.
+	function newInstance(class, name, created)
 		local u = newproxy(true)
 		local mt = getmetatable(u)
-		local d = { props = { ClassName = class, Name = name or class, Archivable = true }, children = {}, signals = {}, attrs = {} }
+		local d = { props = { ClassName = class, Name = name or class, Archivable = true }, children = {}, signals = {}, attrs = {},
+			created = created or false }
 		data[u] = d
 		typeNames[u] = "Instance"
+		-- (a class the API table does not have is answered as before the table existed)
+		local known = API.loaded and API.classes[class] ~= nil
 		mt.__index = function(_, k)
 			local v = d.props[k]
 			if v ~= nil then return v end
 			if k == "Parent" then return nil end
-			if signalProps[k] then return getSignal(d, k).make() end
-			v = methods[k]
-			if v ~= nil then return v end
-			for _, c in ipairs(d.children) do
-				if data[c].props.Name == k then return c end
+			local kind, vtype
+			if known then kind, vtype = memberKind(class, k) end
+			if kind == "event" or (not known and signalProps[k]) then return getSignal(d, k).make() end
+			if kind == "method" or not known or (dataModelExtras[k] and class == "DataModel") then
+				v = methods[k]
+				if v ~= nil then return v end
+				if kind == "method" then return unmodelled(k) end
 			end
-			if class == "DataModel" and type(k) == "string" and services[k] then return services[k] end
+			if kind == nil then
+				-- (a member hides a child of the same name; anything else can be a child)
+				for _, c in ipairs(d.children) do
+					if data[c].props.Name == k then return c end
+				end
+				if class == "DataModel" and type(k) == "string" and services[k] then return services[k] end
+			end
 			if type(k) ~= "string" then return nil end
+			if kind == "prop" then
+				local f = computed[k]
+				if f then
+					v = f(u, d)
+					if v ~= nil then return v end
+				end
+				f = classDefaults[k]
+				if f then
+					v = f(class)
+					if v ~= nil then
+						d.props[k] = v
+						return v
+					end
+				end
+			end
+			if known and kind == nil and d.created then
+				-- the script made this instance itself: what it has is known, and this is not part of it
+				error(k .. " is not a valid member of " .. class .. " \"" .. fullName(u) .. "\"", 2)
+			end
 			-- well-known properties get a value of the right type (scripts do arithmetic on them)
 			v = propDefaults[k]
 			if v == nil and vec2Props[k] and M.Vector2 then v = M.Vector2.new(vec2Props[k][1], vec2Props[k][2]) end
@@ -272,7 +435,16 @@ return function(G, fnames, libnames)
 				d.props[k] = v
 				return v
 			end
-			-- unknown member: hand out a permissive stub so the script keeps going
+			-- The mock cannot know: a property whose engine value it has no model for, or a name
+			-- that is no member of the class and would be a child in the real place.  A permissive
+			-- stand-in keeps the script going; the run's log lists every one handed out.
+			if kind == "prop" then
+				note("stub", class .. "." .. k .. ": property" .. (vtype and " (" .. vtype .. ")" or "") .. " without a value in the mock")
+			elseif known then
+				note("stub", fullName(u) .. "." .. k .. ": not a member of " .. class .. "; taken for a child the real place would have")
+			else
+				note("stub", class .. "." .. k .. ": the class is not in the API table")
+			end
 			v = stub(d.props.Name .. "." .. k)
 			d.props[k] = v
 			return v
@@ -342,8 +514,10 @@ return function(G, fnames, libnames)
 	end)
 	m("IsA", function(self, cls)
 		local c = data[self].props.ClassName
+		if API.loaded and API.classes[c] then return classIsA(c, cls) end
 		return c == cls or cls == "Instance"
 	end)
+	methods.isA = methods.IsA
 	local function ancestor(self, pred)
 		local p = data[self].props.Parent
 		while p and data[p] do
@@ -390,27 +564,22 @@ return function(G, fnames, libnames)
 		for _, s in pairs(d.signals) do s.fire = function() end end
 	end)
 	methods.Remove = methods.Destroy
+	methods.destroy, methods.remove = methods.Destroy, methods.Destroy
 	m("ClearAllChildren", function(self)
 		for _, c in ipairs({ unpack(data[self].children) }) do methods.Destroy(c) end
 	end)
 	m("Clone", function(self)
 		local d = data[self]
-		local c = newInstance(d.props.ClassName, d.props.Name)
+		local c = newInstance(d.props.ClassName, d.props.Name, d.created)
 		for k, v in pairs(d.props) do
 			if k ~= "Parent" then data[c].props[k] = v end
 		end
+		for k, v in pairs(d.attrs) do data[c].attrs[k] = v end
+		if d.tags then data[c].tags = table.clone(d.tags) end
 		for _, ch in ipairs(d.children) do setParent(methods.Clone(ch), c) end
 		return c
 	end)
-	m("GetFullName", function(self)
-		local parts = {}
-		local x = self
-		while x and data[x] and data[x].props.ClassName ~= "DataModel" do
-			table.insert(parts, 1, data[x].props.Name)
-			x = data[x].props.Parent
-		end
-		return table.concat(parts, ".")
-	end)
+	m("GetFullName", function(self) return fullName(self) end)
 	m("GetPropertyChangedSignal", function(self, prop) return getSignal(data[self], "Changed:" .. tostring(prop)).make() end)
 	m("GetAttribute", function(self, k) return data[self].attrs[k] end)
 	m("SetAttribute", function(self, k, v) data[self].attrs[k] = v end)
@@ -420,18 +589,70 @@ return function(G, fnames, libnames)
 		return o
 	end)
 	m("GetAttributeChangedSignal", function(self, k) return getSignal(data[self], "Attr:" .. tostring(k)).make() end)
+	-- Tags (Instance:AddTag / HasTag / RemoveTag / GetTags, and the CollectionService methods of the
+	-- same names, which take the instance first).  Luraph's v15 start-up code tags a Folder and
+	-- asks for the tag back.
+	do
+		local function tagName(v, argn, level)
+			if v == nil then error("Argument " .. argn .. " missing or nil", level + 1) end
+			if rawType(v) == "number" then return tostring(v) end
+			if rawType(v) ~= "string" then error("Unable to cast value to std::string", level + 1) end
+			return v
+		end
+		-- (self, tag) for an Instance, (service, instance, tag) for CollectionService
+		local function target(self, a, b)
+			if data[self].props.ClassName == "CollectionService" then
+				if a == nil then error("Argument 1 missing or nil", 4) end
+				if not data[a] then error("Unable to cast value to Object", 4) end
+				return a, tagName(b, 2, 3)
+			end
+			return self, tagName(a, 1, 3)
+		end
+		m("AddTag", function(self, a, b)
+			local inst, tag = target(self, a, b)
+			local d = data[inst]
+			d.tags = d.tags or {}
+			if not table.find(d.tags, tag) then table.insert(d.tags, tag) end
+		end)
+		m("RemoveTag", function(self, a, b)
+			local inst, tag = target(self, a, b)
+			local i = data[inst].tags and table.find(data[inst].tags, tag)
+			if i then table.remove(data[inst].tags, i) end
+		end)
+		m("HasTag", function(self, a, b)
+			local inst, tag = target(self, a, b)
+			return data[inst].tags ~= nil and table.find(data[inst].tags, tag) ~= nil
+		end)
+		m("GetTags", function(self, a)
+			local inst = self
+			if data[self].props.ClassName == "CollectionService" then
+				if a == nil then error("Argument 1 missing or nil", 3) end
+				if not data[a] then error("Unable to cast value to Object", 3) end
+				inst = a
+			end
+			return table.clone(data[inst].tags or {})
+		end)
+	end
 	local game
 	m("GetService", function(self, name)
 		local s = services[name]
 		if not s then
+			if name == nil then error("Argument 1 missing or nil", 3) end
+			if API.loaded and not (rawType(name) == "string" and API.classes[name]) then
+				error("'" .. tostring(name) .. "' is not a valid Service name", 3)
+			end
 			s = newInstance(name, name)
 			services[name] = s
 			setParent(s, game)
 		end
 		return s
 	end)
-	methods.FindService = methods.GetService
-	methods.service = methods.GetService
+	m("FindService", function(self, name)
+		if services[name] then return services[name] end
+		if API.loaded and not (rawType(name) == "string" and API.classes[name]) then return nil end
+		return methods.GetService(self, name)
+	end)
+	methods.service, methods.getService = methods.GetService, methods.GetService
 	m("IsLoaded", function() return true end)
 	m("IsStudio", function() return false end)
 	-- server=1 in the harness: the script is analysed as server code
@@ -460,10 +681,57 @@ return function(G, fnames, libnames)
 		if M.onHttp then return M.onHttp("POST", url) end
 		return ""
 	end)
+	methods.HttpGetAsync, methods.HttpPostAsync = methods.HttpGet, methods.HttpPost
 	m("GenerateGUID", function() return "00000000-0000-0000-0000-000000000000" end)
 	m("JSONEncode", function() return "{}" end)
 	m("JSONDecode", function() return {} end)
 	m("GetPlayers", function() return {} end)
+	-- EncodingService:DecompressBuffer(buffer, Enum.CompressionAlgorithm.Zstd): Luraph v14.7 keeps its
+	-- VM chunk and data Zstandard-compressed and has Roblox unpack them.  The decoder is devm/zstd.lua
+	-- (a chunk that returns { decompress = function(b: buffer): buffer }), loaded when first asked for.
+	do
+		local zstd
+		local function decoder()
+			if zstd == nil then
+				zstd = false
+				local okr, text = false, nil
+				if opts.readfile and opts.here then okr, text = pcall(opts.readfile, opts.here .. "/zstd.lua") end
+				if okr and rawType(text) == "string" then
+					local f, e = loadstring(text, "=zstd")
+					local okc, lib = pcall(f or error, e)
+					if okc and rawType(lib) == "table" and rawType(lib.decompress) == "function" then
+						zstd = lib
+					else
+						note("env", "devm/zstd.lua did not load: " .. tostring(lib))
+					end
+				end
+			end
+			return zstd
+		end
+		m("DecompressBuffer", function(self, buf, algo)
+			if rawType(buf) ~= "buffer" then
+				error("invalid argument #1 to 'DecompressBuffer' (buffer expected, got " .. rawTypeof(buf) .. ")", 3)
+			end
+			if algo == nil then error("Argument 2 missing or nil", 3) end
+			if typeNames[algo] ~= "EnumItem" or tostring(algo) ~= "Enum.CompressionAlgorithm.Zstd" then
+				error("Unable to cast " .. (typeNames[algo] or rawTypeof(algo)) .. " to token", 3)
+			end
+			local lib = decoder()
+			if not lib then
+				note("env", "the script unpacks Zstandard data with EncodingService:DecompressBuffer, and the decoder " ..
+					"(devm/zstd.lua) is not there: the run stops at this call")
+				error("EncodingService:DecompressBuffer: no Zstandard decoder (devm/zstd.lua is missing)", 0)
+			end
+			local okd, out = pcall(lib.decompress, buf)
+			if not okd or rawType(out) ~= "buffer" then
+				note("env", "EncodingService:DecompressBuffer: the Zstandard data did not decode (" ..
+					string.sub(tostring(out), 1, 120) .. ")")
+				error("Failed to decompress buffer", 3)
+			end
+			return out
+		end)
+	end
+	methods.getPlayers, methods.players = methods.GetPlayers, methods.GetPlayers
 	-- GuiService:GetGuiInset() returns TWO Vector2 (API reference: inset from the top left corner
 	-- and from the bottom right corner); a one-value stand-in makes `local a, b = ...; b.X` fail.
 	-- 58 is the height of the current top bar (36 before the 2023 redesign): from Roblox's
@@ -479,6 +747,9 @@ return function(G, fnames, libnames)
 	m("Fire", function() end)
 	m("InvokeServer", function() return nil end)
 	m("Kick", function() end)
+
+	methods.children, methods.getChildren = methods.GetChildren, methods.GetChildren
+	methods.clone, methods.findFirstChild, methods.isDescendantOf = methods.Clone, methods.FindFirstChild, methods.IsDescendantOf
 
 	game = newInstance("DataModel", "Game")
 	local workspace = newInstance("Workspace", "Workspace")
@@ -547,6 +818,7 @@ return function(G, fnames, libnames)
 		PathWaypoint = { "new" }, CatalogSearchParams = { "new" }, FloatCurveKey = { "new" }, RotationCurveKey = { "new" },
 		SharedTable = { "new", "clear", "clone", "cloneAndFreeze", "increment", "isFrozen", "size", "update" },
 		Content = { "fromUri", "fromObject", "fromAssetId" }, Secret = {}, ValueCurveKey = { "new" },
+		DockWidgetPluginGuiInfo = { "new" },
 	}
 	local ctorCalls = setmetatable({}, { __mode = "k" })
 	M.ctorCalls = ctorCalls
@@ -556,6 +828,7 @@ return function(G, fnames, libnames)
 		for _, k in ipairs(known[name] or { "new" }) do
 			local full = name .. "." .. k
 			l[k] = named(full, function(...)
+				note("stub", full .. "(): the mock has no model of this datatype; the value is a permissive stand-in")
 				local s = stub(full .. "()", tname or name)
 				ctorCalls[s] = { full, table.pack(...) }       -- (a constant of this type is dumped as this call)
 				return s
@@ -564,6 +837,14 @@ return function(G, fnames, libnames)
 		return l
 	end
 	M.lib = lib
+	-- Roblox's own datatype libraries: the only capitalised globals besides Enum, Instance, Game and
+	-- Workspace that exist without the script defining them (harness.lua answers nil for the rest).
+	P.knownLib = function(name) return known[name] ~= nil end
+	-- executor=1: the drawing and socket libraries executors add (not modelled: permissive stand-ins)
+	P.executorLibs = function()
+		known.Drawing = { "new", "clear" }
+		known.WebSocket = { "connect" }
+	end
 
 	-- a plain table like the real one: scripts test getmetatable(Instance) == nil
 	local Instance = {}
@@ -571,7 +852,8 @@ return function(G, fnames, libnames)
 	rawset(Instance, "new", named("Instance.new", function(class, parent)
 		if class == nil then error("Argument 1 missing or nil", 2) end
 		if rawType(class) ~= "string" then error("invalid argument #1 to 'new' (string expected, got " .. rawTypeof(class) .. ")", 2) end
-		local i = newInstance(class)
+		if API.loaded and not API.classes[class] then error("Unable to create an Instance of type \"" .. class .. "\"", 2) end
+		local i = newInstance(class, nil, true)
 		if parent then setParent(i, parent) end
 		return i
 	end))
@@ -762,18 +1044,177 @@ return function(G, fnames, libnames)
 		M.Path2DControlPoint = L
 	end
 
+	-- ------------------------------------------------------------ GUI layout
+	-- AbsoluteSize, AbsolutePosition and AbsoluteRotation of GuiObjects, derived on every read from
+	-- the tree as it is then (the engine updates them before a read sees them).  Luraph's start-up
+	-- code (v14.6 on) builds a ScreenGui "ChallengeGui" with a fixed-size Frame and a random tree of
+	-- Frame / TextLabel / TextButton under it, with UISizeConstraint, UIScale and UIPadding children,
+	-- AnchorPoint and Rotation, reads AbsolutePosition and AbsoluteSize of about ten of them and
+	-- compares math.floor(value * 100) with numbers it carries (a difference of 1 is allowed; any
+	-- other answer starts its tamper response).  The rules below reproduce those numbers:
+	--   content box of the parent: its box minus its UIPadding (scale part relative to the
+	--     parent's own size, offsets times the parent's scale); a negative extent is flipped
+	--     (the box starts at the far edge and has the absolute size)
+	--   size = scale * content + offset * k, k = product of the UIScale of all ancestors;
+	--     clamped to the UISizeConstraint (MinSize / MaxSize times k), then times the own UIScale
+	--   position = content origin + scale * content + offset * k - AnchorPoint * size
+	--   Rotation turns an object and its descendants about its centre; AbsolutePosition is the
+	--     turned centre minus half the (unturned) size
+	-- Not modelled, and said so in the run's log when met: layouts (UIListLayout, UIGridLayout, ...),
+	-- UIAspectRatioConstraint, AutomaticSize, SizeConstraint, ScrollingFrame canvases, BillboardGui /
+	-- SurfaceGui.  A ScreenGui that is not in the game has no size here (0, 0); the probe does not
+	-- depend on it (its first Frame has offsets only).
+	do
+		local LAYER = { ScreenGui = true, BillboardGui = true, SurfaceGui = true, LayerCollector = true }
+		local OBJECT = { Frame = true, TextLabel = true, TextButton = true, TextBox = true, ImageLabel = true, ImageButton = true,
+			ScrollingFrame = true, CanvasGroup = true, ViewportFrame = true, VideoFrame = true }
+		local kinds = {}
+		local function guiKind(cls)
+			local k = kinds[cls]
+			if k == nil then
+				if API.loaded and API.classes[cls] then
+					k = (classIsA(cls, "GuiObject") and "object") or (classIsA(cls, "LayerCollector") and "layer") or false
+				else
+					k = (OBJECT[cls] and "object") or (LAYER[cls] and "layer") or false
+				end
+				kinds[cls] = k
+			end
+			return k
+		end
+		local UNMODELLED = { UIListLayout = true, UIGridLayout = true, UITableLayout = true, UIPageLayout = true,
+			UIAspectRatioConstraint = true, UIFlexItem = true, UITextSizeConstraint = false }
+		local function modifier(d, cls)
+			local found
+			for _, c in ipairs(d.children) do
+				local cc = data[c].props.ClassName
+				if cc == cls and not found then found = data[c] end
+				if UNMODELLED[cc] then note("env", "GUI layout: " .. cc .. " is not modelled; AbsoluteSize / AbsolutePosition ignore it") end
+			end
+			return found
+		end
+		local function num(v, default) return rawType(v) == "number" and v or default end
+		local function ownScale(d)
+			local u = modifier(d, "UIScale")
+			return u and num(u.props.Scale, 1) or 1
+		end
+		local function udimPx(v, extent, k)
+			if typeNames[v] ~= "UDim" then return 0 end
+			return num(v.Scale, 0) * extent + num(v.Offset, 0) * k
+		end
+		local function inGame(inst)
+			local p = inst
+			for _ = 1, 64 do
+				if p == nil then return false end
+				if p == game then return true end
+				p = data[p] and data[p].props.Parent
+			end
+			return false
+		end
+		-- -> width, height, centre x, centre y, rotation (degrees), scale handed to children
+		local function layout(inst, depth)
+			local d = data[inst]
+			local kind = guiKind(d.props.ClassName)
+			if not kind then return 0, 0, 0, 0, 0, 1 end
+			if kind == "layer" or depth > 64 then
+				local s = ownScale(d)
+				if d.props.ClassName == "ScreenGui" and inGame(inst) then
+					-- the viewport the mock uses elsewhere (Camera.ViewportSize) below the top bar
+					-- (GuiService:GetGuiInset); AbsolutePosition does not count the bar
+					local w, h, top = vec2Props.ViewportSize[1], vec2Props.ViewportSize[2], 58
+					if d.props.IgnoreGuiInset == true then return w, h, w / 2, h / 2 - top, 0, s end
+					return w, h - top, w / 2, (h - top) / 2, 0, s
+				end
+				if d.props.ClassName ~= "ScreenGui" then
+					note("env", "GUI layout: " .. d.props.ClassName .. " is not modelled; its AbsoluteSize is (0, 0) here")
+				end
+				return 0, 0, 0, 0, 0, s
+			end
+			local parent = d.props.Parent
+			local pd = parent and data[parent]
+			if not pd or not guiKind(pd.props.ClassName) then return 0, 0, 0, 0, num(d.props.Rotation, 0), ownScale(d) end
+			local pw, ph, pcx, pcy, prot, k = layout(parent, depth + 1)
+			-- the parent's content box
+			local l, t, cw, ch = 0, 0, pw, ph
+			local pad = modifier(pd, "UIPadding")
+			if pad then
+				l, t = udimPx(pad.props.PaddingLeft, pw, k), udimPx(pad.props.PaddingTop, ph, k)
+				cw = pw - l - udimPx(pad.props.PaddingRight, pw, k)
+				ch = ph - t - udimPx(pad.props.PaddingBottom, ph, k)
+				if cw < 0 then l, cw = l + cw, -cw end
+				if ch < 0 then t, ch = t + ch, -ch end
+			end
+			local w, h = 0, 0
+			local size = d.props.Size
+			if typeNames[size] == "UDim2" then
+				w, h = size.X.Scale * cw + size.X.Offset * k, size.Y.Scale * ch + size.Y.Offset * k
+			end
+			local con = modifier(d, "UISizeConstraint")
+			if con then
+				local mn, mx = con.props.MinSize, con.props.MaxSize
+				if typeNames[mx] == "Vector2" then w, h = math.min(w, mx.X * k), math.min(h, mx.Y * k) end
+				if typeNames[mn] == "Vector2" then w, h = math.max(w, mn.X * k), math.max(h, mn.Y * k) end
+			end
+			local s = ownScale(d)
+			w, h = w * s, h * s
+			local x, y = l, t
+			local pos = d.props.Position
+			if typeNames[pos] == "UDim2" then
+				x, y = l + pos.X.Scale * cw + pos.X.Offset * k, t + pos.Y.Scale * ch + pos.Y.Offset * k
+			end
+			local an = d.props.AnchorPoint
+			if typeNames[an] == "Vector2" then x, y = x - an.X * w, y - an.Y * h end
+			local auto, sc = d.props.AutomaticSize, d.props.SizeConstraint
+			if (auto ~= nil and tostring(auto) ~= "Enum.AutomaticSize.None") or (sc ~= nil and tostring(sc) ~= "Enum.SizeConstraint.RelativeXY") then
+				note("env", "GUI layout: AutomaticSize and SizeConstraint are not modelled; AbsoluteSize / AbsolutePosition ignore them")
+			end
+			if pd.props.ClassName == "ScrollingFrame" then
+				note("env", "GUI layout: the canvas of a ScrollingFrame is not modelled; its children are laid out in its window")
+			end
+			-- centre relative to the parent's centre, turned with the parent
+			local rx, ry = x + w / 2 - pw / 2, y + h / 2 - ph / 2
+			local a = math.rad(prot)
+			local ca, sa = math.cos(a), math.sin(a)
+			return w, h, pcx + rx * ca - ry * sa, pcy + rx * sa + ry * ca, prot + num(d.props.Rotation, 0), k * s
+		end
+		P.layout = function(inst) return layout(inst, 0) end
+		local make = vec2
+		computed.AbsoluteSize = function(inst, d)
+			if not guiKind(d.props.ClassName) then return nil end
+			local w, h = layout(inst, 0)
+			return make(w, h)
+		end
+		computed.AbsolutePosition = function(inst, d)
+			if not guiKind(d.props.ClassName) then return nil end
+			local w, h, cx, cy = layout(inst, 0)
+			return make(cx - w / 2, cy - h / 2)
+		end
+		computed.AbsoluteRotation = function(inst, d)
+			if not guiKind(d.props.ClassName) then return nil end
+			local _, _, _, _, rot = layout(inst, 0)
+			return rot
+		end
+		-- engine defaults of the properties the rules read (documented defaults of these classes)
+		local function zero2() return udim2(0, 0, 0, 0) end
+		classDefaults.Size = function(cls) return guiKind(cls) == "object" and zero2() or nil end
+		classDefaults.Position = classDefaults.Size
+		classDefaults.AnchorPoint = function(cls) return guiKind(cls) == "object" and vec2(0, 0) or nil end
+		classDefaults.Scale = function(cls) return cls == "UIScale" and 1 or nil end
+		classDefaults.MinSize = function(cls) return cls == "UISizeConstraint" and vec2(0, 0) or nil end
+		classDefaults.MaxSize = function(cls) return cls == "UISizeConstraint" and vec2(math.huge, math.huge) or nil end
+		for _, side in ipairs({ "PaddingLeft", "PaddingRight", "PaddingTop", "PaddingBottom" }) do
+			classDefaults[side] = function(cls) return cls == "UIPadding" and udim(0, 0) or nil end
+		end
+	end
+
 	-- Path2D: a chain of cubic Beziers. Segment i runs from point i to point i+1 with handles
 	-- pos[i] + RightTangent[i] and pos[i+1] + LeftTangent[i+1]; t in [0,1] spans all segments evenly.
 	do
+		-- (the frame a path is measured against: the AbsoluteSize of its parent, see GUI layout)
 		local function absSize(inst)
 			local p = data[inst].props.Parent
-			while p and data[p] do
-				local sz = data[p].props.Size
-				if typeNames[sz] == "UDim2" then
-					local pw, ph = absSize(p)
-					return sz.X.Scale * pw + sz.X.Offset, sz.Y.Scale * ph + sz.Y.Offset
-				end
-				p = data[p].props.Parent
+			if p and data[p] then
+				local w, h = P.layout(p)
+				return w, h
 			end
 			return 0, 0
 		end
@@ -971,30 +1412,51 @@ return function(G, fnames, libnames)
 		m("UpdateControlPoint", function(self, i, p) (data[self].points or {})[i] = p end)
 		m("GetSegmentCount", function(self) return math.max(#(data[self].points or {}) - 1, 0) end)
 		m("GetMaxControlPoints", function() return 250 end)
-		m("GetLength", function(self) return length(segments(self)) end)
+		-- A Path2D without a parent has no frame to measure against: the engine refuses curve
+		-- queries on it (observed in Studio by the second engine, deobf/envlog.luau).
+		local function needParent(self)
+			if data[self].props.Parent == nil then error("Attempting to use Path2D with invalid parent", 4) end
+		end
+		m("GetLength", function(self)
+			needParent(self)
+			return length(segments(self))
+		end)
+		m("GetBoundingRect", function(self)
+			needParent(self)
+			-- (which rectangle the engine reports - of the curve or of its control points, in which
+			-- space - is not known here: no model, the answer is a stand-in and the log says so)
+			note("stub", "Path2D:GetBoundingRect() has no model in the mock: answered with a permissive stand-in")
+			return stub("Path2D:GetBoundingRect()", "Rect")
+		end)
 		m("GetPositionOnCurve", function(self, t)
+			needParent(self)
 			local seg, u = locate(segments(self), t)
 			if not seg then return udim2(0, 0, 0, 0) end
 			return posAt(self, seg, u)
 		end)
 		m("GetTangentOnCurve", function(self, t)
+			needParent(self)
 			local seg, u = locate(segments(self), t)
 			if not seg then return vec2(0, 0) end
 			return tanAt(self, seg, u)
 		end)
 		m("GetPositionOnCurveArcLength", function(self, t)
+			needParent(self)
 			local seg, u = locateArc(self, segments(self), t)
 			if not seg then return udim2(0, 0, 0, 0) end
 			return posAt(self, seg, u)
 		end)
 		m("GetTangentOnCurveArcLength", function(self, t)
+			needParent(self)
 			local seg, u = locateArc(self, segments(self), t)
 			if not seg then return vec2(0, 0) end
 			return tanAt(self, seg, u)
 		end)
 	end
 
-	-- Enum
+	-- Enum: every enum, item and value of the API table.  An item that does not exist is an error
+	-- (`Enum.PartType.Foo`) or nil (`FromName`, `FromValue`), never a new item: Luraph's start-up
+	-- code asks for items by value and compares what comes back.
 	do
 		local enumTypes = {}
 		local function enumItem(et, etName, name, value)
@@ -1006,7 +1468,13 @@ return function(G, fnames, libnames)
 				if self ~= u then error("Expected ':' not '.' calling member function IsA", 2) end
 				return n == etName
 			end)
-			mt.__index = function(_, k) return props[k] end
+			mt.__index = function(_, k)
+				local v = props[k]
+				if v == nil and API.loaded then
+					error(tostring(k) .. " is not a valid member of \"Enum." .. etName .. "." .. name .. "\"", 2)
+				end
+				return v
+			end
 			mt.__tostring = function() return "Enum." .. etName .. "." .. name end
 			mt.__type = "EnumItem"
 			mt.__metatable = "The metatable is locked"
@@ -1016,11 +1484,12 @@ return function(G, fnames, libnames)
 		local function enumType(etName)
 			local et = enumTypes[etName]
 			if et then return et end
+			if API.loaded and not API.enums[etName] then return nil end
 			et = newproxy(true)
 			enumTypes[etName] = et
 			local mt = getmetatable(et)
 			typeNames[et] = "Enum"
-			local items, byValue, n = {}, {}, 0
+			local items, byValue, order, n = {}, {}, {}, 0
 			local function item(name, value)
 				local it = items[name]
 				if not it then
@@ -1030,32 +1499,40 @@ return function(G, fnames, libnames)
 					n += 1
 					it = enumItem(et, etName, name, value)
 					items[name] = it
+					order[#order + 1] = it
 					if byValue[value] == nil then byValue[value] = it end
 				end
 				return it
 			end
-			if etName == "PartType" then
+			if API.loaded then
+				for iname, v in string.gmatch(API.enums[etName], "([%w_]+)=(%-?%d+)") do item(iname, tonumber(v)) end
+			elseif etName == "PartType" then
 				item("Ball", 0) item("Block", 1) item("Cylinder", 2)
 			end
 			local ms = {}
 			ms.GetEnumItems = named("GetEnumItems", function(self)
 				if self ~= et then error("Expected ':' not '.' calling member function GetEnumItems", 2) end
-				local o = {}
-				for _, it in pairs(items) do o[#o + 1] = it end
-				return o
+				return table.clone(order)
 			end)
 			ms.FromName = named("FromName", function(self, name)
 				if self ~= et then error("Expected ':' not '.' calling member function FromName", 2) end
 				if rawType(name) ~= "string" then error("Argument 1 missing or nil", 2) end
+				if API.loaded then return items[name] end
 				return item(name)
 			end)
 			ms.FromValue = named("FromValue", function(self, v)
 				if self ~= et then error("Expected ':' not '.' calling member function FromValue", 2) end
 				if rawType(v) ~= "number" then error("Argument 1 missing or nil", 2) end
+				if API.loaded then return byValue[v] end
 				return byValue[v] or item("Value" .. tostring(v), v)
 			end)
 			mt.__index = function(_, k)
 				if ms[k] then return ms[k] end
+				if API.loaded then
+					local it = rawType(k) == "string" and items[k] or nil
+					if it == nil then error(tostring(k) .. " is not a valid member of \"Enum." .. etName .. "\"", 2) end
+					return it
+				end
 				if type(k) ~= "string" then return nil end
 				return item(k)
 			end
@@ -1068,11 +1545,17 @@ return function(G, fnames, libnames)
 		local Enum = newproxy(true)
 		local mt = getmetatable(Enum)
 		typeNames[Enum] = "Enums"
-		local ms = { GetEnums = named("GetEnums", function() return {} end) }
+		local ms = { GetEnums = named("GetEnums", function(self)
+			if self ~= Enum then error("Expected ':' not '.' calling member function GetEnums", 2) end
+			local out = {}
+			for i, ename in ipairs(API.enumOrder) do out[i] = enumType(ename) end
+			return out
+		end) }
 		mt.__index = function(_, k)
 			if ms[k] then return ms[k] end
-			if type(k) ~= "string" then return nil end
-			return enumType(k)
+			local et = rawType(k) == "string" and enumType(k) or nil
+			if et == nil and API.loaded then error(tostring(k) .. " is not a valid member of \"Enum\"", 2) end
+			return et
 		end
 		mt.__tostring = function() return "Enums" end
 		mt.__type = "Enums"
@@ -1083,6 +1566,11 @@ return function(G, fnames, libnames)
 			if typeNames[v] == "Enums" then return "Enum" end
 			if typeNames[v] == "Enum" or typeNames[v] == "EnumItem" then return tostring(v) end
 			return nil
+		end
+		P.enumItem = function(etName, name)
+			local et = enumType(etName)
+			local ok, it = pcall(function() return et and et[name] end)
+			return ok and it or nil
 		end
 	end
 
@@ -1427,22 +1915,36 @@ return function(G, fnames, libnames)
 		-- Roblox's scheduler resumes threads without a parent, so a spawned thread has the whole
 		-- C stack budget; coroutine.resume would pass on the depth of the caller (scripts measure it).
 		local resume = G.resumetop or coroutine.resume
+		-- A value that is neither a function nor a thread: the engine's argument error
+		-- (luaL_argerror form, no "got <type>").  Luraph's start-up code calls spawn, defer and delay
+		-- without arguments inside xpcall; before this the message was that of the mock's own
+		-- coroutine.create with a position inside rbxmock.lua.
 		local function run(f, ...)
 			if type(f) == "thread" then
 				resume(f, ...)
 				return f
 			end
+			if type(f) ~= "function" then error("invalid argument #1 to 'spawn' (function or thread expected)", 2) end
 			local co = coroutine.create(f)
 			resume(co, ...)
 			return co
 		end
 		task.spawn = named("task.spawn", run)
 		task.defer = named("task.defer", function(f, ...)
+			if type(f) ~= "thread" and type(f) ~= "function" then
+				error("invalid argument #1 to 'defer' (function or thread expected)", 2)
+			end
 			local co = type(f) == "thread" and f or coroutine.create(f)
 			queue[#queue + 1] = { co, ... }
 			return co
 		end)
-		task.delay = named("task.delay", function(_, f, ...)
+		task.delay = named("task.delay", function(t, f, ...)
+			if t ~= nil and rawType(t) ~= "number" then
+				error("invalid argument #1 to 'delay' (number expected, got " .. rawTypeof(t) .. ")", 2)
+			end
+			if type(f) ~= "thread" and type(f) ~= "function" then
+				error("invalid argument #2 to 'delay' (function or thread expected)", 2)
+			end
 			return type(f) == "thread" and f or coroutine.create(f)
 		end)
 		local function waitImpl(co, t)
@@ -1476,7 +1978,12 @@ return function(G, fnames, libnames)
 		libnames[task] = "task"
 		M.task = task
 		M.wait = namedY("wait", waitImpl)
-		M.spawn = named("spawn", function(f, ...) return run(f, ...) end)
+		M.spawn = named("spawn", function(f, ...)
+			if type(f) ~= "thread" and type(f) ~= "function" then
+				error("invalid argument #1 to 'spawn' (function or thread expected)", 2)
+			end
+			return run(f, ...)
+		end)
 		M.delay = named("delay", function() end)
 	end
 
@@ -1501,8 +2008,60 @@ return function(G, fnames, libnames)
 	M.tick = named("tick", os.clock)
 	M.time = named("time", os.clock)
 	M.elapsedTime = named("elapsedTime", os.clock)
-	M.warn = named("warn", function() end)
-	M.print = named("print", function() end)
+	-- print / warn: nothing is shown, but what the script said goes into the run's log
+	local function said(kind)
+		return function(...)
+			local n = select("#", ...)
+			if n == 0 then return end
+			local parts = table.pack(...)
+			for i = 1, n do
+				local okt, text = pcall(tostring, parts[i])
+				parts[i] = okt and rawType(text) == "string" and text or "?"
+			end
+			local text = string.gsub(string.sub(table.concat(parts, " ", 1, n), 1, 300), "[%c]", " ")
+			note("script", kind .. ": " .. text)
+		end
+	end
+	M.warn = named("warn", said("warn"))
+	M.print = named("print", said("print"))
+	-- What was noted during the run and not written yet, for the end of the run (harness.lua):
+	-- the script's own output in order, then one line each for the undefined globals it read and
+	-- for the permissive stand-ins it was given.
+	P.flush = function()
+		if not ewrite then return end
+		local globals, stubs, nsaid = {}, {}, 0
+		for _, line in ipairs(P.notes) do
+			local g = string.match(line, "^%[script%] undefined global read: (.*)$")
+			local st = string.match(line, "^%[stub%] ([^:(]+)")
+			if g then
+				globals[#globals + 1] = g
+			elseif st then
+				stubs[#stubs + 1] = st
+			elseif string.sub(line, 1, 8) == "[script]" then
+				nsaid += 1
+				if nsaid <= 60 and not P.live then
+					ewrite(line .. (P.counts[line] > 1 and "  (x" .. P.counts[line] .. ")" or "") .. "\n")
+				end
+			end
+		end
+		if nsaid > 60 then ewrite("[script] ... " .. (nsaid - 60) .. " more print / warn lines\n") end
+		local function list(t)
+			local more = #t > 40 and (", ... " .. (#t - 40) .. " more") or ""
+			return table.concat(t, ", ", 1, math.min(#t, 40)) .. more
+		end
+		if #globals > 0 then ewrite("[script] undefined globals read (nil, as in Roblox): " .. list(globals) .. "\n") end
+		if #stubs > 0 then
+			ewrite("[stub] permissive stand-ins handed out where the mock has no Roblox answer: " .. list(stubs) .. "\n")
+		end
+		P.notes = {}
+	end
+	-- the capitalised spellings Roblox still has of its old global functions
+	M.Wait, M.Spawn, M.Delay, M.ElapsedTime = M.wait, M.spawn, M.delay, M.elapsedTime
+	M.stats = named("stats", function() return methods.GetService(game, "Stats") end)
+	M.Stats = M.stats
+	-- (the client's version string; this one is made up in the engine's format)
+	M.version = named("version", function() return "0.650.0.6500692" end)
+	M.Version = M.version
 	M.settings = named("settings", function() return stub("settings") end)
 	M.UserSettings = named("UserSettings", function() return stub("UserSettings") end)
 	M.shared = {}
