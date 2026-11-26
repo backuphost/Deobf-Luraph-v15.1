@@ -599,6 +599,7 @@ return function(G, fnames, libnames, opts)
 	-- same names, which take the instance first).  Luraph's v15 start-up code tags a Folder and
 	-- asks for the tag back.
 	do
+		-- (level: how many mock functions are between the engine method and the caller of tagName)
 		local function tagName(v, argn, level)
 			if v == nil then error("Argument " .. argn .. " missing or nil", level + 1) end
 			if rawType(v) == "number" then return tostring(v) end
@@ -610,9 +611,9 @@ return function(G, fnames, libnames, opts)
 			if data[self].props.ClassName == "CollectionService" then
 				if a == nil then error("Argument 1 missing or nil", 4) end
 				if not data[a] then error("Unable to cast value to Object", 4) end
-				return a, tagName(b, 2, 3)
+				return a, tagName(b, 2, 4)
 			end
-			return self, tagName(a, 1, 3)
+			return self, tagName(a, 1, 4)
 		end
 		m("AddTag", function(self, a, b)
 			local inst, tag = target(self, a, b)
@@ -1068,8 +1069,9 @@ return function(G, fnames, libnames, opts)
 	--     turned centre minus half the (unturned) size
 	-- Not modelled, and said so in the run's log when met: layouts (UIListLayout, UIGridLayout, ...),
 	-- UIAspectRatioConstraint, AutomaticSize, SizeConstraint, ScrollingFrame canvases, BillboardGui /
-	-- SurfaceGui.  A ScreenGui that is not in the game has no size here (0, 0); the probe does not
-	-- depend on it (its first Frame has offsets only).
+	-- SurfaceGui.  A ScreenGui that is not in the game has no size here (0, 0), and an object without
+	-- a gui parent is laid out against the same empty box; the probe does not depend on either (its
+	-- gui is in no parent and its first Frame has offsets only), and Roblox's answer was not measured.
 	do
 		local LAYER = { ScreenGui = true, BillboardGui = true, SurfaceGui = true, LayerCollector = true }
 		local OBJECT = { Frame = true, TextLabel = true, TextButton = true, TextBox = true, ImageLabel = true, ImageButton = true,
@@ -1135,13 +1137,19 @@ return function(G, fnames, libnames, opts)
 				end
 				return 0, 0, 0, 0, 0, s
 			end
+			-- (an object without a gui parent is laid out like one in a ScreenGui outside the game:
+			-- against an empty box at the origin)
 			local parent = d.props.Parent
 			local pd = parent and data[parent]
-			if not pd or not guiKind(pd.props.ClassName) then return 0, 0, 0, 0, num(d.props.Rotation, 0), ownScale(d) end
-			local pw, ph, pcx, pcy, prot, k = layout(parent, depth + 1)
+			local pw, ph, pcx, pcy, prot, k = 0, 0, 0, 0, 0, 1
+			if pd and guiKind(pd.props.ClassName) then
+				pw, ph, pcx, pcy, prot, k = layout(parent, depth + 1)
+			else
+				pd = nil
+			end
 			-- the parent's content box
 			local l, t, cw, ch = 0, 0, pw, ph
-			local pad = modifier(pd, "UIPadding")
+			local pad = pd and modifier(pd, "UIPadding")
 			if pad then
 				l, t = udimPx(pad.props.PaddingLeft, pw, k), udimPx(pad.props.PaddingTop, ph, k)
 				cw = pw - l - udimPx(pad.props.PaddingRight, pw, k)
@@ -1173,7 +1181,7 @@ return function(G, fnames, libnames, opts)
 			if (auto ~= nil and tostring(auto) ~= "Enum.AutomaticSize.None") or (sc ~= nil and tostring(sc) ~= "Enum.SizeConstraint.RelativeXY") then
 				note("env", "GUI layout: AutomaticSize and SizeConstraint are not modelled; AbsoluteSize / AbsolutePosition ignore them")
 			end
-			if pd.props.ClassName == "ScrollingFrame" then
+			if pd and pd.props.ClassName == "ScrollingFrame" then
 				note("env", "GUI layout: the canvas of a ScrollingFrame is not modelled; its children are laid out in its window")
 			end
 			-- centre relative to the parent's centre, turned with the parent
