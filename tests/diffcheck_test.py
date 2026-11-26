@@ -164,6 +164,16 @@ class Plain(Base):
         self.expect(DIFFERENT, GUI, mutate(GUI, 'p.Parent = workspace', 'p.Parent = gui'))
         self.expect(DIFFERENT, GUI, mutate(GUI, 'label.Parent = frame', 'label.Parent = gui'))
 
+    def test_the_executor_function_that_is_called(self):
+        a = 'queue_on_teleport("x")\nsetfpscap(60)\nfireclickdetector(workspace)\n'
+        v = self.expect(SAME, a, a)
+        self.assertEqual(v.data['matched'], 3)
+        self.expect(DIFFERENT, a, mutate(a, 'setfpscap(60)', 'setsimulationradius(60)'), r'setsimulationradius\(60\)')
+        self.expect(DIFFERENT, a, mutate(a, 'queue_on_teleport', 'firesignal'), r'firesignal\("x"\)')
+
+    def test_first_call_that_the_original_never_makes(self):
+        self.expect(DIFFERENT, STARTUP + 'print("a")\n', 'warn("a")\n', r'the first call of the result is not among')
+
     def test_changed_global(self):
         self.expect(DIFFERENT, GUI, mutate(GUI, 'getgenv().HubLoaded = true', 'getgenv().HubLoaded = false'), r'globals left behind differ')
         self.expect(DIFFERENT, GUI, mutate(GUI, 'MyGlobal = "set"', 'local MyGlobal = "set"'), r'globals left behind differ')
@@ -188,6 +198,11 @@ class Plain(Base):
         result2 = 'print("a")\nlocal lib = nil\nlib:CreateWindow({ Parent = game:GetService("CoreGui") })\n'
         self.expect(DIFFERENT, original, result2, r'if the calls below are arguments of that call')
         self.expect(DIFFERENT, original, mutate(result, 'lib:CreateWindow', 'lib:CreateWindows'))
+        # the wording of the error for a method that is not there differs the same way
+        o4 = 'print("a")\nlocal lib = {}\nlocal m = lib.Init\nm(lib, 1)\n'
+        r4 = 'print("a")\nlocal lib = {}\nlib:Init(1)\n'
+        self.expect(SAME, o4, r4, r'both stop with the same error')
+        self.expect(DIFFERENT, o4, 'print("a")\nlocal lib = {}\nlib.Init.x(1)\n', r'different errors')
         # not that case: a local the lift moved into a later expression, behind a call
         o3 = 'print("a")\nlocal lib = nil\nlocal id = lib.Id\nprint(Vector3.new(1, 2, 3), id)\n'
         r3 = 'print("a")\nlocal lib = nil\nprint(Vector3.new(1, 2, 3), lib.Id)\n'
@@ -226,6 +241,10 @@ class TimeAndChance(Base):
         self.assertGreaterEqual(v.data['masked_arguments'], 2)
         self.expect(DIFFERENT, a, mutate(b, 'print("end")', 'print("END")'), r'print\("END"\)')
         self.expect(DIFFERENT, a, mutate(b, '"id"', '"ID"'))
+        # a global left behind that depends on chance
+        g = 'Seed = math.random(1, 1000000000)\nprint("x")\n'
+        self.expect(SAME, g, 'local _ = math.random()\n' + g, r'compared by name only')
+        self.expect(DIFFERENT, g, 'local _ = math.random()\n' + mutate(g, 'Seed =', 'Sead ='), r'globals left behind differ')
 
     def test_waiting_loop_ends_by_the_clock(self):
         a = 'local t0 = tick()\nlocal n = 0\nrepeat task.wait(1) n += 1 until tick() - t0 > 10\nprint("waited", n)\n'

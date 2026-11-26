@@ -372,26 +372,22 @@ if type(globals) == "table" then
 			names[#names + 1] = k
 		end
 	end
-	local made = {}
+	-- (one recording function per NAME: the harness uses one empty function for a dozen of these
+	-- names, and the log has to say which one the script called)
 	for _, k in ipairs(names) do
 		local f = rawget(globals, k)
-		local w = made[f]
-		if not w then
-			w = function(...)
-				if logging and not busy then record("X", k, 0, ...) end
-				local r = table.pack(pcall(f, ...))
-				if r[1] then return unpack(r, 2, r.n) end
-				local msg = r[2]
-				-- raised with error(msg, 2) (no position yet): the position of the script's call goes in front
-				if type(msg) == "string" and string.sub(msg, 1, 6) ~= "__LPH_" and not string.find(msg, "^[^\n]-%.lua:%d+: ")
-					and not string.find(msg, "^rbxmock:%d+: ") then
-					error(msg, 2)
-				end
-				error(msg, 0)
+		rawset(globals, k, function(...)
+			if logging and not busy then record("X", k, 0, ...) end
+			local r = table.pack(pcall(f, ...))
+			if r[1] then return unpack(r, 2, r.n) end
+			local msg = r[2]
+			-- raised with error(msg, 2) (no position yet): the position of the script's call goes in front
+			if type(msg) == "string" and string.sub(msg, 1, 6) ~= "__LPH_" and not string.find(msg, "^[^\n]-%.lua:%d+: ")
+				and not string.find(msg, "^rbxmock:%d+: ") then
+				error(msg, 2)
 			end
-			made[f] = w
-		end
-		rawset(globals, k, w)
+			error(msg, 0)
+		end)
 	end
 end
 

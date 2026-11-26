@@ -426,6 +426,8 @@ def _strip_position(msg):
 
 def _result_markers(text):
     c = collections.Counter()
+    if re.search(r'^--\s+result: PARTIAL', text[:6000], re.M):
+        c['"result: PARTIAL" in its own report'] += 1
     for m in PLACEHOLDER_RE.finditer(text):
         t = m.group(0)
         if t.startswith('__LPH_'):
@@ -453,6 +455,20 @@ def _placeholder_at(res, text):
     return None
 
 
+def _same_error(orig, res, text):
+    """Do both runs stop with the same error?  Positions aside, and one wording aside: for
+    obj:Method() with a method that is not there Luraph's interpreter fetches the member and calls
+    nil ("attempt to call a nil value"), Luau says "attempt to call missing method 'Method' of table"."""
+    if orig.end != 'error' or res.end != 'error':
+        return False
+    a, b = _strip_position(orig.end_message), _strip_position(res.end_message)
+    if a == b:
+        return True
+    g = re.match(r"attempt to call missing method '(\w+)' of ", b)
+    line = _error_line(res, text)
+    return bool(g and a == 'attempt to call a nil value' and line and re.search(r':\s*%s\s*[({"\']' % re.escape(g.group(1)), line))
+
+
 def _error_line(res, text):
     """The line of the result its run stopped on, or None."""
     m = re.match(r'sample:(\d+): ', res.end_message) if res.end == 'error' else None
@@ -478,7 +494,17 @@ def _n(n, word='call'):
     return '%d %s%s' % (n, word, '' if n == 1 else 's')
 
 
-def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS):
+def volatile_globals(a, b):
+    """Names of globals whose value differs between two runs of the same file."""
+    da, db = dict(a.globals), dict(b.globals)
+    return frozenset(n for n in set(da) | set(db) if _global_value(da.get(n, '')) != _global_value(db.get(n, '')))
+
+
+def _global_value(val):
+    return _POSITION.sub('', _ADDRESS.sub(r'\1: 0x?', ID_RE.sub('#', val)))
+
+
+def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noise=NOISE_CALLS, vol_globals=frozenset()):
     """Compare two runs.  Returns a Verdict."""
     for run, who in ((orig, 'original'), (res, 'result')):
         if run.fatal:
@@ -540,6 +566,19 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
             return 'ends (%s); it is partial' % res.how_ended()
         return None
 
+    # 0. the result starts with a call the original never makes
+    if n_r and p == len(eo) and not (orig.cut and not any(not (i in orig.errors or _is_probe(e)) for i, e in eo)):
+        v = finish(DIFFERENT, 'the first call of the result is not among the %s of the original' % _n(len(eo)))
+        v.add('result (call 1):')
+        for line in _context(er, 0, 0, 3):
+            v.add(line)
+        script = [k for k, (i, e) in enumerate(eo) if not (i in orig.errors or _is_probe(e))]
+        if script:
+            v.add('first call of the original that is not start-up (call %d):' % (script[0] + 1))
+            for line in _context(eo, script[0], 1, 3):
+                v.add(line)
+        return v
+
     # 1. a call that differs
     if m < n_r and m < n_o:
         v = finish(DIFFERENT, 'call %d of the result differs from the original (%d equal before it)' % (m + 1, m))
@@ -598,8 +637,7 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
                 return finish(NOT_COMPARABLE, 'the original made no call of the script before its %s' % orig.cut)
             return finish(SAME, 'same for the first %s; the original\'s run was cut at the %s there, the result goes on' % (_n(m), orig.cut))
         extra = [e for _, e in er[m:]]
-        same_error = (orig.end == 'error' and res.end == 'error' and not hole
-                      and _strip_position(orig.end_message) == _strip_position(res.end_message))
+        same_error = not hole and _same_error(orig, res, result_text)
         # obj:Method(args) with a missing obj or method: Luau evaluates the arguments first and then
         # looks the method up, Luraph's VM (Lua 5.1 order) looks it up first.  The same source text
         # therefore makes the argument calls only in the result.
@@ -644,14 +682,14 @@ def compare(orig, res, result_text='', vol_o=frozenset(), vol_r=frozenset(), noi
         if why:
             return finish(NOT_COMPARABLE, 'same up to call %d, then the result %s; the original %s' % (m, why, orig.how_ended()))
         return finish(DIFFERENT, 'the same %s, but the original %s and the result %s' % (_n(m), orig.how_ended(), res.how_ended()))
-    if orig.end == 'error' and _strip_position(orig.end_message) != _strip_position(res.end_message):
+    if orig.end == 'error' and not _same_error(orig, res, result_text):
         at = _placeholder_at(res, result_text)
         if at:
             return finish(NOT_COMPARABLE, 'same up to call %d, then the result stops at a placeholder (%s); the original %s' % (
                 m, 'line %d: %s' % at if at[0] else at[1], orig.how_ended()))
         return finish(DIFFERENT, 'the same %s, but the runs stop with different errors' % _n(m))
-    go = sorted((n, _ADDRESS.sub(r'\1: 0x?', ID_RE.sub('#', val))) for n, val in orig.globals)
-    gr = sorted((n, _ADDRESS.sub(r'\1: 0x?', ID_RE.sub('#', val))) for n, val in res.globals)
+    go = sorted((n, '(depends on time or chance)' if n in vol_globals else _global_value(val)) for n, val in orig.globals)
+    gr = sorted((n, '(depends on time or chance)' if n in vol_globals else _global_value(val)) for n, val in res.globals)
     if go != gr:
         v = finish(DIFFERENT, 'the same %s and the same ending, but the globals left behind differ' % _n(m))
         for n, val in [g for g in go if g not in gr][:6]:
@@ -719,10 +757,13 @@ def check(original, result, workdir=None, timeout=120.0, max_events=20000, optio
             return v
         vol_o, same_o = volatile_args(orig, orig2)
         vol_r, same_r = volatile_args(res, res2)
-        if not vol_o and not vol_r:
+        vol_g = volatile_globals(orig, orig2) | volatile_globals(res, res2) if orig.end and orig2.end and res.end and res2.end else frozenset()
+        if not vol_o and not vol_r and not vol_g:
             return v
-        log('second runs: %d + %d arguments depend on time or chance' % (len(vol_o), len(vol_r)))
-        v2 = compare(orig, res, result_text, vol_o, vol_r)
+        log('second runs: %d + %d arguments and %d globals depend on time or chance' % (len(vol_o), len(vol_r), len(vol_g)))
+        v2 = compare(orig, res, result_text, vol_o, vol_r, vol_globals=vol_g)
+        if vol_g:
+            v2.add('%s left behind (%s) depend on time or chance and were compared by name only' % (_n(len(vol_g), 'global'), ', '.join(sorted(vol_g))[:120]))
         n_o, n_r = len(compared(orig)), len(compared(res))
         if same_o < min(n_o, len(compared(orig2))) or same_r < min(n_r, len(compared(res2))):
             v2.add('two runs of the same file took different paths (original after %d calls, result after %d): '
