@@ -615,6 +615,29 @@ class Model:
                     counts[e[1][1]] = counts.get(e[1][1], 0) + 1
         return max(counts, key=counts.get) if counts else None
 
+    def loopless_closures(self):
+        """[(closure maker, function)]: vararg functions made directly by a closure maker that hold no
+        dispatch loop.  Luraph can compile a proto into an interpreter of its own without a loop
+        (straight-line code for exactly that proto); such a function is entered like any
+        interpreter closure, but the model has nothing to lift it with."""
+        out = []
+        seen = set()
+        for it in self.interps:
+            if len(it.chain) < 2:
+                continue
+            wrap = it.chain[-2]
+            if id(wrap) in seen or not hasattr(wrap, 'kw_pos'):
+                continue
+            seen.add(id(wrap))
+            inside = [f for f in self.funcs_by_id if f is not wrap and wrap.body_pos <= f.kw_pos < wrap.end_pos]
+            for f in inside:
+                if not f.vararg or id(f) in self.interp_funcs:
+                    continue
+                if any(g is not f and g.body_pos <= f.kw_pos < g.end_pos for g in inside):
+                    continue        # nested deeper
+                out.append((wrap, f))
+        return out
+
     def shadowed_maker_names(self):
         """[(function id of a closure maker, [its top-level locals that redeclare a name of the
         enclosing loader])] for the proto-table layout (see normalize.unshadow)."""
@@ -795,7 +818,22 @@ class Model:
                 edits.append((mark[0], '__LPH_MARK('))
                 edits.append((mark[1], ')'))
             captured = set()
-            for it in self.interps:
+
+            class _Loopless:
+                """stands in for an Interp in the loop below"""
+
+                def __init__(self, model, wrap, func, like):
+                    self.func = func
+                    self.chain = like.chain[:-1] + [func]
+                    self.visible = model._visible_names(func)
+
+            targets = list(self.interps)
+            if newproto:
+                # (the script's main function can be one of these: without the hook the script would
+                # run to its end, or for ever, without the dump being taken)
+                by_wrap = {id(it.chain[-2]): it for it in self.interps if len(it.chain) >= 2}
+                targets += [_Loopless(self, wrap, f, by_wrap[id(wrap)]) for wrap, f in self.loopless_closures()]
+            for it in targets:
                 names = it.visible
                 lst = '{' + ','.join('"%s"' % n for n in names) + '}'
                 if newproto:
@@ -829,7 +867,7 @@ class Model:
                 elif self._is_expression(f):
                     edits.append((f.kw_pos, '__LPH_F(%d,' % f.fid))
                     edits.append((f.end_pos, ')'))
-        if step and self.oneline:
+        if (step or newproto) and self.oneline:
             # Watchdog for the loader's own loops (deserialiser state machines are not VM code, so
             # the per-instruction hook never sees them): the harness sets __LPH_N.q while it calls
             # into the loader itself, and __LPH_W stops a loop that does not end.
@@ -1067,7 +1105,7 @@ def run_dump_script(model, workdir, tag, options=(), budget=40000000, timeout=15
             raise
     with open(errpath, errors='replace') as f:
         stderr = f.read()
-    keep = ('[handover]', '[dumpnew]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
+    keep = ('[handover]', '[dumpnew]', '[dump]', '[budget]', '[http]', '[env]', '[carrier]', 'NOT REACHED', 'COMPILE ERROR', '[end]')
     notes = [l for l in stderr.split('\n') if l.startswith(keep)][:40] + notes
     if not os.path.exists(outjson):
         # how the run ended: the error message the harness printed in front of its `[end] error` line

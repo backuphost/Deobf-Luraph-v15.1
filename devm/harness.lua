@@ -169,9 +169,14 @@ local quietHooks = false     -- VM code run by the harness itself (reading const
 
 -- Constant tables can carry an __index hook that decrypts entries on first use; touch every
 -- pending entry so the dump only ever sees plain values.
+local lazyForced, lazyStuck = 0, 0
+local forcing = false        -- true while forceLazy reads: __LPH_W / __LPH_OVER then stop a read that does not end
 local function forceLazy(root)
 	local seen, queue = {}, { root }
 	local qi = 1
+	local N = rawget(_G, "__LPH_N")
+	local wasQ, wasB = N and N.q, N and N.b
+	forcing = true
 	while qi <= #queue do
 		local t = queue[qi]
 		qi += 1
@@ -179,7 +184,19 @@ local function forceLazy(root)
 		if type(mt) == "table" and type(rawget(mt, "__index")) == "function" and type(rawget(t, 0)) == "table" then
 			local keys = {}
 			for k in next, rawget(t, 0) do keys[#keys + 1] = k end
-			for _, k in ipairs(keys) do pcall(function() return t[k] end) end
+			for _, k in ipairs(keys) do
+				-- The hook is code of the script's loader (a decoder loop) or VM code.  Called for a
+				-- key it does not expect it may never return: loops of the loader are counted while
+				-- N.q is set (__LPH_W), VM instructions against a budget of their own (__LPH_OVER).
+				quietSteps = 0
+				if N then N.q = true; N.b = N.s + 2000000 end
+				local ok, err = pcall(function() return t[k] end)
+				lazyForced += 1
+				if not ok and err == "__LPH_POOL_BUDGET" then
+					lazyStuck += 1
+					break
+				end
+			end
 		elseif lazyInsn and type(mt) == "table" and type(rawget(mt, "__index")) == "function" then
 			-- lazyinsn=1 (one table per instruction, Luraph v14.0 - v14.2): the instruction table
 			-- itself carries the hook; a constant not decoded yet is a nil field among its 7 or 8.
@@ -201,6 +218,8 @@ local function forceLazy(root)
 			end
 		end
 	end
+	forcing = false
+	if N then N.q, N.b = wasQ, wasB end
 end
 
 -- Constant pools.  In some builds a proto's constant table is {[-1] = pool, [-2] = index array} with
@@ -427,7 +446,13 @@ end
 local function finish(root)
 	if done then return end
 	done = true
+	local t0 = os.clock()
 	forceLazy(root)
+	if lazyForced >= 1000 or lazyStuck > 0 then
+		-- (large scripts have hundreds of thousands of constants, each decoded by VM code)
+		ewrite(string.format("[dump] %d lazy constants read in %.1f s%s\n", lazyForced, os.clock() - t0,
+			lazyStuck > 0 and string.format("; %d table(s) with a hook that did not return for a pending key: left as they were", lazyStuck) or ""))
+	end
 	findConstFns(root)
 	emit("{")
 	emit('"root":' .. ser(root) .. ",")
@@ -658,6 +683,7 @@ end
 -- the counting hook ran out of budget: the program spins (Luraph's tamper response is an endless
 -- loop) or waits
 function __LPH_OVER()
+	if forcing then error("__LPH_POOL_BUDGET", 0) end
 	if aborted then error(ABORT, 0) end
 	ewrite("[budget] stopped after " .. __LPH_N.s .. " VM instructions" ..
 		(__LPH_N.w == nil and ": the VM's first program has not returned" or ": the script's proto was never entered") .. "\n")
