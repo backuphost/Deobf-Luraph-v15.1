@@ -47,6 +47,11 @@ would (no text of a protected file is in here).
   that is no standard one is no constant, `tostring` handed to the helper makes the value assumed; a
   shared register the call names is marked although another function assigns that variable;
   `rawget` on a library table, and `table.foreach` (CallersVariables).
+* A call that is no site of the instruction's own -- in an arm of a branch, or handed the register array inside a
+  table (only the run's record shows it) -- leaves no variable it names or the run saw change with its value from
+  before the call; pcall is no function that assigns a shared variable, and a callee the code does not resolve may
+  be one only where such a function ran; rawget through pcall, getmetatable of a string and coroutine.yield are
+  not proved (CallsThatAreNoSite).
 """
 import json
 import os
@@ -1470,9 +1475,9 @@ class CallersVariables(unittest.TestCase):
         self.assertEqual(run.report(text)[0], 'result: PARTIAL')
 
     def test_no_run_values_and_no_site(self):
-        # runvals not run at all (the proto-table layout has no traced run), or a call it does not treat as a site (one in
-        # an arm of a branch): the printed register array, and the note on the calls the code hands it, each make the
-        # text PARTIAL
+        # runvals not run at all (the proto-table layout has no traced run), or a call it does not treat as a site of the
+        # instruction's own (one in an arm of a branch, marked after it: CallsThatAreNoSite): the printed register array,
+        # and the note on the calls the code hands it, each make the text PARTIAL
         m = lift(MAIN_REGS, helper_into_regs())
         text = text_of(m)
         self.assertRegex(text, r'\(\w+, \(\{\}\), 2\)')
@@ -1487,7 +1492,7 @@ class CallersVariables(unittest.TestCase):
                       'if regs[7] then regs[1](regs[2], regs, 2) end', *PRINT_R2_RUN)
         oracle = loop_oracle(eff, range(1, len(eff) + 2), REVERSE, vm=True)
         m, sites, notes, text, report = show_seven(main, oracle)
-        self.assertEqual(sites, [])
+        self.assertEqual([(s.kind, s.marked, s.ran) for s in sites], [('regs', {2}, False)])
         self.assertTrue(notes and notes[-1].startswith('[runvals-handed] 1 call(s)'), notes)
         self.assertEqual(report[0], 'result: PARTIAL', report)
         self.assertEqual(run.report('print("x")\n', notes=notes)[0], 'result: PARTIAL')
@@ -1553,6 +1558,209 @@ class CallersVariables(unittest.TestCase):
                          [({2: PLAIN}, True, True, runvals.ASSUMED_LIB)])
         self.assertIn('table.foreach', sites[0].why)
         self.assertEqual(report[0], 'result: PARTIAL', report)
+
+
+# ops of the calls show_run_values takes as no site of its own: a call in an arm with a register number read at run
+# time, a library function (pcall) handed the register array, the register array handed inside a table, and a call
+# handed three registers (for a helper that calls pcall)
+EIGHT = """elseif op == 54 then
+if R[C[pc]] then R[A[pc]](R[B[pc]], R, R[A[pc] + 6]) end
+elseif op == 55 then
+pcall(R[A[pc]], R[B[pc]], R, R[C[pc]])
+elseif op == 56 then
+R[A[pc]]({R}, R[B[pc]], C[pc])
+elseif op == 57 then
+R[A[pc]](R[A[pc] + 1], R[A[pc] + 2], R[A[pc] + 3])
+"""
+
+
+def show_eight(main, oracle, helpers=True, records=None):
+    """show_seven with the ops of EIGHT; records(m): oracle records of other programs to add (the probe runs the
+    helper as a function of its own, so the run's record of a function the program makes is put in by hand)"""
+    m = Mini(HANDLERS + MORE + SEVEN + EIGHT + shared_handlers(), prologue='for i = 1, NP do R[i] = args[i] end',
+             outer=PACKER)
+    m.lift(proto(main))
+    m.root = m.lifter.root_key
+    m.helper = min((k for k in m.protos if k != m.root), default=None)
+    hs = {m.helper} if helpers and m.helper is not None else set()
+    orc = own(oracle, m.root)
+    if records:
+        orc.update(records(m))
+    sites = runvals.show_run_values(m.protos, orc, hs)
+    notes = runvals.notes(sites, hs)
+    handed = runvals.handed_note(m.protos, sites)
+    notes += [handed] if handed else []
+    text = text_of(m, runvals.labels(sites, hs, m.protos))
+    return m, sites, notes, text, run.report(text, notes=notes)
+
+
+def upvalue_store_ran(m):
+    """the record of the run that the store into its upvalue of every function the program makes ran"""
+    out = {}
+    for pid, pir in m.protos.items():
+        if pid == m.root:
+            continue
+        for k, node in pir.nodes.items():
+            if node.tree is not None and any(st[0] == 'set' and st[1][0] == 'up' or st[0] == 'setindex' and
+                                             st[1][0] == 'upcell' for st in runvals._all_stmts(node.tree)):
+                out[(pid, k[0], k[1])] = {'n': 1, 'r': {}, 's': {}, 'succ': set()}
+    return out
+
+
+def helper_pcall_of_rawget():
+    """function(s, R, n) pcall(rawget, string, "n"); R[n] = s:reverse() end  (string.n, through pcall)"""
+    return proto([(3, 5, 'pcall', 0), (3, 6, 'rawget', 0), (3, 7, 'string', 0), (1, 8, 'n', 0), (57, 5, 0, 0),
+                  (23, 4, 1, 0), (22, 2, 3, 4), (2, 1, 0, 0)], nparams=3)
+
+
+def helper_getmetatable_of_a_string():
+    """function(s, R, n) R[n] = s:reverse() .. getmetatable("").__index.n end  (string.n, past the check)"""
+    return proto([(3, 5, 'getmetatable', 0), (1, 6, '', 0), (52, 5, 0, 0), (41, 7, 5, '__index'), (41, 8, 7, 'n'),
+                  (23, 4, 1, 0), (21, 4, 4, 8), (22, 2, 3, 4), (2, 1, 0, 0)], nparams=3)
+
+
+def helper_yields():
+    """function(s, R, n) coroutine.yield(); R[n] = s:reverse() end  (the code that resumes it runs in between)"""
+    return proto([(3, 5, 'coroutine', 0), (41, 5, 5, 'yield'), (45, 5, 0, 0), (23, 4, 1, 0), (22, 2, 3, 4),
+                  (2, 1, 0, 0)], nparams=3)
+
+
+@unittest.skipUnless(have_luau(), 'needs bin/luau')
+class CallsThatAreNoSite(unittest.TestCase):
+    """A call the run values do not take as a site of their own -- one in an arm of a branch, one handed the register
+    array inside a table -- leaves no variable it names or the run saw change printed with its value from before the
+    call: the MARK goes in after it (in its arm).  A library function called (pcall) is not the function that assigns
+    a shared variable, and a function that is not resolved may be that function only where such a function ran."""
+
+    def run_it(self, main, eff, work, helpers=True, records=None):
+        oracle = loop_oracle(eff, range(1, len(eff) + 2), work, vm=True)
+        return (oracle,) + show_eight(main, oracle, helpers, records)
+
+    def test_call_in_an_arm_names_the_register(self):
+        # (the verifier's N1) `if flag then helper(R2, R, 2) end`: R2 is marked inside the arm, right after the call
+        main = [(8, 1, helper_into_regs(), 0), (1, 2, ENC, 0), (3, 7, 'flag', 0), (53, 1, 2, 7)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[7] = true',
+                      'if regs[7] then regs[1](regs[2], regs, 2) end', *PRINT_R2_RUN)
+        for helpers in (True, False):
+            oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=helpers)
+            self.assertEqual(report[0], 'result: PARTIAL', report)
+            self.assertEqual([(s.kind, s.marked) for s in sites], [('regs', {2})])
+            self.assertIn('in an arm of a branch', sites[0].why)
+            self.assertRegex(text, r'\t\w+\((\w+), \(\{\}\), 2\)\n\t\1 = %s\nend\nreturn print\(\1 \.\. " world"\)'
+                             % re.escape(MARKED))
+            self.assertTrue(any(n.startswith('[runvals-missing] ') for n in notes), notes)
+
+    def test_call_in_an_arm_with_a_register_number_read_at_run_time(self):
+        # (N1r) the register number is read at run time: only the run's record of the call (w = {2}) says R2 changed
+        main = [(8, 1, helper_into_regs(), 0), (1, 2, ENC, 0), (3, 8, 'flag', 0), (3, 7, 'idx', 0), (54, 1, 2, 8)] \
+            + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[8] = true', 'regs[7] = 2',
+                      'if regs[8] then regs[1](regs[2], regs, regs[7]) end', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE)
+        rec = own(oracle, m.root)[(m.root, 0, 5)]
+        self.assertEqual((rec['h'], rec['n'], rec['w']), (1, 1, {2}))
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.kind, s.marked) for s in sites], [('regs', {2})])
+        self.assertRegex(text, r'\t\w+\((\w+), \(\{\}\), \w+\)\n\t\1 = %s\nend\nreturn print\(\1 \.\. " world"\)'
+                         % re.escape(MARKED))
+
+    def test_library_function_handed_the_array_and_a_shared_register(self):
+        # (N2r) pcall(helper, R5, R, idx): R5 is shared with X, which assigns it but is never called; pcall is a library
+        # function and the function it calls is not X: the change is not X's, and R5 is marked
+        main = [(1, 5, ENC, 0), (37, 6, sets_its_upvalue_to_a_global(), 5), (8, 1, helper_into_regs(), 0),
+                (3, 7, 'idx', 0), (55, 1, 5, 7)] + PRINT_R5
+        eff = effects('regs[5] = "%s"' % ENC, 'regs[6] = function() end', 'regs[1] = helper', 'regs[7] = 5',
+                      'pcall(regs[1], regs[5], regs, regs[7])', *PRINT_R5_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=False)
+        self.assertEqual(own(oracle, m.root)[(m.root, 0, 5)]['w'], {5})
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, {5})])
+        self.assertRegex(text, r'\(\{\}\), idx\)\n(\w+) = %s\nreturn print\(\1 \.\. " world"\)' % re.escape(MARKED))
+
+    def test_unresolved_function_and_a_shared_variable_no_function_that_ran_assigns(self):
+        # (N2u) decode(R5, R, idx), decode read from a global: it may be X, which shares R5 and assigns it -- but X never
+        # ran, so the change is not X's: R5 is marked
+        main = [(1, 5, ENC, 0), (37, 6, sets_its_upvalue_to_a_global(), 5), (3, 1, 'decode', 0), (3, 7, 'idx', 0),
+                (43, 1, 5, 7)] + PRINT_R5
+        eff = effects('regs[5] = "%s"' % ENC, 'regs[6] = function() end', 'regs[1] = helper', 'regs[7] = 5',
+                      'regs[1](regs[5], regs, regs[7])', *PRINT_R5_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=False)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, {5})])
+        self.assertRegex(text, r'decode\((\w+), \(\{\}\), idx\)\n\1 = %s\nreturn print\(\1 \.\. " world"\)'
+                         % re.escape(MARKED))
+
+    def test_unresolved_function_and_a_shared_variable_a_function_that_ran_assigns(self):
+        # (control) the same where the function that shares R5 assigns it through its upvalue in code the run executed
+        # (it may be the function called, read from a global): its text shows the change, and R5 is not marked
+        main = [(1, 5, ENC, 0), (37, 6, helper_sets_its_upvalue(), 5), (3, 1, 'decode', 0), (3, 7, 'idx', 0),
+                (43, 1, 5, 7)] + PRINT_R5
+        eff = effects('regs[5] = "%s"' % ENC, 'regs[6] = function() end', 'regs[1] = helper', 'regs[7] = 9',
+                      'regs[1](regs[5], regs, regs[7])', *PRINT_R5_RUN)
+        work = 'R[n] = string.reverse(s); R[5] = R[n]'
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, work, helpers=False)
+        self.assertEqual(own(oracle, m.root)[(m.root, 0, 5)]['w'], {5, 9})
+        self.assertIn(MARKED, text)         # (no record that the function that assigns R5 ran)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, work, helpers=False, records=upvalue_store_ran)
+        self.assertNotIn(MARKED, text)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, set())])
+        self.assertRegex(text, r'decode\((\w+), \(\{\}\), idx\)\nreturn print\(\1 \.\. " world"\)')
+        self.assertEqual(report[0], 'result: PARTIAL', report)      # (handed the register array)
+
+    def test_register_array_inside_a_table(self):
+        # (N6) helper({R}, R2, 2): the code does not show the call handed the register array (the table lifts as a value
+        # the lift could not describe), but the run saw R2 change, and no statement changes it: marked
+        helper_t = proto([(23, 4, 2, 0), (1, 5, 1, 0), (41, 6, 1, 1), (22, 6, 3, 4), (2, 1, 0, 0)], nparams=3)
+        main = [(8, 1, helper_t, 0), (1, 2, ENC, 0), (56, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1]({regs}, regs[2], 2)', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, 's[1][n] = string.reverse(R)')
+        self.assertEqual(own(oracle, m.root)[(m.root, 0, 3)]['w'], {2})
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.kind, s.marked) for s in sites], [('seen', {2})])
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+        self.assertNotIn('print("%s" .. " world")' % ENC, text)
+        self.assertTrue(any(n.startswith('[runvals-missing] ') and 'that no statement of the text changes' in n
+                            for n in notes), notes)
+
+    def test_call_of_a_function_that_shares_the_variable(self):
+        # (control) X() -- no register array handed -- assigns R5 through its upvalue, and its result goes to R6: the
+        # run saw both change, the text shows both changes, nothing is marked and the result is complete
+        main = [(1, 5, ENC, 0), (37, 6, sets_its_upvalue_to_a_global(), 5), (45, 6, 0, 0)] + PRINT_R5
+        eff = effects('regs[5] = "%s"' % ENC, 'regs[6] = helper', 'regs[6] = regs[6]("x", regs, 5)', *PRINT_R5_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=False)
+        self.assertEqual(own(oracle, m.root)[(m.root, 0, 3)]['w'], {5, 6})
+        self.assertEqual((sites, notes), ([], []))
+        self.assertNotIn(MARKED, text)
+        self.assertEqual(report[0], 'result: complete (no unlifted instructions, no missing constants, all control flow '
+                                    'structured)', report)
+
+    def test_pcall_of_rawget_on_a_library_table(self):
+        # (minor) rawget(string, "n") called through pcall: not proved
+        main = [(8, 1, helper_pcall_of_rawget(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE)
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2}, False)])
+        self.assertIn('rawget or rawset', sites[0].why)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+    def test_getmetatable_of_a_string(self):
+        # (minor) getmetatable("").__index is the string table: its field n is not the library's, and not proved
+        main = [(8, 1, helper_getmetatable_of_a_string(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. '
+                                                                       'tostring(getmetatable("").__index.n)')
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2}, False)])
+        self.assertIn('getmetatable', sites[0].why)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+    def test_helper_that_yields(self):
+        # (minor) coroutine.yield: what it returns is the resuming code's, and that code runs in the middle of the call
+        main = [(8, 1, helper_yields(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE)
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2}, False)])
+        self.assertIn('yield', sites[0].why)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
 
 
 # MAIN_REGS with the helper filled in (for mini_seven, which lifts the code as given)

@@ -35,9 +35,12 @@ calls a function with the register array, and whose every execution went on to t
   * that no function of the program captures by reference (a variable a closure shares changes
     through the closure, whose text shows it; but one the call names or the run saw it change --
     by `w`, else by the values I and J saw -- is marked, unless the call does not name it, a function
-    of the program assigns it through its upvalue, and the function called is not resolved (it may be
-    that function) or is that function itself, makes it or shares it: another function that assigns
-    the variable is not the call's doing),
+    of the program assigns it through its upvalue, and that function can have made the change: the
+    function called is that function itself, makes it or shares it (through pcall / xpcall: the
+    function handed to them), or is not resolved and a function that assigns the variable ran (the
+    run has a record of its statement that assigns it).  A library function called is not that
+    function, nor is a resolved one that does not assign it: another function that assigns the
+    variable, or one that never ran, is not the call's doing: _exempt),
   * that the code reads after the call before writing it again (Live),
   * that J saw holding one value V at every visit,
   * and that did not hold V already before the call (I's entry value, or a constant I itself
@@ -56,9 +59,10 @@ call, as far as the code shows (_Proof):
   3. every variable the closure captures holds a constant, a standard library function or a closure
      that meets these rules, and nothing changes it after the closure is made;
   4. the closure's lifted code, its nested functions included, reads no global but the standard
-     library's tables and functions (not a random source, nor a field the library does not have, also
-     not through rawget / rawset on a table it did not make), changes no variable it shares, and only
-     stores into the register array it is handed (never reads it).
+     library's tables and functions (not a random source, nor coroutine.yield, nor a field the library
+     does not have, also not through rawget / rawset on a table it did not make, called directly or
+     through pcall / xpcall, nor through getmetatable of a value it did not make), changes no variable
+     it shares, and only stores into the register array it is handed (never reads it).
 
 and, for all the calls of the program together (_settle): every call handed the program's register
 array meets these rules, and the array reaches no other code (_escape: a call that may be handed it
@@ -90,13 +94,23 @@ these when a rule above fails -- `R[r] = nil --[[...]]` (MARK) goes in after the
 not show the earlier value as the current one, and the call counts as not shown (notes:
 `[runvals-missing]`, the result is PARTIAL).  The same after a call that did not run or went on to
 more than one instruction, and after every call of an instruction with several calls handed the
-register array, for the registers it names and those the run saw any of them change.  A register
+register array, for the registers it names and those the run saw any of them change.  The same, too,
+after the calls that are no site of an instruction's own (_other_calls): a call the code shows handed
+the register array in an arm of a branch (the MARK goes in the arm, right after it) or inside another
+value, for the registers it names and those the run saw the instruction's calls change; and, in an
+instruction with no call handed the register array, a call after which the run saw a variable change
+that no statement of the instruction writes after its first call and no function that shares it and
+assigns it through its upvalue in a statement the run executed can have changed (only the register
+array reaches a variable nothing shares: the call or code it ran had it, kept somewhere the code does
+not show, as `{R}`, which lifts as a value the lift could not describe).  A register
 that held no one value before the call nor after it, that the call does not name and that the run did
 not see it change (a callee that is no VM function is not seen), is left as the code has it (best
-effort, said by the `[runvals-handed]` note); so is everything after a call that fails a rule but
-changed nothing the code reads afterwards, as far as the run saw: that call gets no mark and no note
-of its own (its failure makes the other values of the program not proved).  Registers nothing reads
-afterwards are dropped again with the other dead stores (ircfg.ProtoCFG._dead_stores).
+effort, said by the `[runvals-handed]` note); so is a change the instruction's own statements after its
+first call can explain, after a call the code does not show handed the register array, and everything
+after a call that fails a rule but changed nothing the code reads afterwards, as far as the run saw:
+that call gets no mark and no note of its own (its failure makes the other values of the program not
+proved).  Registers nothing reads afterwards are dropped again with the other dead stores
+(ircfg.ProtoCFG._dead_stores).
 
 A call of a helper of the build (a program the pipeline names one) whose results go straight to
 registers is shown the same way: `R[a] = helper(enc)` becomes `helper(enc); R[a] = V --[[...]]`
@@ -197,7 +211,9 @@ _LIB_MEMBERS = {
 _LIB_FUNCS = frozenset(('select', 'type', 'typeof', 'tostring', 'tonumber', 'pcall', 'xpcall', 'error', 'assert',
                         'next', 'pairs', 'ipairs', 'rawget', 'rawset', 'rawequal', 'rawlen', 'setmetatable',
                         'getmetatable', 'unpack'))
-_NOT_LIB = frozenset(('math.random', 'math.randomseed', 'coroutine.running', 'coroutine.isyieldable'))
+# (coroutine.yield: what it returns is whatever the code that resumes the function hands it)
+_NOT_LIB = frozenset(('math.random', 'math.randomseed', 'coroutine.running', 'coroutine.isyieldable',
+                      'coroutine.yield'))
 # ... of which these can give another result at another execution for the same arguments: `tostring`
 # of a table or a function is its address (`string.format` with %s or %p the same), and `next`,
 # `pairs` and `table.foreach` go through a table's keys in the order they are stored in: a function
@@ -1291,6 +1307,46 @@ class _Proof:
                             out[c[1]] = True if a is True or b is True else None if a is None or b is None else False
         return out
 
+    def assign_ran(self, key, i, depth=0):
+        """did the run execute a statement of function `key` (or of a function it makes that shares the variable)
+        that assigns to its upvalue i?  (an instruction the run has a record of; no record of the program: no)"""
+        memo = ('ran', key, i)
+        if memo in self._assigns:
+            return self._assigns[memo]
+        if key not in self.trees or depth > self.DEPTH:
+            return False
+        self._assigns[memo] = False         # (a function that makes itself)
+        ran = self.ran(key) or set()
+        out = False
+        for k, (tree, _err) in self.trees[key].items():
+            if tree is None:
+                continue
+            for st in _all_stmts(tree):
+                if k in ran and (st[0] == 'set' and st[1] == ('up', i)
+                                 or st[0] == 'setindex' and st[1] == ('upcell', i)):
+                    out = True
+                for cl in _closures(st, []):
+                    for j, c in enumerate(cl[2]):
+                        if (c == ('up', i) or c == ('upcell', i)) and self.assign_ran(cl[1], j, depth + 1):
+                            out = True
+        self._assigns[memo] = out
+        return out
+
+    def ref_assign_ran(self, pid):
+        """{register: True}: the registers of program pid that a function made there captures by reference and
+        assigns to through its upvalue in a statement the run executed (assign_ran)"""
+        out = {}
+        for tree, _err in self.trees.get(pid, {}).values():
+            if tree is None:
+                continue
+            for st in _all_stmts(tree):
+                for cl in _closures(st, []):
+                    for j, c in enumerate(cl[2]):
+                        if isinstance(c, tuple) and len(c) == 2 and c[0] == 'ref' and isinstance(c[1], int) \
+                                and c[1] not in out and self.assign_ran(cl[1], j):
+                            out[c[1]] = True
+        return out
+
     def check(self, val, regs_pos=(), depth=0):
         """val: what Flow.fixed says the function called is; regs_pos: the positions of its arguments
         that are the caller's register array"""
@@ -1424,13 +1480,21 @@ class _Proof:
                     if st[0] == 'vararg':
                         acc['va'] = True
                     # rawget / rawset on a table the function did not make itself: a library table has fields the
-                    # library does not have only where a script keeps a value (`rawget(string, "n")`)
+                    # library does not have only where a script keeps a value (`rawget(string, "n")`, also called
+                    # through pcall / xpcall); getmetatable of a value it did not make reaches a library table past
+                    # the check of its members (`getmetatable("").__index` is the string table)
                     at = idx if top else len(tree[0])
-                    if st[0] == 'call' and name_of(stands_for(st[2], k, at)) in _RAW:
-                        t0 = stands_for(st[3][0], k, at) if st[3] else None
-                        if t0 is None or t0[0] != 'newtable':
-                            bad.add('it calls rawget or rawset on a table it did not make (on a library table that '
-                                    'reads a field the library does not have, where a script can keep a value)')
+                    if st[0] == 'call':
+                        fname, fargs = name_of(stands_for(st[2], k, at)), st[3]
+                        if fname in ('pcall', 'xpcall') and fargs:
+                            fname, fargs = name_of(stands_for(fargs[0], k, at)), fargs[1 if fname == 'pcall' else 2:]
+                        if fname in _RAW or fname == 'getmetatable':
+                            t0 = stands_for(fargs[0], k, at) if fargs else None
+                            if t0 is None or t0[0] != 'newtable':
+                                bad.add('it calls rawget or rawset on a table it did not make (on a library table that '
+                                        'reads a field the library does not have, where a script can keep a value)'
+                                        if fname in _RAW else 'it calls getmetatable on a value it did not make '
+                                        '(through it a library table is reached past the check of its members)')
                     # (a field of a library table read through a variable that holds the table)
                     for ix in _indexes(exprs, []):
                         if flow is None:
@@ -1576,6 +1640,37 @@ def _assigns_shared(flow, proof, made, r, key, idx, depth=0):
     return False
 
 
+def _callee_closures(flow, st, key, idx):
+    """the functions of the program a call statement st calls (read at top-level statement idx of instruction key;
+    the number of its statements for one in an arm), as _closures_of: None where that is not resolved (a value read
+    at run time, an upvalue); for pcall and xpcall, the function handed to them; [] for another library function
+    (whose own code is no function of the program: never the one that assigns a variable the program shares)"""
+    f = flow.value(flow._plain(st[2]), key, idx)
+    if f is not None and f[0] == 'kfn':
+        if f[1] in ('pcall', 'xpcall') and st[3]:
+            return _closures_of(flow, flow._plain(st[3][0]), key, idx)
+        return []
+    return _closures_of(flow, flow._plain(st[2]), key, idx)
+
+
+def _exempt(flow, proof, st, key, idx, r, named, ran):
+    """A register a function of the program shares by reference changes through that function, whose text shows
+    the change: after call statement st (at top-level statement idx of instruction key) it is not marked when the
+    call does not name it (`named`: it writes a register it names through the register array), a function of the
+    program assigns the shared variable (flow.ref_assigned), and the function called is that function itself (or
+    makes one, or shares a closure that is one: _assigns_shared; through pcall / xpcall, the function handed to
+    them), or is not resolved and a function that assigns the variable ran (`ran`: _Proof.ref_assign_ran; the
+    function called may be that one).  Not for a library function called (its code is not the program's), nor for
+    a resolved function that does not assign it (another function that assigns the variable is not the call's
+    doing)."""
+    if flow.ref_assigned.get(r) is not True or r in named:
+        return False
+    cls = _callee_closures(flow, st, key, idx)
+    if cls is None:
+        return bool(ran.get(r))
+    return bool(cls) and all(_assigns_shared(flow, proof, cl, r, key, idx) for cl in cls)
+
+
 def _has_regs(x):
     """does x (a statement, an expression, a tree) hold the ('regs',) atom anywhere"""
     if isinstance(x, tuple):
@@ -1619,8 +1714,10 @@ def handed_note(protos, sites=()):
     return '[runvals-handed] %d call(s) are handed the variables of the code that calls them (its register array, ' \
            'printed `({})` or kept in a variable): what they change is shown only as far as the run saw it -- after ' \
            'them the text shows the value the run had, with a comment that says so, or `nil --[[%s]]`, for a ' \
-           'variable the call names or the run saw it change; one the call does not name and the run did not see it ' \
-           'change keeps its value from before the call' % (n, MARK)
+           'variable the call names or the run saw change (where it saw every call of the instruction), unless a ' \
+           'function of the program shares the variable and assigns it, and the change can be that function\'s, ' \
+           'whose text shows it; a variable the call does not name and the run did not see change keeps its value ' \
+           'from before the call' % (n, MARK)
 
 
 def show_run_values(protos, oracle, helpers=()):
@@ -1668,10 +1765,14 @@ def show_run_values(protos, oracle, helpers=()):
                 kind = 'result'
             todo.append((key, kind, found, rec))
         if not todo:
+            # (no site: the other calls handed the register array, and the calls the run saw change a variable that no
+            # statement shows changing)
+            sites += _other_calls(pid, pir, oracle, flow, proof, set())
             continue
         # (what the sites of the program need, once per program, from the code as lifted: the trees
         # change below)
         flow.ref_assigned = proof.ref_assigned(pid)
+        ran = proof.ref_assign_ran(pid)
         # (Flow.spare: what the run saw a call that meets the rules leave alone)
         _trusted(flow, pir, pid, oracle, proof)
         entries, psites = [], []
@@ -1736,17 +1837,8 @@ def show_run_values(protos, oracle, helpers=()):
                 return 'reread' if first == 'read' else 'free'
 
             def exempt(r, ci, named):
-                # A register a function of the program shares by reference changes through that function, whose
-                # text shows the change: not marked when the call does not name it, and the function called is not
-                # resolved (it may be such a function) or is such a function itself (or makes one, or shares a
-                # closure that is one).  Not when the call names it (it writes it through the register array), nor
-                # when another function assigns the shared variable (the call did not use that function).
-                if flow.ref_assigned.get(r) is not True or r in named:
-                    return False
-                cls = _closures_of(flow, stmts[ci][2], key, ci)
-                if cls is None:
-                    return True
-                return bool(cls) and all(_assigns_shared(flow, proof, cl, r, key, ci) for cl in cls)
+                # (a shared register whose change the text shows through the function that assigns it: _exempt)
+                return _exempt(flow, proof, stmts[ci], key, ci, r, named, ran)
 
             def markable(r, ci, reads, named):
                 # (a register the call may have set, after a call whose effect the run does not show)
@@ -1879,7 +1971,174 @@ def show_run_values(protos, oracle, helpers=()):
             put += [('set', ('r', r), ('opaque', MARK)) for r in sorted(site.unproved)]
             if put:
                 node.tree = (insert(stmts, {ci: put}), term)
+        sites += _other_calls(pid, pir, oracle, flow, proof, {(s.key, s.call) for s in psites if s.kind == 'regs'})
     return sites
+
+
+def _call_spots(tree, path=(), acc=None):
+    """[(path, index, statement)]: the call statements of a tree, those of its branch arms included; path: the
+    positions in the terminators that lead to the arm (() for the top level)"""
+    acc = [] if acc is None else acc
+    for i, st in enumerate(tree[0]):
+        if st[0] == 'call':
+            acc.append((path, i, st))
+    term = tree[1]
+    for j in ((2, 3) if term[0] == 'br' else (3, 4) if term[0] == 'forbr' else ()):
+        _call_spots(term[j], path + (j,), acc)
+    return acc
+
+
+def _arm(tree, path):
+    for j in path:
+        tree = tree[1][j]
+    return tree
+
+
+def _put_after(tree, path, at):
+    """the tree with the statements at[i] put right after statement i of the statement list at `path`"""
+    if not path:
+        out = []
+        for i, x in enumerate(tree[0]):
+            out.append(x)
+            out += at.get(i, [])
+        return out, tree[1]
+    term = list(tree[1])
+    term[path[0]] = _put_after(term[path[0]], path[1:], at)
+    return tree[0], tuple(term)
+
+
+def _first_touch(stmts, r):
+    """what the statements do to register r first: 'read' (also one whose writes are not known), 'write', or None"""
+    for x in stmts:
+        if r in _stmt_reads(x):
+            return 'read'
+        w = _writes(x)
+        if w is None:
+            return 'read'
+        if _hits(w, r):
+            return 'write'
+    return None
+
+
+def _other_calls(pid, pir, oracle, flow, proof, done):
+    """MARK after the calls of program pid that are not sites (`done`: (instruction, call id) of the sites handed the
+    register array, which show_run_values has dealt with), in every instruction that lifted:
+
+      * a call the code shows handed the register array (an argument that stands for it or holds it inside, as
+        handed), also one in an arm of a branch: a register it names, or that the run saw the instruction's calls
+        change (`w`, where every visit saw them enter a function of the VM), and that the code reads afterwards gets
+        `R[r] = nil --[[MARK]]` right after the call (in its arm), unless the instruction's own statements write it
+        again first, or a function of the program shares it and its change is that function's (_exempt);
+      * in an instruction with no call handed the register array, a register the run saw its calls change (`w`, as
+        above) that no statement of the instruction writes after its first call, and that no function of the
+        program that shares it and assigns it through its upvalue in a statement the run executed can have changed:
+        nothing in the text changes it (the change went through a register array the code does not show handed:
+        kept in a table, a value the lift could not describe), and it gets the MARK after each of the instruction's
+        calls where the code reads it afterwards.
+
+    Returns a Site for every call given a MARK (kind 'regs' for a call handed the register array, 'seen' for one the
+    run alone shows changing a variable): notes() counts them as calls whose effect the run does not show."""
+    out = []
+    caps = live = ran = None
+    for key, node in list(pir.nodes.items()):
+        if node.tree is None or node.error:
+            continue
+        spots = _call_spots(node.tree)
+        if not spots:
+            continue
+        rec = oracle.get((pid, key[0], key[1]))
+        seenw = _seen_writes(rec) or set()
+        if flow is None:
+            flow = Flow(pir)
+        top = node.tree[0]
+        handed_here = any((key, st[1]) in done for _p, _i, st in spots)
+        work = []
+        for path, i, st in spots:
+            if (key, st[1]) in done:
+                continue
+            at = i if not path else len(top)
+            pos = [j for j, a in enumerate(st[3]) if _has_regs(flow._plain(a)) or flow.value(a, key, at) == ('regs',)
+                   or not path and flow.is_regs_arg(a, key, i, rec, top)]
+            handed_here = handed_here or bool(pos)
+            if pos or seenw:
+                work.append((path, i, st, at, pos))
+        if not work:
+            continue
+        # (record only: the registers a statement of the instruction writes after its first call -- what the run saw
+        # change may be their doing -- or None where a statement's writes are not known)
+        later = set()
+        if not handed_here:
+            first_path, first_i, _st = spots[0]
+            arm0 = _arm(node.tree, first_path)
+            for x in list(arm0[0][first_i + 1:]) + _nested(arm0):
+                w = _writes_any(x)
+                if w is None:
+                    later = None
+                    break
+                later |= {r for r in seenw if _hits(w, r)}
+            if later is None or not seenw - later:
+                continue
+        if caps is None:
+            caps, live = captured(pir), Live(pir)
+            if not flow.ref_assigned:
+                flow.ref_assigned = proof.ref_assigned(pid)
+            ran = proof.ref_assign_ran(pid)
+        lout = live._out(key)
+        edits = {}
+        for path, i, st, at, pos in work:
+            if not pos and handed_here:
+                continue        # (what the run saw change is the doing of the calls handed the register array)
+            named = set()
+            if pos:
+                for a in st[3][pos[0] + 1:]:
+                    e = flow._plain(a)
+                    v = e if e[0] == 'k' else None if path else flow.fixed(a, key, at, loose=True)
+                    if v is not None and v[0] == 'k' and P.is_num(v[1]) and not isinstance(v[1], bool) \
+                            and float(v[1]).is_integer() and 0 <= v[1] < 1 << 20:
+                        named.add(int(v[1]))
+            arm = _arm(node.tree, path)
+            rest = arm[0][i + 1:]
+            after = None
+            marked = set()
+            for r in sorted(named | seenw):
+                if not pos and r in later:
+                    continue
+                touch = _first_touch(rest, r)
+                if touch == 'write':
+                    continue
+                if touch is None and lout is not None and r not in lout:
+                    if after is None:
+                        after = _tree_reads(([], arm[1]), set())
+                    if r not in after:
+                        continue        # (nothing reads it afterwards)
+                if r in caps:
+                    if pos and _exempt(flow, proof, st, key, at, r, named, ran):
+                        continue
+                    if not pos and flow.ref_assigned.get(r) is True and \
+                            (ran.get(r) or _exempt(flow, proof, st, key, at, r, named, ran)):
+                        continue
+                marked.add(r)
+            if not marked:
+                continue
+            edits.setdefault(path, {})[i] = [('set', ('r', r), ('opaque', MARK)) for r in sorted(marked)]
+            f = flow.value(flow._plain(st[2]), key, at)
+            site = Site(pid, key, f[1] if f is not None and f[0] == 'closure' and isinstance(f[1], int) else None,
+                        'regs' if pos else 'seen', st[1])
+            site.marked = marked
+            if not pos:
+                site.why = 'the call is not shown handed the register array, and the run saw it change a variable no ' \
+                           'statement shows changing'
+            elif path:
+                site.why = 'the call is in an arm of a branch, where the run values do not follow a call'
+            else:
+                site.why = 'the call is handed the register array inside another value, which the run values do not ' \
+                           'follow'
+            out.append(site)
+        tree = node.tree
+        for path, at_ in edits.items():
+            tree = _put_after(tree, path, at_)
+        node.tree = tree
+    return out
 
 
 def _helper(k, callers=None):
@@ -1920,13 +2179,16 @@ def notes(sites, helpers=(), callers=None):
         who = _who(callee, helpers, callers)
         if kind == 'regs':
             what = 'are handed the register array of the code that calls them (printed `({})`) and write into its variables'
+        elif kind == 'seen':
+            what = 'change variables of the code that calls them, as the run saw, that no statement of the text ' \
+                   'changes (they are not shown handed its register array)'
         else:
             what = 'return values that the code that calls them keeps in variables'
         if shown:
             out.append('[runvals] %d call(s) of %s %s: after %s the text shows the values they %s as the run saw them '
                        '(%d value(s), each with a comment: %d proved, --[[%s]], %d assumed)' % (
                            len(group), who, what, 'each of them' if len(shown) == len(group) else
-                           '%d of them' % len(shown), 'wrote' if kind == 'regs' else 'returned',
+                           '%d of them' % len(shown), 'wrote' if kind != 'result' else 'returned',
                            sum(len(s.shown) for s in shown), sum(len(s.shown) for s in shown if not s.assumed), PROVED,
                            sum(len(s.shown) for s in shown if s.assumed)))
         if assumed:
@@ -1943,7 +2205,7 @@ def notes(sites, helpers=(), callers=None):
         if missing:
             there = ('after those calls a variable the call may have set is printed `nil --[[%s]]` (where the call names '
                      'it or the run saw the call change it), and a constant handed to the call stays as it was (encrypted)'
-                     % MARK if kind == 'regs' else
+                     % MARK if kind != 'result' else
                      'there the text keeps the call, and the constants handed to it stay as they were (encrypted)')
             whys = sorted({s.why for s in missing if s.why and not s.fixed})
             out.append('[runvals-missing] %d call(s) of %s %s, and for %s the run does not show one value of what they %s '
@@ -1951,7 +2213,7 @@ def notes(sites, helpers=(), callers=None):
                        'what followed it held different values at different times, or what it is handed is not constant or '
                        'not shown to give the same at every execution%s): %s' % (
                            len(group), who, what, 'all of them' if len(missing) == len(group) else
-                           '%d of them' % len(missing), 'wrote' if kind == 'regs' else 'returned',
+                           '%d of them' % len(missing), 'wrote' if kind != 'result' else 'returned',
                            ('; here: ' + '; '.join(whys[:2])) if whys else '', there))
     return out
 

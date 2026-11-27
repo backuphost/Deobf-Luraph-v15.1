@@ -811,7 +811,10 @@ stays as a statement, handed its constant, and the register gets the value the r
      library's tables and functions (`string`, `table`, `math` but `math.random`, `bit32`, `utf8`,
      `buffer`, `select`, `tostring`, ...; a field the library does not have, such as `string.n`, is a
      place where a script can keep a value, also when it is read through a variable that holds the
-     table, or with `rawget` / `rawset` on a table the function did not make), no value of Luraph's
+     table, with `rawget` / `rawset` on a table the function did not make, called directly or through
+     `pcall` / `xpcall`, or through `getmetatable` of a value it did not make, such as
+     `getmetatable("").__index`; nor `coroutine.yield`, which returns whatever the code that resumes
+     the function hands it), no value of Luraph's
      loader, changes no variable it shares with other functions, and only stores into the register
      array it is handed (never reads it, nor passes it on).  The library's functions count as
      functions of their arguments, except `tostring`, `next`, `pairs`, `table.foreach` and
@@ -852,14 +855,15 @@ stays as a statement, handed its constant, and the register gets the value the r
   closure handed constants: that was a claim about its captures and its code that nothing checked.)
 * **What the run saw a call change, and what it saw it leave alone.**  The harness sees a call only by
   the VM function it enters.  Where every visit saw one entered (`h` == `n`), each register in its
-  record of what changed (`w`) is one the call may have set, and is proved or marked as below, in every
-  case (one call or several in the instruction, a callee the code resolves or not); `w` is only ever
-  used to add a register, never to leave one out (a callee that is no VM function changes registers
-  the harness does not see change).  That the run saw a call leave a register alone counts only for
-  the proof of another call, and only where the instruction's one call is the one handed the register
-  array, calls a closure of the program and meets the rules itself (`runvals._trusted`; in a loop the
-  instructions are taken together, by induction over the run): otherwise it can write that register
-  at another execution.
+  record of what changed (`w`) is one the call may have set, and is proved or marked as below,
+  whether the instruction has one call or several, the code resolves the callee or not, and the call is
+  one of the instruction's own or sits in an arm of a branch (below), save the exemption of a shared
+  variable below; `w` is only ever used to add a register, never to leave one out (a callee that is no
+  VM function changes registers the harness does not see change).  That the run saw a call leave a
+  register alone counts only for the proof of another call, and only where the instruction's one call
+  is the one handed the register array, calls a closure of the program and meets the rules itself
+  (`runvals._trusted`; in a loop the instructions are taken together, by induction over the run):
+  otherwise it can write that register at another execution.
 * **What is not proved is marked, not shown stale.**  For a register the call may have set -- one
   that held one value before the call and none after it, one the call names (a constant register
   number handed with the register array), one the run saw the call change -- where the run proves no
@@ -872,23 +876,41 @@ stays as a statement, handed its constant, and the register gets the value the r
   reference) is marked too when the call names it or the run saw it change (by `w`, else because it
   held one value before the call and another, or none, after it), unless the call does not name it, a
   function of the program assigns it through its upvalue, and that change can be the one the run saw:
-  the function called is not resolved (it may be that function), or it is that function, makes it or
-  shares it.  Then that function's text shows the change.  A call that names the register writes it
-  through the register array, which no text shows; and a function that assigns the variable but is not
-  the one called (nor made or shared by it) did not make the change the call made.  A register the instruction's own statements after
+  the function called is that function, makes it or shares it (through `pcall` / `xpcall`: the function
+  handed to them), or it is not resolved and a function that assigns the variable ran (the oracle has
+  a record of its statement that assigns it): it may be that function.  Then that function's text shows
+  the change.  A call that names the register writes it through the register array, which no text
+  shows; a library function called is no function of the program; and a function that assigns the
+  variable but is not the one called (nor made or shared by it), or that never ran, did not make the
+  change the call made (`runvals._exempt`).  A register the instruction's own statements after
   the call read before setting it again is marked (the next instruction saw what they made of it,
   not what the call left); one they set again without reading it first is left alone.  One such
   register is enough for the call to count as not shown (`values not shown: ...`, PARTIAL), whatever
   else it shows.  A register nothing reads after the call is not counted.
+* **Calls that are no site of their own.**  The values above are those of a call of the instruction's
+  own statements.  A call the code shows handed the register array somewhere else -- in an arm of a
+  branch (`if x then f(s, R, 2) end`), or inside another value -- gets the mark all the same, for the
+  registers it names and those the run saw the instruction's calls change, right after it (in its
+  arm), with the same exemption of a shared variable; it counts as not shown (`values not shown`).  And
+  where an instruction has no call handed the register array but the run saw its calls change a
+  variable (`w`, every visit seen) that no statement of the instruction writes after its first call,
+  and that no function that shares it and assigns it through its upvalue in code the run executed can
+  have changed, nothing in the text changes it: only the register array reaches a variable nothing
+  shares, so the call, or code it ran, had the array somewhere the code does not show (`f({R}, s, 2)`
+  lifts the table as a value the lift could not describe).  That variable gets the mark after each of
+  the instruction's calls, and the call counts as not shown (`runvals._other_calls`; kind `seen` in
+  the devm log).
 * **What is not seen.**  A register that held no one value before the call nor after it, that the
   call does not name, and that the run did not see the call change (a callee that is no VM function
   is not seen) is left as the code has it: best effort, which the `variables handed to calls` line
-  says, and the reason such a text is never complete.  A call that fails a rule but, as far as the run saw,
-  changed nothing the code reads afterwards gets no mark and no note of its own (its `why=` is in
-  the devm log); what it can do at another execution is what makes every other value of the same
-  function not proved (above), and those are marked.  In a loop, the function called is only proved
-  when the run saw the call leave the register that holds it alone (the call itself could change
-  it).
+  says, and the reason such a text is never complete.  So is, after a call the code does not show
+  handed the register array, a change that the instruction's own statements after its first call can
+  explain (the record does not say whether the call or those statements made it).  A call that fails
+  a rule but, as far as the run saw, changed nothing the code reads afterwards gets no mark and no
+  note of its own (its `why=` is in the devm log); what it can do at another execution is what makes
+  every other value of the same function not proved (above), and those are marked.  In a loop, the
+  function called is only proved when the run saw the call leave the register that holds it alone
+  (the call itself could change it).
 * Calls are kept: whether a helper has other effects is not known (its own lift can be incomplete).
 * Programs the pipeline names helpers of the build (programs on other interpreters set aside
   because the run's weighed evidence points at the first interpreter, see "Which program is the
@@ -924,9 +946,10 @@ stays as a statement, handed its constant, and the register gets the value the r
   function called is a library function), so nothing else in that program could be either, and
   neither gets a mark or a note of its own: no register the code reads after them held one value
   before the call and another (or none) after it, none they name is read afterwards without such a
-  value, and the first one's register the run saw change is a variable the function called (not
-  resolved) can change through its upvalue.  Both are counted by that result's `variables handed to
-  calls` line (it is PARTIAL in any case: it is the start-up code).  No complete result of the
+  value, and the first one's register the run saw change is a variable that a function of the program
+  that ran assigns through its upvalue, and the function called (not resolved) may be that one.  Both
+  are counted by that result's `variables handed to calls` line (it is PARTIAL in any case: it is the
+  start-up code).  No complete result of the
   measured sets has such a call: none of the 6 complete factory-layout results, of the 53 complete
   results of the 126-file hold-out set nor of the 24 of the 44-file regression set prints the
   register array as a value (`({})` as an argument or the value of a variable; 38 of the 67 PARTIAL
@@ -961,7 +984,14 @@ stays as a statement, handed its constant, and the register gets the value the r
   instruction; `os.clock` shared with the helper or handed to it (no constant); `tostring` handed to
   it (assumed); a shared register the call names while another function assigns that variable
   (marked) and the same without that function (proved, with its comment); `rawget` on a library
-  table (not proved) and `table.foreach` (assumed).
+  table (not proved) and `table.foreach` (assumed).  And (`CallsThatAreNoSite`): a call in an arm of a
+  branch that names the register, or is handed a register number read at run time (marked in the arm);
+  `pcall` handed the helper, the array and a shared variable another function assigns (marked); a
+  callee read from a global with such a variable, where the function that assigns it never ran
+  (marked) and where it ran (not marked); the array handed inside a table (marked by the run's record
+  alone); a call of the function that assigns a shared variable, handed no array (not marked,
+  complete); and `rawget` through `pcall`, `getmetatable("").__index` and `coroutine.yield` in the
+  helper (not proved).
 
 ### Names
 
