@@ -86,7 +86,7 @@ Exit status:
 | Code | Meaning |
 |---|---|
 | 0 | complete result written: the engine reports nothing missing (see "Limits" for what that does and does not mean) |
-| 6 | result written, but **partial**: the last line (`result: PARTIAL: ...`) and the report before it say what is missing (unlifted code, a run that stopped early, only a behaviour trace, a result that does not parse, or only the functions a form-A script kept as plain Lua while its main flow runs on the VM: with `--engine static` / `--no-run`, or when no engine recovered the script) |
+| 6 | result written, but **partial**: the last line (`result: PARTIAL: ...`) and the report before it say what is missing (unlifted code, a run that stopped early, only a behaviour trace, a result that does not parse, or only the functions a form-A script kept as plain Lua while its main flow runs on the VM: with `--engine static` / `--no-run`, or when no engine recovered the script; also every `--force` export of a VM script: its plain functions, or else a skeleton of the VM, `result: PARTIAL: a VM skeleton, not the script's code (static)`) |
 | 4 | a VM-only script and no engine produced a result (or `--engine static` / `--no-run` on such a script); the last lines are the engines' own reasons |
 | 8 | Luraph, but it cannot be processed as given: cut-off or edited text, a payload that does not decode, a build for Lua 5.3/5.4 or LuaJIT, a VM chunk without its data; the last line says what and where |
 | 3 | static result written, but it failed its own syntax check |

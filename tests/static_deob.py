@@ -22,7 +22,10 @@ No sample file is needed.  The inputs have Luraph's SHAPES (nothing is copied fr
   container   key line + header comment + code that hands a VM-only chunk to loadstring and
               calls it with a buffer -> chunk and buffer are saved byte for byte, the tool says
               "Luraph v15.2 virtual machine, use python3 -m devm.run" and exits 4; with --force
-              the output's header says that the exported functions are VM dispatchers; the
+              the output's header says that the exported functions are VM dispatchers, and the
+              exit is 6 with the PARTIAL line of a VM skeleton (also for an inline VM under
+              --no-run); with a plain function in the chunk, --force exports it, exit 6 with
+              the form-A PARTIAL line (the main flow is not in the output); the
               saved chunk given back as input gets the advice with `--chunk-arg <its buffer>`;
               without -o / --work nothing is left in the temporary directory;
   plain       an ordinary script -> not executed, exit 2; with --force its `local function`
@@ -54,9 +57,13 @@ FORM_A_LINE = ('result: PARTIAL: only the functions kept as plain Lua; the virtu
                'output (static)')
 
 
-def partial_line(log):
+# --force on a VM script with no function of the script's own in it: a skeleton of the VM
+SKELETON_LINE = "result: PARTIAL: a VM skeleton, not the script's code (static)"
+
+
+def partial_line(log, line=FORM_A_LINE):
     lines = [ln for ln in log.split('\n') if ln.strip()]
-    return bool(lines) and lines[-1] == FORM_A_LINE
+    return bool(lines) and lines[-1] == line
 
 
 PART_HEAD = re.compile(r'^-- 第 (\d+) 段  原始偏移 (\d+) - (\d+)  \(([\d,]+) 字节\)  (.*)$', re.M)
@@ -431,8 +438,10 @@ def main():
               '--chunk-arg <数据 buffer 文件>' in log and '带容器的原始文件' in log, log[-900:])
         check('object, default threshold: no output without --force', not os.path.exists(os.path.join(tmp, 'obj.def.lua')))
         rc, log = deob([inp, '-o', os.path.join(tmp, 'obj.def.lua'), '--force'], tmp)
-        check('object, default threshold, --force: exit 0', rc == 0, log[-500:])
-        if rc == 0:
+        # (the script's main flow is in the VM: only the plain functions are exported, a partial result)
+        check('object, default threshold, --force: exit 6 with the form-A PARTIAL line',
+              rc == FORM_A and partial_line(log), log[-500:])
+        if rc == FORM_A:
             text = open(os.path.join(tmp, 'obj.def.lua'), encoding='utf-8').read()
             found = parts('object --force', src, text, rename=True)
             check('object --force: the five plain functions, nothing else',
@@ -564,8 +573,9 @@ def main():
               rc == 4 and '3 个大函数里 2 个是 VM 分派器' in log and '其余 1 个不是分派器' in log
               and '全是 VM 分派器' not in log and '有 1 个没被虚拟化的小函数' in log, log[-1200:])
         rc, log = deob([c3, '-o', os.path.join(tmp, 'vm3.out.lua'), '--min-size', '3000', '--force'], tmp)
-        check('VM chunk with a big non-interpreter method --force: exit 0', rc == 0, log[-500:])
-        if rc == 0:
+        check('VM chunk with a big non-interpreter method --force: exit 6 with the form-A PARTIAL line',
+              rc == FORM_A and partial_line(log), log[-500:])
+        if rc == FORM_A:
             text = open(os.path.join(tmp, 'vm3.out.lua'), encoding='utf-8').read()
             found = parts('vm3 --force', chunk3, text, rename=True)
             said = re.search(r'--force 已指定：导出 (\d+) 个函数（1 个没被虚拟化的小函数，1 个 ≥ 3,000 字节、不是分派器的函数', log)
@@ -661,8 +671,9 @@ def main():
         check('container with a plain function: exit 4 and the function is announced',
               rc == 4 and '有 1 个没被虚拟化的小函数' in log, log[-700:])
         rc, log = deob([cin2, '-o', os.path.join(tmp, 'cw2', 'f.lua'), '--force', '--min-size', '3000'], tmp)
-        check('container with a plain function --force: exit 0', rc == 0, log[-500:])
-        if rc == 0:
+        check('container with a plain function --force: exit 6 with the form-A PARTIAL line',
+              rc == FORM_A and partial_line(log), log[-500:])
+        if rc == FORM_A:
             text = open(os.path.join(tmp, 'cw2', 'f.lua'), encoding='utf-8').read()
             found = parts('container2 --force', chunk2, text, rename=True)
             a2 = chunk2.index(FACTORY_SCRIPT)
@@ -674,8 +685,10 @@ def main():
                   any('这里只有没被虚拟化的小函数' in ln for ln in head)
                   and any('另有 VM 分派器 2 个未导出' in ln for ln in head), str(head))
         rc, log = deob([cin, '-o', os.path.join(work, 'f.lua'), '--force', '--min-size', '3000'], tmp)
-        check('container --force: exit 0', rc == 0, log[-500:])
-        if rc == 0:
+        # (nothing but the interpreter's dispatchers: a skeleton of the VM, never exit 0)
+        check('container --force: exit 6 with the PARTIAL line of a VM skeleton',
+              rc == FORM_A and partial_line(log, SKELETON_LINE), log[-500:])
+        if rc == FORM_A:
             text = open(os.path.join(work, 'f.lua'), encoding='utf-8').read()
             head = text.split('\n', 6)[:6]
             check('container --force: header says the parts are VM dispatchers, not business code',
@@ -781,6 +794,15 @@ def main():
         check('inline VM --no-run: exit 4, says --no-run skipped the dynamic path, nothing generated or run',
               rc == 4 and '--no-run' in log and '[6e]' not in log and '[6c]' not in log
               and not any('harness' in n for n in made),
+              log[-600:] + ' ' + str(made))
+        # with --force the VM's skeleton is exported, still without running anything; that is
+        # not the script: exit 6 and the PARTIAL line of a VM skeleton, not exit 0
+        rc, log = deob([cin, '-o', os.path.join(tmp, 'inline.f.lua'), '--min-size', '3000', '--no-run', '--force',
+                        '--work', cwork], tmp)
+        made = sorted(os.listdir(cwork)) if os.path.isdir(cwork) else []
+        check('inline VM --no-run --force: exit 6, the PARTIAL line of a VM skeleton, nothing run',
+              rc == FORM_A and partial_line(log, SKELETON_LINE) and '[6e]' not in log and '[6c]' not in log
+              and not any('harness' in n for n in made) and os.path.isfile(os.path.join(tmp, 'inline.f.lua')),
               log[-600:] + ' ' + str(made))
 
         # --engine devm / deobf / trace start an engine, and every engine runs the input in its mock

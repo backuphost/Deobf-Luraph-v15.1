@@ -43,7 +43,9 @@ Luraph v15.1 的常见形态是：
 形态 A（明文函数）的文件里还有 VM 分派循环时，主流程仍在 VM 里：静态结果只是一部分，退出码 6，
 最后一行 `result: PARTIAL: only the functions kept as plain Lua; the virtualized main flow is not in the
 output (static)`（--engine static / --no-run）；默认模式下文件交给引擎，静态结果只在没有引擎还原出
-脚本时作为结果（同样记为 PARTIAL）。--no-run：任何会执行输入的步骤都不做（沙箱剥容器、形态 B / C
+脚本时作为结果（同样记为 PARTIAL）。VM 脚本加 --force 导出的（没被虚拟化的小函数，或 VM 函数骨架，
+形态 B / C 也一样）都不是脚本本身：退出码 6，最后一行是上面那句，或者没有脚本自己的函数时
+`result: PARTIAL: a VM skeleton, not the script's code (static)`。--no-run：任何会执行输入的步骤都不做（沙箱剥容器、形态 B / C
 的动态路径、引擎）。
 
 识别（[2a]，libs/lphfront.py，只看 token，不执行）
@@ -725,6 +727,7 @@ class Scan:
         self.chunk_score = 0        # the same signals counted over the whole chunk
         self.vm = {"dispatch_loops": 0, "object": False, "entry": None, "loader": None}
         self.form = "unknown"
+        self.partial_why = None     # set by run() with a partial result (exit 6): what the output lacks
         self._ast_cache = {}
         self._facts = {}
         # the front check (libs/lphfront.py; see front_check)
@@ -2171,7 +2174,8 @@ def main():
                     help="能证明只赋值一次的槽位直接替换成变量名（默认只加注释，不改代码）")
     ap.add_argument("--no-lift", action="store_true", help="不尝试动态反编译（形态 B 时跳过）")
     ap.add_argument("--force", action="store_true",
-                    help="判定为 VM 时也导出：有没被虚拟化的小函数就导出它们，否则导出 VM 函数骨架；"
+                    help="判定为 VM 时也导出：有没被虚拟化的小函数就导出它们，否则导出 VM 函数骨架"
+                         "（都不是脚本本身：退出码 6，最后一行 result: PARTIAL）；"
                          "输入不像 Luraph 产物时，仍把其中的函数切出来")
     ap.add_argument("--keep-dispatchers", action="store_true",
                     help="被判为 VM 分派器的大函数也导出（排在最后，逐段标注为分派器）；"
@@ -2281,9 +2285,10 @@ def main():
         # unwrapped is only kept where the user asked for it (--work, or next to -o)
         scan.cleanup(keep_work=False)
     form_a_partial = rc == allinone.PARTIAL and scan.form == "A"
+    partial_why = getattr(scan, "partial_why", None) if rc == allinone.PARTIAL else None
     if plan is None:
-        if form_a_partial:
-            print("result: PARTIAL: %s (static)" % FORM_A_MISSING)
+        if partial_why:
+            print("result: PARTIAL: %s (static)" % partial_why)
         return rc
     engine, extra = plan
     fallback, fb_dir = None, None
@@ -2499,12 +2504,17 @@ def run(scan, args, inp, out_path, kept_work):
     out_dir = Path(args.work) if args.work else (out_path.parent if args.output else Path("."))
 
     forced_all = False          # --force on a layer without any candidate: export every function
+    # --force on a script that runs on Luraph's VM (form vm, forms B / C): what is exported is the
+    # VM's own code, or the few functions it kept as plain Lua, never the script.  Such a result
+    # is partial (exit 6); main() prints the `result:` line.
+    vm_export = False
     if not scan.sized:
         if scan.form == "vm":
             print_vm_block(scan, inp, kept_work)
             if not args.force:
                 return 4, keep_vm
             keep = keep_vm
+            vm_export = True
         elif scan.evidence():
             print(f"[!] 没有找到 ≥ {args.min_size:,} 字节的函数。这是 {label} 的产物"
                   f"（依据：{'、'.join(scan.evidence())}），但这一层没有明文业务函数。")
@@ -2527,6 +2537,8 @@ def run(scan, args, inp, out_path, kept_work):
         form_before = scan.form
         scan.classify()
         scan.form = form_before if form_before == "vm" else scan.form
+        if scan.evidence() and scan.form != "A":
+            vm_export = True        # a Luraph build, and none of its functions is the script's
 
     # ---- 形态识别：判断是真明文业务代码，还是纯 VM 字节码 ----
     # 只看结构化信号（真实 API 调用），不看字符串。
@@ -2557,6 +2569,7 @@ def run(scan, args, inp, out_path, kept_work):
             keep = keep_vm
             if not args.force:
                 return 4, keep
+            vm_export = True
             plain = [x for x in scan.sized if x not in scan.dropped]
             if plain:
                 bits = []
@@ -2651,6 +2664,7 @@ def run(scan, args, inp, out_path, kept_work):
                     return 4, keep
             print("  --force 已指定，继续导出骨架…")
             print("")
+            vm_export = True
 
     # ---- 切出来 → 重命名 → 断行，逐段校验 ----
     from deobf_plus import tokenize_pos
@@ -2808,12 +2822,26 @@ def run(scan, args, inp, out_path, kept_work):
         for line in devm_advice(scan, inp):
             print(line)
         if ok and all_ok:
+            scan.partial_why = FORM_A_MISSING
             return allinone_code("PARTIAL"), keep
+    if ok and all_ok and (vm_export or scan.closed_container()):
+        # --force on a VM script (or on a container that did not open): never the script itself
+        if scan.closed_container():
+            scan.partial_why = CONTAINER_CODE
+        elif n_bus or n_script:
+            scan.partial_why = FORM_A_MISSING
+        else:
+            scan.partial_why = VM_SKELETON
+        return allinone_code("PARTIAL"), keep
     return (0 if (ok and all_ok) else 3), keep
 
 
 # the last line of a static form-A result: what it lacks
 FORM_A_MISSING = "only the functions kept as plain Lua; the virtualized main flow is not in the output"
+# ... of a --force export of a VM script with no function of the script's own in it
+VM_SKELETON = "a VM skeleton, not the script's code"
+# ... of a --force export of one of Luraph's containers that did not open
+CONTAINER_CODE = "the container's own code (its decoder), not the script's code"
 
 
 if __name__ == "__main__":

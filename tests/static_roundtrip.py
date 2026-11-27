@@ -21,7 +21,8 @@ output file is checked from the outside, without using the tool's own bookkeepin
 
 An input whose script is virtualized (deob.py exits 4, e.g. the v15.2 sample) is run with
 --force, which exports the small functions that were not virtualized (or, when there are
-none, the VM's own big functions): the same checks apply to them.
+none, the VM's own big functions): the same checks apply to them.  Such an export is not the
+script, so deob.py must exit 6 with a PARTIAL line (form A, or a VM skeleton), never 0.
 
 What is exported is checked against the input as well: every outermost function of the VM
 object that reads a global, has the closure-factory shape `function(..)return function(..)`
@@ -71,13 +72,18 @@ def compiles(luau, text):
 
 
 # A static result was written: exit 0, or exit 6 for form A in a file with VM dispatch loops
-# (the main flow runs on the VM; the last line says what the output lacks)
+# (the main flow runs on the VM; the last line says what the output lacks).  A virtualized
+# script exported with --force is never exit 0: 6 with the form-A line (only the functions it
+# kept as plain Lua) or with the skeleton line (nothing of the script's own).
 FORM_A_LINE = ('result: PARTIAL: only the functions kept as plain Lua; the virtualized main flow is not in the '
                'output (static)')
+SKELETON_LINE = "result: PARTIAL: a VM skeleton, not the script's code (static)"
 
 
-def written(rc, log):
+def written(rc, log, forced=False):
     last = log.strip().split('\n')[-1] if log.strip() else ''
+    if forced:
+        return rc == 6 and last in (FORM_A_LINE, SKELETON_LINE)
     return rc == 0 or (rc == 6 and last == FORM_A_LINE)
 
 
@@ -141,9 +147,10 @@ def check_input(inp, luau, ast, report):
             extra = ['--force']
             rc, log, dt = run_deob(inp, out1, tmp, ['--no-rename'] + extra)
             report(name + ': virtualized, checked with --force', True)
-        report('%s: deob.py --no-rename exits 0, or 6 with the form-A PARTIAL line (%.0fs)' % (name, dt), written(rc, log),
+        what = '6 with a PARTIAL line (--force)' if extra else '0, or 6 with the form-A PARTIAL line'
+        report('%s: deob.py --no-rename exits %s (%.0fs)' % (name, what, dt), written(rc, log, bool(extra)),
                log.strip().splitlines()[-1] if log.strip() else '')
-        if not written(rc, log) or not os.path.exists(out1):
+        if not written(rc, log, bool(extra)) or not os.path.exists(out1):
             return
         src = source_of(inp, tmp)
         text1 = read(out1)
@@ -270,9 +277,9 @@ def check_input(inp, luau, ast, report):
         # ---------------------------------------------------------------- default (rename)
         out2 = os.path.join(tmp, 'renamed.lua')
         rc, log, dt = run_deob(inp, out2, tmp, extra)
-        report('%s: deob.py (rename) exits 0, or 6 with the form-A PARTIAL line (%.0fs)' % (name, dt), written(rc, log),
+        report('%s: deob.py (rename) exits %s (%.0fs)' % (name, what, dt), written(rc, log, bool(extra)),
                log.strip().splitlines()[-1] if log.strip() else '')
-        if not written(rc, log) or not os.path.exists(out2):
+        if not written(rc, log, bool(extra)) or not os.path.exists(out2):
             return
         text2 = read(out2)
         ok, msg = compiles(luau, text2)
