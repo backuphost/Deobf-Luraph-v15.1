@@ -1003,7 +1003,7 @@ def report(text, returned=None, notes=None, parse=None):
     # functions, while the first program did all the work (the script is probably that program)
     hint = next((n for n in notes if n.startswith('[hint]')), None)
     # calls that wrote into their caller's variables (or helpers of the build whose results the
-    # script keeps) where the run proved no value: the text shows the earlier value (runvals.notes)
+    # script keeps) where the run proved no value: a variable may show its earlier value (runvals.notes)
     unshown = [n[len('[runvals-missing] '):] for n in notes if n.startswith('[runvals-missing] ')]
     unparsed = parse is not None and parse[0] is False
     # instructions without a marker, said in a head line of the text (not one more marker)
@@ -1086,8 +1086,9 @@ def report(text, returned=None, notes=None, parse=None):
                    'it ran: what that code decodes at run time is still encoded, and the script is not separated from it')
     if unshown:
         out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
-                   'the run shows no single value for some of them (see the "values not shown" line%s above): there the '
-                   'text shows the earlier value, or the call, with the constants handed to it still encrypted' % (
+                   'the run does not show one value for some of them (see the "values not shown" line%s above): after '
+                   'those calls a variable may show its earlier value, or the text keeps the call, and the constants '
+                   'handed to them stay encrypted' % (
                        len(unshown), 's' if len(unshown) > 1 else ''))
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)

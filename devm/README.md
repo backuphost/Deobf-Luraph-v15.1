@@ -86,7 +86,7 @@ line per kind of thing that is missing:
 | `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 | `note: N call(s) of program K, a helper of the build ...` | not a defect: calls handed their caller's register array (or a helper's results the script keeps) whose effect on the caller's variables the run proves; the values are shown after the calls (see "Values the run proves") |
-| `values not shown: ...` | such calls where the run shows no single value of what they wrote (code that did not run, values that differed between runs of the call): the text shows the earlier value there, and the constant handed to the call stays encrypted |
+| `values not shown: ...` | such calls where the run does not show one value of what they wrote (the call did not run, it went on to more than one instruction, or what followed it held different values at different times): after them a variable may show its earlier value, and the constant handed to the call stays encrypted |
 
 `run.report(text, notes=...)` gives the second part for any result file (it skips a head written
 earlier, and reads the start-up, single-root and hint lines off it when no run notes are given;
@@ -718,9 +718,13 @@ the run saw.
   gets no label (its values are shown all the same: the call wrote them).
 * The run notes: `note: N call(s) of program K, a helper of the build ... write into its variables:
   after each of them the text shows the values they wrote as the run saw them`; and, where the run
-  shows no single value for what such calls wrote, `values not shown: ...`, which makes the result
-  PARTIAL (there the text shows the earlier value, and a constant handed to the call stays
-  encrypted).
+  does not show one value for what such calls wrote, `values not shown: ...`, which makes the result
+  PARTIAL (after them a variable may show its earlier value, and a constant handed to the call
+  stays encrypted).
+* Cost: the oracle file is a fifth to a third larger, and the traced run a few per cent slower
+  (side by side on the same machine: 62 s against 60 s and 88 s against 83 s of processor time).
+  The factory-layout files of the public sample corpus come out as before: in none of them did the
+  run show a call writing into its caller's registers, and no run note was added.
 * `tests/devm_runvals.py`: the harness's records, and hand-written programs for the small VM of
   `tests/devm_lift_v14.py` whose helper decodes a constant while the probe runs, with the negative
   cases (values that differ per execution, a call that did not run, two successors, another table in

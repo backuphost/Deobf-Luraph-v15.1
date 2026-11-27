@@ -442,11 +442,12 @@ def notes(sites, helpers=()):
                                           '%d of them' % len(shown), 'wrote' if kind == 'regs' else 'returned',
                                           sum(len(s.shown) for s in shown)))
         if missing:
-            there = ('there the text shows the value the variable had before the call, and a constant handed to the call '
-                     'stays as it was (encrypted)' if kind == 'regs' else
+            there = ('after those calls a variable the call wrote may show the value it had before, and a constant handed '
+                     'to the call stays as it was (encrypted)' if kind == 'regs' else
                      'there the text keeps the call, and the constants handed to it stay as they were (encrypted)')
-            out.append('[runvals-missing] %d call(s) of %s %s, and for %s the run shows no single value of what they %s '
-                       '(code that did not run, or values that differed between runs of the call): %s' % (
+            out.append('[runvals-missing] %d call(s) of %s %s, and for %s the run does not show one value of what they %s '
+                       '(the call did not run, it went on to more than one instruction, or what followed it held different '
+                       'values at different times): %s' % (
                            len(group), who, what, 'all of them' if len(missing) == len(group) else
                            '%d of them' % len(missing), 'wrote' if kind == 'regs' else 'returned', there))
     return out
