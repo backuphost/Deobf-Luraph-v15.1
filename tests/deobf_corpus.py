@@ -5,7 +5,8 @@ that the public Luraph corpus asked for.
     python3 tests/deobf_corpus.py [NAME ...]      only the checks whose name contains one of NAME
 
 Without the corpus: the final `result:` / `deobf:` line, the time limit, no harness process left
-behind when the engine is killed, and unit checks of the lifter changes on hand-made input.
+behind when the engine is killed, unit checks of the lifter changes on hand-made input, and the
+environment's answers on hand-made scripts (instances a script made, Path2D bounding boxes).
 With the corpus (environment variable LURAPH_CORPUS = the directory that holds one directory per
 Luraph version): the engine on files picked by directory and property at run time. Nothing of a
 corpus file is kept or printed here; the scripts are run only inside the engine's own sandbox.
@@ -369,6 +370,71 @@ def check_instance_model():
             [w for w in INSTANCE_WANT if w not in got]
 
 
+PATH2D_SCRIPT = """
+local sg = Instance.new("ScreenGui")
+local f = Instance.new("Frame")
+f.Size = UDim2.fromOffset(300, 200)
+f.Parent = sg
+local p = Instance.new("Path2D")
+p.Parent = f
+-- a straight segment (10, 20) - (110, 70)
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromOffset(10, 20)), Path2DControlPoint.new(UDim2.fromOffset(110, 70)) })
+local r = p:GetBoundingRect()
+print("line", typeof(r), r.Min.X, r.Min.Y, r.Max.X, r.Max.Y, r.Width, r.Height)
+p.Thickness = 3
+r = p:GetBoundingRect()
+print("thick", r.Min.X, r.Min.Y, r.Max.X, r.Max.Y)
+p.Thickness = 1
+-- handles (50, 10) and (150, 10): the box holds them (the curve itself only reaches y = 20)
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromOffset(20, 50), UDim2.new(), UDim2.fromOffset(30, -40)),
+    Path2DControlPoint.new(UDim2.fromOffset(180, 50), UDim2.fromOffset(-30, -40), UDim2.new()) })
+r = p:GetBoundingRect()
+print("curve", r.Min.X, r.Min.Y, r.Max.X, r.Max.Y, tostring(r))
+-- Scale and Offset in the 300 x 200 frame: points (85, 80), (220, 50); handles (120, 30), (220, 190);
+-- the first point's left handle (-65, 80) shapes no segment
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.new(0.25, 10, 0.5, -20), UDim2.new(-0.5, 0, 0, 0), UDim2.new(0.1, 5, 0, -50)),
+    Path2DControlPoint.new(UDim2.new(0.75, -5, 0.25, 0), UDim2.new(0, 0, 0.5, 40), UDim2.new()) })
+r = p:GetBoundingRect()
+print("mixed", r.Min.X, r.Min.Y, r.Max.X, r.Max.Y, r.Width, r.Height)
+-- the point list edits move the curve; GetControlPoint gives the stored point
+local cp = p:GetControlPoint(1)
+print("cp", typeof(cp), cp.RightTangent.Y.Offset)
+p:InsertControlPoint(2, Path2DControlPoint.new(UDim2.new(0.5, 0, 1, 10)))
+r = p:GetBoundingRect()
+print("insert", r.Max.Y, #p:GetControlPoints())
+p:RemoveControlPoint(2)
+r = p:GetBoundingRect()
+print("remove", r.Max.Y, #p:GetControlPoints())
+"""
+
+# hand-computed: the box of each point and of the tangent handles that shape a segment, in the parent
+# Frame's pixels, widened by Thickness / 2 on every side (envlog.luau, CHAIN.p2d.rect)
+PATH2D_WANT = [
+    'print("line", "Rect", 9.5, 19.5, 110.5, 70.5, 101, 51)',
+    'print("thick", 8.5, 18.5, 111.5, 71.5)',
+    'print("curve", 19.5, 9.5, 180.5, 50.5, "19.5, 9.5, 180.5, 50.5")',
+    'print("mixed", 84.5, 29.5, 220.5, 190.5, 136, 161)',
+    'print("cp", "Path2DControlPoint", -50)',
+    'print("insert", 210.5, 3)',
+    'print("remove", 190.5, 2)',
+]
+
+
+def check_path2d_rect():
+    """Path2D:GetBoundingRect, GetControlPoint and the point list edits come from the offline model (Luraph
+    v15.1/v15.2 start-up code calls them): a Rect with the model's numbers, no "does not cover" warning."""
+    with tempfile.TemporaryDirectory() as d:
+        src = write(d, "own.luau", PATH2D_SCRIPT)
+        out = os.path.join(d, "out.luau")
+        rc, so, se = engine([src, "--obfuscator", "generic", "--no-devirt", "-o", out])
+        assert rc == 0 and os.path.exists(out), (rc, so[-1:], se[-1:])
+        assert not any("offline model does not cover" in ln for ln in se), se
+        with open(out, encoding="utf-8") as f:
+            got = [l.strip() for l in f if l.strip().startswith("print(")]
+        assert got == PATH2D_WANT, [g for g in got if g not in PATH2D_WANT] + ["missing:"] + \
+            [w for w in PATH2D_WANT if w not in got]
+
+
 def _block(stmts, values=None):
     import structure
     b = structure.Block(1)
@@ -654,6 +720,7 @@ CHECKS = [
     ("shifted-pack", check_shifted_pack),
     ("declarations", check_declarations),
     ("instance-model", check_instance_model),
+    ("path2d-rect", check_path2d_rect),
     ("result-line", check_result_line_trace),
     ("failure-line", check_failure_line),
     ("time-limit-lift", check_time_limit_lift),

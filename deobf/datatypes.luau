@@ -543,8 +543,9 @@ local V2Lib = {
 local newRect = valueType("Rect", function(f, k)
 	if k == "Min" then return v2(f.lo) end
 	if k == "Max" then return v2(f.hi) end
-	if k == "Width" then return f.hi.x - f.lo.x end
-	if k == "Height" then return f.hi.y - f.lo.y end
+	-- (float32 like the corners: the engine subtracts in float)
+	if k == "Width" then return f32(f.hi.x - f.lo.x) end
+	if k == "Height" then return f32(f.hi.y - f.lo.y) end
 	return nil
 end, {
 	__eq = function(a, b) return TYPE[a] == TYPE[b] and VAL[a].lo == VAL[b].lo and VAL[a].hi == VAL[b].hi end,

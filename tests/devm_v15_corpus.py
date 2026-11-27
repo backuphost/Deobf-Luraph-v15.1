@@ -14,6 +14,8 @@ computes every test into a local first.
 * `lifter.hub_line`: the instructions without effect in front of a jump through a register belong to
   that jump (one copy per jump target), and nothing else does;
 * a traced run that created no VM function ends in `run failed: the VM never started: ...`;
+* a traced run that failed says why in its message (`vmmodel.harness_tail`: the harness's verdict and error
+  lines, not its per-access trace lines), and `devm.run` prints that;
 * the `--root` hint is given for a helper function (arithmetic only), not for every small script;
 * `vmmodel.is_dispatch_loop`: `local OP = CODE[PC]; local T = OP >= 10; if T then` is a dispatch loop;
 * `pe._classify_state_vars`: the open-upvalue map is found through a handler's local copy of it, and a
@@ -294,6 +296,56 @@ class VmNeverStarted(unittest.TestCase):
             vmmodel.run_oracle = keep
         self.assertTrue(str(cm.exception).startswith('run failed: the VM never started: ' + how), str(cm.exception))
         self.assertIn('--chunk-arg', str(cm.exception))
+
+
+class RunFailedMessage(unittest.TestCase):
+    """A traced run that failed: the message carries the end of the harness output that says why (its
+    verdict and error lines), not the per-access trace lines of the run, and devm.run prints it."""
+    STDERR = '\n'.join(['[global] Rect', '[global] TweenInfo', '[call] Instance.new("Frame")'] * 800 + [
+        '[script] print: ' + 'x' * 300,
+        '[oracle] script stopped: sample:3: attempt to call a nil value after 4096 instructions',
+        'NOT REACHED: the script ended without entering the VM hook',
+        '/w/devm/harness.lua:2178: hook not reached', '', 'stacktrace:', '[C] function error',
+        '/w/devm/harness.lua:2178', ''])
+
+    def test_tail(self):
+        tail = vmmodel.harness_tail(self.STDERR)
+        self.assertNotIn('[global]', tail)
+        self.assertNotIn('[call]', tail)
+        self.assertNotIn('[C] function', tail)
+        self.assertIn('[oracle] script stopped: sample:3: attempt to call a nil value after 4096 instructions', tail)
+        self.assertTrue(tail.endswith('/w/devm/harness.lua:2178: hook not reached'), tail)
+        self.assertLessEqual(len(tail), 700)
+        self.assertEqual(vmmodel.harness_tail(''), '(no output)')
+        # (a verdict line far up is kept, the trace after it is not)
+        self.assertEqual(vmmodel.harness_tail('[budget] stopped after 9 VM instructions\n' + '[global] a\n' * 50),
+                         '[budget] stopped after 9 VM instructions')
+
+    def test_main_prints_it(self):
+        import contextlib
+        import io
+        from devm import run
+        keep = run.deobfuscate
+
+        def fail(*a, **k):
+            raise RuntimeError('oracle run failed: ' + vmmodel.harness_tail(self.STDERR))
+        run.deobfuscate = fail
+        out = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(out):
+                src = os.path.join(d, 'x.lua')
+                with open(src, 'w') as f:
+                    f.write('return 1\n')
+                with self.assertRaises(SystemExit) as cm:
+                    run.main([src, '-o', os.path.join(d, 'x.out.lua'), '--work', os.path.join(d, 'w')])
+        finally:
+            run.deobfuscate = keep
+        self.assertEqual(cm.exception.code, 1)
+        line = out.getvalue().strip().split('\n')[-1]
+        self.assertTrue(line.startswith('devm: run failed: oracle run failed: '), line)
+        self.assertIn('attempt to call a nil value after 4096 instructions', line)
+        self.assertIn('hook not reached', line)
+        self.assertNotIn('[global]', line)
 
 
 class OutlinedDispatch(unittest.TestCase):

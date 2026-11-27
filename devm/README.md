@@ -149,7 +149,11 @@ exactly rather than approximately:
 * `getfenv()` is a nearly empty table that falls through to the globals; the script enumerates it;
 * the executed copy is one line (line numbers in its own error messages are compared);
 * Path2D geometry is a float32 model in the engine's order of operations, ported from the
-  Studio-verified model of the "deobf" Luraph deobfuscator; the float32 bit patterns are key bytes;
+  Studio-verified model of the "deobf" Luraph deobfuscator; the float32 bit patterns are key bytes.
+  `GetBoundingRect` is the box of the control polygon (every point and the tangent handles that
+  shape a segment) widened by `Thickness`/2, in the parent's pixels: the plausible rule, shared
+  with deobf and not measured in Roblox (the v15.1/v15.2 start-up code seen calls it without
+  reading the Rect); a path with fewer than 2 points still gets a logged stand-in;
 * executor-style globals (`identifyexecutor`, `iscclosure`, `islclosure`) exist, as in the
   reference environment the key material was compared against.
 
@@ -264,7 +268,10 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
 * **Failures are one line.**  A run that writes no result ends with `devm: <stage>: <reason>` and a
   non-zero status: `unsupported target` (a build for Lua 5.3/5.4 or LuaJIT: `normalize.foreign_dialect`
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
-  does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.
+  does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.  A failed
+  harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`: the `[oracle]`,
+  `[budget]`, `[timeout]`, `[error]` lines and the last error, without the per-access `[global]` /
+  `[call]` trace lines), printed up to 1000 characters.
 * **Containers.**  With `devm/container_static.py` in the tree the container is read without
   running it; otherwise by the sandboxed probe.  Either way the run executes the shipped file.
 

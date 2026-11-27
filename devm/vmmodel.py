@@ -1075,6 +1075,42 @@ def start_server(cmd, workdir):
         return f.read()
 
 
+# per-access lines of a traced run (each global read, call, new proto): thousands of them bury the reason
+_TRACE_TAGS = ('[global] ', '[call] ', '[proto] ', '[gread] ', '[gwrite] ')
+# the run's verdict lines: kept wherever they are
+_VERDICT_TAGS = ('[oracle]', '[budget]', '[timeout]', '[end]', '[error]', '[fail]')
+
+
+def harness_tail(stderr, limit=600):
+    """The meaningful end of a failed harness run's stderr, as one line for a failure message: the
+    per-access trace lines and the harness's own traceback dropped, the last verdict lines ([oracle],
+    [budget], [timeout], [end], [error], [fail]) kept, then the last other lines (the error and where
+    it happened) up to about `limit` characters, in their order, joined by ' | '."""
+    lines, skip = [], False
+    for line in stderr.split('\n'):
+        line = line.strip()
+        if line == 'stacktrace:':
+            skip = True         # (the frames that follow, up to an empty line, are the harness's own)
+            continue
+        if not line:
+            skip = False
+            continue
+        if skip or line.startswith(_TRACE_TAGS):
+            continue
+        lines.append(line)
+    keep = {i for i, l in enumerate(lines) if l.startswith(_VERDICT_TAGS)}
+    keep = set(sorted(keep)[-4:])
+    size = sum(min(len(lines[i]), limit) + 3 for i in keep)
+    for i in range(len(lines) - 1, -1, -1):
+        if i in keep:
+            continue
+        if keep and size + len(lines[i]) > limit:
+            break
+        keep.add(i)
+        size += min(len(lines[i]), limit) + 3
+    return ' | '.join(lines[i][:limit] for i in sorted(keep)) or '(no output)'
+
+
 def run_oracle(model, workdir, tag, options=()):
     """Run the script to its end with per-instruction recording.
 
@@ -1108,7 +1144,7 @@ def run_oracle(model, workdir, tag, options=()):
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
     note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive'))]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
-        raise RuntimeError('oracle run failed: ' + r.stderr[-2000:])
+        raise RuntimeError('oracle run failed: ' + harness_tail(r.stderr))
     with open(outjson + '.oracle') as f:
         raw = json.load(f)
     out = {}
@@ -1222,6 +1258,6 @@ def run_dump(model, workdir, tag, layers=(), timeout=600):
         raise RuntimeError('dump failed: the run did not reach the first interpreter entry within %d s '
                            '(the loader itself waits or does not end)' % timeout)
     if not os.path.exists(outjson):
-        raise RuntimeError('dump failed: ' + r.stderr[-2000:])
+        raise RuntimeError('dump failed: ' + harness_tail(r.stderr))
     with open(outjson) as f:
         return json.load(f)

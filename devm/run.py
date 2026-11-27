@@ -760,10 +760,11 @@ def main(argv=None):
         print('devm: %s: %s' % (e.stage, e.reason))
         sys.exit(1)
     except (pe.PEError, RuntimeError, bootstrap.BootstrapError, SyntaxError, subprocess.TimeoutExpired) as e:
-        msg = ' '.join(str(e).split())[:400]
+        stage = failure_stage(e)
+        # (a failed run's message carries the end of the harness output, vmmodel.harness_tail: room for it)
+        msg = ' '.join(str(e).split())[:1000 if stage == 'run failed' else 400]
         if isinstance(e, SyntaxError):
             msg = 'the text does not parse as Luau (%s)' % msg
-        stage = failure_stage(e)
         if msg.startswith(stage + ': '):
             msg = msg[len(stage) + 2:]
         print('devm: %s: %s' % (stage, msg))

@@ -90,8 +90,8 @@ python deobf/deob.py <script> --debug            # all intermediate files in <in
   "prelude=rawset(G,'webhook','x') setprop(game,'PlaceId',123)"` (Luau run before the script,
   untraced; `G`, `genv`, `shared`, `game`, `env`, `setprop(proxy, key, value)`) and `--cfg
   falsy=name1,name2` (calls of those method/function names return `false`).
-- Path2D answers come from the offline engine model (`envlog.luau` `CHAIN.p2d`, bit-exact;
-  `research/path2d/README.md`); "N Path2D answers computed by the offline engine model".
+- Path2D answers come from the offline engine model (`envlog.luau` `CHAIN.p2d`; see Environment
+  fidelity, Path2D); "N Path2D answers computed by the offline engine model".
 - `--studio` (rarely needed) serves each harness on `127.0.0.1:34889` via a `*.studio_loader.luau`
   (MCP `execute_luau`); engine Path2D answers go to `<script>.path2d` (preferred offline).
   **Danger:** an endless-loop tamper response freezes Studio: evaluate just the Path2D calls instead.
@@ -253,7 +253,7 @@ IR module as parameter `D`. `backend.lower`: `structure.build_cfg` ->
 Luraph keys its decryption on the environment (LURAPH.md), so these rules
 hold for every change to the shared runtime:
 
-- **Path2D.** Lengths, positions and tangents are float32 bits. Emulated bit-exactly offline (`CHAIN.p2d` in envlog; the full model is in `research/path2d/README.md`). Constructors record their arguments (`INFO[p].ctor`); `--cfg p2d_check=true` compares the model with recorded answers.
+- **Path2D.** Lengths, positions and tangents are float32 bits. Emulated bit-exactly offline (`CHAIN.p2d` in envlog; the model is described in its comments). Points as the engine stores them (float32 Scale, int32 Offset: the UDim2's datatype twin, else the constructor's arguments, `INFO[p].ctor`); `GetControlPoint` gives the stored point, `Update/Insert/RemoveControlPoint` edit the list and the curve. `GetBoundingRect` (`CHAIN.p2d.rect`, devm the same): the box of the control polygon (every point and the handles that shape a segment) widened by Thickness/2, parent-Frame pixels, float32. That rule is the plausible one, **not measured**: Luraph v15.1/v15.2 start-up code calls it but never reads the Rect (`ptrace`), so no run can confirm it. `--cfg p2d_check=true` compares the model with recorded answers.
 - **Random** is Roblox's real generator (PCG32 XSH-RR, stream increment
   **105**), emulated bit-exactly offline incl. seeding edge cases, userdata
   objects and error messages (see envlog; only range = 2^32−1 differs).
@@ -435,8 +435,9 @@ hold for every change to the shared runtime:
 - **Remote code isn't followed:** `HttpGet` + `loadstring` is recorded, never fetched.
 - Layered protection (one obfuscator's output obfuscated again, or a
   loader that loadstrings another obfuscator's chunk) isn't detected per layer.
-- **Path2D model:** assumes an offset-only parent Frame Size (every probe seen);
-  a Scale size or unmodelled method prints a warning: then `--studio` once.
+- **Path2D model:** assumes an offset-only parent Frame Size (every probe seen); a Scale size,
+  fewer than 2 points or an unmodelled method prints a warning: then `--studio` once.
+  `GetBoundingRect`'s rule is not measured (Environment fidelity, Path2D).
 - `setmetatable(randomObj, {})` says "got userdata" (Roblox: "got Random"); wrapping `setmetatable` is unsafe.
 
 ## Workflow gotchas (for Claude Code in this repo)

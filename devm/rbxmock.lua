@@ -1386,7 +1386,8 @@ return function(G, fnames, libnames, opts)
 			end
 			return c
 		end
-		local function segments(self)
+		-- the control points in pixels: { x, y, left dx, left dy, right dx, right dy }
+		local function points(self)
 			local W, H = absSize(self)
 			local pts = {}
 			for i, cp in ipairs(data[self].points or {}) do
@@ -1395,6 +1396,10 @@ return function(G, fnames, libnames, opts)
 				local rx, ry = resolve(cp.RightTangent, W, H)
 				pts[i] = { px, py, lx, ly, rx, ry }
 			end
+			return pts
+		end
+		local function segments(self)
+			local pts = points(self)
 			local segs = {}
 			for i = 1, #pts - 1 do
 				local a, b = pts[i], pts[i + 1]
@@ -1554,12 +1559,44 @@ return function(G, fnames, libnames, opts)
 			needParent(self)
 			return length(segments(self))
 		end)
+		-- Rect: Min / Max corners, Width / Height (float32, as the engine stores them)
+		local RectMT = {}
+		local function rect(x0, y0, x1, y1)
+			local t = setmetatable({ Min = vec2(x0, y0), Max = vec2(x1, y1), Width = f32(x1 - x0), Height = f32(y1 - y0) }, RectMT)
+			typeNames[t] = "Rect"
+			return t
+		end
+		RectMT.__eq = function(a, b) return a.Min == b.Min and a.Max == b.Max end
+		RectMT.__tostring = function(a)
+			return string.format("%.9g, %.9g, %.9g, %.9g", a.Min.X, a.Min.Y, a.Max.X, a.Max.Y)
+		end
+		seal(RectMT)
+		-- The box of the curve's control polygon (each point and the tangent handles that shape a
+		-- segment) widened by half the stroke (Thickness, pixels) on every side, in the parent's
+		-- pixels.  The engine's rule is not documented beyond "encloses the path, expanded by its
+		-- rendered thickness": this is the plausible one, the same as the second engine's
+		-- (deobf/envlog.luau, CHAIN.p2d.rect), not one measured in Roblox.
 		m("GetBoundingRect", function(self)
 			needParent(self)
-			-- (which rectangle the engine reports - of the curve or of its control points, in which
-			-- space - is not known here: no model, the answer is a stand-in and the log says so)
-			note("stub", "Path2D:GetBoundingRect() has no model in the mock: answered with a permissive stand-in")
-			return stub("Path2D:GetBoundingRect()", "Rect")
+			local pts = points(self)
+			if #pts < 2 then
+				note("stub", "Path2D:GetBoundingRect() of a path without a segment has no model in the mock: answered with a permissive stand-in")
+				return stub("Path2D:GetBoundingRect()", "Rect")
+			end
+			local T = data[self].props.Thickness
+			if type(T) ~= "number" then T = 1 end
+			local lx, ly, hx, hy = math.huge, math.huge, -math.huge, -math.huge
+			local function add(x, y)
+				lx, hx = math.min(lx, x), math.max(hx, x)
+				ly, hy = math.min(ly, y), math.max(hy, y)
+			end
+			for i, q in ipairs(pts) do
+				add(q[1], q[2])
+				if i > 1 then add(f32(q[1] + q[3]), f32(q[2] + q[4])) end
+				if i < #pts then add(f32(q[1] + q[5]), f32(q[2] + q[6])) end
+			end
+			local e = f32(f32(T) / 2)
+			return rect(f32(lx - e), f32(ly - e), f32(hx + e), f32(hy + e))
 		end)
 		m("GetPositionOnCurve", function(self, t)
 			needParent(self)

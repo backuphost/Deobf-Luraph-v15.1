@@ -7,7 +7,8 @@ environment side of devm/harness.lua).
 Hand-written scripts are run through the harness and what they observe is compared with what
 the engine answers: enum items and values, instance methods and their errors, tags, undefined
 globals, task argument errors, GUI layout numbers worked out by hand from the rules in
-rbxmock.lua ("GUI layout"), EncodingService:DecompressBuffer.  No corpus file is needed.
+rbxmock.lua ("GUI layout"), Path2D bounding boxes worked out by hand, EncodingService:DecompressBuffer.
+No corpus file is needed.
 
 MOCK_DEVM_DIR: a directory with harness.lua / rbxmock.lua to test instead of devm/ (the API table
 is read from <dir>/../deobf/roblox_api.luau).
@@ -360,6 +361,39 @@ p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromScale(0, 0)), Path2DContro
 show("len", p:GetLength(), p:GetSegmentCount(), p:GetPositionOnCurve(0.25).X.Scale, p:GetPositionOnCurve(0.75).Y.Scale)
 ''')
         self.assertEqual(got.get('len'), '150|2|0.5|0.5', log)
+
+    def test_bounding_rect(self):
+        # Hand-computed: the box of each point and of the tangent handles that shape a segment, in the
+        # parent's pixels, widened by Thickness / 2 on every side (rbxmock.lua, GetBoundingRect)
+        got, log = run('''
+local sg = Instance.new("ScreenGui")
+local f = Instance.new("Frame"); f.Size = UDim2.fromOffset(300, 200); f.Parent = sg
+local p = Instance.new("Path2D"); p.Parent = f
+local function box(r) return r.Min.X .. "," .. r.Min.Y .. "," .. r.Max.X .. "," .. r.Max.Y end
+-- a straight segment (10, 20) - (110, 70)
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromOffset(10, 20)), Path2DControlPoint.new(UDim2.fromOffset(110, 70)) })
+local r = p:GetBoundingRect()
+show("line", typeof(r), box(r), r.Width, r.Height)
+p.Thickness = 3
+show("thick", box(p:GetBoundingRect()))
+p.Thickness = 1
+-- handles (50, 10) and (150, 10): the box holds them (the curve itself only reaches y = 20)
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromOffset(20, 50), UDim2.new(), UDim2.fromOffset(30, -40)),
+	Path2DControlPoint.new(UDim2.fromOffset(180, 50), UDim2.fromOffset(-30, -40), UDim2.new()) })
+r = p:GetBoundingRect()
+show("curve", box(r), tostring(r), r == p:GetBoundingRect())
+-- Scale and Offset in the 300 x 200 frame: points (85, 80), (220, 50); handles (120, 30), (220, 190);
+-- the first point's left handle (-65, 80) shapes no segment
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.new(0.25, 10, 0.5, -20), UDim2.new(-0.5, 0, 0, 0), UDim2.new(0.1, 5, 0, -50)),
+	Path2DControlPoint.new(UDim2.new(0.75, -5, 0.25, 0), UDim2.new(0, 0, 0.5, 40), UDim2.new()) })
+r = p:GetBoundingRect()
+show("mixed", box(r), r.Width, r.Height)
+''')
+        self.assertEqual(got.get('line'), 'Rect|9.5,19.5,110.5,70.5|101|51', log)
+        self.assertEqual(got.get('thick'), '8.5,18.5,111.5,71.5')
+        self.assertEqual(got.get('curve'), '19.5,9.5,180.5,50.5|19.5, 9.5, 180.5, 50.5|true')
+        self.assertEqual(got.get('mixed'), '84.5,29.5,220.5,190.5|136|161')
+        self.assertNotIn('GetBoundingRect() has no model', log)
 
 
 @unittest.skipUnless(LUAU, 'needs bin/luau')
