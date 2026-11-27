@@ -5063,8 +5063,15 @@ def script_not_reached(source, protos_path, chunk_paths=()):
     it as the script's main function (`root_callee`): the run did not get
     past the start-up code, or the script never touched the environment.
     (Luraph v15.2 keeps start-up code and script in one function: its lifts
-    are judged by what the run covered, not by this.)"""
-    prog = Program(source, protos_path, chunk_paths)
+    are judged by what the run covered, not by this; the driver uses the same
+    test there to tell whether the lift includes that start-up code.)"""
+    return lifts_first_program(Program(source, protos_path, chunk_paths))
+
+
+def lifts_first_program(prog):
+    """script_not_reached on a loaded Program: every root lift_program lifts
+    is the first proto any VM made a closure of (`__seq` 1), and the run named
+    no script main function (`root_callee`)."""
     if prog.dump.raw.get("root_callee") is not None:
         return False
     roots = program_roots(prog)

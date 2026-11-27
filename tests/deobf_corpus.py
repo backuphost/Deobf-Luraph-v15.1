@@ -219,6 +219,34 @@ def check_not_reached_unknown():
     assert "could not tell the script's main function" in err.getvalue(), err.getvalue()
 
 
+def check_nested_root_lack():
+    """Luraph v15.2 nested shapes: the lack 'the output includes Luraph's start-up code' only when
+    the lifted root is the program the VM entered first (__seq 1, no root_callee); a payload VM
+    made apart from the start-up VM is lifted without that code."""
+    from obfuscators.luraph_v15 import devirt, driver
+
+    def prog(protos, root_callee=None):
+        dump = type("Dump", (), {})()
+        dump.protos = protos
+        dump.raw = {"root_callee": root_callee} if root_callee is not None else {}
+        p = type("Prog", (), {})()
+        p.dump = dump
+        return p
+    one_vm = {"1": {"__maker": b"m@0,1", "__seq": 1}, "5": {"__maker": b"m@0,1", "__seq": 2}}
+    assert devirt.lifts_first_program(prog(one_vm))
+    # the payload VM is made after the start-up VM: its root (seq 3) is lifted, not the first program
+    two_vms = dict(one_vm, **{"9": {"__maker": b"p@0,9", "__seq": 3}, "12": {"__maker": b"p@0,9", "__seq": 4}})
+    assert [pid for _t, pid, _c in devirt.program_roots(prog(two_vms))] == ["9"]
+    assert not devirt.lifts_first_program(prog(two_vms))
+    # the run named the script's main function: the lift starts there
+    assert not devirt.lifts_first_program(prog(one_vm, root_callee="5"))
+    assert driver.root_lack("nested", True) == driver.NESTED_START_UP
+    assert driver.root_lack("nested", False) is None
+    assert driver.root_lack("nested", None) == driver.MAIN_UNKNOWN
+    assert driver.root_lack(None, None) == driver.MAIN_UNKNOWN
+    assert driver.root_lack(False, None) is None
+
+
 def check_chunk_params():
     """The main function's parameters at the top level never give `local ... = ...`."""
     from obfuscators.luraph_v15 import devirt
@@ -610,6 +638,7 @@ CHECKS = [
     ("syntax-warnings", check_no_syntax_warnings),
     ("pack-site", check_pack_site),
     ("not-reached-unknown", check_not_reached_unknown),
+    ("nested-root-lack", check_nested_root_lack),
     ("chunk-params", check_chunk_params),
     ("run-once-forin", check_run_once_forin),
     ("operand-order", check_operand_order),

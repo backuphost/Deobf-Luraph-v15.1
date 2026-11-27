@@ -416,14 +416,11 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             log('[%s] %d instructions could not be lifted: %d marked LIFT ERROR in the output%s' % (
                 tag, len(stage.errors), shown,
                 ', the others in code the output does not contain (cut as unreachable)' if shown < len(stage.errors) else ''))
-            ran, cold = hidden_errors(stage.errors, stage.oracle, text)
-            if ran:
+            head, cold = hidden_head(stage.errors, stage.oracle, text)
+            if head:
                 # Code that ran cannot have been unreachable: the result must not pass for complete
                 # (the same head line as lift_program writes for the proto-table layout)
-                texts = sorted({' '.join(str(e[1]).split())[:100] for _k, e in stage.errors
-                                if (_k, e[0][0], e[0][1]) in stage.oracle})
-                text = ('-- LIFT ERROR: %d instruction(s) that the traced run executed did not lift and have no marker in the '
-                        'text below.  Their lift errors: %s\n' % (ran, '; '.join(texts[:12]))) + text
+                text = head + '\n' + text
             if cold:
                 LAST_RUN['notes'].append('[cut] %d instruction(s) that never ran did not lift; the result does not contain the code '
                                          'they are in (cut as never-executed junk or as unreachable)' % cold)
@@ -556,23 +553,51 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
     return lift_program(stage, data, tag, log, oneline, 'real program')
 
 
-def hidden_errors(errors, oracle, text):
+def hidden_errors(errors, oracle, text, detail=False):
     """Lift errors of the factory route that have no LIFT ERROR marker in the text: (in code the
     traced run executed, in code that never ran).  Markers carry the error's message, not its
     place: per message, the errors of code that ran are counted first among those without a
-    marker (which of them have one is not known, and code that ran must not be taken for cut)."""
+    marker (which of them have one is not known, and code that ran must not be taken for cut), so
+    the first number is an upper bound where a message has markers and errors of both kinds.
+    detail: (that bound, the second number, the least number of executed errors without a marker
+    -- every marker on one that ran --, the messages of executed errors that may have none)."""
     import collections
     marks = collections.Counter(' '.join(m.split()) for m in re.findall(r'LIFT ERROR: ([^\n]*)', text))
     by_msg = {}
     for k, e in errors:
         ran = isinstance(e[0], tuple) and (k, e[0][0], e[0][1]) in oracle
         by_msg.setdefault(' '.join(str(e[1]).split()), [0, 0])[0 if ran else 1] += 1
-    hidden_ran = hidden_cold = 0
+    hidden_ran = hidden_cold = least = 0
+    msgs = []
     for msg, (r, c) in by_msg.items():
-        hidden = max(0, r + c - marks.get(msg, 0))
+        m = marks.get(msg, 0)
+        hidden = max(0, r + c - m)
         hidden_ran += min(r, hidden)
         hidden_cold += hidden - min(r, hidden)
+        least += max(0, r - m)
+        if min(r, hidden):
+            msgs.append(msg)
+    if detail:
+        return hidden_ran, hidden_cold, least, sorted(msgs)
     return hidden_ran, hidden_cold
+
+
+def hidden_head(errors, oracle, text):
+    """(the head line for executed lift errors without a marker, or None; the number of errors
+    without a marker in code that never ran).  Where errors with one message are marked only in
+    part, which of them have the markers is not known: the count is then an upper bound ('up
+    to'), and the line lists the messages of the executed errors that may have none."""
+    ran, cold, least, msgs = hidden_errors(errors, oracle, text, detail=True)
+    if not ran:
+        return None, cold
+    if least == ran:
+        what = '%d instruction(s) that the traced run executed did not lift and have no marker in the text below' % ran
+    else:
+        what = ('up to %d instruction(s) that the traced run executed did not lift and may have no marker in the text '
+                'below (%s: markers name the error, not its place, and some errors with the same message are marked)'
+                % (ran, 'at least %d have none' % least if least else 'possibly none'))
+    texts = sorted({m[:100] for m in msgs})
+    return '-- LIFT ERROR: %s.  Their lift errors: %s' % (what, '; '.join(texts[:12])), cold
 
 
 def lift_program(stage, data, tag, log, oneline, what, replayed=True):
@@ -706,8 +731,14 @@ def main(argv=None):
 
     def write_result(text):
         """the result file: the report first (see below), then the text; returns the report lines"""
+        # (a text that does not parse is never complete, whatever else it has: bin/luau-ast says)
+        parsed = parse_check(text, work if os.path.isdir(work) else None)
         lines = run_report(LAST_RUN['notes']) + report(text, returned=any(
-            n.startswith('[oracle] script returned') for n in LAST_RUN['notes']), notes=LAST_RUN['notes'])
+            n.startswith('[oracle] script returned') for n in LAST_RUN['notes']), notes=LAST_RUN['notes'], parse=parsed)
+        if parsed[0] is False and parsed[1] is not None:
+            # (the line of the error as the written file has it: below the head of 1 + len(lines) lines)
+            lines = [PARSE_PREFIX + 'line %d: %s' % (parsed[1] + 2 + len(lines), parsed[2]) if ln.startswith(PARSE_PREFIX) else ln
+                     for ln in lines]
         head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
         head += ['--   ' + ln for ln in lines]
         text = '\n'.join(head) + '\n' + text
@@ -777,7 +808,54 @@ HEAD_MARK = 'recovered by devm (python -m devm.run)'      # first line of a file
 # (how run_report starts the lines of the run notes report() also reads off the head of a file)
 SINGLE_ROOT_LINE = 'the VM has a single root program'
 STARTUP_LINE = 'start-up code: '
+HINT_LINE = '  hint: '
+PARSE_PREFIX = '  the text does not parse: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
+
+
+def _luau_ast():
+    """bin/luau-ast (luaubin.find, the repository's one lookup), or None."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('luaubin', os.path.join(HERE, '..', 'luaubin.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.find('luau-ast')
+    except Exception:       # (no lookup module, or it failed: no parser)
+        return None
+
+
+def parse_check(text, workdir=None):
+    """Does the text parse as Luau?  bin/luau-ast reports errors on stderr and by its exit status.
+    Returns (True, None, '') when it parses, (False, line, first error) when it does not (line:
+    0-based in the text, None when the message names none), (None, None, why) when it was not
+    checked (no parser, or the parser did not finish)."""
+    ast = _luau_ast()
+    if not ast:
+        return None, None, 'bin/luau-ast was not found'
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.luau', prefix='parse-', dir=workdir)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+        r = subprocess.run([ast, path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors='replace',
+                           timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, None, 'luau-ast did not finish (%s)' % type(e).__name__
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if r.returncode == 0 and 'Parse errors' not in r.stderr[:4000]:
+        return True, None, ''
+    if r.returncode < 0:
+        return None, None, 'luau-ast was stopped by signal %d' % -r.returncode
+    m = re.search(r'(?m)^\s*\((\d+), \d+\) - \(\d+, \d+\) - (.*)$', r.stderr)
+    if m:
+        return False, int(m.group(1)), ' '.join(m.group(2).split())[:300]
+    first = next((ln.strip() for ln in r.stderr.split('\n') if ln.strip() and not ln.startswith('Parse errors')), '')
+    return False, None, ' '.join(first.split())[:300] or 'luau-ast exit status %d' % r.returncode
 
 
 def run_report(notes):
@@ -815,7 +893,7 @@ def run_report(notes):
         if n.startswith('[env]'):
             out.append('  ' + n[len('[env] '):])
         elif n.startswith('[hint]'):
-            out.append('  ' + n[len('[hint] '):])
+            out.append(HINT_LINE + n[len('[hint] '):])
         elif n.startswith('[cut] '):
             out.append('  note: ' + n[len('[cut] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
@@ -838,10 +916,15 @@ KEY_LEFT = re.compile(r'(?m)^[ \t]*return bit32\.bxor\(p\d+, \d{7,}\)(?:,.*)?$')
 KEY_MIX = re.compile(r'(?m)^.*\b(v\d+) - \1 % 1\b.*$')
 
 
-def report(text, returned=None, notes=None):
+# the head line deobfuscate / lift_program put in front of a text whose lift errors are not all
+# marked in it (not a marker itself)
+HIDDEN_HEAD = re.compile(r'^-- LIFT ERROR: (up to )?(\d+) instruction\(s\) (that the traced run executed )?did not lift and')
+
+
+def report(text, returned=None, notes=None, parse=None):
     """What is left unrecovered in a result, in plain words.  `returned`: the traced run went to
     the script's end; `notes`: the run notes (LAST_RUN; None: read both off the head of a file
-    main() wrote)."""
+    main() wrote); `parse`: what parse_check said about the text (None: not asked)."""
     lines = text.split('\n')
     head_notes = []
     if lines and HEAD_MARK in lines[0]:
@@ -854,13 +937,22 @@ def report(text, returned=None, notes=None):
                 head_notes.append('[single-root]')
             elif lines[0].startswith('--   ' + STARTUP_LINE):
                 head_notes.append('[startup] ' + lines[0][len('--   ' + STARTUP_LINE):])
+            elif lines[0].startswith('--   ' + HINT_LINE):
+                head_notes.append('[hint] ' + lines[0][len('--   ' + HINT_LINE):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
         notes = head_notes
     single_root = any(n.startswith('[single-root]') for n in notes)
     startup = any(n.startswith('[startup]') for n in notes)
-    errs = text.count('LIFT ERROR')
+    # pipeline's hint: the proto taken for the script is tiny and calls nothing but pure library
+    # functions, while the first program did all the work (the script is probably that program)
+    hint = next((n for n in notes if n.startswith('[hint]')), None)
+    unparsed = parse is not None and parse[0] is False
+    # instructions without a marker, said in a head line of the text (not one more marker)
+    hidden = [HIDDEN_HEAD.match(ln) for ln in lines[:2]]
+    hidden = [m for m in hidden if m]
+    errs = text.count('LIFT ERROR') - sum(m.string.count('LIFT ERROR') for m in hidden)
     # (`(nil)[k]`, `(nil)(...)`, `t[nil]`, `nil .. x`; a call that passes nil, `f(nil)`, is ordinary code)
     blank = len(re.findall(r'(?m)^.*(?:\[nil\]|(?<![\w\)\]])\(nil\)[\[.(:]|= nil \.\.).*$', text))
     # (comment lines are not code: a LIFT ERROR marker can name the VM table it could not write
@@ -898,11 +990,28 @@ def report(text, returned=None, notes=None):
                      'protection, not of the script' % (calls, m.group(1)))
     lines = max(1, text.count('\n'))
     out = []
+    unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes or dead or single_root or startup):
+            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
-        return out + traps
+        return out + unchecked + traps
     out.append('result: PARTIAL')
+    if unparsed:
+        out.append(PARSE_PREFIX + ('line %d: ' % (parse[1] + 1) if parse[1] is not None else '') + parse[2])
+    out += unchecked
+    if hint:
+        m = re.search(r'--root (\d+)', hint)
+        out.append('  the result may not be the script: the function taken for it is small and calls nothing but pure '
+                   'library functions, while the VM\'s first program did the work of the run (see the hint above%s)'
+                   % ('; --root %s lifts the first program' % m.group(1) if m else ''))
+    for m in hidden:
+        if m.group(3):
+            out.append('  %s%s instruction(s) that the traced run executed did not lift and %s no LIFT ERROR marker in the '
+                       'text (its first line lists their errors)' % (m.group(1) or '', m.group(2),
+                                                                     'may have' if m.group(1) else 'have'))
+        else:
+            out.append('  %s instruction(s) did not lift and have no LIFT ERROR marker: they are in code the text does not '
+                       'contain (its first line lists the errors)' % m.group(2))
     if startup:
         out.append('  the result is the VM\'s first program, which begins with Luraph\'s start-up code: the script was not '
                    'found as a program of its own (what the run shows about it is in the start-up code line above)')

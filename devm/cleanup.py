@@ -23,7 +23,8 @@ RESERVED = KEYWORDS | {
 
 TOKEN = re.compile(r'''
     (?P<comment>--\[(=*)\[.*?\]\2\]|--[^\n]*)
-  | (?P<string>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\[(=*)\[.*?\]\4\]|`(?:\\.|[^`\\])*`)
+  | (?P<string>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\[(=*)\[.*?\]\4\])
+  | (?P<tick>`)
   | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<other>.)
 ''', re.S | re.X)
@@ -31,12 +32,156 @@ TOKEN = re.compile(r'''
 GEN = re.compile(r'^[vp]\d+$')
 
 
-def tokens(text):
+def token_spans(text):
+    """[(kind, text, start)] of the whole text (kinds: comment, string, ident, other; `other` is one
+    character).  A backtick string comes out in pieces: its literal parts are `string` tokens (the
+    first starts with the backtick, a part before an interpolation ends with its `{`) and the
+    expressions inside `{...}` are tokens like any other, so that a name read only there counts as
+    read, and a rename reaches it.  The pieces concatenate to the text."""
     out = []
-    for m in TOKEN.finditer(text):
-        kind = m.lastgroup
-        out.append([kind, m.group(0)])
-    return out
+    pos = 0
+    while True:
+        for m in TOKEN.finditer(text, pos):
+            if m.lastgroup == 'tick':
+                pos = m.start()
+                break
+            out.append((m.lastgroup, m.group(0), m.start()))
+        else:
+            return out
+        pos = _interp(text, pos, out)
+
+
+def _interp(text, pos, out):
+    """The backtick string at text[pos] into out (see token_spans); returns the position after it."""
+    n = len(text)
+    seg = pos
+    j = pos + 1
+    while j < n:
+        c = text[j]
+        if c == '\\':
+            j += 2
+        elif c == '`':
+            out.append(('string', text[seg:j + 1], seg))
+            return j + 1
+        elif c == '{':
+            out.append(('string', text[seg:j + 1], seg))
+            j = _interp_expr(text, j + 1, out)
+            seg = j         # (the `}` starts the next literal part)
+            j += 1
+        else:
+            j += 1
+    if seg < n:
+        out.append(('string', text[seg:], seg))      # (not closed: the rest of the text)
+    return n
+
+
+def _interp_expr(text, pos, out):
+    """The tokens of the expression of an interpolation, from pos up to its closing `}` (returns
+    the position of that brace, or the end of the text)."""
+    depth = 0
+    while pos < len(text):
+        if text[pos] == '`':
+            pos = _interp(text, pos, out)
+            continue
+        m = TOKEN.match(text, pos)
+        s = m.group(0)
+        if s == '{':
+            depth += 1
+        elif s == '}':
+            if not depth:
+                return pos
+            depth -= 1
+        out.append((m.lastgroup, s, pos))
+        pos = m.end()
+    return pos
+
+
+def tokens(text):
+    return [[kind, s] for kind, s, _ in token_spans(text)]
+
+
+def ident_counts(text):
+    """How often each name occurs as a token (comments and string literals left out, the
+    expressions of backtick interpolations counted)."""
+    return _uses(text)[0]
+
+
+def spanned_lines(text):
+    """Indexes of the lines a token that runs over a line break touches (a long comment or long
+    string, a string continued with a backslash, a backtick string): their text is not all code,
+    or not all of the code is on the line."""
+    return _uses(text)[1]
+
+
+def _uses(text):
+    """(ident_counts, spanned_lines) in one pass over the tokens."""
+    count = {}
+    out = set()
+    line = 0
+    for kind, s, _at in token_spans(text):
+        if kind == 'ident':
+            count[s] = count.get(s, 0) + 1
+        elif '\n' in s:
+            k = s.count('\n')
+            if not s.isspace():
+                out.update(range(line, line + k + 1))
+            line += k
+    return count, out
+
+
+def drop_block_semicolons(text):
+    """structure.Printer.emit and the source printer put `;` in front of a statement that starts
+    with `(` (it would continue the statement before it).  Where a later pass removed the statement
+    before (dead constants, opaque tests), the `;` can end up first in a block, which Luau does not
+    parse (it has no empty statement).  Drops a `;` whose previous token (comments aside) opens a
+    block -- do, then, else, repeat, the `)` that ends a function's parameter list -- or is another
+    `;`, or that starts the text; every other `;` stays (it keeps two statements apart)."""
+    if ';' not in text:
+        return text
+    spans = token_spans(text)
+    sig = [t for t in spans if t[0] != 'comment' and not (t[0] == 'other' and t[1].isspace())]
+    drop = set()
+    for j, (kind, s, at) in enumerate(sig):
+        if kind != 'other' or s != ';':
+            continue
+        if j == 0:
+            drop.add(at)
+            continue
+        pkind, ps, _ = sig[j - 1]
+        if pkind == 'ident' and ps in ('do', 'then', 'else', 'repeat') or pkind == 'other' and ps == ';' \
+                or pkind == 'other' and ps == ')' and _ends_params(sig, j - 1):
+            drop.add(at)
+    if not drop:
+        return text
+    return ''.join(s for _k, s, at in spans if at not in drop)
+
+
+def _ends_params(sig, j):
+    """sig[j] (a `)`) closes the parameter list of `function(...)`, `function name(...)` or
+    `function a.b:c(...)`."""
+    depth = 0
+    while j >= 0:
+        kind, s, _ = sig[j]
+        if kind == 'other' and s == ')':
+            depth += 1
+        elif kind == 'other' and s == '(':
+            depth -= 1
+            if not depth:
+                break
+        j -= 1
+    j -= 1
+    if j < 0:
+        return False
+    if sig[j][:2] == ('ident', 'function'):
+        return True
+    # a function name: NAME {'.' NAME} [':' NAME]
+    while j >= 0 and sig[j][0] == 'ident' and sig[j][1] not in KEYWORDS:
+        j -= 1
+        if j >= 0 and sig[j][:2] in (('other', '.'), ('other', ':')):
+            j -= 1
+            continue
+        break
+    return j >= 0 and sig[j][:2] == ('ident', 'function')
 
 
 def camel(name, lower=True):
@@ -160,22 +305,19 @@ def tidy(text):
             break
         text = new
     from . import renamer       # (imports this module)
-    return renamer.humanize(text)
+    # (last: the passes above remove statements, and a `;(` statement can be first in its block then)
+    return drop_block_semicolons(renamer.humanize(text))
 
 
 def drop_unused(text):
     while True:
-        toks = tokens(text)
-        count = {}
-        for kind, s in toks:
-            if kind == 'ident':
-                count[s] = count.get(s, 0) + 1
+        count, inside = _uses(text)
         lines = text.split('\n')
         keep = []
         changed = False
-        for ln in lines:
+        for i, ln in enumerate(lines):
             m = re.match(r'^\s*local (v\d+)(?: = nil)?$', ln)
-            if m and count.get(m.group(1)) == 1:
+            if m and count.get(m.group(1)) == 1 and i not in inside:
                 changed = True
                 continue
             keep.append(ln)
@@ -206,9 +348,55 @@ def _str_sub(s, i=1, j=-1):
     return s[i - 1:j] if i <= j else ''
 
 
+# (bin/luau: a size in a format is at most 2^30 -- "size specifier is too large" -- and so is the
+# whole of string.packsize -- "format result too large")
+_FMT_MAX = 1 << 30
+
+
+def _format_ok(fmt, unpack):
+    """A format of string.unpack / string.packsize that Luau accepts as pe.lua_unpack /
+    pe.lua_packsize read it: integer sizes 1..16 ("integral size out of limits"), sizes and the
+    total within _FMT_MAX.  unpack: integers wider than 8 bytes are refused too (Luau raises
+    unless the extra bytes only extend the sign, which pe.lua_unpack does not check)."""
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 4, 'J': 4, 'T': 4, 'f': 4, 'd': 8, 'n': 8, 'x': 1}
+    total = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        i += 1
+        j = i
+        while j < len(fmt) and fmt[j].isdigit():
+            j += 1
+        if c in 'iIc' and j > i:
+            n = int(fmt[i:j])
+            i = j
+            if n > _FMT_MAX or c != 'c' and not 1 <= n <= (8 if unpack else 16):
+                return False
+        elif c in 'iI':
+            n = 4
+        elif c in sizes:
+            n = sizes[c]
+        elif c in '<=> ':
+            n = 0
+        else:
+            return False        # (c without its count, alignment, variable-length: not read here)
+        total += n
+        if total > _FMT_MAX:
+            return False
+    return True
+
+
 def _call_pure(name, args):
     """The results of a pure library call on constants; _NotConst where it would raise in Luau or
     is not one this evaluator knows."""
+    if name in ('bit32.band', 'bit32.bor', 'bit32.bxor', 'bit32.btest') and not args:
+        # (valid in Luau: the empty AND is all ones, the empty OR / XOR zero)
+        return pe.fold_pure(name, [])
+    if name in ('string.unpack', 'string.packsize'):
+        # (pe.fold_pure ignores string.unpack's third argument, where it starts reading)
+        if len(args) != (2 if name == 'string.unpack' else 1) or not isinstance(args[0], str) \
+                or not _format_ok(args[0], name == 'string.unpack'):
+            raise _NotConst()
     if name in pe.PURE:
         if not args or not all(_lua_number(a) and math.isfinite(a) for a in args):
             raise _NotConst()
@@ -358,15 +546,14 @@ def dead_constant_lines(text):
     values Luraph v14 programs compute for the self-patches of their code (the lifter folds those
     into the instructions they patch; the register assignment is left with no reader).
     Returns (removable, left): removable when E evaluates without an error (dropping the line then
-    changes nothing a script can see), left when it has that shape but does not evaluate here."""
-    count = {}
-    for kind, s in tokens(text):
-        if kind == 'ident':
-            count[s] = count.get(s, 0) + 1
+    changes nothing a script can see), left when it has that shape but does not evaluate here.
+    (Lines a long comment or a string runs over are neither: dropping one would take part of that
+    token with it, or the line is not code.)"""
+    count, inside = _uses(text)
     removable, left = [], []
     for i, ln in enumerate(text.split('\n')):
         m = _DEAD_DEF.match(ln)
-        if not m or count.get(m.group(1)) != 1 or not re.search(r'\d', m.group(2)):
+        if not m or count.get(m.group(1)) != 1 or not re.search(r'\d', m.group(2)) or i in inside:
             continue
         try:
             # (the parser reads source bytes as latin-1, which is how the escapes come out; a
