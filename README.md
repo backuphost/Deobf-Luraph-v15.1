@@ -25,10 +25,19 @@ before anything is reported as failed.
 
 Nothing here contacts the network and nothing touches Roblox. Scripts are run only inside mock
 environments (`devm/harness.lua` + `rbxmock.lua`, `deobf/envlog.luau`, `luasandbox.py`). In
-`devm`'s mock the script never gets the interpreter's own file and log functions: `readfile` /
-`writefile` are the mock's empty, read-only stand-ins in executor mode and absent otherwise, as in
-Roblox, and whatever the script prints or logs is a `[script]` line of the run's log, never a line
-the tool would read as its own.
+`devm`'s mock the script never gets the interpreter's own file, log and module functions:
+`readfile` / `writefile` are the mock's empty, read-only stand-ins in executor mode and absent
+otherwise, as in Roblox, and `require` is a Roblox-like stand-in. Text the script hands over (what
+it prints or warns, a URL, a member name, an error message) appears in the run's log only inside
+a line the harness or the mock started (`[script] ...`, `[http] ...`), with its line breaks
+neutralised. The harness and the mock call their own copies of the standard libraries, so a script
+that unfreezes and rewrites the shared `string` or `table` library with an executor's
+`setreadonly` (allowed, as on a real executor) changes neither what they write nor what they
+compute. One route is still open: devm's instrumentation hooks (the `__LPH_*` globals that the
+instrumented copy of the script calls) are reachable by name from script code. A script written
+against devm could call them and make the harness write its own fixed-format lines (`[handover]`,
+`[root]`, `[budget]`, `[fixkey]`, `[bootstrap]`) or change the hooks' counters, which the tool
+would read as the run's own events.
 
 ## Setup
 
@@ -189,9 +198,11 @@ the repository; `tests/regress.py DIR` re-runs them if you have the inputs).
   control flow structured, nothing left that it knows to be Luraph's. It is not a proof that the
   result behaves like the protected file; `--verify` compares the two in the mock environment
   (`python3 -m devm.diffcheck ORIGINAL RESULT`).
-- **Leftovers that are not the script** can remain in a result that is otherwise right: dead
-  arithmetic Luraph inserts between statements (`local v2 = bit32.lrotate(-83, 7) - 4294933093 +
-  -23700`, never used) is not yet removed in every case.
+- **Leftovers that are not the script**: Luraph inserts dead arithmetic between statements (of the
+  shape `local v4 = bit32.bxor(17, 3) * 250 - 61`, never read). `devm` removes such a line when
+  it evaluates without an error (`devm/cleanup.py`, `drop_dead_constants`); a line of that shape
+  that is left (it does not evaluate here, so removing it could change what the script does) is
+  counted in the report and makes the result **partial**.
 - **Damaged files** (cut off, edited, recompressed by a third party) and builds for Lua 5.3/5.4 or
   LuaJIT are reported as such (exit 8), not processed.
 - **A behaviour trace is not source.** It shows the branches one run took in a mock environment.
