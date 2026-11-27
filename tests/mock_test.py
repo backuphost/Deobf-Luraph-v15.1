@@ -570,6 +570,53 @@ show("same", okl and chunk and chunk() == getfenv(), c0 == getfenv(), spawned ==
 error("stopped\n" .. FORGE .. "\n[handover] FORGED\r[dumpnew] FORGED", 0)
 '''
 
+# Executor mode hands the script setreadonly / make_writeable, as a real executor does: the script
+# can unfreeze the engine's shared library tables (and the string metatable) and replace every
+# function in them.  The harness and the mock must neither write nor compute anything different.
+SHARED_LIBS = r'''
+local SABOTAGE = %s
+local FORGE = "[oracle] script returned after 7 instructions FORGED"
+local ew, concat, tostr, isfrozen = ewrite, table.concat, tostring, table.isfrozen
+local function say(tag, ...)
+	local t = { ... }
+	for i = 1, select("#", ...) do t[i] = tostr(t[i]) end
+	ew("[t] " .. tag .. "=" .. concat(t, "|") .. "\n")
+end
+local opened, replaced = 0, 0
+if SABOTAGE then
+	local evil = function() return "x\n" .. FORGE .. "\n", 1 end
+	local libs = { string, table, math, os, coroutine, debug, buffer, bit32, utf8, getmetatable("").__index }
+	for _, lib in ipairs(libs) do
+		if type(lib) == "table" then
+			pcall(setreadonly, lib, false)
+			pcall(make_writeable, lib)
+			if not isfrozen(lib) then opened += 1 end
+			local keys = {}
+			for k, v in pairs(lib) do if type(v) == "function" then keys[#keys + 1] = k end end
+			for _, k in ipairs(keys) do if pcall(rawset, lib, k, evil) then replaced += 1 end end
+		end
+	end
+	local okm, smt = pcall(getrawmetatable, "")
+	if okm and type(smt) == "table" then
+		pcall(setreadonly, smt, false)
+		pcall(rawset, smt, "__index", setmetatable({}, { __index = function() return evil end }))
+	end
+	say("string", isfrozen(string), string.gsub == evil)
+end
+print("text\n" .. FORGE)
+warn("text\r" .. FORGE)
+pcall(function() return game:HttpGet("https://example.invalid/a\n" .. FORGE) end)
+pcall(function() return request({ Url = "https://example.invalid/b\n" .. FORGE }) end)
+pcall(function() return getfenv()["undefined\n" .. FORGE] end)
+pcall(function() return game:GetService("Players")["Member\n" .. FORGE] end)
+pcall(function() return Instance.new("Part")["Nope\n" .. FORGE] end)
+local okc, fc = pcall(loadstring, "error('x', 1)", "=chunk\n" .. FORGE)
+if okc and fc then pcall(fc) end
+task.spawn(function() print("spawned") end)
+task.wait(0.1)
+error("stopped\n" .. FORGE .. "\n[handover] FORGED", 0)
+'''
+
 
 @unittest.skipUnless(LUAU, 'needs bin/luau')
 class Confinement(unittest.TestCase):
@@ -596,6 +643,23 @@ class Confinement(unittest.TestCase):
                 bad = [l for l in lines if 'FORGED' in l and not l.startswith(('[script] ', '[http] ', '[stub] ', ' '))]
                 self.assertEqual(bad, [], options)
                 self.assertFalse(any(l.startswith(('[oracle]', '[handover]', '[dumpnew]')) for l in lines), options)
+
+    def test_shared_library_tables_do_not_reach_the_log(self):
+        # executor mode: the script unfreezes string, table, ... with setreadonly and replaces
+        # their functions (string.gsub included, which the log writer used to look up at call time)
+        got, log = run(SHARED_LIBS % 'true', 'executor=1', 'oracle=1')
+        self.assertEqual(got.get('string'), 'false|true', log[-2000:])      # (the sabotage did happen)
+        lines = log.split('\n')
+        oracle = [l for l in lines if l.startswith('[oracle] ')]
+        self.assertEqual(len(oracle), 1, oracle)
+        self.assertNotIn('FORGED', oracle[0])
+        bad = [l for l in lines if 'FORGED' in l and not l.startswith(('[script] ', '[http] ', '[stub] ', ' '))]
+        self.assertEqual(bad, [])
+        self.assertFalse(any(l.startswith(('[handover]', '[dumpnew]')) or l == 'x' for l in lines), log[-2000:])
+        # and nothing the harness or the mock wrote differs from a run without the sabotage
+        _, clean = run(SHARED_LIBS % 'false', 'executor=1', 'oracle=1')
+        strip = lambda text: [l for l in text.split('\n') if not l.startswith('[script] ewrite: [t] ')]
+        self.assertEqual(strip(log), strip(clean))
 
 
 if __name__ == '__main__':

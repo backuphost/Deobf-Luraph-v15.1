@@ -3,6 +3,30 @@
 local samplePath, outPath = ...
 local _G = getfenv() -- the CLI runs scripts in a sandboxed thread: script globals live here, not in the real _G
 
+-- ---------------------------------------------------------------- the engine's libraries, kept apart
+-- The script shares the engine's library tables (string, table, math, ...; string is also what the
+-- string metatable's __index is).  The engine freezes them, but in executor mode the script has the
+-- executor's setreadonly / make_writeable (as on a real executor) and can unfreeze them and replace
+-- their functions.  So this file never calls through them once the script can run: the names below
+-- are private copies, taken here, before the mock or the script are loaded, and never handed out.
+-- rbxmock.lua runs with the same copies (mockEnv).  Whatever a script does to the shared tables
+-- changes neither what the harness and the mock write nor what they compute.  sharedLib keeps the
+-- shared tables themselves: the copies the script is given are made from them.
+local LIB_NAMES = { "string", "table", "math", "bit32", "buffer", "coroutine", "os", "utf8", "debug" }
+local sharedLib, privateLibs = {}, {}
+local string, table, math, bit32, buffer, coroutine, os, utf8, debug
+do
+	local clone, freeze = _G.table.clone, _G.table.freeze
+	for _, n in ipairs(LIB_NAMES) do
+		sharedLib[n] = _G[n]
+		privateLibs[n] = freeze(clone(_G[n]))
+	end
+	local P = privateLibs
+	string, table, math, bit32, buffer = P.string, P.table, P.math, P.bit32, P.buffer
+	coroutine, os, utf8, debug = P.coroutine, P.os, P.utf8, P.debug
+end
+local tostring, type, select, pcall, unpack, error = tostring, type, select, pcall, unpack, error
+
 -- ---------------------------------------------------------------- the CLI's own functions
 -- The CLI (luau_cli.patch) gives this file real file access (readfile, writefile), its stderr
 -- (ewrite, and __LPH_RUNMAIN, which is the same C function), C closures (cwrap), a scheduler
@@ -26,21 +50,23 @@ if type(realGlobals) ~= "table" then realGlobals = nil end
 -- one space.  (Stack frames, "[C] ..." and "[string "..."]:n ...", are left as they are.)
 local ewrite = ewrite      -- (the CLI's: replaced by the checked writer below)
 do
+	-- (only the private copies above: nothing the script can reach or replace)
 	local hostEwrite = ewrite
+	local find, gsub = string.find, string.gsub
 	local function tagged(line)
-		if string.find(line, "^%[") then
-			return not (string.find(line, "^%[C%]") or string.find(line, '^%[string "'))
+		if find(line, "^%[") then
+			return not (find(line, "^%[C%]") or find(line, '^%[string "'))
 		end
-		return string.find(line, "^NOT REACHED") ~= nil or string.find(line, "^COMPILE ERROR") ~= nil
-			or string.find(line, "^LAYER COMPILE ERROR") ~= nil
+		return find(line, "^NOT REACHED") ~= nil or find(line, "^COMPILE ERROR") ~= nil
+			or find(line, "^LAYER COMPILE ERROR") ~= nil
 	end
 	local function clean(s, all)
-		s = string.gsub(s, "[%z\1-\8\11-\31\127]", "?")
-		s = string.gsub(s, "\226\128[\168\169]", "?")      -- U+2028, U+2029
-		s = string.gsub(s, "\194\133", "?")                -- U+0085
+		s = gsub(s, "[%z\1-\8\11-\31\127]", "?")
+		s = gsub(s, "\226\128[\168\169]", "?")      -- U+2028, U+2029
+		s = gsub(s, "\194\133", "?")                -- U+0085
 		if all and tagged(s) then s = " " .. s end
-		if string.find(s, "\n", 1, true) then
-			s = string.gsub(s, "\n([^\n]+)", function(line)
+		if find(s, "\n", 1, true) then
+			s = gsub(s, "\n([^\n]+)", function(line)
 				if tagged(line) then return "\n " .. line end
 				return nil
 			end)
@@ -1282,7 +1308,19 @@ local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
 -- (the mock writes its log lines through the same checked writer; it reads ewrite, cwrap,
 -- resumetop and setvectormetatable from the table given to it while it is being built, and never later)
 rawset(_G, "ewrite", ewrite)
-local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames, { here = here, readfile = readfile })
+-- The mock's code runs with the private library copies (see sharedLib above): its environment
+-- reads them first and everything else from this thread's globals, where its global writes go too.
+-- Chunks it loads (the API table, the zstd decoder) get the same environment.
+local mockEnv = setmetatable({}, { __index = _G, __newindex = _G })
+for n, lib in pairs(privateLibs) do rawset(mockEnv, n, lib) end
+rawset(mockEnv, "loadstring", function(text, name)
+	local f, e = loadstring(text, name)
+	if f then setfenv(f, mockEnv) end
+	return f, e
+end)
+local mockChunk = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))
+setfenv(mockChunk, mockEnv)
+local mock = mockChunk()(_G, fnames, libnames, { here = here, readfile = readfile })
 mockRef = mock
 -- Take the CLI's functions out of every global table: this thread's (where the harness and the
 -- mock look up their globals) and the engine's own, behind it (read-only: opened for this with
@@ -1486,7 +1524,7 @@ function populateSandbox()
 	-- same iteration sequence as the reference environment's pairs(math).
 	do
 		local mathCopy = {}
-		for k, v in pairs(math) do mathCopy[k] = v end
+		for k, v in pairs(sharedLib.math) do mathCopy[k] = v end
 		libnames[mathCopy] = "math"
 		rawset(sandbox, "math", mathCopy)
 	end
@@ -1793,7 +1831,7 @@ do
 		return table.concat(parts)
 	end
 	local u = {}
-	for k, v in pairs(utf8) do u[k] = v end
+	for k, v in pairs(sharedLib.utf8) do u[k] = v end
 	-- insertion order fixes the iteration order of the table, which scripts hash: the same order
 	-- as the reference environment (graphemes, nfcnormalize, nfdnormalize after the built-ins)
 	u.graphemes = true
@@ -1839,7 +1877,7 @@ end
 -- buffer writes fed with mock objects (where Roblox would have produced a number) must not throw
 do
 	local b = {}
-	for k, v in pairs(buffer) do b[k] = v end
+	for k, v in pairs(sharedLib.buffer) do b[k] = v end
 	for _, k in ipairs({ "writeu8", "writei8", "writeu16", "writei16", "writeu32", "writei32", "writef32", "writef64" }) do
 		local real = buffer[k]
 		local size = (string.find(k, "64") and 8) or (string.find(k, "32") and 4) or (string.find(k, "16") and 2) or 1
@@ -1874,10 +1912,11 @@ mock.setfenv = function(f, env)
 	if type(f) == "number" and f > 0 then f += 1 end
 	return realSetfenv(f, env)
 end
--- (the harness's globals and the engine's own global table are never handed to the script: they
--- are what a function of the harness, of the mock or a thread the script did not make has)
+-- (the harness's globals, the mock's environment and the engine's own global table are never handed
+-- to the script: they are what a function of the harness, of the mock or a thread the script did
+-- not make has)
 local function ownEnv(env)
-	if env == _G or (realGlobals and env == realGlobals) then return sandbox end
+	if env == _G or env == mockEnv or (realGlobals and env == realGlobals) then return sandbox end
 	return env
 end
 mock.getfenv = function(f)
@@ -1900,7 +1939,7 @@ fnames[mock.setfenv] = "setfenv"
 do
 	local realInfo = debug.info
 	local d = {}
-	for k, v in pairs(mock.debug or debug) do d[k] = v end
+	for k, v in pairs(mock.debug or sharedLib.debug) do d[k] = v end
 	local function mockLua(src)
 		return src ~= "[C]" and not isScriptSrc(src)
 	end
