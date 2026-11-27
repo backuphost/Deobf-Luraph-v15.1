@@ -1124,7 +1124,8 @@ def harness_tail(stderr, limit=600):
     the error itself (the last line without a [tag]: the error and where it happened; else the last
     other line), always, whole when they fit and otherwise sharing the room (the longest cut first,
     each cut marked with '...'); then the other lines, latest first, while the whole stays within
-    `limit`.  In their order, joined by ' | '."""
+    `limit`.  In their order, joined by ' | '.  (Those five lines need 27 characters at their
+    shortest, '...' each and ' | ' between them: below that the joined line is cut to `limit`.)"""
     lines, skip = [], False
     for line in stderr.split('\n'):
         line = line.strip()
@@ -1152,7 +1153,8 @@ def harness_tail(stderr, limit=600):
             break
         keep[i] = lines[i]
         size += len(lines[i]) + 3
-    return ' | '.join(keep[i] for i in sorted(keep)) or '(no output)'
+    text = ' | '.join(keep[i] for i in sorted(keep)) or '(no output)'
+    return text if len(text) <= limit else _clip(text, limit) if limit >= 3 else text[:max(limit, 0)]
 
 
 # The traced run of a script that does not end (a key system waiting for its key, a GUI script in
@@ -1219,7 +1221,7 @@ def run_oracle(model, workdir, tag, options=()):
         pass
     r.stderr = stderr
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
-    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive', '[stalled]', '[effects]', '[where]',
+    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive', '[stalled]', '[effects]', '[under]', '[where]',
                                                                       '[started]', '[watch]'))]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
         raise RuntimeError('oracle run failed: ' + harness_tail(r.stderr))

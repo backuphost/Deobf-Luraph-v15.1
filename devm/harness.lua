@@ -1029,9 +1029,11 @@ end
 -- :Wait()), so such a script spins.  The traced run (oracle=1 dumpend=1) is therefore watched.
 --   progress   a VM instruction runs for the first time or in a new version of its code, or a
 --              program is made (__LPH_PROTO)
---   start      the script's own code runs: a program on an interpreter other than the first one
---              (the payload of two-interpreter builds), or the script's first line of output or
---              first request (builds whose script's top level is in Luraph's main function)
+--   start      the script's own code runs: its first line of output or first request, or a
+--              program the run made on an interpreter other than the first one (the payload of
+--              two-interpreter builds) once the run is found in or under that program (watch.under)
+--              when a limit is reached.  Such a program can be a helper of the build that the
+--              start-up code calls: made, it only provisionally starts the limits after the start
 --   stall=<s>      after the start: <s> seconds without progress, the script loops over code it
 --                  has run before
 --   stallwait=<s>  <s> seconds of waiting the mock simulated without progress (task.wait, wait, an
@@ -1039,9 +1041,10 @@ end
 --                  event the mock never fires): a wait loop.  Counted from the beginning of the run:
 --                  Luraph's start-up code does not wait in loops
 --   stallrun=<s>   <s> seconds after the start, progress or not
--- Before the start, 4 x <stall> seconds without progress end the run without a dump: it spins in
--- Luraph's start-up code (an environment check that failed loops for ever) or in code that shows
--- nothing, and a lift would be the start-up code.  Otherwise the run is stopped like a budget stop
+-- Before the start (also after a program made on another interpreter that the run is not in or
+-- under), 4 x <stall> seconds without progress end the run without a dump: it spins in Luraph's
+-- start-up code (an environment check that failed loops for ever) or in code that shows nothing,
+-- and a lift would be the start-up code.  Otherwise the run is stopped like a budget stop
 -- (every instruction, loop round and hook raises while the script unwinds) and then ends as one
 -- that returned: [stalled] line, exercise pass, oracle, dump, serve mode.  Seconds are processor
 -- time of this process (watch.clock), which never sleeps.  beat=<s> prints a [beat] line every <s>
@@ -1096,10 +1099,44 @@ watch.t0, watch.beatNext = watch.clock(), 0
 -- the programs the script's output and requests came from (the one that ran the last VM
 -- instruction before each): pipeline.py takes the script from that program's interpreter
 watch.effects = {}
+-- for each line of output and request, the innermost program of another interpreter on its VM
+-- call chain (watch.under; 0: none), when that can be told: the [under] line
+watch.unders = {}
+watch.made = nil           -- the first program the run made on another interpreter
+watch.th = nil             -- the thread that ran the last VM instruction (watch.step)
+watch.info = debug.info    -- (the real one: walks the stack of that thread)
 if watch.ticking then __LPH_N.k = watch.TICK end
 do
 	local w = watch
-	-- effect: output or a request (counted for the program that ran the last VM instruction)
+	-- The innermost program of an interpreter other than the first one on the VM call chain of the
+	-- thread that ran the last VM instruction (`pid`: that instruction's program, itself when it is
+	-- on another interpreter); 0 when there is none; nil when that cannot be told (the closures of
+	-- those programs are known from __LPH_REG's wrapper only with binds=1, exercise=1 or poke=).
+	-- The chain is that thread's Lua stack: a VM call is a call of the callee's closure, and Luau
+	-- has no tail calls, so a routine of the first interpreter that the script's program called
+	-- runs with that program's closure below it on the stack, and a function the start-up code
+	-- called does not, whichever program called it first (the record's `caller`).  (A function a
+	-- mock function calls back runs on that function's own thread, cwrap: its chain starts there.)
+	function w.under(pid)
+		if not pid then
+			local v = ring[stepCount % ringN]
+			pid = v and v // 2 ^ 32 or 0
+		end
+		local first = protos[1] and protos[1].interp
+		if protos[pid] and protos[pid].interp ~= first then return pid end
+		if not (exercise or pokePath or recordBinds) then return nil end
+		local th = w.th or coroutine.running()
+		for level = 1, 100000 do
+			local okI, f = pcall(w.info, th, level, "f")
+			if not okI or f == nil then break end
+			local p = protoOfFn[f]
+			p = p and (pidAlias[p] or p)
+			if p and protos[p] and protos[p].interp ~= first then return p end
+		end
+		return 0
+	end
+	-- effect: output or a request (counted for the program that ran the last VM instruction, and
+	-- for the innermost program of another interpreter on its call chain)
 	function w.start(how, effect)
 		if w.ended or w.exercising or probing then return end
 		-- (once the run is stopped, output and requests raise the stop again, like waits: see w.waited)
@@ -1107,7 +1144,13 @@ do
 		if effect then
 			local v = ring[stepCount % ringN]
 			local pid = v and v // 2 ^ 32 or 0
-			if pid > 0 then w.effects[pid] = (w.effects[pid] or 0) + 1 end
+			if pid > 0 then
+				w.effects[pid] = (w.effects[pid] or 0) + 1
+				-- (only where every effect can be placed: a list of the ones on other interpreters alone
+				-- would leave out those under none)
+				local u = (exercise or pokePath or recordBinds) and w.under(pid)
+				if u then w.unders[u] = (w.unders[u] or 0) + 1 end
+			end
 		end
 		if w.from or not w.on then return end
 		w.from, w.how = w.clock(), how
@@ -1148,7 +1191,8 @@ do
 		return string.format("[beat] %.0f s: %d VM instructions (%d distinct), %d programs, %d loop rounds%s; new code %.0f s "
 			.. "ago, since then %d instructions, %d loop rounds, %d waits%s, %.1f s of waiting simulated; last instructions: %s\n",
 			now - w.t0, stepCount, w.distinct, #protos, __LPH_N.l,
-			w.from and string.format(", the script started %.0f s ago (%s)", now - w.from, w.how) or "",
+			w.from and string.format(", the script started %.0f s ago (%s)", now - w.from, w.how)
+				or w.made and string.format(", program %d on another interpreter made %.0f s ago", w.made, now - w.madeAt) or "",
 			now - w.new, stepCount - w.steps, __LPH_N.l - w.loops, total, kind and (" (mostly " .. kind .. ")") or "",
 			w.virt, table.concat(last, " "))
 	end
@@ -1156,10 +1200,12 @@ do
 	-- has it); otherwise the last instruction's
 	function w.tick(pid)
 		local now = w.clock()
-		-- (the longest stretch without progress, before and after the start: the [watch] line, which
-		-- says how close a run that ended came to the limits)
+		-- (the longest stretch without progress, before and after the start -- here: the first line of
+		-- output or request, else the first program made on another interpreter, from which the limits
+		-- after the start are checked: the [watch] line, which says how close a run that ended came to
+		-- the limits)
 		local gap = now - w.new
-		if w.from then
+		if w.from or w.made then
 			if gap > w.gapAfter then w.gapAfter = gap end
 		elseif gap > w.gapBefore then
 			w.gapBefore = gap
@@ -1174,37 +1220,66 @@ do
 			ewrite(beatLine(now))
 		end
 		if w.stalled or not w.on or w.ended or quietHooks or forcing or probing or w.exercising then return end
-		local why
+		local why, before
 		if w.virt >= w.wait then
 			why = what(now)
-		elseif w.from then
+		elseif w.from or w.made then
 			if now - w.new >= w.secs then
 				why = what(now)
-			elseif now - w.from >= w.run then
+			elseif now - (w.from or w.madeAt) >= w.run then
 				why = string.format("still running (the limit for a run after the script starts is %d s; new code ran %d s ago)",
 					w.run, now - w.new)
 			end
-		elseif now - w.new >= 4 * w.secs then
-			why = what(now)
-			w.before = true
+			-- Without output or a request, a program made on another interpreter is the start only when the run
+			-- is in it or under it: it can be a helper of the build that the start-up code made (and calls), and
+			-- a spin of the start-up code after that is not the script's.  Otherwise the rules before the start
+			-- apply.
+			if why and not w.from and (w.under(pid) or 0) == 0 then why = nil end
 		end
-		if why then w.stop(now, why, pid) end
+		if not why and not w.from and now - w.new >= 4 * w.secs then
+			why, before = what(now), true
+		end
+		if why then
+			if before then w.before = true end
+			w.stop(now, why, pid)
+		end
+	end
+	-- (the programs the run made on another interpreter, for the lines that say none of them ran)
+	local function madeList()
+		local list, first = {}, protos[1] and protos[1].interp
+		for i, rec in ipairs(protos) do
+			if rec.interp ~= first and not pidAlias[i] then
+				list[#list + 1] = tostring(i)
+				if #list == 4 then list[#list + 1] = "..." break end
+			end
+		end
+		return table.concat(list, ", ")
 	end
 	function w.stop(now, why, pid)
-		-- (where the script was: the program it was stopped in, evidence for pipeline.py like the
-		-- programs its output came from)
+		-- (where the script was: the program it was stopped in and the innermost program of another
+		-- interpreter on its call chain, evidence for pipeline.py like the programs its output came from)
 		if not pid then
 			local v = ring[stepCount % ringN]
 			pid = v and v // 2 ^ 32 or 0
 		end
 		w.where = pid
+		local u = pid > 0 and w.under(pid) or nil
+		w.whereUnder = u
 		if w.from then
 			w.stalled = string.format("the script did not end: it was stopped %d s after %s, %s; code it would "
 				.. "load or fetch later is missing", now - w.from, w.how, why)
+		elseif not w.before and u and u > 0 then
+			-- (what showed the start: the program of another interpreter the run was stopped in or under;
+			-- pipeline.script_programs takes the script from its interpreter, see the [where] line)
+			w.stalled = string.format("the script did not end: it was stopped %d s after the run made program %d on another "
+				.. "interpreter, %s; code it would load or fetch later is missing", now - (protos[u].made or w.madeAt or w.t0),
+				u, why)
 		elseif w.before then
-			w.stalled = string.format("the run did not end and showed nothing of the script (no output, no request, no program "
-				.. "on another interpreter): it was stopped after %d s, %s.  It spins in Luraph's start-up code (an environment "
-				.. "check that failed loops for ever) or in code that shows nothing", now - w.t0, why)
+			w.stalled = string.format("the run did not end and showed nothing of the script (no output, no request, %s): it "
+				.. "was stopped after %d s, %s.  It spins in Luraph's start-up code (an environment check that failed loops "
+				.. "for ever) or in code that shows nothing",
+				w.made and "and it was not in or under a program it made on another interpreter (" .. madeList() .. ")"
+					or "no program on another interpreter", now - w.t0, why)
 		else
 			-- (a wait loop before anything else of the script showed: Luraph's start-up code does not
 			-- wait, so the waiting is the script's own code, run by a program of the first interpreter
@@ -1212,9 +1287,10 @@ do
 			-- state is lifted, unlike a spin before the start: a script that builds its window without
 			-- a word and then sits in its update loop is all in there)
 			w.stalled = string.format("the script did not end: it was stopped after %d s, before it showed itself otherwise "
-				.. "(no output, no request, no program on another interpreter), %s.  Luraph's start-up code does not wait: the "
-				.. "waits are the script's own code, on the first interpreter; code it would load or fetch later is missing",
-				now - w.t0, why)
+				.. "(no output, no request, %s), %s.  Luraph's start-up code does not wait: the waits are the script's own "
+				.. "code, on the first interpreter; code it would load or fetch later is missing", now - w.t0,
+				w.made and "and it was not in or under a program it made on another interpreter (" .. madeList() .. ")"
+					or "no program on another interpreter", why)
 		end
 		aborted = true
 		__LPH_N.k = -1
@@ -1238,7 +1314,9 @@ do
 		if n < 2 then return end
 		-- (a call of the exercise or probe pass ends here: the code it would scramble is the dump's)
 		if w.ended or probing or w.exercising then error("__LPH_BUDGET", 0) end
-		if not w.from then w.before = true end
+		-- (before the start, or after a program made on another interpreter that the run is not in or
+		-- under: nothing of the script to lift, see w.tick)
+		if not w.from and (w.under(pid) or 0) == 0 then w.before = true end
 		w.stop(w.clock(), string.format("at the entry of Luraph's tamper response (program %d, handed %d code arrays of program "
 			.. "%d: it scrambles them and then loops for ever; stopped before it changed them)", pid, n, owner), pid)
 	end
@@ -1274,7 +1352,9 @@ end
 if cwrap and watch.ticking then __LPH_L = cwrap("__LPH_L", __LPH_L) end
 
 local lastRegs, seenErr = nil, {}
-function __LPH_STEP(pid, loop, pc, regs, names, ...)
+-- th: the thread that runs the instruction (cwrap hands it over, see below; nil without cwrap),
+-- whose stack watch.under walks
+function watch.step(th, pid, loop, pc, regs, names, ...)
 	if quietHooks then
 		-- a pool read with an index that is not in the pool can decode garbage for a long time
 		quietSteps += 1
@@ -1282,6 +1362,7 @@ function __LPH_STEP(pid, loop, pc, regs, names, ...)
 		return
 	end
 	if aborted then error(ABORT, 0) end
+	watch.th = th
 	stepCount += 1
 	if stepCount > budgetAt then error("__LPH_BUDGET", 0) end
 	if watch.ticking and stepCount % 1024 == 0 then watch.tick(pidAlias[pid] or pid) end
@@ -1444,8 +1525,11 @@ end
 
 -- Recording costs calls; with a single frame left on the script's stack (it probes for that) a
 -- Lua __LPH_STEP that calls anything would overflow where the bare script does not.
+-- (cwrap with a marker hands the implementation the calling thread; the marker is never returned)
 if cwrap and (oracleOn or traceMode or showErrors or tbPid) then
-	__LPH_STEP = cwrap("__LPH_STEP", __LPH_STEP)
+	__LPH_STEP = cwrap("__LPH_STEP", watch.step, newproxy())
+else
+	function __LPH_STEP(...) return watch.step(nil, ...) end
 end
 
 function __LPH_RUN(names, n, ...)
@@ -1518,10 +1602,11 @@ function __LPH_PROTO(interp, names, n, ...)
 	end
 	protos[#protos + 1] = rec
 	watch.progress += 1
-	if interp ~= protos[1].interp and not watch.from then
-		-- (what showed the start, in the words of pipeline.py's notes, which may call that program a
-		-- helper of the build: "the program(s) the run made on other interpreters")
-		watch.start("the run made program " .. #protos .. " on another interpreter")
+	if interp ~= protos[1].interp and watch.on and not watch.ended and not watch.exercising and not probing then
+		-- (the script's start once the run is found in or under it, see watch.tick: the program can be
+		-- a helper of the build, which pipeline.py's notes then call it)
+		rec.made = watch.clock()
+		if not watch.made then watch.made, watch.madeAt = #protos, rec.made end
 	end
 	if #protos == 1 and mockRef then mockRef.mainThread = coroutine.running() end
 	if traceMode and runLog then ewrite("[proto] pid=" .. #protos .. " interp=" .. interp .. "\n") end
@@ -2737,19 +2822,40 @@ local function afterRun(ok, message)
 		for i, pid in ipairs(list) do list[i] = string.format("%d (%d)", pid, watch.effects[pid]) end
 		ewrite("[effects] the script's output and requests came from programs " .. table.concat(list, ", ") .. "\n")
 	end
+	if next(watch.unders) ~= nil then
+		local list = {}
+		for pid in watch.unders do
+			if pid > 0 then list[#list + 1] = pid end
+		end
+		table.sort(list)
+		for i, pid in ipairs(list) do list[i] = string.format("under program %d (%d)", pid, watch.unders[pid]) end
+		if watch.unders[0] then
+			list[#list + 1] = string.format("under no program of another interpreter (%d)", watch.unders[0])
+		end
+		ewrite("[under] the VM call chains of the script's output and requests: " .. table.concat(list, ", ") .. "\n")
+	end
 	if watch.on then
 		-- (how close the run came to the limits of vmmodel.STALL: diagnosis, and the measure the
 		-- defaults were checked with)
 		local now = watch.clock()
 		ewrite(string.format("[watch] %.0f s of " .. watch.clockName .. "; the script %s; longest stretch without new code: %.0f s "
 			.. "before the start, %.0f s after it; %.0f s of waiting simulated since the last new code\n", now - watch.t0,
-			watch.from and string.format("started at %.0f s (%s)", watch.from - watch.t0, watch.how) or "never showed itself",
+			watch.from and string.format("started at %.0f s (%s)", watch.from - watch.t0, watch.how)
+				or watch.made and string.format("showed no output and no request (the start: the run made program %d on another "
+					.. "interpreter at %.0f s)", watch.made, watch.madeAt - watch.t0)
+				or "never showed itself",
 			watch.gapBefore, watch.gapAfter, watch.virt))
 	end
 	-- how the run ended, for the [oracle] and [end] lines
 	local how = ok and "script returned" or "script stopped: " .. tostring(string.match(tostring(message), "^[^\n]*"))
 	if watch.stalled then
-		if (watch.where or 0) > 0 then ewrite("[where] the run was stopped in program " .. watch.where .. "\n") end
+		if (watch.where or 0) > 0 then
+			-- (and the innermost program of another interpreter on its call chain, watch.under)
+			local u = watch.whereUnder
+			ewrite("[where] the run was stopped in program " .. watch.where .. (u == nil and "" or u == 0 and
+				", under no program of another interpreter" or u == watch.where and ", on another interpreter" or
+				", under program " .. u .. " of another interpreter") .. "\n")
+		end
 		ewrite("[stalled] " .. watch.stalled .. "\n")
 		how = "script did not end (stopped by the watch on a run that does not end)"
 		if watch.before then

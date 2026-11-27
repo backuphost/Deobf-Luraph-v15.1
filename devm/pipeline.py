@@ -88,15 +88,16 @@ def _run_traced(self):
         c = self.dump.conv(p, '__LPH_PROTOS[%d]' % (i + 1)).h.get('caller')
         if isinstance(c, (int, float)):
             callers[i + 1] = int(c)
+    reason = None
     if forced:
         payload = [forced] if forced != root else []
     elif payload:
-        payload, helpers = script_programs([idx for idx, _ in self.lifter.records], payload, notes, callers, first_root)
+        interps = [idx for idx, _ in self.lifter.records]
+        payload, helpers = script_programs(interps, payload, notes, callers, first_root)
         if helpers:
-            self.log('[%s] the script\'s output and requests came from programs of the first interpreter (%s), not from '
-                     'the %d program(s) on other interpreters (%s)' % (
-                         self.tag, ', '.join(str(p) for p in sorted(effect_programs(notes))), len(helpers),
-                         ', '.join(str(p) for p in helpers[:8]) + (', ...' if len(helpers) > 8 else '')))
+            reason = helpers_reason(interps, helpers, notes, callers, first_root)
+            self.log('[%s] %s the %d program(s) on other interpreters (%s)' % (
+                self.tag, reason, len(helpers), ', '.join(str(p) for p in helpers[:8]) + (', ...' if len(helpers) > 8 else '')))
     entered = None
     if not forced and not payload:
         # The script runs on the first interpreter.  Its top level can be part of Luraph's main
@@ -141,7 +142,8 @@ def _run_traced(self):
     if entry:
         self.hints.append('[entry] ' + entry[1])
     if not payload:
-        self.hints.append(startup_note(notes, forced, first_root, len(m.interps), helpers=helpers, entered=entered))
+        self.hints.append(startup_note(notes, forced, first_root, len(m.interps), helpers=helpers, entered=entered,
+                                       reason=reason))
     if payload and not forced and not entry:
         # The proto taken for the script is the first one on the second interpreter.  Where that
         # interpreter only runs a helper, next to nothing is lifted while the run shows the first
@@ -165,35 +167,101 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def script_programs(interps, payload, notes, callers=None, first_root=1):
-    """(payload, helpers): the programs on interpreters other than the first one (`payload`, in
-    order; `interps[i]` is the interpreter of program i + 1) narrowed to those on an interpreter
-    the script's output and requests came from (the harness's [effects] line).  A build can make
-    programs on other interpreters that are helpers (routines of the build) while the script's own code
-    runs on the first interpreter, its top level next to Luraph's start-up code: then no program
-    is left and `helpers` lists the ones set aside (the first program is lifted, with the
-    [startup] note).  Without the line the payload stays as it is.
+def script_votes(interps, payload, notes, callers=None, first_root=1):
+    """({interpreter: count}, kind): where the script's code ran, by the run's evidence, counted for
+    the interpreters it points at (`interps[i]` is the interpreter of program i + 1, `payload` the
+    programs on interpreters other than the first program's, `first_root` the first program).
 
-    The script's program can itself call functions of the first interpreter (routines of the
-    build), and the last VM instruction before a line of its output is then in one of those.  So a
-    program the output came from is followed through `callers` ({program: the program that ran the
-    instruction before its first one}, harness.lua's record) towards the first program: where the
-    chain passes a program of `payload`, the output counts for that program's interpreter."""
-    eff = effect_programs(notes)
+    kind 'under': the harness's [under] line, which places each line of the script's output and
+    each request under the innermost program of another interpreter on its VM call chain (the
+    script's program calls routines of the first interpreter too, and the last VM instruction
+    before its output can be in one of those), or under none (the first interpreter).
+    kind 'effects': without that line, the programs of the [effects] line (the ones that ran the
+    last VM instruction before each), each followed through `callers` ({program: the program
+    that ran the instruction before its first one}, harness.lua's record) towards the first
+    program: where the chain passes a program of `payload`, its count goes to that program's
+    interpreter.  These links are only the caller at a program's first entry, so they are weaker
+    evidence than the call chain, and every program counts as often as its output and requests.
+    kind 'where': a run that did not end and showed no output and no request: the program it was
+    stopped in ([where]), placed like the output, by the call chain where the line gives it and
+    otherwise through `callers`.  ({}, None) without evidence."""
+    first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
     pay, callers = set(payload), callers or {}
-    where = set()
-    for p in eff:
+
+    def interp(p):
+        return interps[p - 1] if 0 < p <= len(interps) else None
+
+    def placed(p):
         x, seen = p, set()
         while x not in pay and x != first_root and x in callers and x not in seen:
             seen.add(x)
             x = callers[x]
-        q = x if x in pay else p
-        if 0 < q <= len(interps):
-            where.add(interps[q - 1])
-    if not where:
+        return interp(x if x in pay else p)
+
+    votes = {}
+
+    def vote(i, n):
+        if i is not None:
+            votes[i] = votes.get(i, 0) + n
+
+    under = under_programs(notes)
+    if under:
+        for p, n in under.items():
+            vote(interp(p) if p else first, n)
+        return votes, 'under'
+    eff = effect_programs(notes)
+    if eff:
+        for p, n in eff.items():
+            vote(placed(p), n)
+        return votes, 'effects'
+    u = stopped_under(notes)
+    if u is not None:
+        vote(interp(u) if u else first, 1)
+        return votes, 'where'
+    for p, n in stopped_in(notes).items():
+        vote(placed(p), n)
+    return votes, ('where' if votes else None)
+
+
+def script_programs(interps, payload, notes, callers=None, first_root=1):
+    """(payload, helpers): the programs on interpreters other than the first one (`payload`, in
+    order; `interps[i]` is the interpreter of program i + 1) narrowed to those on the interpreter
+    the run's evidence points at (script_votes: the script's output and requests, or for a run
+    that did not end and showed neither, the program it was stopped in).  A build can make
+    programs on other interpreters that are helpers (routines of the build) while the script's own
+    code runs on the first interpreter, its top level next to Luraph's start-up code: then no
+    program is left and `helpers` lists the ones set aside (the first program is lifted, with the
+    [startup] note).
+
+    The evidence is weighed: an interpreter other than the first is taken only when more of it
+    points there than at the first interpreter (the one with the most, if several), so that one
+    program among many, say one first called from a helper, does not decide.  Without evidence
+    the payload stays as it is."""
+    votes, _kind = script_votes(interps, payload, notes, callers, first_root)
+    if not votes:
         return payload, None
-    take = [p for p in payload if interps[p - 1] in where]
+    first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
+    others = {i: n for i, n in votes.items() if i != first}
+    best = max(others.values(), default=0)
+    take = [p for p in payload if best > votes.get(first, 0) and others.get(interps[p - 1]) == best]
     return take, (payload if not take else None)
+
+
+def helpers_reason(interps, payload, notes, callers=None, first_root=1):
+    """What made script_programs set the programs on other interpreters aside, in words for the
+    notes: the start of a sentence that goes on with the programs (`... not from` / `... not in or
+    under`)"""
+    votes, kind = script_votes(interps, payload, notes, callers, first_root)
+    first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
+    if kind == 'where':
+        p = next(iter(stopped_in(notes)), None)
+        return ('the run was stopped in program %s, a program of the first interpreter that does not run under a program of '
+                'another interpreter, not in or under' % p)
+    own, total = votes.get(first, 0), sum(votes.values())
+    if own == total:
+        return 'the script\'s output and requests came from programs of the first interpreter, not from'
+    return ('%d of the script\'s %d lines of output and requests came from programs of the first interpreter (%d from under '
+            'programs of other interpreters), not from' % (own, total, total - own))
 
 
 # instructions of the first program that may run for the first time after the program it entered
@@ -269,10 +337,28 @@ def stopped_in(notes):
     """{program: 1} of the harness's [where] line (the program a run that did not end was stopped
     in), {} without it"""
     for n in notes:
-        m = re.match(r'\[where\] the run was stopped in program (\d+)$', n)
+        m = re.match(r'\[where\] the run was stopped in program (\d+)(?:,|$)', n)
         if m:
             return {int(m.group(1)): 1}
     return {}
+
+
+def stopped_under(notes):
+    """The innermost program of another interpreter on the VM call chain where a run that did not
+    end was stopped (the harness's [where] line): that program, 0 for none, None when the line does
+    not say (or there is none)"""
+    for n in notes:
+        m = re.match(r'\[where\] the run was stopped in program (\d+)(.*)$', n)
+        if not m:
+            continue
+        rest = m.group(2)
+        if rest == ', on another interpreter':
+            return int(m.group(1))
+        if rest == ', under no program of another interpreter':
+            return 0
+        u = re.match(r', under program (\d+) of another interpreter$', rest)
+        return int(u.group(1)) if u else None
+    return None
 
 
 def effect_programs(notes):
@@ -284,11 +370,25 @@ def effect_programs(notes):
     return {}
 
 
+def under_programs(notes):
+    """{program: count} of the harness's [under] line: for each line of the script's output and
+    each request, the innermost program of an interpreter other than the first one on its VM call
+    chain, 0 for none ({} without the line)"""
+    for n in notes:
+        if n.startswith('[under] '):
+            got = {int(a): int(b) for a, b in re.findall(r'under program (\d+) \((\d+)\)', n)}
+            m = re.search(r'under no program of another interpreter \((\d+)\)', n)
+            if m:
+                got[0] = int(m.group(1))
+            return got
+    return {}
+
+
 # the words of harness.lua's [stalled] line for a wait loop before the script showed itself otherwise
 WAITED_FIRST = 'before it showed itself otherwise'
 
 
-def startup_note(notes, forced, first_root, interps, helpers=None, entered=None):
+def startup_note(notes, forced, first_root, interps, helpers=None, entered=None, reason=None):
     """The run note for a factory-layout result that is the VM's first program: Luraph's start-up
     code (environment checks, key derivation, decryption), possibly with the script's top level
     flattened into it (v15.2 builds without a payload interpreter).  What the run shows about
@@ -307,10 +407,11 @@ def startup_note(notes, forced, first_root, interps, helpers=None, entered=None)
         '%d line(s) of output' % len(said) if said else '',
         '%d request(s)' % len(asked) if asked else '') if x)
     if helpers:
-        head = ('[startup] the script\'s output and requests came from programs of the first interpreter, not from the %d '
-                'program(s) the run made on other interpreters (%s: helpers): the result is the VM\'s first program, which '
-                'begins with Luraph\'s start-up code.  ' % (len(helpers), ', '.join(str(p) for p in helpers[:8]) +
-                                                             (', ...' if len(helpers) > 8 else '')))
+        # (reason: helpers_reason, what set them aside)
+        head = ('[startup] %s the %d program(s) the run made on other interpreters (%s: helpers): the result is the VM\'s '
+                'first program, which begins with Luraph\'s start-up code.  ' % (
+                    reason or 'the script\'s output and requests came from programs of the first interpreter, not from',
+                    len(helpers), ', '.join(str(p) for p in helpers[:8]) + (', ...' if len(helpers) > 8 else '')))
     else:
         head = ('[startup] the run created no program on an interpreter other than the first one (%d modelled): the result is '
                 'the VM\'s first program, which begins with Luraph\'s start-up code.  ' % interps)
