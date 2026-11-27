@@ -10,23 +10,31 @@ devm/harness.lua and its mock with small limits.
   event's :Wait(), a plain-Lua loop -- is stopped by the harness's watch (harness.lua watch.tick):
   the `[stalled]` line says why, the oracle and the end-state dump are written, and the run ends
   within seconds;
-* the script cannot hold the run up by catching the stop (pcall in a loop);
-* a run that loops before showing anything of the script ends without a dump (Luraph's start-up
-  code spinning: nothing of the script to lift);
+* the script cannot hold the run up by catching the stop (pcall in a loop), also not by waiting on
+  in a loop without a hook (each wait raises the stop again);
+* a run that spins before showing anything of the script ends without a dump (Luraph's start-up
+  code spinning: nothing of the script to lift); one that waits in a loop before showing anything
+  else is dumped and lifted (the start-up code does not wait: the waits are the script's), and the
+  first program's note says so; the [started] line counts the waits before it;
 * a run that keeps making new code is stopped at the run limit; a run that ends is left alone;
 * waits of a coroutine other than the main thread do not count;
 * the exercise pass cannot hang in a plain-Lua loop of an exercised function;
 * Luraph's tamper response (a function handed another program's code arrays) is stopped before it
-  changes anything; before the script showed itself that is a failure without a dump;
+  changes anything; before the script showed itself that is a failure without a dump; tamper=0
+  (devm --no-tamper-stop) lets it run, and the time limits stop it;
 * the harness says which programs the script's output came from (`[effects]`), where a stopped run
   was (`[where]`) and which program called each program first (`caller`); pipeline.script_programs
   and pipeline.entered_program take the script from that evidence (helpers on other interpreters
-  are not the script; a program the start-up code entered at its end and never came back from is);
+  are not the script; in a run that did not end, a program the start-up code entered at the end of
+  its run is lifted on its own, PARTIAL, with a note that the first program's code before the call
+  is missing and `--root 1`; a run that ended keeps the first program, whose note names the
+  entered program);
 * serve mode starts after a stalled run (vmmodel.start_server / run_oracle, the route the lifter
   uses for lazily decoded constants), and run_oracle passes the `[stalled]` line on as a note;
 * the instrumented copy of a VM chunk counts the rounds of its plain-Lua loops (Model.patched_source);
-* the report: a stalled run is PARTIAL with its `[stalled]` line, also read back off a file's head;
-  the front end's final line is `result: PARTIAL: the script did not end: ... (devm)`, and devm's
+* the report: a stalled run is PARTIAL with its `[stalled]` line, a result lifted from the entered
+  program is PARTIAL with its `script program:` line, both also read back off a file's head; the
+  front end's final line is `result: PARTIAL: the script did not end: ... (devm)`, and devm's
   result stands (the second engine is not tried).
 """
 import os
@@ -108,6 +116,31 @@ while true do
     pcall(function() while true do __LPH_STEP(p, 0, 1, regs) end end)
 end
 ''' % LOOP
+# the script catches the stop and then waits on in code without a hook (a plain-Lua `for` loop): the
+# wait itself raises the stop again
+CATCH_THEN_WAIT = '''
+local regs = {}
+local p = __LPH_PROTO(0, {"K"}, 1, {1})
+local ev = Instance.new("BindableEvent")
+print("x")
+pcall(function() while true do task.wait(); __LPH_STEP(p, 0, 1, regs) end end)
+for _ = 1, 2 ^ 40 do pcall(function() end); %s end
+print("not reached")
+'''
+# a script that shows nothing (its top level in the first program) and sits in a wait loop
+SILENT_WAIT = '''
+local regs = {}
+local p = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(p, 0, 1, regs)
+local gui = Instance.new("ScreenGui")
+while true do task.wait(); __LPH_STEP(p, 0, 2, regs) end
+'''
+WAITS_THEN_OUTPUT = '''
+local regs = {}
+local p = __LPH_PROTO(0, {"K"}, 1, {1})
+for i = 1, 3 do task.wait(); __LPH_STEP(p, 0, i, regs) end
+print("ready")
+'''
 SILENT_SPIN = '''
 local regs = {}
 local p = __LPH_PROTO(0, {"K"}, 1, {1})
@@ -211,14 +244,14 @@ class Watch(unittest.TestCase):
 
     def test_vm_loop_after_the_payload_started(self):
         line, err, dump = self.stalled(PAYLOAD_VM_LOOP)
-        self.assertIn('(a program on interpreter 1)', line)
-        self.assertIn('in a loop of its VM code (no new code for 1 s', line)
+        # (what showed the start, in the words of pipeline's notes on programs of other interpreters)
+        self.assertIn('stopped 1 s after the run made program 2 on another interpreter, in a loop of its VM code (no new '
+                      'code for 1 s', line)
         self.assertEqual(len(dump['protos']), 2)
 
     def test_task_wait_loop(self):
         line, err, _ = self.stalled(TASK_WAIT_LOOP)
-        self.assertIn('(its first line of output)', line)
-        self.assertIn('waiting in task.wait()', line)
+        self.assertIn(' after its first line of output, waiting in task.wait()', line)
         # 30 s of waiting simulated at 1/60 s or a little more a call
         n = int(line.split(' waits, ')[0].rsplit(' ', 1)[1])
         self.assertTrue(1400 <= n <= 1801, line)
@@ -249,6 +282,17 @@ class Watch(unittest.TestCase):
     def test_catching_the_stop_does_not_hold_the_run(self):
         self.stalled(CATCHES_THE_STOP)
 
+    def test_a_wait_after_the_stop_raises_it_again(self):
+        """The script catches the stop, then waits (or prints) in a loop the harness has no hook in: each
+        wait raises the stop again (else the run would spin until start_server's last-resort limit)."""
+        for wait in ('task.wait()', 'wait()', 'ev.Event:Wait()', 'game:GetService("RunService").Heartbeat:Wait()',
+                     'print("again")', 'warn("again")'):
+            took, err, dump, oracle = run_probe(CATCH_THEN_WAIT % wait, *self.OPTS, limit=60)
+            self.assertIsNotNone(stalled_line(err), (wait, err[-1500:]))
+            self.assertIsNotNone(dump, (wait, err[-1500:]))
+            self.assertNotIn('not reached', err)
+            self.assertLess(took, 30, wait)
+
     def test_new_code_for_ever_meets_the_run_limit(self):
         line, _, _ = self.stalled(NEW_CODE_FOR_EVER, 'stall=30', 'stallwait=30', 'stallrun=2')
         self.assertIn('still running (the limit for a run after the script starts is 2 s', line)
@@ -275,6 +319,19 @@ class Watch(unittest.TestCase):
         self.assertIn('tamper response', line)
         self.assertIsNone(dump)
 
+    def test_tamper_stop_can_be_switched_off(self):
+        """tamper=0 (devm --no-tamper-stop): the function runs, changes the victim's array, and the time limits
+        stop the run."""
+        took, err, dump, oracle = run_probe(TAMPER % 'warn("no key given")', 'tamper=0', *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertNotIn('tamper response', line)
+        self.assertIn('in a loop of its VM code', line)
+        rec = dump['tables'][str(dump['protos'][0]['t'])]
+        env = next(v for k, v in rec['hash'] if k == {'s': '76617273'})        # "vars"
+        a = next(v for k, v in dump['tables'][str(env['t'])]['hash'] if k == {'s': '41'})     # "A"
+        self.assertNotEqual(dump['tables'][str(a['t'])]['arr'][0], 1)
+
     def test_not_a_tamper_response(self):
         took, err, dump, oracle = run_probe(NOT_TAMPER, *self.OPTS)
         self.assertIsNone(stalled_line(err), err[-1500:])
@@ -294,24 +351,77 @@ class Watch(unittest.TestCase):
         # the failure message devm prints keeps the line (vmmodel.harness_tail)
         self.assertIn('[stalled] the run did not end', vmmodel.harness_tail(err))
 
+    def test_silent_wait_loop_before_the_start_is_lifted(self):
+        """A wait loop before the script showed anything else: Luraph's start-up code does not wait, so the
+        waits are the script's (its top level in the first program): unlike a silent spin, the state is
+        dumped and lifted, and the line says so."""
+        took, err, dump, oracle = run_probe(SILENT_WAIT, *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertNotIn('[started]', err)
+        self.assertTrue(line.startswith('[stalled] the script did not end: it was stopped after '), line)
+        from devm import pipeline
+        self.assertIn(pipeline.WAITED_FIRST, line)
+        self.assertIn('waiting in task.wait()', line)
+        self.assertIn('the waits are the script\'s own code', line)
+        self.assertIsNotNone(dump)
+        self.assertTrue(oracle)
+        self.assertLess(took, 30)
+        # the first program's note does not claim the script showed nothing
+        note = pipeline.startup_note(['[oracle] script did not end', line], None, 1, 2)
+        self.assertIn('The run was stopped while the script waited, before it showed anything else', note)
+
+    def test_waits_before_the_start_are_counted(self):
+        took, err, dump, oracle = run_probe(WAITS_THEN_OUTPUT, *self.OPTS)
+        self.assertIn('[started] the script\'s own code runs (its first line of output) after 3 VM instructions and 3 waits '
+                      'of the main thread', err)
+
     def test_a_run_that_ends_is_left_alone(self):
         for text in (ENDS, COROUTINE_WAITS):
             took, err, dump, oracle = run_probe(text, 'stall=1', 'stallwait=1', 'stallrun=1')
             self.assertIsNone(stalled_line(err), err[-1500:])
             self.assertIn('[oracle] script returned', err)
             self.assertIsNotNone(dump)
+            # how close it came to the limits (the measure the defaults were checked with on the corpus)
+            line = next((ln for ln in err.split('\n') if ln.startswith('[watch] ')), '')
+            self.assertRegex(line, r'^\[watch\] \d+ s of processor time; the script started at \d+ s \(its first line of '
+                                   r'output\); longest stretch without new code: \d+ s before the start, \d+ s after it; ')
 
-    def test_off_without_options(self):
-        """Without the options the watch is off: the old behaviour for every other harness run."""
+    def test_no_time_limits_without_options(self):
+        """Without stall= / stallwait= / stallrun= the watch has no time limits: a long wait loop runs to its
+        end.  (oracle=1 dumpend=1 still turn the watch on: [effects], callers, the tamper-response check.)"""
         took, err, dump, oracle = run_probe(TASK_WAIT_LOOP.replace('while true do', 'for _ = 1, 40000 do'))
         self.assertIsNone(stalled_line(err), err[-1500:])
         self.assertIn('[oracle] script returned', err)
+        self.assertIn('[started] the script\'s own code runs (its first line of output)', err)
 
     def test_exercise_cannot_hang_in_a_plain_loop(self):
         took, err, dump, oracle = run_probe(EXERCISED_LOOP, 'exercise=1', *self.OPTS)
         self.assertIn('[exercise] called 1 payload closures', err)
         self.assertIsNotNone(dump, err[-1500:])
         self.assertLess(took, 60)
+
+    def test_limits_are_processor_time(self):
+        """The limits count the harness's processor time (/proc/self/stat), not wall-clock time: a run that
+        waits for a processor (here: stopped for 3 s) does not reach them sooner."""
+        import signal
+        if not os.path.exists('/proc/self/stat'):
+            self.skipTest('no /proc')
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, 'sample.lua')
+            with open(src, 'w') as f:
+                f.write(PAYLOAD_VM_LOOP)
+            p = subprocess.Popen([vmmodel.find_luau(), HARNESS, '-a', src, os.path.join(d, 'end.json'), 'oracle=1', 'dumpend=1',
+                                  'stall=2', 'stallwait=30', 'stallrun=20'], stderr=subprocess.PIPE, text=True, errors='replace')
+            time.sleep(0.3)
+            p.send_signal(signal.SIGSTOP)
+            time.sleep(3)
+            p.send_signal(signal.SIGCONT)
+            err = p.communicate(timeout=120)[1]
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('in a loop of its VM code (no new code for 2 s', line)
+        self.assertIn('s of processor time;', next(ln for ln in err.split('\n') if ln.startswith('[watch] ')))
 
     def test_beat_lines(self):
         took, err, dump, oracle = run_probe(PAYLOAD_VM_LOOP, 'beat=1', *self.OPTS)
@@ -360,10 +470,34 @@ class ServeAfterStall(unittest.TestCase):
 
     def test_options(self):
         self.assertEqual(vmmodel.stall_options(), ['stall=%d' % vmmodel.STALL['stall'], 'stallwait=%d' % vmmodel.STALL['stallwait'],
-                                                   'stallrun=%d' % vmmodel.STALL['stallrun']])
-        self.assertEqual(vmmodel.stall_options(['stall=5'], stallwait=7, stallrun=None),
+                                                   'stallrun=%d' % vmmodel.STALL['stallrun'], 'tamper=1'])
+        self.assertEqual(vmmodel.stall_options(['stall=5', 'tamper=0'], stallwait=7, stallrun=None),
                          ['stallwait=7', 'stallrun=%d' % vmmodel.STALL['stallrun']])
-        self.assertEqual(vmmodel.stall_options(stall=0, stallwait=0, stallrun=0), ['stall=0', 'stallwait=0', 'stallrun=0'])
+        self.assertEqual(vmmodel.stall_options(stall=0, stallwait=0, stallrun=0, tamper=0),
+                         ['stall=0', 'stallwait=0', 'stallrun=0', 'tamper=0'])
+
+    def test_devm_option(self):
+        """devm.run --no-tamper-stop reaches the harness as tamper=0 (through deob.py / allinone.py: --engine-args)."""
+        seen = {}
+
+        def fake(path, workdir, **kw):
+            seen.update(kw)
+            raise run.DevmError('no model', 'stop here')
+        import signal
+        keep, handlers = run.deobfuscate, {n: signal.getsignal(n) for n in (signal.SIGTERM, signal.SIGHUP)}
+        run.deobfuscate = fake
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                with self.assertRaises(SystemExit):
+                    run.main([os.path.join(d, 'x.lua'), '-o', os.path.join(d, 'o.lua'), '--work', d, '--no-tamper-stop'])
+                self.assertIs(seen.get('tamper_stop'), False)
+                with self.assertRaises(SystemExit):
+                    run.main([os.path.join(d, 'x.lua'), '-o', os.path.join(d, 'o.lua'), '--work', d])
+                self.assertIsNone(seen.get('tamper_stop'))
+        finally:
+            run.deobfuscate = keep
+            for n, h in handlers.items():
+                signal.signal(n, h)
 
 
 @unittest.skipUnless(os.path.exists(SAMPLE), 'needs the v15.2 sample')
@@ -389,27 +523,28 @@ class ScriptPrograms(unittest.TestCase):
 
     def test_helpers_on_other_interpreters(self):
         from devm import pipeline
-        interps = [5] * 36 + [0] + [5] * 32 + [4] + [5] * 4      # programs 37 (interpreter 0) and 70 (4)
-        notes = ['[effects] the script\'s output and requests came from programs 35 (1), 36 (1)']
-        self.assertEqual(pipeline.script_programs(interps, [37, 70], notes), ([], [37, 70]))
-        note = pipeline.startup_note(notes + ['[script] print: hi'], None, 1, 6, helpers=[37, 70])
+        interps = [3, 3, 3, 1, 3, 2, 3]      # programs 4 (interpreter 1) and 6 (interpreter 2)
+        notes = ['[effects] the script\'s output and requests came from programs 2 (1), 3 (1)']
+        self.assertEqual(pipeline.script_programs(interps, [4, 6], notes), ([], [4, 6]))
+        note = pipeline.startup_note(notes + ['[script] print: hi'], None, 1, 3, helpers=[4, 6])
         self.assertTrue(note.startswith('[startup] the script\'s output and requests came from programs of the first '
-                                        'interpreter, not from the 2 program(s) the run made on other interpreters (37, 70'), note)
+                                        'interpreter, not from the 2 program(s) the run made on other interpreters (4, 6'), note)
         self.assertIn('The script\'s top level ran inside that program', note)
 
     def test_payload_interpreter(self):
         from devm import pipeline
-        interps = [1] * 35 + [2] * 3 + [3]
-        notes = ['[effects] the script\'s output and requests came from programs 37 (2)']
-        self.assertEqual(pipeline.script_programs(interps, [36, 37, 38, 39], notes), ([36, 37, 38], None))
+        interps = [1] * 4 + [2] * 3 + [3]
+        notes = ['[effects] the script\'s output and requests came from programs 6 (2)']
+        self.assertEqual(pipeline.script_programs(interps, [5, 6, 7, 8], notes), ([5, 6, 7], None))
         # without the evidence nothing changes
-        self.assertEqual(pipeline.script_programs(interps, [36, 37, 38, 39], []), ([36, 37, 38, 39], None))
-        self.assertEqual(pipeline.effect_programs(notes), {37: 2})
+        self.assertEqual(pipeline.script_programs(interps, [5, 6, 7, 8], []), ([5, 6, 7, 8], None))
+        self.assertEqual(pipeline.effect_programs(notes), {6: 2})
 
 
 class EnteredProgram(unittest.TestCase):
-    """pipeline.entered_program: the program Luraph's start-up code entered at its end and never came
-    back from is the script, when the script's output came from programs that run under it."""
+    """pipeline.entered_candidate / entered_program: the program Luraph's start-up code entered at the end of
+    its run, when the script's output came from programs that run under it.  Only a run that did not end
+    is lifted from that program, and the note says what the result then lacks."""
 
     @staticmethod
     def oracle(firsts):
@@ -424,36 +559,59 @@ class EnteredProgram(unittest.TestCase):
         from devm import pipeline
         callers = {2: 1, 3: 1, 4: 3, 5: 4, 6: 3}
         oracle = self.oracle({1: [1, 2, 3, 99], 2: [10], 3: [100, 101], 4: [102], 5: [103], 6: [104]})
-        got = pipeline.entered_program({5: 1, 6: 1}, callers, oracle)
+        self.assertEqual(pipeline.entered_candidate({5: 1, 6: 1}, callers, oracle), (3, 100, 0))
+        got = pipeline.entered_program({5: 1, 6: 1}, callers, oracle, stalled=True)
         self.assertEqual(got[0], 3)
-        self.assertIn('program 3 is the script: the first program (Luraph\'s start-up code) called it at step 100 and '
-                      'ran no new instruction after that', got[1])
+        self.assertIn('program 3 is taken for the script: the run did not end, and the first program called it at step 100 '
+                      'and ran no new instruction after that', got[1])
+        # what the result lacks, and how to get it
+        self.assertIn('The first program\'s code before that call is not in the result: Luraph\'s start-up code, and any '
+                      'part of the script\'s top level that Luraph put in that program (--root 1 lifts the first program)',
+                      got[1])
+
+    def test_a_run_that_ended_keeps_the_first_program(self):
+        """A v15.2-style build: the first program is Luraph's start-up code followed by the script's top level
+        (300 instructions), whose last statement calls the script's main function (program 2), which
+        prints; the run returns.  Lifting program 2 alone would drop the top level: the first program is
+        the result, and its note names program 2."""
+        from devm import pipeline
+        oracle = self.oracle({1: list(range(1, 301)) + [400, 401, 402], 2: list(range(301, 351))})
+        self.assertEqual(pipeline.entered_candidate({2: 3}, {2: 1}, oracle, 1), (2, 301, 3))
+        self.assertIsNone(pipeline.entered_program({2: 3}, {2: 1}, oracle, 1))
+        self.assertIsNone(pipeline.entered_program({2: 3}, {2: 1}, oracle, 1, stalled=False))
+        note = pipeline.startup_note(['[oracle] script returned after 402 instructions', '[script] print: hi'], None, 1, 1,
+                                     entered=(2, 301, 3))
+        self.assertIn('The script\'s top level ran inside that program', note)
+        self.assertIn('The output came from program 2 (and what it calls), which the first program called at the end of '
+                      'its run: --root 2 lifts it on its own, without the first program\'s code before the call', note)
 
     def test_top_level_in_the_first_program(self):
         from devm import pipeline
         callers = {2: 1, 3: 2}
         # the first program said something itself
-        self.assertIsNone(pipeline.entered_program({1: 1, 3: 1}, callers, self.oracle({1: [1], 2: [5], 3: [6]})))
+        self.assertIsNone(pipeline.entered_program({1: 1, 3: 1}, callers, self.oracle({1: [1], 2: [5], 3: [6]}),
+                                                   stalled=True))
         # ... or went on with code of its own after it called the program the output came from
         oracle = self.oracle({1: [1] + list(range(10, 60)), 2: [5], 3: [6]})
-        self.assertIsNone(pipeline.entered_program({3: 1}, callers, oracle))
+        self.assertIsNone(pipeline.entered_program({3: 1}, callers, oracle, stalled=True))
+        self.assertIsNone(pipeline.entered_candidate({3: 1}, callers, oracle))
         # a few new instructions of the start-up code's own epilogue are allowed
         oracle = self.oracle({1: [1, 2] + list(range(10, 20)), 2: [5], 3: [6]})
-        self.assertEqual(pipeline.entered_program({3: 1}, callers, oracle)[0], 2)
+        self.assertEqual(pipeline.entered_program({3: 1}, callers, oracle, stalled=True)[0], 2)
 
     def test_stopped_in(self):
         from devm import pipeline
         self.assertEqual(pipeline.stopped_in(['[where] the run was stopped in program 7']), {7: 1})
         self.assertEqual(pipeline.stopped_in(['[stalled] x']), {})
         got = pipeline.entered_program({5: 1}, {2: 1, 5: 2}, self.oracle({1: [1], 2: [10], 5: [11]}),
-                                       evidence='the run was stopped in')
+                                       evidence='the run was stopped in', stalled=True)
         self.assertIn('the run was stopped in program(s) 5', got[1])
 
     def test_no_evidence(self):
         from devm import pipeline
-        self.assertIsNone(pipeline.entered_program({}, {2: 1}, self.oracle({1: [1], 2: [5]})))
+        self.assertIsNone(pipeline.entered_program({}, {2: 1}, self.oracle({1: [1], 2: [5]}), stalled=True))
         # (a chain that does not reach the first program)
-        self.assertIsNone(pipeline.entered_program({3: 1}, {3: 0}, self.oracle({1: [1], 3: [5]})))
+        self.assertIsNone(pipeline.entered_program({3: 1}, {3: 0}, self.oracle({1: [1], 3: [5]}), stalled=True))
 
 
 @unittest.skipUnless(have_luau(), 'needs bin/luau')
@@ -481,7 +639,7 @@ print("from a")
 
 
 class Report(unittest.TestCase):
-    STALL = ('[stalled] the script did not end: it was stopped 91 s after it started (its first line of output), '
+    STALL = ('[stalled] the script did not end: it was stopped 91 s after its first line of output, '
              'waiting in task.wait() (no new code for 90 s: 5400 waits, 90 s of waiting simulated, 21600 VM '
              'instructions); code it would load or fetch later is missing')
     NOTES = ['[oracle] script did not end (stopped by the watch on a run that does not end) after 1200 instructions',
@@ -496,6 +654,29 @@ class Report(unittest.TestCase):
         lines = run.report('local x = 1\nprint(x)\n', notes=self.NOTES, parse=(True, None, ''))
         self.assertEqual(lines[0], 'result: PARTIAL')
         self.assertTrue(any(ln.startswith('  the script did not end') for ln in lines), lines)
+
+    ENTRY = ('[entry] program 2 is taken for the script: the run did not end, and the first program called it at step 301 '
+             'and ran no new instruction after that; the script\'s output came from program(s) 2, which run under it.  The '
+             'first program\'s code before that call is not in the result: Luraph\'s start-up code, and any part of the '
+             'script\'s top level that Luraph put in that program (--root 1 lifts the first program)')
+
+    def test_entry_is_partial(self):
+        """A result lifted from the program the start-up code entered lacks the first program's code before the
+        call: never `complete`, and the report says what is missing and how to get it."""
+        notes = ['[oracle] script returned after 1200 instructions', self.ENTRY]
+        lines = run.report('local x = 1\nprint(x)\n', notes=notes, parse=(True, None, ''))
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertIn('  the result is program 2 on its own, which the VM\'s first program called at the end of its run: the '
+                      'first program\'s code before that call is not in it (Luraph\'s start-up code, and any part of the '
+                      'script\'s top level Luraph put there); --root 1 lifts the first program', lines)
+        # ... also read back off the head of a file devm wrote
+        head = run.run_report(notes)
+        self.assertIn(run.ENTRY_LINE + self.ENTRY[len('[entry] '):], head)
+        text = '-- x.lua, %s.  How the run went and what this file lacks:\n%s\nlocal x = 1\nprint(x)\n' % (
+            run.HEAD_MARK, '\n'.join('--   ' + ln for ln in head + lines))
+        again = run.report(text)
+        self.assertEqual(again[0], 'result: PARTIAL')
+        self.assertTrue(any(ln.startswith('  the result is program 2 on its own') for ln in again), again)
 
     def test_read_off_the_head(self):
         text = '-- x.lua, %s.  How the run went and what this file lacks:\n--   %s\n--   result: PARTIAL\nlocal x = 1\n' % (
@@ -538,9 +719,16 @@ class FrontEnd(unittest.TestCase):
         self.assertFalse(tried)
         self.assertTrue(os.path.exists(out))
         last = self.said[-1]
-        self.assertTrue(last.startswith('result: PARTIAL: the script did not end: it was stopped 91 s after it started'), last)
+        self.assertTrue(last.startswith('result: PARTIAL: the script did not end: it was stopped 91 s after its first line of output'), last)
         self.assertIn('code it would load or fetch later is missing', last)
         self.assertTrue(last.endswith('(devm)'), last)
+
+    def test_entry_result_says_so(self):
+        self.fake_devm([Report.STALL, run.ENTRY_LINE + Report.ENTRY[len('[entry] '):], 'result: PARTIAL'])
+        res = allinone.run_devm('in.lua', os.path.join(self.tmp.name, 'o.lua'), work=os.path.join(self.tmp.name, 'w'))
+        self.assertFalse(res['complete'])
+        self.assertIn('the result is program 2, without the code of the VM\'s first program before it called it (--root 1 '
+                      'lifts that program)', res['why'])
 
     def test_startup_result_says_so(self):
         self.fake_devm([Report.STALL, 'start-up code: the run created no program on an interpreter other than the first '

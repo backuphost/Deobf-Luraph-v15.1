@@ -218,12 +218,20 @@ which can only turn borderline results from complete into partial.
   own code has run 90 s without anything new (`--stall`), has waited 600 s in `task.wait` / `wait`
   / an event's `:Wait()` without anything new (`--stall-wait`; nothing really waits in the mock, so
   these waits are counted), or 600 s after it started (`--stall-run`), and at once when it enters
-  Luraph's tamper response; options go through `--engine-args`.  What the script had built up to
-  that moment is lifted and the result is **partial** (exit 6), with a line
-  `[stalled] the script did not end: it was stopped N s after it started, <in what>; code it would
-  load or fetch later is missing`.  A run that never showed anything of the script (no output, no
-  request, no program of its own) is not written out: Luraph's start-up code is never presented
-  as the script, and the next engine is tried.
+  Luraph's tamper response (`--no-tamper-stop` lets it run); options go through `--engine-args`.
+  What the script had built up to that moment is lifted and the result is **partial** (exit 6),
+  with a line `[stalled] the script did not end: it was stopped N s after <its first output, its
+  first request, ...>, <in what>; code it would load or fetch later is missing`.  A run stopped
+  in a busy loop before it showed anything of the script (no output, no request, no program on
+  another interpreter) is not written out: that is Luraph's start-up code, which is never
+  presented as the script, and the next engine is tried.  A run stopped *waiting* in a loop before
+  it showed anything else is lifted: the start-up code does not wait, so the waits are the script's
+  (a script that builds its window silently and then sits in its update loop); the result is the
+  VM's first program, labelled as beginning with the start-up code.  Where the script is a program
+  the start-up code entered at the end of its run, a run that did not end is lifted from that
+  program alone and says that the first program's code before the call is missing (`--root 1`
+  lifts it).  The defaults were checked on the sample corpus: see `devm/README.md`, "A script that
+  does not end".
 - **Names, comments, formatting** do not survive protection and cannot be recovered by any tool.
   Names are re-derived from use (`starterGui`, `getService`), the rest are numbered (`v12`).
 - **"complete" is the engine's own judgement**: no unlifted instruction, no missing constant, all

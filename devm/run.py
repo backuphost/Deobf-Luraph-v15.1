@@ -239,7 +239,7 @@ def v152_generation(model):
     return any(l[2][0][0] == 'local' and vmmodel._outlined_test(l[2], l[2][0]) for l in model.loops)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True, stall=None, stall_wait=None, stall_run=None, beat=None):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True, stall=None, stall_wait=None, stall_run=None, beat=None, tamper_stop=None):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -367,7 +367,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # code decrypts itself too.
         # (a script that does not end is stopped by the harness and its state lifted where it was:
         # vmmodel.STALL; beat=<s> logs what the run is doing every <s> seconds)
-        stage.harness_options = vmmodel.stall_options(stall=stall, stallwait=stall_wait, stallrun=stall_run) + \
+        stage.harness_options = vmmodel.stall_options(stall=stall, stallwait=stall_wait, stallrun=stall_run,
+                                                     tamper=None if tamper_stop is None else int(bool(tamper_stop))) + \
             (['beat=%d' % beat] if beat else []) + (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
         # (a script in its shipped layout keeps its source's control flow: nothing to unflatten.
         # Luraph v15.2 does flatten: its start-up code and the script's main function share one
@@ -737,6 +738,10 @@ def main(argv=None):
                          'new code (nothing really waits in the mock, so these are counted; default %d)' % vmmodel.STALL['stallwait'])
     ap.add_argument('--stall-run', type=int, default=None, metavar='S',
                     help='... or this many seconds after its own code started, new code or not (default %d)' % vmmodel.STALL['stallrun'])
+    ap.add_argument('--no-tamper-stop', dest='tamper_stop', action='store_false', default=None,
+                    help='factory layout (v15): do not stop the traced run at the entry of Luraph\'s tamper response (a '
+                         'VM function handed two or more code arrays of another program); it then scrambles them and '
+                         'loops for ever, and the time limits above stop it')
     ap.add_argument('--beat', type=int, default=None, metavar='S',
                     help='diagnosis: the traced run logs what it is doing every S seconds ([beat] lines in the harness\'s '
                          'stderr, serve/stderr.txt in the work directory)')
@@ -766,7 +771,7 @@ def main(argv=None):
 
     stop_on_signals()
     try:
-        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis, stall=a.stall, stall_wait=a.stall_wait, stall_run=a.stall_run, beat=a.beat)
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis, stall=a.stall, stall_wait=a.stall_wait, stall_run=a.stall_run, beat=a.beat, tamper_stop=a.tamper_stop)
     except Terminated as e:
         if vmmodel.SERVER is not None:
             vmmodel.SERVER.close()
@@ -828,6 +833,8 @@ HEAD_MARK = 'recovered by devm (python -m devm.run)'      # first line of a file
 SINGLE_ROOT_LINE = 'the VM has a single root program'
 STARTUP_LINE = 'start-up code: '
 HINT_LINE = '  hint: '
+# pipeline.entered_program: the result is the program Luraph's start-up code entered, not the first program
+ENTRY_LINE = 'script program: '
 PARSE_PREFIX = '  the text does not parse: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
 
@@ -921,7 +928,7 @@ def run_report(notes):
         elif n.startswith('[hint]'):
             out.append(HINT_LINE + n[len('[hint] '):])
         elif n.startswith('[entry] '):
-            out.append('  ' + n[len('[entry] '):])
+            out.append(ENTRY_LINE + n[len('[entry] '):])
         elif n.startswith('[cut] '):
             out.append('  note: ' + n[len('[cut] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
@@ -969,6 +976,8 @@ def report(text, returned=None, notes=None, parse=None):
                 head_notes.append('[hint] ' + lines[0][len('--   ' + HINT_LINE):])
             elif lines[0].startswith('--   [stalled] '):
                 head_notes.append(lines[0][len('--   '):])
+            elif lines[0].startswith('--   ' + ENTRY_LINE):
+                head_notes.append('[entry] ' + lines[0][len('--   ' + ENTRY_LINE):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
@@ -977,6 +986,9 @@ def report(text, returned=None, notes=None, parse=None):
     startup = any(n.startswith('[startup]') for n in notes)
     # the traced run did not end: the harness stopped it (vmmodel.STALL)
     stalled = any(n.startswith('[stalled]') for n in notes)
+    # the result is the program Luraph's start-up code entered (pipeline.entered_program): the first
+    # program's code before that call is not in it
+    entry = next((n for n in notes if n.startswith('[entry]')), None)
     # pipeline's hint: the proto taken for the script is tiny and calls nothing but pure library
     # functions, while the first program did all the work (the script is probably that program)
     hint = next((n for n in notes if n.startswith('[hint]')), None)
@@ -1024,7 +1036,7 @@ def report(text, returned=None, notes=None, parse=None):
     out = []
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled):
+            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + unchecked + traps
     out.append('result: PARTIAL')
@@ -1047,6 +1059,12 @@ def report(text, returned=None, notes=None, parse=None):
     if stalled:
         out.append('  the script did not end (see the [stalled] line above): the run was stopped and the state at that moment '
                    'lifted; what it would have done later (code it would load, fetch or decrypt after the wait) is not in the result')
+    if entry:
+        m, r = re.match(r'\[entry\] program (\d+) ', entry), re.search(r'--root (\d+)', entry)
+        out.append('  the result is %s on its own, which the VM\'s first program called at the end of its run: the first '
+                   'program\'s code before that call is not in it (Luraph\'s start-up code, and any part of the script\'s '
+                   'top level Luraph put there); --root %s lifts the first program' % (
+                       'program ' + m.group(1) if m else 'a program', r.group(1) if r else 1))
     if startup:
         out.append('  the result is the VM\'s first program, which begins with Luraph\'s start-up code: the script was not '
                    'found as a program of its own (what the run shows about it is in the start-up code line above)')

@@ -403,6 +403,14 @@ def run_devm(inp, out, work=None, timeout=None, extra=()):
         if any(l.startswith("start-up code: ") for l in report):
             why.append("the result is the VM's first program, which begins with Luraph's start-up code "
                        "(the script is not separated from it)")
+        # (devm.run ENTRY_LINE, pipeline.entered_program: the program the start-up code entered at
+        # the end of its run, lifted without the first program's code before that call)
+        entry = next((l for l in report if l.startswith("script program: ")), None)
+        if entry:
+            m, r = re.match(r"script program: program (\d+) ", entry), re.search(r"--root (\d+)", entry)
+            why.append("the result is %s, without the code of the VM's first program before it called it "
+                       "(--root %s lifts that program)" % ("program " + m.group(1) if m else "a program the first one called",
+                                                            r.group(1) if r else 1))
     reason = None
     if not ok:
         reason = why[0] if why else ("devm: timed out after %d s" % timeout if status is None

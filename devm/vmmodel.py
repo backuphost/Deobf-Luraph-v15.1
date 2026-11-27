@@ -1126,15 +1126,19 @@ def harness_tail(stderr, limit=600):
 
 # The traced run of a script that does not end (a key system waiting for its key, a GUI script in
 # its event loop, `while true do task.wait() end`): the harness stops it and takes the end-state
-# dump there (harness.lua, watch.tick).  Seconds of the run's processor time:
+# dump there (harness.lua, watch.tick).  Seconds of the run's processor time (/proc/self/stat; Luau's
+# os.clock is a wall clock):
 #   stall      after the script's own code started, this long without a VM instruction running
 #              for the first time (or a program being made); 4 x this before it started ends the
 #              run without a dump (Luraph's start-up code spinning: nothing of the script to lift)
 #   stallwait  this much waiting simulated by the mock (task.wait, wait, an event's :Wait())
 #              without new code
 #   stallrun   this long after the script's own code started, new code or not
-# 0 switches one off.  devm.run --stall / --stall-wait / --stall-run set them.
-STALL = {'stall': 90, 'stallwait': 600, 'stallrun': 600}
+#   tamper     1: stop the run at the entry of Luraph's tamper response (a VM function handed two or
+#              more code arrays of another program, harness.lua watch.entered), before it scrambles
+#              them; 0: let it run (it then loops for ever and a time limit stops it)
+# 0 switches one off.  devm.run --stall / --stall-wait / --stall-run / --no-tamper-stop set them.
+STALL = {'stall': 90, 'stallwait': 600, 'stallrun': 600, 'tamper': 1}
 
 
 def stall_options(options=(), **given):
@@ -1184,7 +1188,8 @@ def run_oracle(model, workdir, tag, options=()):
         pass
     r.stderr = stderr
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
-    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive', '[stalled]', '[effects]', '[where]'))]
+    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive', '[stalled]', '[effects]', '[where]',
+                                                                      '[started]', '[watch]'))]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
         raise RuntimeError('oracle run failed: ' + harness_tail(r.stderr))
     with open(outjson + '.oracle') as f:

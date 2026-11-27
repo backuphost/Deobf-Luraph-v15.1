@@ -1842,6 +1842,10 @@ class Printer:
             elif f[0] == 'method' and args and args[0][0] == 'selfarg':
                 head = self.prefix(f[1]) + ':' + f[2]
                 args = args[1:]
+            elif f[0] == 'closure':
+                # a function made and called on the spot: once one made at several places is defined
+                # once (Decompiler.run, HOIST_SHARED), its name; otherwise its text in parentheses
+                head = self.d.shared_call(f, args) or '(' + self.d.closure_text(f, self) + ')'
             else:
                 head = self.prefix(f)
             parts = [self.expr(a) for a in args]
@@ -1875,6 +1879,7 @@ class Printer:
         if t == 'table':
             return self.table(e)
         if t == 'closure':
+            self.d.closure_seen(e)
             return self.d.closure_text(e, self)
         if t == 'selfarg':
             return 'nil --[[self]]'
@@ -1960,6 +1965,7 @@ class Printer:
             else:
                 self.emit('local %s' % ', '.join(st[1]))
         elif t == 'localfunction':
+            self.d.closure_seen(st[2])
             text = self.d.closure_text(st[2], self, name=st[1])
             self.emit('local ' + text)
         elif t == 'call':
@@ -2030,6 +2036,16 @@ class Printer:
 
 
 FLAT_FALLBACK = True
+# A function of the protected code that is made afresh and called on the spot at several places
+# (Luraph's VM makes a new closure of one program at each call: `(function(p1, ...) ... end)(...)`
+# five times over) is printed once, as a local function at the top of the result, and called by
+# name.  Only where that cannot change what the code does: the function captures nothing (no
+# upvalue: a closure made here or there is the same function), every place calls it on the spot
+# (it is never stored, so no one can compare two of them), and every place passes the same large
+# literal numbers (Luraph's per-call keys and opaque numbers, which the text passes of opaque.py
+# fold per call site of a function called on the spot, and for a named function only where all
+# callers agree).  Decompiler.run decides after a first printing.
+HOIST_SHARED = True
 
 # Luraph's tamper response is a function that loads the instruction arrays of its own VM function
 # into registers and hands them to a routine that overwrites them (called wherever a check of the
@@ -2115,6 +2131,11 @@ class Decompiler:
         self.native_text = native_text
         self.stats = {'protos': 0, 'unstructured': 0, 'warnings': []}
         self.done = {}
+        # HOIST_SHARED: what the first printing saw (key -> [(captures nothing, big literals passed)],
+        # keys made anywhere else than on the spot of a call), and in the second one the functions
+        # printed once (key -> name, None until first used), in the order of first use
+        self.on_spot, self.elsewhere = {}, set()
+        self.hoist, self.hoist_used, self.hoist_deps, self.hoist_cur = {}, [], {}, None
 
     def proto_ast(self, key):
         """(params, vararg, ast)"""
@@ -2160,6 +2181,48 @@ class Decompiler:
             # crash code is compiled into it, but it is not the tamper response)
             ast.insert(0, ['comment', TRAP_NOTE])
         return params, cfg.vararg, ast
+
+    @staticmethod
+    def _big_literals(args):
+        """the large numeric literals among a call's arguments, by position (see HOIST_SHARED)"""
+        out = []
+        for i, a in enumerate(args):
+            if a[0] == 'un' and a[1] == '-':
+                a = a[2]
+            if a[0] == 'k' and isinstance(a[1], (int, float)) and not isinstance(a[1], bool) and abs(a[1]) >= 10 ** 6:
+                out.append((i, a[1]))
+        return tuple(out)
+
+    def closure_seen(self, e):
+        """a closure printed anywhere but at the head of a call (first printing)"""
+        if not self.hoist:
+            self.elsewhere.add(e[1])
+
+    def shared_call(self, f, args):
+        """the name of the function printed once for a closure called on the spot, else None (and
+        the first printing takes note of the call)"""
+        key = f[1]
+        if not self.hoist:
+            if not isinstance(key, tuple):
+                self.on_spot.setdefault(key, []).append((not f[2], self._big_literals(args)))
+            return None
+        if key not in self.hoist or f[2]:
+            return None
+        if self.hoist[key] is None:
+            self.hoist[key] = self.namer.var()
+            self.hoist_used.append(key)
+        if self.hoist_cur is not None:
+            self.hoist_deps.setdefault(self.hoist_cur, set()).add(key)
+        return self.hoist[key]
+
+    def shared_keys(self):
+        """the functions to print once (HOIST_SHARED), from what the first printing saw"""
+        out = []
+        for key, seen in self.on_spot.items():
+            if len(seen) >= 2 and key != self.root_key and key not in self.elsewhere and all(c for c, _ in seen) \
+                    and len({b for _, b in seen}) == 1:
+                out.append(key)
+        return out
 
     def closure_text(self, e, printer, name=None):
         key = e[1]
@@ -2207,4 +2270,62 @@ class Decompiler:
         p = Printer(self, [])
         p.level = -1
         p.block(ast)
-        return '\n'.join(p.lines) + '\n'
+        text = '\n'.join(p.lines) + '\n'
+        # (not for opaque.relift_params, which reads `-- proto N` heads and the calls of named
+        # functions off the text, and not when the heads are asked for)
+        keys = self.shared_keys() if HOIST_SHARED and not os.environ.get('DEVM_PROTO_IDS') else []
+        if not keys:
+            return text
+        return self.run_shared(keys) or text
+
+    def run_shared(self, keys):
+        """The second printing (HOIST_SHARED): the functions in `keys` once, at the top, as local
+        functions, called by name; None where that does not work out (a function that does not
+        print as one, functions that make each other, too many locals at the top level)."""
+        first = self.namer, self.stats
+        self.namer, self.stats = Namer(), {'protos': 0, 'unstructured': 0, 'warnings': []}
+        self.hoist = {k: None for k in keys}
+        params, vararg, ast = self.proto_ast(self.root_key)
+        p = Printer(self, [])
+        p.level = -1
+        p.block(ast)
+        defs = {}
+        i = 0
+        while i < len(self.hoist_used):
+            key = self.hoist_used[i]
+            i += 1
+            d = Printer(self, [])
+            d.level = 0
+            self.hoist_cur = key
+            text = self.closure_text(('closure', key, ()), d, name=self.hoist[key])
+            self.hoist_cur = None
+            if not text.startswith('function %s(' % self.hoist[key]):
+                break
+            defs[key] = text
+        order, state = [], {}
+
+        def visit(k):
+            # (a function is defined before the ones that call it; functions that call each other
+            # cannot all be defined first)
+            if state.get(k) == 1:
+                return False
+            if state.get(k) == 2:
+                return True
+            state[k] = 1
+            if not all(visit(x) for x in sorted(self.hoist_deps.get(k, ()), key=str)):
+                return False
+            state[k] = 2
+            order.append(k)
+            return True
+        ok = len(defs) == len(self.hoist_used) and all(visit(k) for k in self.hoist_used) \
+            and max_locals(ast) + len(params) + len(defs) <= 195
+        if not ok:
+            self.namer, self.stats = first
+            self.hoist = {}
+            return None
+        lines = ['-- (the protected code makes %s afresh at each place that calls %s; %s nothing, so %s defined once '
+                 'here)' % (('this function', 'it', 'it captures', 'it is') if len(order) == 1 else
+                            ('the next %d functions' % len(order), 'one', 'they capture', 'each is'))]
+        for k in order:
+            lines.append('local ' + defs[k])
+        return '\n'.join(lines + p.lines) + '\n'
