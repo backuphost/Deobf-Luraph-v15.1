@@ -183,6 +183,17 @@ def _reap_group(proc):
     proc.wait()
 
 
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\u0085\u2028\u2029]")
+
+
+def _echo(line):
+    """An engine line as it is shown on the terminal: control characters (a carriage return in
+    text a script printed, say) become '?', so nothing overwrites the start of the line.  The
+    lines kept for judging the result stay as the engine printed them."""
+    body = line[:-1] if line.endswith("\n") else line
+    return _CTRL.sub("?", body) + ("\n" if line.endswith("\n") else "")
+
+
 def _stream(cmd, timeout, cwd=HERE, env=None):
     """Run cmd, pass its output through line by line, return (exit status or None on timeout,
     the output as text).  A Python traceback of the engine is not passed through line by
@@ -234,10 +245,10 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
                 if line[:1] in (" ", "\t") or not line.strip():
                     continue
                 in_tb = False
-                sys.stdout.write("    [engine error] " + line)
+                sys.stdout.write("    [engine error] " + _echo(line))
                 sys.stdout.flush()
                 continue
-            sys.stdout.write("    " + line)
+            sys.stdout.write("    " + _echo(line))
             sys.stdout.flush()
         if own_session:
             _reap_group(proc)

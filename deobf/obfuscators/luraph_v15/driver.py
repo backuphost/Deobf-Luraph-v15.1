@@ -436,7 +436,7 @@ def run(job):
                 nested_first = None
                 if "nested" in shapes:
                     reached = "nested"
-                    nested_first = not_reached(job, ppath, chunk_paths)
+                    nested_first = nested_root(job, ppath, chunk_paths)
                 else:
                     reached = not_reached(job, ppath, chunk_paths)
                 if reached is True:
@@ -517,17 +517,35 @@ NESTED_START_UP = ("Luraph v15.2 keeps its start-up code and the script's main f
                    "output includes Luraph's start-up code, not separated from the script")
 
 
+NESTED_CALLEE = ("Luraph v15.2 keeps its start-up code and the script's top level in one function: the lift "
+                 "starts from the function that one called last, so the script's top level is not in the output")
+
+
 def root_lack(reached, nested_first):
     """What a lift lacks for where it starts: reached is not_reached()'s answer
-    (or "nested" for v15.2 nested shapes), nested_first not_reached()'s answer
-    for a nested shape. A nested shape's lift includes Luraph's start-up code
-    only when its root is the program the VM entered first (nested_first True);
-    a payload VM made apart from the start-up VM is lifted without it."""
+    (or "nested" for v15.2 nested shapes), nested_first nested_root()'s answer
+    for a nested shape ('first' or True, 'callee', 'separate' or False, None).
+    A nested shape's lift includes Luraph's start-up code when its root is the
+    program the VM entered first; it lacks the script's top level when it
+    starts from a function that program called (same VM); a payload VM made
+    apart from the start-up VM is lifted without either."""
     if reached is None or reached == "nested" and nested_first is None:
         return MAIN_UNKNOWN
-    if reached == "nested" and nested_first is True:
+    if reached == "nested" and nested_first in (True, "first"):
         return NESTED_START_UP
+    if reached == "nested" and nested_first == "callee":
+        return NESTED_CALLEE
     return None
+
+
+def nested_root(job, ppath, chunk_paths):
+    """devirt.nested_root, or None when it could not be told."""
+    from obfuscators.luraph_v15 import devirt
+    try:
+        return devirt.nested_root(job.source_path, ppath, chunk_paths)
+    except Exception as e:  # noqa: BLE001 - the lift itself reports what is wrong with the dump
+        print("[!] could not tell where the lift starts (%s: %s)" % (type(e).__name__, e), file=sys.stderr)
+        return None
 
 
 def not_reached(job, ppath, chunk_paths):

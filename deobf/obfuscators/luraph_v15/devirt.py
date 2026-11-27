@@ -5078,6 +5078,34 @@ def lifts_first_program(prog):
     return bool(roots) and all((cap.get("__seq") or 0) == 1 for _, _, cap in roots)
 
 
+def nested_root(source, protos_path, chunk_paths=()):
+    """Luraph v15.2 nested shapes (start-up code and the script's top level in
+    one function): where lift_program starts.  See nested_root_kind."""
+    return nested_root_kind(Program(source, protos_path, chunk_paths))
+
+
+def nested_root_kind(prog):
+    """'first': the lift starts from the program the VM entered first, so the
+    output includes Luraph's start-up code; 'callee': it starts from the
+    function that program called last (root_callee) in the same VM, so the
+    script's top level, which sits inside the first program, is not in the
+    output; 'separate': it starts from a payload VM made apart from the
+    start-up VM; None: cannot be told."""
+    if lifts_first_program(prog):
+        return "first"
+    protos = prog.dump.protos
+    first = next((cap for cap in protos.values()
+                  if isinstance(cap, dict) and (cap.get("__seq") or 0) == 1), None)
+    roots = program_roots(prog)
+    if first is None or not roots:
+        return None
+    if all(cap.get("__maker") != first.get("__maker") for _, _, cap in roots):
+        return "separate"
+    if prog.dump.raw.get("root_callee") is not None:
+        return "callee"
+    return None
+
+
 def chunk_lines(params, lines):
     """The main function's lines as the chunk's top-level code. Its
     parameters (variables.extract_params: names, then "..." when the rest

@@ -136,7 +136,7 @@ def run_bootstrap(model_stage, boot_text, workdir, tag, log, options=()):
         raise RuntimeError('bootstrap did not reach the real program: the native replay of the init did not end within 900 s')
     failed = 0
     for line in r.stderr.split('\n'):
-        if 'failed environment check' in line:
+        if line.startswith('[bootstrap] failed environment check'):
             failed += 1
         elif line.startswith('[fixkey]') or line.startswith('[keyfn]'):
             log(line)
@@ -422,8 +422,10 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                 # (the same head line as lift_program writes for the proto-table layout)
                 text = head + '\n' + text
             if cold:
-                LAST_RUN['notes'].append('[cut] %d instruction(s) that never ran did not lift; the result does not contain the code '
-                                         'they are in (cut as never-executed junk or as unreachable)' % cold)
+                # (where the head line is an upper bound, this count is the matching lower bound)
+                LAST_RUN['notes'].append('[cut] %s%d instruction(s) that never ran did not lift; the result does not contain the code '
+                                         'they are in (cut as never-executed junk or as unreachable)' % (
+                                             'at least ' if head and ' up to ' in head else '', cold))
         return text
     # ---- proto-table layout (every Luraph v14 build)
     common = (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + \

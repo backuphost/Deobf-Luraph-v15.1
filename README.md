@@ -29,8 +29,9 @@ environments (`devm/harness.lua` + `rbxmock.lua`, `deobf/envlog.luau`, `luasandb
 `readfile` / `writefile` are the mock's empty, read-only stand-ins in executor mode and absent
 otherwise, as in Roblox, and `require` is a Roblox-like stand-in. Text the script hands over (what
 it prints or warns, a URL, a member name, an error message) appears in the run's log only inside
-a line the harness or the mock started (`[script] ...`, `[http] ...`), with its line breaks
-neutralised. The harness and the mock call their own copies of the standard libraries, so a script
+a line the harness or the mock started (`[script] ...`, `[http] ...`); a line break in it cannot
+start a line the tool reads as its own (carriage returns and similar characters become `?`, and a
+following line that looks like a log line is indented). The harness and the mock call their own copies of the standard libraries, so a script
 that unfreezes and rewrites the shared `string` or `table` library with an executor's
 `setreadonly` (allowed, as on a real executor) changes neither what they write nor what they
 compute. One route is still open: devm's instrumentation hooks (the `__LPH_*` globals that the
@@ -183,6 +184,26 @@ interpreter binaries.
 
 Earlier results recovered with `devm` are in `deobfuscated/` (their protected inputs are not in
 the repository; `tests/regress.py DIR` re-runs them if you have the inputs).
+
+## Status on the public sample corpus
+
+Measured on the public `obfuscator-samples` collection (4,286 files of v14.0.2 - v15.2; 4,270
+of them Luraph). Recognition (`--classify`) agrees with a hand-checked census on 4,284 files.
+Full runs (`deob.py FILE`, automatic mode, 900 s per file) on a hold-out set of 126 files spread
+over all versions, which none of the development work had run:
+
+| Outcome | Files |
+|---|---|
+| complete (the engine reports nothing missing) | 53 |
+| partial (result written; the report says what is missing) | 67 |
+| timed out (very large v14.7 scripts: 230,000 - 260,000 instructions lifted without error, structuring not finished in 900 s) | 5 |
+| no result (one v14.9 file: out of memory) | 1 |
+
+119 of the 120 written results parse; the other one is reported partial. Most partial results
+are partial because of gaps in lifting the script itself: Luraph's key arithmetic left in,
+values of its loader shown as `__LPH_ENV[...]`, instructions that did not lift (`LIFT ERROR`),
+control flow left as a state machine. These numbers were taken before the last review fixes,
+which can only turn borderline results from complete into partial.
 
 ## Limits, stated plainly
 

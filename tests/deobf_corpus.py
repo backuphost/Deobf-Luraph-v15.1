@@ -240,6 +240,14 @@ def check_nested_root_lack():
     assert not devirt.lifts_first_program(prog(two_vms))
     # the run named the script's main function: the lift starts there
     assert not devirt.lifts_first_program(prog(one_vm, root_callee="5"))
+    assert devirt.nested_root_kind(prog(one_vm)) == "first"
+    assert devirt.nested_root_kind(prog(two_vms)) == "separate"
+    # the run named a function of the first program's VM: the lift starts there and leaves out the
+    # script's top level, which sits inside the first program
+    assert devirt.nested_root_kind(prog(one_vm, root_callee="5")) == "callee"
+    assert driver.root_lack("nested", "callee") == driver.NESTED_CALLEE
+    assert driver.root_lack("nested", "first") == driver.NESTED_START_UP
+    assert driver.root_lack("nested", "separate") is None
     assert driver.root_lack("nested", True) == driver.NESTED_START_UP
     assert driver.root_lack("nested", False) is None
     assert driver.root_lack("nested", None) == driver.MAIN_UNKNOWN
