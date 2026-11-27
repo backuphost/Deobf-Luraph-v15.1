@@ -700,6 +700,11 @@ class Layer3Full(unittest.TestCase):
         # the script runs to its end (GuiService:GetGuiInset() gives two values); functions on the
         # VM get their captured variables and their for loops; no stub for the first plain function
         self.assertTrue(any('script returned' in ln for ln in logs), logs[-12:])
+        # the payload is the script's program: a request its plain functions make in a thread they
+        # started is not placed by its call chain (not "under no program"), so it does not outvote
+        # the one made under the payload (harness.lua watch.under)
+        self.assertTrue(any(' payload: proto ' in ln for ln in logs), [ln for ln in logs if '[under]' in ln])
+        self.assertTrue(any('[under] ' in ln and 'not placed' in ln for ln in logs), [ln for ln in logs if '[under]' in ln])
         self.assertLess(text.count('UPVAL_'), 20)
         self.assertNotIn('forval', text)
         self.assertNotIn('native function L', text)

@@ -185,7 +185,9 @@ def script_votes(interps, payload, notes, callers=None, first_root=1):
     kind 'under': the harness's [under] line, which places each line of the script's output and
     each request under the innermost program of another interpreter on its VM call chain (the
     script's program calls routines of the first interpreter too, and the last VM instruction
-    before its output can be in one of those), or under none (the first interpreter).
+    before its output can be in one of those), or under none (the first interpreter).  Lines it
+    could not place (on a thread whose chain starts there, see harness.lua watch.under) count for
+    neither; when it placed none, the [effects] line is used.
     kind 'effects': without that line, the programs of the [effects] line (the ones that ran the
     last VM instruction before each), each followed through `callers` ({program: the program
     that ran the instruction before its first one}, harness.lua's record) towards the first
@@ -383,7 +385,8 @@ def effect_programs(notes):
 def under_programs(notes):
     """{program: count} of the harness's [under] line: for each line of the script's output and
     each request, the innermost program of an interpreter other than the first one on its VM call
-    chain, 0 for none ({} without the line)"""
+    chain, 0 for none ({} without the line).  The ones the line says it could not place (`not
+    placed: ...`, a thread whose call chain starts there) are not in it."""
     for n in notes:
         if n.startswith('[under] '):
             got = {int(a): int(b) for a, b in re.findall(r'under program (\d+) \((\d+)\)', n)}

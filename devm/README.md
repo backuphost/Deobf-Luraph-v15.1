@@ -249,7 +249,13 @@ lazily decoded constants.
   requests: under program N (count), ..., under no program of another interpreter (count)`;
   `[where] the run was stopped in program N, under program M of another interpreter` / `, on
   another interpreter` / `, under no program of another interpreter`).  A function that a mock
-  function calls back runs on that function's own thread (`cwrap`), so its chain starts there.
+  function calls back runs on that function's own thread (`cwrap`), and a function `task.spawn`
+  or a coroutine runs is on a thread of its own as well: such a chain starts at that function.
+  On a thread other than the one the VM started on, a stack without a program of another
+  interpreter therefore says nothing about where the code was started from (a script on another
+  interpreter whose plain functions run a loop in a spawned thread): those lines are counted as
+  `not placed: on a thread whose call chain starts there (count)` and vote for no interpreter,
+  and a run stopped there gets no placement on its `[where]` line.
   - The script is taken from the interpreter its output came from (`pipeline.script_programs`,
     `pipeline.script_votes`).  A build can make programs on other interpreters that are helpers
     (routines of the build) while the script runs on the first interpreter; the first of those
@@ -257,11 +263,11 @@ lazily decoded constants.
     helpers.  The script's own program can in turn call routines of the first interpreter, and the
     last VM instruction before its output is then in one of those (seen in v15.1 and v15.2 corpus
     builds whose script is a program on the second interpreter): the `[under]` line places that
-    output under the script's program.  Without that line a program the output came from is
-    followed through its first callers, and where that chain passes a program on another
-    interpreter, the output counts for that program's interpreter -- weaker evidence: a caller is
-    only the program of the instruction before a program's first one, which can be a helper that
-    happened to run just before.
+    output under the script's program.  Without that line (or when it placed none of the lines) a
+    program the output came from is followed through its first callers, and where that chain
+    passes a program on another interpreter, the output counts for that program's interpreter --
+    weaker evidence: a caller is only the program of the instruction before a program's first one,
+    which can be a helper that happened to run just before.
   - The evidence is weighed: every line of output and request counts once, and an interpreter
     other than the first is taken only when more of it points there than at the first interpreter
     (the one with the most, if several).  One program among several, say one first called from a

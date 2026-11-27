@@ -1110,7 +1110,9 @@ watch.effects = {}
 -- for each line of output and request, the innermost program of another interpreter on its VM
 -- call chain (watch.under; 0: none), when that can be told: the [under] line
 watch.unders = {}
-watch.made = nil           -- the first program the run made on another interpreter
+-- (and how many of them ran on a thread whose call chain starts there, see watch.under: not placed)
+watch.unplaced = 0
+watch.made = nil          -- the first program the run made on another interpreter
 watch.th = nil             -- the thread that ran the last VM instruction (watch.step)
 watch.info = debug.info    -- (the real one: walks the stack of that thread)
 if watch.ticking then __LPH_N.k = watch.TICK end
@@ -1123,8 +1125,14 @@ do
 	-- The chain is that thread's Lua stack: a VM call is a call of the callee's closure, and Luau
 	-- has no tail calls, so a routine of the first interpreter that the script's program called
 	-- runs with that program's closure below it on the stack, and a function the start-up code
-	-- called does not, whichever program called it first (the record's `caller`).  (A function a
-	-- mock function calls back runs on that function's own thread, cwrap: its chain starts there.)
+	-- called does not, whichever program called it first (the record's `caller`).
+	-- A thread other than the one the VM started on (mock.mainThread) begins its chain at its own
+	-- function: a function a mock function calls back (cwrap runs it on that function's thread), a
+	-- function task.spawn / defer / delay or the script's coroutine library runs.  Where that thread
+	-- was started from is not on its stack, so when its stack shows no program of another
+	-- interpreter, nothing is known (nil), not "none": a script on another interpreter whose plain
+	-- functions spawn a loop is not on the first interpreter for that.  (Only when the step hook
+	-- handed over the thread, w.th: otherwise the thread running is the hook's caller's own.)
 	function w.under(pid)
 		if not pid then
 			local v = ring[stepCount % ringN]
@@ -1141,6 +1149,8 @@ do
 			p = p and (pidAlias[p] or p)
 			if p and protos[p] and protos[p].interp ~= first then return p end
 		end
+		local main = mockRef and mockRef.mainThread
+		if w.th ~= nil and main ~= nil and w.th ~= main then return nil end
 		return 0
 	end
 	-- effect: output or a request (counted for the program that ran the last VM instruction, and
@@ -1154,10 +1164,17 @@ do
 			local pid = v and v // 2 ^ 32 or 0
 			if pid > 0 then
 				w.effects[pid] = (w.effects[pid] or 0) + 1
-				-- (only where every effect can be placed: a list of the ones on other interpreters alone
-				-- would leave out those under none)
-				local u = (exercise or pokePath or recordBinds) and w.under(pid)
-				if u then w.unders[u] = (w.unders[u] or 0) + 1 end
+				-- (only where the closures are known: a list of the ones on other interpreters alone would
+				-- leave out those under none; an effect on a thread whose chain is not known is counted
+				-- as such, w.unplaced)
+				if exercise or pokePath or recordBinds then
+					local u = w.under(pid)
+					if u then
+						w.unders[u] = (w.unders[u] or 0) + 1
+					else
+						w.unplaced += 1
+					end
+				end
 			end
 		end
 		if w.from or not w.on then return end
@@ -2848,7 +2865,7 @@ local function afterRun(ok, message)
 		for i, pid in ipairs(list) do list[i] = string.format("%d (%d)", pid, watch.effects[pid]) end
 		ewrite("[effects] the script's output and requests came from programs " .. table.concat(list, ", ") .. "\n")
 	end
-	if next(watch.unders) ~= nil then
+	if next(watch.unders) ~= nil or watch.unplaced > 0 then
 		local list = {}
 		for pid in watch.unders do
 			if pid > 0 then list[#list + 1] = pid end
@@ -2857,6 +2874,10 @@ local function afterRun(ok, message)
 		for i, pid in ipairs(list) do list[i] = string.format("under program %d (%d)", pid, watch.unders[pid]) end
 		if watch.unders[0] then
 			list[#list + 1] = string.format("under no program of another interpreter (%d)", watch.unders[0])
+		end
+		if watch.unplaced > 0 then
+			-- (see watch.under: a thread other than the VM's first one, its stack without such a program)
+			list[#list + 1] = string.format("not placed: on a thread whose call chain starts there (%d)", watch.unplaced)
 		end
 		ewrite("[under] the VM call chains of the script's output and requests: " .. table.concat(list, ", ") .. "\n")
 	end

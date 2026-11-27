@@ -810,6 +810,57 @@ print("ready")
 while true do __LPH_STEP(s, 0, 2, r0) end
 '''
 
+# the script's program (second interpreter) prints, then runs a plain function of its own in a thread
+# of its own (task.spawn), which prints too: that thread's stack starts at the plain function
+SCRIPT_SPAWNS_PLAIN = '''
+local r0, r1, r2 = {}, {}, {}
+local boot = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(boot, 0, 1, r0)
+local routine = __LPH_PROTO(0, {"K"}, 1, {2})
+local function routineFn() __LPH_STEP(routine, 0, 1, r2) end
+local spid = __LPH_PROTO(1, {"K"}, 1, {3})
+local function beat() routineFn(); print("beat") end
+local m = __LPH_REG(spid, function() return function()
+    __LPH_STEP(spid, 0, 1, r1)
+    routineFn(); print("hello")
+    task.spawn(beat)
+    __LPH_STEP(spid, 0, 2, r1)
+end end)()
+m()
+__LPH_STEP(boot, 0, 2, r0)
+'''
+# the same with a function of the script's program run in the thread: its closure is on that stack
+SCRIPT_SPAWNS_ITS_OWN = '''
+local r0, r1, r2 = {}, {}, {}
+local boot = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(boot, 0, 1, r0)
+local routine = __LPH_PROTO(0, {"K"}, 1, {2})
+local function routineFn() __LPH_STEP(routine, 0, 1, r2) end
+local spid = __LPH_PROTO(1, {"K"}, 1, {3})
+local beat = __LPH_REG(spid, function() return function() __LPH_STEP(spid, 0, 3, r1); routineFn(); print("beat") end end)()
+local m = __LPH_REG(spid, function() return function()
+    __LPH_STEP(spid, 0, 1, r1)
+    routineFn(); print("hello")
+    task.spawn(beat)
+    __LPH_STEP(spid, 0, 2, r1)
+end end)()
+m()
+__LPH_STEP(boot, 0, 2, r0)
+'''
+# the start-up code prints, and prints again in a thread it started
+STARTUP_SPAWNS = '''
+local r0, r1 = {}, {}
+local boot = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(boot, 0, 1, r0)
+local helper = __LPH_PROTO(1, {"K"}, 1, {2})
+local h = __LPH_REG(helper, function() return function() __LPH_STEP(helper, 0, 1, r1) return 7 end end)()
+h()
+__LPH_STEP(boot, 0, 2, r0)
+print("one")
+task.spawn(function() __LPH_STEP(boot, 0, 3, r0); print("two") end)
+__LPH_STEP(boot, 0, 4, r0)
+'''
+
 
 def probe_evidence(dump, err):
     """(interpreter of each program, callers, notes) of a probe run, as pipeline.script_programs takes them"""
@@ -924,6 +975,48 @@ class CallChain(unittest.TestCase):
         self.assertTrue(note.startswith('[startup] the script\'s output and requests came from programs of the first '
                                         'interpreter, not from the 1 program(s) the run made on other interpreters (2: '
                                         'helpers)'), note)
+
+    def test_a_thread_the_script_spawned(self):
+        """The script's program prints, and a plain function of its own prints in a thread task.spawn started:
+        that thread's stack starts at the plain function, so its line is not placed (not 'under none', which
+        would tie with the program's own line and give the first program); the payload is kept."""
+        took, err, dump, oracle = run_probe(SCRIPT_SPAWNS_PLAIN, *self.OPTS)
+        self.assertIn('[effects] the script\'s output and requests came from programs 2 (2)', err)
+        self.assertIn('[under] the VM call chains of the script\'s output and requests: under program 3 (1), not placed: on '
+                      'a thread whose call chain starts there (1)', err)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(interps, [0, 0, 1])
+        self.assertEqual(pipeline.under_programs(notes), {3: 1})
+        self.assertEqual(pipeline.script_votes(interps, [3], notes, callers), ({1: 1}, 'under'))
+        self.assertEqual(pipeline.script_programs(interps, [3], notes, callers), ([3], None))
+
+    def test_a_thread_running_a_function_of_the_script_program(self):
+        """A thread whose function is a closure of the script's program: its stack shows that program."""
+        took, err, dump, oracle = run_probe(SCRIPT_SPAWNS_ITS_OWN, *self.OPTS)
+        self.assertIn('[under] the VM call chains of the script\'s output and requests: under program 3 (2)\n', err)
+
+    def test_a_thread_the_start_up_code_spawned(self):
+        """The start-up code prints on the VM's thread (under none) and in a thread it started (not placed):
+        the first interpreter has the only vote, and the helper is set aside."""
+        took, err, dump, oracle = run_probe(STARTUP_SPAWNS, *self.OPTS)
+        self.assertIn('[under] the VM call chains of the script\'s output and requests: under no program of another '
+                      'interpreter (1), not placed: on a thread whose call chain starts there (1)', err)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(pipeline.script_votes(interps, [2], notes, callers), ({0: 1}, 'under'))
+        self.assertEqual(pipeline.script_programs(interps, [2], notes, callers), ([], [2]))
+
+    def test_no_line_placed(self):
+        """An [under] line that placed none of the lines leaves the choice to the [effects] line."""
+        from devm import pipeline
+        interps = [1, 1, 2]
+        notes = ['[effects] the script\'s output and requests came from programs 2 (2)',
+                 '[under] the VM call chains of the script\'s output and requests: not placed: on a thread whose call '
+                 'chain starts there (2)']
+        self.assertEqual(pipeline.under_programs(notes), {})
+        self.assertEqual(pipeline.script_votes(interps, [3], notes, {2: 3, 3: 1}), ({2: 2}, 'effects'))
+        self.assertEqual(pipeline.script_programs(interps, [3], notes, {2: 3, 3: 1}), ([3], None))
 
 
 class Report(unittest.TestCase):
