@@ -1462,7 +1462,7 @@ class CallersVariables(unittest.TestCase):
         self.assertEqual(report[0], 'result: PARTIAL', report)
         self.assertTrue(any(ln.startswith('  1 call(s) are handed the variables of the code that calls them (its register '
                                           'array: printed `({})` 1 time(s) in the text') for ln in report), report)
-        self.assertTrue(any('1 value(s) in the text are the run\'s after a call, proved' in ln for ln in report), report)
+        self.assertTrue(any('1 value(s) in the text are the run\'s after a call, where the function called was checked' in ln for ln in report), report)
         lines = run.run_report(notes)
         self.assertTrue(any(ln.startswith(run.RUNVALS_HANDED_LINE + '1 call(s)') for ln in lines), lines)
         head = ['-- case.lua, %s.  How the run went and what this file lacks:' % run.HEAD_MARK]

@@ -10,7 +10,11 @@ reads it after the call.
 
 Such a text is never complete.  What a call handed the register array changes is shown only as far
 as the run saw it, whatever is proved below: a register the call does not name and the run did not
-see it change keeps its value from before the call in the text.  So every call handed the array (a
+see it change keeps its value from before the call in the text, and the marks described below are best
+effort: synthetic probes still find cases they miss (a register array handed through a temporary in an
+arm of a branch, a change that a later statement of the same instruction also writes, a shared
+variable a function of the program assigns at some other time, a later call of the same instruction
+that changes the register again).  So every call handed the array (a
 site found below, or a call the code shows handed it anywhere: handed) gives the run note
 `[runvals-handed]` (handed_note), and run.report counts the printed `({})` in the text as well: either
 alone makes the result PARTIAL, also where every value the call changed is shown and proved, and
@@ -1714,10 +1718,11 @@ def handed_note(protos, sites=()):
     return '[runvals-handed] %d call(s) are handed the variables of the code that calls them (its register array, ' \
            'printed `({})` or kept in a variable): what they change is shown only as far as the run saw it -- after ' \
            'them the text shows the value the run had, with a comment that says so, or `nil --[[%s]]`, for a ' \
-           'variable the call names or the run saw change (where it saw every call of the instruction), unless a ' \
-           'function of the program shares the variable and assigns it, and the change can be that function\'s, ' \
-           'whose text shows it; a variable the call does not name and the run did not see change keeps its value ' \
-           'from before the call' % (n, MARK)
+           'variable the call names or the run saw change; this marking is best effort (it can miss a variable ' \
+           'handed through a temporary in an arm of a branch, a change that a later statement of the same ' \
+           'instruction also writes, and a variable that a function of the program shares and assigns), and a ' \
+           'variable the call does not name and the run did not see change keeps its value from before the call, ' \
+           'so any of them can show a value from before the call' % (n, MARK)
 
 
 def show_run_values(protos, oracle, helpers=()):

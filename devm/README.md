@@ -911,6 +911,15 @@ stays as a statement, handed its constant, and the register gets the value the r
   every other value of the same function not proved (above), and those are marked.  In a loop, the
   function called is only proved when the run saw the call leave the register that holds it alone
   (the call itself could change it).
+* **Known gaps in the marks.**  The marks above are best effort, not a proof.  Synthetic probes still
+  find texts where a variable such a call changed is printed with its value from before the call and
+  no mark: the register array handed through a temporary in an arm of a branch; a change that a later
+  statement of the same instruction also writes; a shared variable that some function of the program
+  assigns (the exemption above), also when that function did not run during the call; and a later call
+  of the same instruction that changes the register again after a proved site (the value shown is then
+  the one the next instruction saw, not the one the site's call wrote).  None of these was found in
+  the measured corpus or in the files it was tried on, and every text with a call handed the register
+  array is PARTIAL, so none of them can make a result complete.
 * Calls are kept: whether a helper has other effects is not known (its own lift can be incomplete).
 * Programs the pipeline names helpers of the build (programs on other interpreters set aside
   because the run's weighed evidence points at the first interpreter, see "Which program is the

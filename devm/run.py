@@ -1125,8 +1125,9 @@ def report(text, returned=None, notes=None, parse=None):
             or marks or assumed or amarks or handed or regsvals):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         if pmarks:
-            out.append('  note: %d value(s) in the text are the run\'s after a call of a helper of the build, proved to be '
-                       'what every execution of the call returns: each carries the comment --[[%s]]' % (
+            out.append('  note: %d value(s) in the text are the run\'s after a call of a helper of the build, where the '
+                       'function called was checked to depend only on the constants it is handed (by the rules in '
+                       'devm/README.md, which are not a proof): each carries the comment --[[%s]]' % (
                            pmarks, runvals.PROVED))
         return out + unchecked + traps
     out.append('result: PARTIAL')
@@ -1175,8 +1176,9 @@ def report(text, returned=None, notes=None, parse=None):
                        '%s call(s) are' % m.group(1) if m else 'calls are', regsvals,
                        ' (see the "variables handed to calls" line above)' if handed else ''))
     if pmarks:
-        out.append('  %d value(s) in the text are the run\'s after a call, proved to be what every execution of the call '
-                   'writes or returns: each carries the comment --[[%s]]%s' % (
+        out.append('  %d value(s) in the text are the run\'s after a call, where the function called was checked to depend '
+                   'only on the constants it is handed (by the rules in devm/README.md, which are not a proof; see its '
+                   'known gaps): each carries the comment --[[%s]]%s' % (
                        pmarks, runvals.PROVED, '; %d more are only assumed (below)' % amarks if amarks else ''))
     if (assumed or amarks) and akinds in ([], [runvals.ASSUMED]):
         out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
