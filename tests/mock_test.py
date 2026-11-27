@@ -23,6 +23,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DEVM = os.environ.get('MOCK_DEVM_DIR') or os.path.join(ROOT, 'devm')
 sys.path.insert(0, ROOT)
+sys.path.append(HERE)     # (path2d_cases.py)
+
+from path2d_cases import (PATH2D_ARGS, PATH2D_ARGS_WANT, PATH2D_LATE, PATH2D_LATE_WANT, PATH2D_STORED,  # noqa: E402
+                          PATH2D_STORED_WANT, matches)
 
 
 def find_luau():
@@ -395,6 +399,67 @@ show("mixed", box(r), r.Width, r.Height)
         self.assertEqual(got.get('mixed'), '84.5,29.5,220.5,190.5|136|161')
         self.assertNotIn('GetBoundingRect() has no model', log)
 
+    def test_stored_udim_values(self):
+        # The same script and hand-computed numbers as the deobf engine's check (tests/path2d_cases.py,
+        # PATH2D_STORED; tests/deobf_corpus.py): both environments store a UDim as the engine does (float32 Scale, int32 Offset truncated toward
+        # zero) and UDim2:Lerp rounds the offsets, so a Path2D gives the same Rect and length in both.
+        got, log = run(PATH2D_STORED.replace('print(', 'show('))
+        for tag, want in PATH2D_STORED_WANT.items():
+            parts = got.get(tag, '').split('|')
+            self.assertEqual(parts[:-1], want[:-1], (tag, parts, log))
+            self.assertAlmostEqual(float(parts[-1]), want[-1], delta=0.005, msg=tag)
+        got, log = run('''
+show("udim", UDim.new(0.5, -2.7).Offset, UDim.new(0.1, 0).Scale, (UDim.new(1, 2.9) + UDim.new(0, 0.5)).Offset, (-UDim.new(0, 3.9)).Offset)
+show("udim2", tostring(UDim2.new(0.1, 1.9, 0, -1.9)), UDim2.fromOffset(4.5, -4.5).X.Offset, UDim2.fromScale(0.3, 0).X.Scale)
+show("unm", tostring(-UDim2.new(0.25, 3, 0.5, -4)), UDim2.new(0, 2.5, 0, 0) == UDim2.fromOffset(2, 0))
+''')
+        self.assertEqual(got.get('udim'), '-2|0.10000000149011612|2|-3', log)
+        self.assertEqual(got.get('udim2'), '{0.100000001, 1}, {0, -1}|4|0.30000001192092896')
+        self.assertEqual(got.get('unm'), '{-0.25, -3}, {-0.5, 4}|true')
+
+    def test_constructor_arguments(self):
+        # The same script and hand-computed numbers as the deobf engine's check (tests/path2d_cases.py,
+        # PATH2D_ARGS): numeric strings, a missing value, UDim2.new(UDim, UDim), offsets in (-1, 0)
+        got, log = run(PATH2D_ARGS.replace('print(', 'show('))
+        for tag, want in PATH2D_ARGS_WANT.items():
+            parts = got.get(tag, '').split('|')
+            self.assertTrue(matches(parts, want), (tag, parts, want, log))
+
+    def test_measured_at_query_time(self):
+        # The same script and numbers as the deobf engine's check (tests/path2d_cases.py, PATH2D_LATE):
+        # the curve is measured
+        # against the parent Frame as it is when asked (points set before the parent and before a
+        # resize); a path of one point gets a stand-in of type Rect, said in the log.
+        got, log = run(PATH2D_LATE.replace('print(', 'show('))
+        for tag, want in PATH2D_LATE_WANT.items():
+            parts = got.get(tag, '').split('|')
+            self.assertEqual(parts, [str(w) for w in want], (tag, parts, log))
+        self.assertIn('[stub] permissive stand-ins handed out where the mock has no Roblox answer: Path2D:GetBoundingRect()', log)
+
+    def test_rect_value(self):
+        # a Rect is a userdata like the engine's: locked metatable, no unknown members, read-only
+        got, log = run('''
+local f = Instance.new("Frame"); f.Size = UDim2.fromOffset(100, 50)
+local p = Instance.new("Path2D"); p.Parent = f
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromOffset(10, 20)), Path2DControlPoint.new(UDim2.fromOffset(30, 40)) })
+local r = p:GetBoundingRect()
+show("type", type(r), typeof(r), getmetatable(r), r == p:GetBoundingRect(), r ~= nil)
+show("foo", err(function() return r.Foo end))
+show("set", err(function() r.Width = 5 end), r.Width)
+show("new", err(function() r.Foo = 5 end))
+-- Min / Max are a new Vector2 on every read: a write through one does not change the Rect
+pcall(function() r.Min.X = 999 end)
+pcall(function() local m = r.Max; m.Y = -1 end)
+show("corners", rawequal(r.Min, r.Min), r.Min == r.Min, r.Min.X, r.Max.Y, tostring(r), r == p:GetBoundingRect())
+''')
+        self.assertEqual(got.get('type'), 'userdata|Rect|The metatable is locked|true|true', log)
+        self.assertEqual(got.get('corners'), 'false|true|9.5|40.5|9.5, 19.5, 30.5, 40.5|true')
+        self.assertTrue(got.get('foo', '').endswith('Foo is not a valid member of Rect'), got.get('foo'))
+        a, b = got.get('set', '|').split('|')
+        self.assertTrue(a.endswith('Width cannot be assigned to'), a)
+        self.assertEqual(b, '21')
+        self.assertTrue(got.get('new', '').endswith('Foo is not a valid member of Rect'), got.get('new'))
+
 
 @unittest.skipUnless(LUAU, 'needs bin/luau')
 class Layout(unittest.TestCase):
@@ -480,6 +545,86 @@ show("cam", v2(workspace.CurrentCamera.ViewportSize))
         self.assertEqual(got.get('a'), '1920,1022|0,0|970,1022|960,0', log)
         self.assertEqual(got.get('b'), '1920,1080|0,-58|970,1080')
         self.assertEqual(got.get('cam'), '1920,1080')
+
+    EXACT = '''
+local function x17(v) return string.format("%.17g,%.17g", v.X, v.Y) end
+'''
+
+    def test_single_precision(self):
+        """AbsoluteSize / AbsolutePosition are float32 values computed in float32 (each operation
+        rounded): exact numbers, worked out by hand with the float32 rounding of every step
+        (f32(0.1) = 0.100000001490116, f32(0.3) = 0.300000011920929, f32(0.7) = 0.699999988079071,
+        f32(0.9) = 0.899999976158142, f32(0.35) = 0.349999994039536)."""
+        got, log = run(self.EXACT + '''
+local gui = Instance.new("ScreenGui", game:GetService("CoreGui"))
+local f = Instance.new("Frame", gui); f.Size = UDim2.fromScale(0.1, 0.3); f.Position = UDim2.fromScale(0.7, 0.1)
+local g = Instance.new("Frame", f); g.Size = UDim2.new(0.33, 0, 0.6, 0)
+local c = Instance.new("Frame", f); c.Size = UDim2.fromScale(0.35, 0.9); c.Position = UDim2.fromScale(0.5, 0.5)
+c.AnchorPoint = Vector2.new(0.5, 0.5)
+show("f", x17(f.AbsoluteSize), x17(f.AbsolutePosition), f.AbsoluteSize.X == 192, math.floor(f.AbsolutePosition.X * 100))
+show("g", x17(g.AbsoluteSize), x17(g.AbsolutePosition))
+show("c", x17(c.AbsoluteSize), x17(c.AbsolutePosition))
+local sg = Instance.new("ScreenGui")
+local outer = Instance.new("Frame", sg); outer.Size = UDim2.fromOffset(400, 300); outer.Position = UDim2.fromOffset(17, 23)
+for _, s in ipairs({ 0.3, 0.7, 0.9, 0.35 }) do
+	local o = Instance.new("Frame", outer); o.Size = UDim2.fromScale(s, s); o.Position = UDim2.fromScale(s, 1 - s)
+	show("s" .. s, x17(o.AbsoluteSize), x17(o.AbsolutePosition))
+end
+''')
+        # viewport 1920 x 1022 (below the top bar): f32(f32(0.1) * 1920) = 192 (192.0000029 in double
+        # rounds to 192 in float32), f32(f32(0.3) * 1022) = 306.600006103516; position
+        # f32(f32(0.7) * 1920) = 1344 (1343.99997711 in double), f32(f32(0.1) * 1022) = 102.200004577637
+        self.assertEqual(got.get('f'), '192,306.60000610351562|1344,102.20000457763672|true|134400', log)
+        # f32(f32(0.33) * 192) = 63.3600006103516, f32(f32(0.6) * 306.600006103516) = 183.960006713867
+        self.assertEqual(got.get('g'), '63.360000610351562,183.96000671386719|1344,102.20000457763672')
+        # size f32(f32(0.35) * 192) = 67.1999969482422, f32(f32(0.9) * 306.600006103516) = 275.940002441406;
+        # x = 1344 + f32(f32(0.5 * 192) - f32(0.5 * 67.1999969482422)) = 1406.40002441406,
+        # y = 102.200004577637 + f32(153.300003051758 - 137.970001220703) = 117.530006408691
+        self.assertEqual(got.get('c'), '67.199996948242188,275.94000244140625|1406.4000244140625,117.53000640869141')
+        # in a 400 x 300 frame at (17, 23): Scale s and 1 - s (stored as float32).  0.3: width
+        # f32(f32(0.3) * 400) = 120.000007629395, x 17 + that = 137 (a tie, rounded to even);
+        # 0.9: y = 23 + f32(f32(0.1) * 300) = 53 (29.999999999999993 + 23 in double precision)
+        self.assertEqual(got.get('s0.3'), '120.00000762939453,90|137,233')
+        self.assertEqual(got.get('s0.7'), '280,210|297,113')
+        self.assertEqual(got.get('s0.9'), '360,270|377,53')
+        self.assertEqual(got.get('s0.35'), '140,105|157,218')
+
+    def test_path2d_in_a_frame_sized_with_scale(self):
+        """A Path2D is measured against its parent's AbsoluteSize, float32: a Frame of Scale 0.7 x 0.3 in
+        400 x 300 is exactly 280 x 90 (279.99999523 in double precision), so the curve is the one of a
+        Frame of Offset 280 x 90, bit for bit."""
+        got, log = run(self.EXACT + '''
+local sg = Instance.new("ScreenGui")
+local outer = Instance.new("Frame", sg); outer.Size = UDim2.fromOffset(400, 300)
+local fs = Instance.new("Frame", outer); fs.Size = UDim2.fromScale(0.7, 0.3)
+local fo = Instance.new("Frame", outer); fo.Size = UDim2.fromOffset(280, 90)
+local function pts()
+	return { Path2DControlPoint.new(UDim2.fromScale(0.1, 0.2), UDim2.new(), UDim2.fromOffset(13, 7)),
+		Path2DControlPoint.new(UDim2.fromScale(0.9, 0.7)), Path2DControlPoint.new(UDim2.fromScale(1, 1)) }
+end
+local p = Instance.new("Path2D", fs); p:SetControlPoints(pts())
+local q = Instance.new("Path2D", fo); q:SetControlPoints(pts())
+local function f17(v) return string.format("%.17g", v) end
+local function answers(path)
+	local r = path:GetBoundingRect()
+	return table.concat({ f17(path:GetLength()), f17(path:GetPositionOnCurveArcLength(0.37).X.Scale),
+		f17(path:GetPositionOnCurve(0.61).Y.Scale), x17(path:GetTangentOnCurveArcLength(0.8)), x17(r.Min), x17(r.Max) }, ";")
+end
+show("size", x17(fs.AbsoluteSize))
+show("same", answers(p) == answers(q), answers(p))
+local gui = Instance.new("ScreenGui", game:GetService("CoreGui"))
+local f = Instance.new("Frame", gui); f.Size = UDim2.fromScale(0.1, 0.3); f.Position = UDim2.fromScale(0.7, 0.1)
+local v = Instance.new("Path2D", f)
+v:SetControlPoints({ Path2DControlPoint.new(UDim2.new()), Path2DControlPoint.new(UDim2.fromScale(1, 1)) })
+show("view", x17(v:GetBoundingRect().Max))
+''')
+        self.assertEqual(got.get('size'), '280,90', log)
+        same, answers = got.get('same', '|').split('|', 1)
+        self.assertEqual(same, 'true', answers)
+        # the box of (0.9 * 280, 0.7 * 90) .. (280, 90) widened by half the stroke: max (280.5, 90.5)
+        self.assertTrue(answers.endswith(';280.5,90.5'), answers)
+        # 192 x 306.600006103516 (the frame of test_single_precision); f32(306.600006103516 + 0.5)
+        self.assertEqual(got.get('view'), '192.5,307.10000610351562')
 
 
 def zstd_frame(parts):

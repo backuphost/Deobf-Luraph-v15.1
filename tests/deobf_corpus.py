@@ -31,6 +31,7 @@ CORPUS = os.environ.get("LURAPH_CORPUS")
 SLOW = 4 if os.environ.get("DEOBF_TEST_SLOW") else 1     # stretch the time limits on a loaded machine
 
 sys.path.insert(0, DEOBF)
+sys.path.append(HERE)     # (tests/path2d_cases.py; after deobf/, whose modules come first)
 
 
 class Skip(Exception):
@@ -256,6 +257,103 @@ def check_nested_root_lack():
     assert driver.root_lack(False, None) is None
 
 
+def check_start_up_only_lack():
+    """A Luraph v15.2 lift that starts with Luraph's start-up code (NESTED_START_UP) from a run the spin
+    watchdog stopped (the start-up code's tamper loop: VM code that spins without touching the
+    environment): the result line says first, plainly, that only the start-up code was recovered and the
+    run did not get past it, instead of "includes Luraph's start-up code, not separated from the script"
+    and "the traced run did not end (... endless loop in the script's own code ...)"; the lifted file
+    says so in its header."""
+    from obfuscators.luraph_v15 import driver
+    spin = "aborted: endless loop in the script's own code (no environment access)"
+    got = driver.kept_lift_lacks(["3 unlifted blocks", driver.NESTED_START_UP], spin, True)
+    assert got == [driver.START_UP_ONLY, "3 unlifted blocks"], got
+    assert driver.START_UP_ONLY.startswith("only Luraph's start-up code was recovered: the traced run did not "
+                                           "get past it"), driver.START_UP_ONLY
+    assert "tamper response" in driver.START_UP_ONLY
+    # another way of stopping, or a lift that does not start with the start-up code: as before
+    got = driver.kept_lift_lacks([driver.NESTED_START_UP], "aborted: statement limit reached", True)
+    assert got == [driver.NESTED_START_UP, "the traced run did not end (aborted: statement limit reached)"], got
+    assert driver.kept_lift_lacks(["x"], spin, True) == ["x", "the traced run did not end (%s)" % spin]
+    assert driver.kept_lift_lacks([driver.NESTED_START_UP], "finished", True) == [driver.NESTED_START_UP]
+    assert driver.kept_lift_lacks([], "script error: boom", True) == [
+        "the traced run stopped (script error: boom): Luraph v15.2 code is recovered only as far as the run got"]
+    assert driver.kept_lift_lacks([], "script error: boom", False) == []
+    # a run stopped in the start-up code of an earlier layout (the trace is written): the loop is named
+    assert driver.start_up_status(spin) == "Luraph's tamper response, an endless loop without environment " \
+                                           "access; run status: " + spin
+    assert driver.start_up_status("aborted: statement limit reached") == "aborted: statement limit reached"
+    # the header note: comment lines after the file's own header, the code untouched
+    out = driver.header_note("-- a\n-- b\n\nlocal x = 1\n", driver.START_UP_ONLY).split("\n")
+    assert out[:2] == ["-- a", "-- b"] and out[2].startswith("-- NOTE: only Luraph's start-up code"), out
+    assert out[-3:] == ["", "local x = 1", ""] and all(ln.startswith("--") for ln in out[:-3]), out
+    assert " ".join(ln[9:] for ln in out[2:-3]) == driver.START_UP_ONLY
+
+
+def check_start_up_only_file():
+    """driver.run end to end on a synthetic run (no VM: the traced run, the main function test and the
+    lift are stand-ins): a v15.2 nested lift that starts with Luraph's start-up code from a run the spin
+    watchdog stopped is the result, its file says in the header that only the start-up code was
+    recovered (the lifted code itself untouched), and the result line says so first."""
+    import contextlib
+    import io
+    import deob
+    import harness as dh
+    from obfuscators.base import Job
+    from obfuscators.luraph_v15 import driver
+    spin = "aborted: endless loop in the script's own code (no environment access)"
+    lifted = "-- Deobfuscated by deobf (devirtualized)\n-- source: own.lua\n\nlocal x = 1\nprint(x)\n"
+
+    class Runner:
+        bridge = None
+
+        def __init__(self, job):
+            self.runs = 0
+
+        def run(self, patched, cfg, chunks):
+            self.runs += 1
+            assert cfg.get("top_thread") is True, cfg      # (a v15.2 nested shape runs as a top-level thread)
+            return "-- run status: %s\n-- 2 statements recorded in 0.01s\n\x00PROTOS {}\nlocal a = 1\n" % spin, ""
+
+        def finish(self):
+            pass
+
+    def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths):
+        job.write(dpath, lifted)
+        return [], None
+
+    def patch_entries(source, path, shapes=None, hooks=True):
+        shapes.add("nested")
+        return source
+
+    saved = {(driver, "patch_entries"): driver.patch_entries, (driver, "lift"): driver.lift,
+             (driver, "nested_root"): driver.nested_root, (dh, "Runner"): dh.Runner}
+    with tempfile.TemporaryDirectory() as d:
+        src = write(d, "own.lua", "return 1\n")
+        args = deob.parser().parse_args([src, "--obfuscator", "luraph_v15"])
+        job = Job(src, "return 1\n", args, os.path.join(d, "own.deobf.luau"), False, "Luraph v15.2")
+        driver.patch_entries, driver.lift = patch_entries, lift
+        driver.nested_root = lambda job, ppath, chunk_paths: "first"
+        dh.Runner = Runner
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                result = driver.run(job)
+        finally:
+            for (mod, name), value in saved.items():
+                setattr(mod, name, value)
+        assert result == job.path(".devirt.luau"), result
+        with open(result, encoding="utf-8") as f:
+            out = f.read().split("\n")
+        assert job.missing == [driver.START_UP_ONLY], job.missing
+        assert out[:2] == lifted.split("\n")[:2], out
+        note = [ln for ln in out if ln.startswith("-- NOTE: ") or ln.startswith("--       ")]
+        assert out[2].startswith("-- NOTE: only Luraph's start-up code was recovered"), out
+        assert " ".join(ln[9:] for ln in note) == driver.START_UP_ONLY, note
+        assert out[2 + len(note):] == lifted.split("\n")[2:], out
+        line = deob.report(job, result)
+        assert line == "result: PARTIAL: " + driver.START_UP_ONLY, line
+
+
 def check_chunk_params():
     """The main function's parameters at the top level never give `local ... = ...`."""
     from obfuscators.luraph_v15 import devirt
@@ -433,6 +531,62 @@ def check_path2d_rect():
             got = [l.strip() for l in f if l.strip().startswith("print(")]
         assert got == PATH2D_WANT, [g for g in got if g not in PATH2D_WANT] + ["missing:"] + \
             [w for w in PATH2D_WANT if w not in got]
+
+
+def _print_args(line):
+    """The arguments of an output line `print(a, "b, c", 1.5)`: strings unquoted, numbers as written."""
+    inner = line[line.index("(") + 1:line.rindex(")")]
+    out = []
+    for tok in re.findall(r'"(?:[^"\\]|\\.)*"|[^,\s][^,]*', inner):
+        tok = tok.strip()
+        out.append(tok[1:-1] if tok.startswith('"') else tok)
+    return out
+
+
+def _path2d_answers(script):
+    """{tag: [printed values]} of a hand-written Path2D script run in the engine's environment, and its stderr."""
+    with tempfile.TemporaryDirectory() as d:
+        src = write(d, "own.luau", script)
+        out = os.path.join(d, "out.luau")
+        rc, so, se = engine([src, "--obfuscator", "generic", "--no-devirt", "-o", out])
+        assert rc == 0 and os.path.exists(out), (rc, so[-1:], se[-1:])
+        with open(out, encoding="utf-8") as f:
+            lines = [_print_args(l.strip()) for l in f if l.strip().startswith("print(")]
+    return {a[0]: a[1:] for a in lines if a}, se
+
+
+def check_path2d_stored():
+    """Points as the engine stores them (float32 Scale, int32 Offset truncated toward zero; UDim2:Lerp
+    rounds the offsets): the same Rect and length as devm's mock gives (tests/path2d_cases.py, also run
+    by tests/mock_test.py)."""
+    from path2d_cases import PATH2D_STORED, PATH2D_STORED_WANT
+    got, se = _path2d_answers(PATH2D_STORED)
+    for tag, want in PATH2D_STORED_WANT.items():
+        vals = got.get(tag)
+        assert vals and vals[:-1] == want[:-1], (tag, vals, want)
+        assert abs(float(vals[-1]) - want[-1]) < 0.005, (tag, vals[-1], want[-1])
+
+
+def check_path2d_query_time():
+    """The curve is measured against the parent Frame as it is when asked (points set before the parent
+    and before a resize, as devm does); GetBoundingRect of a one-point path is a stand-in of type Rect,
+    with the "does not cover" warning (tests/path2d_cases.py, also run by tests/mock_test.py)."""
+    from path2d_cases import PATH2D_LATE, PATH2D_LATE_WANT
+    got, se = _path2d_answers(PATH2D_LATE)
+    for tag, want in PATH2D_LATE_WANT.items():
+        assert got.get(tag) == [str(w) for w in want], (tag, got.get(tag), want)
+    assert any("offline model does not cover" in ln for ln in se), se
+
+
+def check_path2d_arguments():
+    """Constructor arguments as the engine takes them (numeric strings, a value the engine does not
+    know, UDim2.new(UDim, UDim), offsets in (-1, 0) stored as 0), also where a UDim2 has no model twin
+    and its constructor's arguments are read: the same answers as devm's mock gives
+    (tests/path2d_cases.py, also run by tests/mock_test.py)."""
+    from path2d_cases import PATH2D_ARGS, PATH2D_ARGS_WANT, matches
+    got, se = _path2d_answers(PATH2D_ARGS)
+    for tag, want in PATH2D_ARGS_WANT.items():
+        assert matches(got.get(tag), want), (tag, got.get(tag), want)
 
 
 def _block(stmts, values=None):
@@ -713,6 +867,8 @@ CHECKS = [
     ("pack-site", check_pack_site),
     ("not-reached-unknown", check_not_reached_unknown),
     ("nested-root-lack", check_nested_root_lack),
+    ("start-up-only-lack", check_start_up_only_lack),
+    ("start-up-only-file", check_start_up_only_file),
     ("chunk-params", check_chunk_params),
     ("run-once-forin", check_run_once_forin),
     ("operand-order", check_operand_order),
@@ -721,6 +877,9 @@ CHECKS = [
     ("declarations", check_declarations),
     ("instance-model", check_instance_model),
     ("path2d-rect", check_path2d_rect),
+    ("path2d-stored", check_path2d_stored),
+    ("path2d-query-time", check_path2d_query_time),
+    ("path2d-arguments", check_path2d_arguments),
     ("result-line", check_result_line_trace),
     ("failure-line", check_failure_line),
     ("time-limit-lift", check_time_limit_lift),

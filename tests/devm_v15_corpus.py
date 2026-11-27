@@ -321,6 +321,65 @@ class RunFailedMessage(unittest.TestCase):
         self.assertEqual(vmmodel.harness_tail('[budget] stopped after 9 VM instructions\n' + '[global] a\n' * 50),
                          '[budget] stopped after 9 VM instructions')
 
+    # long verdict lines (an [oracle] line quotes the script's own error text) before the real error
+    LONG = '\n'.join(['[oracle] script stopped: ' + c * 700 for c in 'abcde'] + ['[global] a'] * 20 + [
+        '[script] print: ' + 'y' * 900, '/w/devm/harness.lua:2178: hook not reached', '', 'stacktrace:',
+        '[C] function error', ''])
+
+    def test_long_verdicts_keep_the_error(self):
+        tail = vmmodel.harness_tail(self.LONG)
+        parts = tail.split(' | ')
+        # the last four verdicts and the error line do not fit in 600 characters: the error (42) is
+        # kept whole, the verdicts share the rest, (600 - 4 * 3 - 42) // 4 = 136 characters each
+        self.assertEqual([p[:len('[oracle] script stopped: b')] for p in parts[:4]],
+                         ['[oracle] script stopped: ' + c for c in 'bcde'], parts)
+        self.assertEqual([len(p) for p in parts[:4]], [136] * 4)
+        self.assertTrue(all(p.endswith('...') for p in parts[:4]), parts)
+        self.assertEqual(parts[-1], '/w/devm/harness.lua:2178: hook not reached')
+        self.assertNotIn('[global]', tail)
+        self.assertLessEqual(len(tail), 600)
+        # an error line longer than its share is cut, not dropped: five lines of (600 - 12) // 5 = 117
+        tail = vmmodel.harness_tail(self.LONG.replace('/w/devm/harness.lua:2178: hook not reached', 'E' * 900))
+        parts = tail.split(' | ')
+        self.assertTrue(parts[-1].startswith('EEEE') and tail.endswith('...'), tail[-200:])
+        self.assertEqual([len(p) for p in parts], [117] * 5)
+        # without verdicts the error line gets the whole limit
+        self.assertEqual(vmmodel.harness_tail('x' * 50 + '\n' + 'boom: ' + 'z' * 1000), 'boom: ' + 'z' * 591 + '...')
+
+    def test_nothing_cut_when_it_fits(self):
+        """A verdict line is cut only when the lines that must be there do not fit: an [oracle] line
+        that quotes the script's own error (a chunk name in it) keeps its end."""
+        why = ('[string "local Players = game:GetService(\'Players\') local LocalPlayer = Players.LocalPlayer"]:1: '
+               'attempt to index nil with \'Character\'')
+        err = '\n'.join(['[script] print: hi', '[stubs] last permissive stubs: a, b, c',
+                         '[oracle] script stopped: ' + why + ' after 4096 instructions'])
+        self.assertEqual(vmmodel.harness_tail(err), err.replace('\n', ' | '))
+        # short verdicts and a long error: the error gets all the room they leave
+        err = '[budget] stopped after 9 VM instructions\n[end] no hand-over\nboom: ' + 'z' * 1000
+        tail = vmmodel.harness_tail(err)
+        self.assertTrue(tail.startswith('[budget] stopped after 9 VM instructions | [end] no hand-over | boom: zz'), tail)
+        self.assertEqual(len(tail), 600)
+        self.assertTrue(tail.endswith('z...'))
+
+    def test_error_before_later_tagged_lines(self):
+        """The error is the last line without a tag, also when tagged lines follow it; four long
+        verdicts in front do not push it out."""
+        err = '\n'.join(['[oracle] script stopped: ' + c * 700 for c in 'abcd'] + [
+            'sample:9: real error here', '[stubs] last permissive stubs: x, y'])
+        tail = vmmodel.harness_tail(err)
+        parts = tail.split(' | ')
+        self.assertEqual(parts[-1], 'sample:9: real error here', parts[-2:])
+        self.assertEqual([len(p) for p in parts[:4]], [(600 - 12 - 25) // 4] * 4)
+        self.assertLessEqual(len(tail), 600)
+        # (when everything fits, the tagged line after it is there too)
+        err = '[oracle] script stopped: x\nsample:9: real error here\n[stubs] last permissive stubs: x, y'
+        self.assertEqual(vmmodel.harness_tail(err), err.replace('\n', ' | '))
+
+    def test_main_prints_the_error_after_long_verdicts(self):
+        line = self._main_line(self.LONG)
+        self.assertTrue(line.startswith('devm: run failed: oracle run failed: [oracle] script stopped: b'), line[:200])
+        self.assertTrue(line.endswith('hook not reached'), line[-200:])
+
     def test_stopped_run_says_so(self):
         """A harness that does not end within the limit is stopped, and the tail says that it was."""
         cmd = [sys.executable, '-c', 'import sys, time; sys.stderr.write("[global] a\\n[script] print: waiting\\n"); '
@@ -331,13 +390,21 @@ class RunFailedMessage(unittest.TestCase):
         self.assertEqual(tail, '[script] print: waiting | [timeout] the run was stopped after 2 s without reaching its end')
 
     def test_main_prints_it(self):
+        line = self._main_line(self.STDERR)
+        self.assertTrue(line.startswith('devm: run failed: oracle run failed: '), line)
+        self.assertIn('attempt to call a nil value after 4096 instructions', line)
+        self.assertIn('hook not reached', line)
+        self.assertNotIn('[global]', line)
+
+    def _main_line(self, stderr):
+        """The last line devm.run prints when its run fails with harness_tail(stderr) in the message."""
         import contextlib
         import io
         from devm import run
         keep = run.deobfuscate
 
         def fail(*a, **k):
-            raise RuntimeError('oracle run failed: ' + vmmodel.harness_tail(self.STDERR))
+            raise RuntimeError('oracle run failed: ' + vmmodel.harness_tail(stderr))
         run.deobfuscate = fail
         out = io.StringIO()
         try:
@@ -350,11 +417,7 @@ class RunFailedMessage(unittest.TestCase):
         finally:
             run.deobfuscate = keep
         self.assertEqual(cm.exception.code, 1)
-        line = out.getvalue().strip().split('\n')[-1]
-        self.assertTrue(line.startswith('devm: run failed: oracle run failed: '), line)
-        self.assertIn('attempt to call a nil value after 4096 instructions', line)
-        self.assertIn('hook not reached', line)
-        self.assertNotIn('[global]', line)
+        return out.getvalue().strip().split('\n')[-1]
 
 
 class OutlinedDispatch(unittest.TestCase):

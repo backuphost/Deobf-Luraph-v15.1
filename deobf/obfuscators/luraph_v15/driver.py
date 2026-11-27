@@ -444,9 +444,9 @@ def run(job):
                         # Nothing of the script to lift: the lift would be
                         # Luraph's start-up program, which is not the script.
                         print("[!] the traced run stopped inside Luraph's start-up code, before the script's own "
-                              "code (%s): nothing of the script to lift" % status, file=sys.stderr)
+                              "code (%s): nothing of the script to lift" % start_up_status(status), file=sys.stderr)
                         failure[0] = ("the traced run stopped in Luraph's start-up code, before the script's own "
-                                      "code (%s)" % status)
+                                      "code (%s)" % start_up_status(status))
                     else:
                         lifted_lacks, failure[0] = lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath,
                                                         chunk_paths)
@@ -476,18 +476,13 @@ def run(job):
             print("[!] nothing was lifted: the traced run made no VM function (%s)" % status, file=sys.stderr)
             job.lacks("nothing was lifted: the traced run made no VM function (%s)" % status)
         elif not stopped and (nil_calls < 50 or nil_calls * 100 < lifted.count("\n")):
-            for what in lifted_lacks:
+            lacks = kept_lift_lacks(lifted_lacks, status, "nested" in shapes)
+            if START_UP_ONLY in lacks:
+                # (the file says so as well: what it holds is Luraph's code, not the script)
+                with open(dpath, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(header_note(lifted, START_UP_ONLY))
+            for what in lacks:
                 job.lacks(what)
-            if not trace.run_ended(status):
-                # (a run the tracer had to stop: a tamper response scrambles
-                # code, and what was dumped is then not the script's)
-                job.lacks("the traced run did not end (%s)" % status)
-            elif "nested" in shapes and status != "finished":
-                # (v15.2: one function holds Luraph's start-up code and the
-                # script, and its lift follows what the run executed: a run
-                # that stopped with an error did not show the rest)
-                job.lacks("the traced run stopped (%s): Luraph v15.2 code is recovered only as far as "
-                          "the run got" % status)
             return dpath
         elif stopped:
             print("[!] the devirtualized output stops after %d lines (%s); the behaviour trace shows more: "
@@ -515,6 +510,61 @@ MAIN_UNKNOWN = ("the script's main function could not be identified: the output 
                 "start-up code")
 NESTED_START_UP = ("Luraph v15.2 keeps its start-up code and the script's main function in one function: the "
                    "output includes Luraph's start-up code, not separated from the script")
+
+
+# envlog's run status when its spin watchdog stopped the run: VM code went round without touching the
+# environment (no statement, no new value) for SPIN_CHECKS checks
+SPIN_STATUS = "aborted: endless loop in the script's own code"
+START_UP_ONLY = ("only Luraph's start-up code was recovered: the traced run did not get past it (it ended in "
+                 "Luraph's tamper response, an endless loop without environment access, not in the script's own "
+                 "code)")
+
+
+def tamper_loop(status):
+    """The run was stopped by the spin watchdog (envlog's "endless loop in the script's own code": the
+    script as the environment sees it, VM code included).  Inside Luraph's start-up code that loop is
+    its tamper response: a failed environment check ends in VM code that spins for ever without
+    touching the environment."""
+    return bool(status) and status.startswith(SPIN_STATUS)
+
+
+def start_up_status(status):
+    """The run status as said of a run that stopped in Luraph's start-up code (the status itself
+    stays in the text: deob.report then does not repeat it after the trace's own lack)."""
+    if tamper_loop(status):
+        return "Luraph's tamper response, an endless loop without environment access; run status: " + status
+    return status
+
+
+def kept_lift_lacks(lifted_lacks, status, nested):
+    """What the result line says a kept lift lacks: the lift's own lacks, then what the run's end
+    means.  A run the tracer stopped did not end: a tamper response scrambles code, and what was
+    dumped is then not the script's.  A v15.2 lift (nested) follows what the run executed: a run
+    that stopped with an error did not show the rest.  A v15.2 lift that starts with Luraph's
+    start-up code (NESTED_START_UP: the run named no script main function) from a run stopped in
+    that code's tamper loop holds the start-up code and nothing after it: said plainly, first,
+    in place of both of those lacks."""
+    out = list(lifted_lacks)
+    if not trace.run_ended(status):
+        if NESTED_START_UP in out and tamper_loop(status):
+            out.remove(NESTED_START_UP)
+            out.insert(0, START_UP_ONLY)
+        else:
+            out.append("the traced run did not end (%s)" % status)
+    elif nested and status != "finished":
+        out.append("the traced run stopped (%s): Luraph v15.2 code is recovered only as far as the run got" % status)
+    return out
+
+
+def header_note(text, note):
+    """text with `note` as comment lines (NOTE: ...) after its leading comment lines."""
+    import textwrap
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines) and lines[i].startswith("--"):
+        i += 1
+    add = [("-- NOTE: " if k == 0 else "--       ") + part for k, part in enumerate(textwrap.wrap(note, 90))]
+    return "\n".join(lines[:i] + add + lines[i:])
 
 
 NESTED_CALLEE = ("Luraph v15.2 keeps its start-up code and the script's top level in one function: the lift "

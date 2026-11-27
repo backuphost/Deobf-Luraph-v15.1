@@ -382,7 +382,10 @@ end
 local function int32(x)
 	x = num(x)
 	if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
-	return x < 0 and math.ceil(x) or math.floor(x)
+	-- (truncated toward zero; a value in (-1, 0) gives 0, not -0: an int32 has no -0)
+	x = x < 0 and math.ceil(x) or math.floor(x)
+	if x == 0 then return 0 end
+	return x
 end
 
 local newUDim

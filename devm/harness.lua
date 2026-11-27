@@ -1358,6 +1358,19 @@ do
 		if x == math.floor(x) and math.abs(x) < 2 ^ 53 then return string.format("%d", x) end
 		return string.format("%.14g", x)
 	end
+	-- a UDim's Scale is a float32 (rbxmock.lua): written as the shortest decimal that gives it back
+	local F32 = buffer.create(4)
+	local function scale(x)
+		if type(x) ~= "number" or x ~= x or x == math.huge or x == -math.huge then return x end
+		for digits = 1, 9 do
+			local d = tonumber(string.format("%." .. digits .. "g", x))
+			if d then
+				buffer.writef32(F32, 0, d)
+				if buffer.readf32(F32, 0) == x then return d end
+			end
+		end
+		return x
+	end
 	local function all(...)
 		local out = {}
 		for i = 1, select("#", ...) do
@@ -1387,12 +1400,12 @@ do
 			local a = all(rawget(v, "X"), rawget(v, "Y"))
 			return a and "Vector2.new(" .. a .. ")"
 		elseif tn == "UDim" then
-			local a = all(rawget(v, "Scale"), rawget(v, "Offset"))
+			local a = all(scale(rawget(v, "Scale")), rawget(v, "Offset"))
 			return a and "UDim.new(" .. a .. ")"
 		elseif tn == "UDim2" then
 			local x, y = rawget(v, "X"), rawget(v, "Y")
 			if type(x) ~= "table" or type(y) ~= "table" then return nil end
-			local a = all(rawget(x, "Scale"), rawget(x, "Offset"), rawget(y, "Scale"), rawget(y, "Offset"))
+			local a = all(scale(rawget(x, "Scale")), rawget(x, "Offset"), scale(rawget(y, "Scale")), rawget(y, "Offset"))
 			return a and "UDim2.new(" .. a .. ")"
 		end
 		-- a datatype the mock does not model: the constructor call that made it
