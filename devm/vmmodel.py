@@ -1088,19 +1088,37 @@ _TRACE_TAGS = ('[global] ', '[call] ', '[proto] ', '[gread] ', '[gwrite] ')
 _VERDICT_TAGS = ('[oracle]', '[budget]', '[timeout]', '[end]', '[error]', '[fail]')
 
 
+# a line the harness wrote with a tag ("[script] print: ...", "[stubs] ..."); an error text has none
+# (a chunk's own name in it is no tag: '[string "..."]:1: attempt to ...')
+_TAGGED = re.compile(r'\[\w+\]')
+
+
 def _clip(line, n):
     """line cut to at most n characters, the cut marked with '...'."""
     return line if len(line) <= n else line[:max(n - 3, 0)] + '...'
 
 
+def _share(lengths, room):
+    """The length lines of these lengths are cut to when they share `room` characters: the largest
+    cap with sum(min(length, cap)) <= room (a line shorter than its share is kept whole and leaves
+    the rest of its share to the others)."""
+    rest, left = room, len(lengths)
+    for n in sorted(lengths):
+        share = rest // left
+        if n > share:
+            return share
+        rest, left = rest - n, left - 1
+    return max(lengths, default=0)
+
+
 def harness_tail(stderr, limit=600):
-    """The meaningful end of a failed harness run's stderr, as one line for a failure message: the
-    per-access trace lines and the harness's own traceback dropped; the last four verdict lines
-    ([oracle], [budget], [timeout], [end], [error], [fail]), each cut to about limit / 4 characters;
-    the last line that is neither (the error itself, where it happened), always, in the room the
-    verdicts leave (at least limit / 4); then the other lines before it, latest first, while the whole
-    stays within `limit`.  In their order, joined by ' | ' (at most about limit * 1.3 characters:
-    devm.run prints 1000 of a failure message)."""
+    """The meaningful end of a failed harness run's stderr, as one line of at most `limit` characters
+    for a failure message: the per-access trace lines and the harness's own traceback dropped; the
+    last four verdict lines ([oracle], [budget], [timeout], [end], [error], [fail]) and the error
+    itself (the last line without a [tag]: the error and where it happened; else the last other
+    line), always, whole when they fit and otherwise sharing the room (the longest cut first, each
+    cut marked with '...'); then the other lines, latest first, while the whole stays within `limit`.
+    In their order, joined by ' | '."""
     lines, skip = [], False
     for line in stderr.split('\n'):
         line = line.strip()
@@ -1113,14 +1131,16 @@ def harness_tail(stderr, limit=600):
         if skip or line.startswith(_TRACE_TAGS):
             continue
         lines.append(line)
-    verdicts = [i for i, l in enumerate(lines) if l.startswith(_VERDICT_TAGS)][-4:]
+    must = [i for i, l in enumerate(lines) if l.startswith(_VERDICT_TAGS)][-4:]
     others = [i for i, l in enumerate(lines) if not l.startswith(_VERDICT_TAGS)]
-    keep = {i: _clip(lines[i], limit // 4) for i in verdicts}
-    size = sum(len(t) + 3 for t in keep.values())
     if others:
-        last = others.pop()
-        keep[last] = _clip(lines[last], max(limit - size, limit // 4))
-        size += len(keep[last]) + 3
+        plain = [i for i in others if not _TAGGED.match(lines[i])]
+        last = (plain or others)[-1]
+        others.remove(last)
+        must.append(last)
+    cap = _share([len(lines[i]) for i in must], limit - 3 * (len(must) - 1))
+    keep = {i: _clip(lines[i], cap) for i in must}
+    size = sum(len(t) + 3 for t in keep.values())
     for i in reversed(others):
         if size + len(lines[i]) > limit:
             break

@@ -290,6 +290,70 @@ def check_start_up_only_lack():
     assert " ".join(ln[9:] for ln in out[2:-3]) == driver.START_UP_ONLY
 
 
+def check_start_up_only_file():
+    """driver.run end to end on a synthetic run (no VM: the traced run, the main function test and the
+    lift are stand-ins): a v15.2 nested lift that starts with Luraph's start-up code from a run the spin
+    watchdog stopped is the result, its file says in the header that only the start-up code was
+    recovered (the lifted code itself untouched), and the result line says so first."""
+    import contextlib
+    import io
+    import deob
+    import harness as dh
+    from obfuscators.base import Job
+    from obfuscators.luraph_v15 import driver
+    spin = "aborted: endless loop in the script's own code (no environment access)"
+    lifted = "-- Deobfuscated by deobf (devirtualized)\n-- source: own.lua\n\nlocal x = 1\nprint(x)\n"
+
+    class Runner:
+        bridge = None
+
+        def __init__(self, job):
+            self.runs = 0
+
+        def run(self, patched, cfg, chunks):
+            self.runs += 1
+            assert cfg.get("top_thread") is True, cfg      # (a v15.2 nested shape runs as a top-level thread)
+            return "-- run status: %s\n-- 2 statements recorded in 0.01s\n\x00PROTOS {}\nlocal a = 1\n" % spin, ""
+
+        def finish(self):
+            pass
+
+    def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths):
+        job.write(dpath, lifted)
+        return [], None
+
+    def patch_entries(source, path, shapes=None, hooks=True):
+        shapes.add("nested")
+        return source
+
+    saved = {(driver, "patch_entries"): driver.patch_entries, (driver, "lift"): driver.lift,
+             (driver, "nested_root"): driver.nested_root, (dh, "Runner"): dh.Runner}
+    with tempfile.TemporaryDirectory() as d:
+        src = write(d, "own.lua", "return 1\n")
+        args = deob.parser().parse_args([src, "--obfuscator", "luraph_v15"])
+        job = Job(src, "return 1\n", args, os.path.join(d, "own.deobf.luau"), False, "Luraph v15.2")
+        driver.patch_entries, driver.lift = patch_entries, lift
+        driver.nested_root = lambda job, ppath, chunk_paths: "first"
+        dh.Runner = Runner
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                result = driver.run(job)
+        finally:
+            for (mod, name), value in saved.items():
+                setattr(mod, name, value)
+        assert result == job.path(".devirt.luau"), result
+        with open(result, encoding="utf-8") as f:
+            out = f.read().split("\n")
+        assert job.missing == [driver.START_UP_ONLY], job.missing
+        assert out[:2] == lifted.split("\n")[:2], out
+        note = [ln for ln in out if ln.startswith("-- NOTE: ") or ln.startswith("--       ")]
+        assert out[2].startswith("-- NOTE: only Luraph's start-up code was recovered"), out
+        assert " ".join(ln[9:] for ln in note) == driver.START_UP_ONLY, note
+        assert out[2 + len(note):] == lifted.split("\n")[2:], out
+        line = deob.report(job, result)
+        assert line == "result: PARTIAL: " + driver.START_UP_ONLY, line
+
+
 def check_chunk_params():
     """The main function's parameters at the top level never give `local ... = ...`."""
     from obfuscators.luraph_v15 import devirt
@@ -512,6 +576,17 @@ def check_path2d_query_time():
     for tag, want in PATH2D_LATE_WANT.items():
         assert got.get(tag) == [str(w) for w in want], (tag, got.get(tag), want)
     assert any("offline model does not cover" in ln for ln in se), se
+
+
+def check_path2d_arguments():
+    """Constructor arguments as the engine takes them (numeric strings, a value the engine does not
+    know, UDim2.new(UDim, UDim), offsets in (-1, 0) stored as 0), also where a UDim2 has no model twin
+    and its constructor's arguments are read: the same answers as devm's mock gives
+    (tests/path2d_cases.py, also run by tests/mock_test.py)."""
+    from path2d_cases import PATH2D_ARGS, PATH2D_ARGS_WANT, matches
+    got, se = _path2d_answers(PATH2D_ARGS)
+    for tag, want in PATH2D_ARGS_WANT.items():
+        assert matches(got.get(tag), want), (tag, got.get(tag), want)
 
 
 def _block(stmts, values=None):
@@ -793,6 +868,7 @@ CHECKS = [
     ("not-reached-unknown", check_not_reached_unknown),
     ("nested-root-lack", check_nested_root_lack),
     ("start-up-only-lack", check_start_up_only_lack),
+    ("start-up-only-file", check_start_up_only_file),
     ("chunk-params", check_chunk_params),
     ("run-once-forin", check_run_once_forin),
     ("operand-order", check_operand_order),
@@ -803,6 +879,7 @@ CHECKS = [
     ("path2d-rect", check_path2d_rect),
     ("path2d-stored", check_path2d_stored),
     ("path2d-query-time", check_path2d_query_time),
+    ("path2d-arguments", check_path2d_arguments),
     ("result-line", check_result_line_trace),
     ("failure-line", check_failure_line),
     ("time-limit-lift", check_time_limit_lift),

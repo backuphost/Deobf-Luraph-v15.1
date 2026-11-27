@@ -55,3 +55,52 @@ PATH2D_LATE_WANT = {
     'resized': ['149.5, 49.5, 450.5, 80.5', '301.496', 0.5],
     'one': ['Rect', 'userdata'],
 }
+# Constructor arguments as the engine takes them: a numeric string is its number, a missing value
+# (an attribute that is not set: nil in devm; a value the deobf engine does not know, which its
+# model reads as 0) counts as 0, UDim2.new(UDim, UDim) takes the UDims' parts, offsets truncated
+# toward zero.  Frame 300 x 200: points (75 + 10, 100 - 3) = (85, 97), (225 + 0, 100 - 20) =
+# (225, 80) and (f32(f32(0.1) * 300) = 30, 0 + 0); the box of those widened by 0.5, and the length
+# sqrt(140^2 + 17^2) + sqrt(195^2 + 80^2) = 141.028 + 210.772 = 351.801.
+# answer: an engine answer (a UDim2 of Scale only) used as a point: GetPositionOnCurve(0) is the
+# first point, (85 / 300, 97 / 200) in float32, which is (85, 97) again in the same Frame.
+# negzero: an offset in (-1, 0) is stored as 0, not -0 (1 / offset is +inf).
+PATH2D_ARGS = '''
+local sg = Instance.new("ScreenGui")
+local f = Instance.new("Frame")
+f.Size = UDim2.fromOffset(300, 200)
+f.Parent = sg
+local z = workspace:GetAttribute("missing")
+local p = Instance.new("Path2D")
+p.Parent = f
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.new("0.25", "10.7", "0.5", "-3.2")),
+    Path2DControlPoint.new(UDim2.new("0.75", z, 0.5, "-20.9")),
+    Path2DControlPoint.new(UDim2.new(UDim.new("0.1", z), UDim.new(z, "-0.5"))) })
+print("args", tostring(p:GetBoundingRect()), p:GetLength())
+local q = Instance.new("Path2D")
+q.Parent = f
+q:SetControlPoints({ Path2DControlPoint.new(p:GetPositionOnCurve(0)), Path2DControlPoint.new(UDim2.fromOffset(300, 0)) })
+print("answer", tostring(q:GetBoundingRect()))
+print("negzero", 1 / UDim.new(0, -0.5).Offset > 0, 1 / UDim2.new(0, -0.2, 0, 0.9).X.Offset > 0,
+    1 / (-UDim.new(0, 0.5)).Offset > 0, 1 / UDim2.fromOffset(-0.7, 0).X.Offset > 0)
+'''
+PATH2D_ARGS_WANT = {
+    'args': ['29.5, -0.5, 225.5, 97.5', 351.801],
+    'answer': ['84.5, -0.5, 300.5, 97.5'],
+    'negzero': ['true', 'true', 'true', 'true'],
+}
+
+
+def matches(got, want):
+    """got (printed values as text) against want: numbers that are not exact (float) within 0.005."""
+    if got is None or len(got) != len(want):
+        return False
+    for g, w in zip(got, want):
+        if isinstance(w, float):
+            try:
+                if abs(float(g) - w) >= 0.005:
+                    return False
+            except ValueError:
+                return False
+        elif g != str(w):
+            return False
+    return True

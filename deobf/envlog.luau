@@ -1232,6 +1232,8 @@ do
 
 	local function num(x)
 		if R.type(x) == "number" then return x end
+		-- (a numeric string is its number, as the engine's constructors take it; devm too)
+		if R.type(x) == "string" then return R.tonumber(x) or 0 end
 		return 0
 	end
 	-- UDim2 proxy -> {sx, ox, sy, oy} as the engine stores it (float32 Scale,
@@ -1239,10 +1241,32 @@ do
 	-- arguments (stored the same way: offsets truncated toward zero)
 	local function off32(x)
 		if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
-		return x < 0 and math.ceil(x) or math.floor(x)
+		-- (truncated toward zero; a value in (-1, 0) gives 0, not -0: an int32 has no -0)
+		x = x < 0 and math.ceil(x) or math.floor(x)
+		if x == 0 then return 0 end
+		return x
 	end
 	local function stored(u)
 		return { f32(u[1]), off32(u[2]), f32(u[3]), off32(u[4]) }
+	end
+	local function isUDim(v) return isP(v) and INFO[v].tname == "UDim" end
+	-- UDim proxy -> scale, offset (as given; stored() rounds them): its model twin, its
+	-- constructor's arguments, else its members (a replayed engine answer)
+	local function udimParts(v)
+		if not isUDim(v) then return 0, 0 end
+		local rv = REALV[v]
+		if rv ~= nil then
+			local ok, sc, of = R.pcall(function() return rv.Scale, rv.Offset end)
+			if ok and R.type(sc) == "number" and R.type(of) == "number" then return sc, of end
+		end
+		local inf = INFO[v]
+		local c = inf.ctor
+		if c and c.ns == "UDim" then
+			if c.fn == "new" then return num(c.args[1]), num(c.args[2]) end
+			return 0, 0
+		end
+		local pr = inf.props or {}
+		return num(pr.Scale), num(pr.Offset)
 	end
 	function M.udim2(p)
 		if not isP(p) then return nil end
@@ -1259,10 +1283,11 @@ do
 		if c and c.ns == "UDim2" then
 			local a = c.args
 			if c.fn == "new" then
-				if isP(a[1]) or isP(a[2]) then
-					local x, y = INFO[a[1]] and INFO[a[1]].ctor, INFO[a[2]] and INFO[a[2]].ctor
-					return stored({ x and num(x.args[1]) or 0, x and num(x.args[2]) or 0, y and num(y.args[1]) or 0,
-						y and num(y.args[2]) or 0 })
+				-- UDim2.new(UDim, UDim), else the four numbers (a numeric string is its number)
+				if isUDim(a[1]) or isUDim(a[2]) then
+					local xs, xo = udimParts(a[1])
+					local ys, yo = udimParts(a[2])
+					return stored({ xs, xo, ys, yo })
 				end
 				return stored({ num(a[1]), num(a[2]), num(a[3]), num(a[4]) })
 			elseif c.fn == "fromScale" then
@@ -1275,7 +1300,7 @@ do
 		local X, Y = inf.props and inf.props.X, inf.props and inf.props.Y
 		if isP(X) and isP(Y) then
 			local xp, yp = INFO[X].props, INFO[Y].props
-			return { num(xp.Scale), num(xp.Offset), num(yp.Scale), num(yp.Offset) }
+			return stored({ num(xp.Scale), num(xp.Offset), num(yp.Scale), num(yp.Offset) })
 		end
 		return nil
 	end
