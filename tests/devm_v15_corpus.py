@@ -346,6 +346,13 @@ class RunFailedMessage(unittest.TestCase):
         # without verdicts the error line gets the whole limit
         self.assertEqual(vmmodel.harness_tail('x' * 50 + '\n' + 'boom: ' + 'z' * 1000), 'boom: ' + 'z' * 591 + '...')
 
+    def test_tiny_limits(self):
+        """The lines that are always kept need 27 characters at their shortest ('...' each, ' | ' between them):
+        below that the joined line is cut to the limit."""
+        for limit in range(0, 40):
+            self.assertLessEqual(len(vmmodel.harness_tail(self.LONG, limit)), limit, limit)
+        self.assertEqual(vmmodel.harness_tail(self.LONG, 27), ' | '.join(['...'] * 5))
+
     def test_nothing_cut_when_it_fits(self):
         """A verdict line is cut only when the lines that must be there do not fit: an [oracle] line
         that quotes the script's own error (a chunk name in it) keeps its end."""

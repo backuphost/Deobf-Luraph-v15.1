@@ -151,11 +151,16 @@ traced run (`harness.lua`, `watch`) and, when it stops it, ends the run as if th
 returned: `[stalled]` line, exercise pass, oracle, end-state dump, serve mode for the lifter's
 lazily decoded constants.
 
-* **The script's start.**  The watch works on the script's own code.  That has started when the
-  run makes a program on an interpreter other than the first one (the payload of two-interpreter
-  builds; a build's helper there counts too), or at the script's first line of output or first
-  request (builds whose script runs on the first interpreter, next to Luraph's start-up code).
-  The `[started]` line says which, and how many waits of the main thread came before it.
+* **The script's start.**  The watch works on the script's own code.  That has started at the
+  script's first line of output or first request (the `[started]` line says which, and how many
+  waits of the main thread came before it).  A program the run makes on an interpreter other than
+  the first one (the payload of two-interpreter builds) starts the limits after the start only
+  provisionally: such a program can also be a helper of the build that Luraph's start-up code
+  makes and calls.  When a limit is reached and the script showed no output and no request, the
+  run counts as started only if it is in that program or under it, i.e. a program of another
+  interpreter is on the VM call chain of the instruction it is in (`watch.under`, see "Which
+  program is the script" below); otherwise the rules before the start apply, and a spin of the
+  start-up code after it made a helper ends like any spin before the start, without a dump.
 * **Progress** is a VM instruction that runs for the first time (or in a new version of its code)
   or a program that is made.  VM code is watched through the instruction hook; code that is not VM
   code (the loader, and the script's functions Luraph keeps as plain Lua) through its `while` /
@@ -196,14 +201,17 @@ lazily decoded constants.
   The `[watch]` line of each run (`N s of processor time; the script started at N s (...); longest
   stretch without new code: N s before the start, N s after it`) gave, measured as wall-clock time
   on a loaded machine, so an upper bound: runs of 30 - 245 s, the script started 30 - 145 s into
-  them and ran at most 114 s after that; the longest stretch without new code was 26 s before the
-  start (`--stall` x 4 = 360) and 4 s after it (`--stall` 90); no run waited.  The trade-off: lower
+  them and ran at most 114 s after that (the start then included the first program made on
+  another interpreter, from which the limits after the start are still checked); the longest
+  stretch without new code was 26 s before the start (`--stall` x 4 = 360) and 4 s after it
+  (`--stall` 90); no run waited.  The trade-off: lower
   limits would end a script that does not end sooner (and a run killed at the last-resort limit
   has no dump at all), higher ones let a long run that ends on its own finish on a slower
   machine; at these values the slowest corpus run has five times the room it needs, and a
   `--stall` or `--stall-run` that is too low for a script shows in the result as a `[stalled]`
   line, never as a silent cut.
-* **Before the start** the run is stopped in two ways, and they end differently:
+* **Before the start** (also after a program made on another interpreter, while the run is not in
+  or under one) the run is stopped in two ways, and they end differently:
   - 4 x `--stall` seconds without progress (a busy loop, not a wait loop), or the tamper response:
     the run ends *without* a dump.  It spins in Luraph's start-up code (an environment check that
     failed loops for ever) or in code that shows nothing, and a lift would be the start-up code,
@@ -220,23 +228,47 @@ lazily decoded constants.
   start: its first line of output, its first request, the run made program N on another
   interpreter>, <in what: waiting in task.wait() / Heartbeat:Wait() ..., in a loop of its VM
   code, in a loop outside the VM's code, at the entry of Luraph's tamper response, still running>;
-  code it would load or fetch later is missing`, and the result is PARTIAL.  `deob.py` /
-  `allinone.py` keep that result (the second engine is not tried) and end with
-  `result: PARTIAL: the script did not end: ... (devm)`.
+  code it would load or fetch later is missing`, and the result is PARTIAL.  Where the start is a
+  program made on another interpreter, the one named is the program the run was stopped in or
+  under (the `[where]` line), which is also the evidence the script is then taken from: the line
+  does not name a program that the report calls a helper.  `deob.py` / `allinone.py` keep that
+  result (the second engine is not tried) and end with `result: PARTIAL: the script did not end:
+  ... (devm)`.
 * **Which program is the script.**  A run that does not end is often one that never reached the
   script's interpreter, so the choice of the root matters more than before.  The harness notes
   which program ran the last VM instruction before each line of the script's output and each
   request (`[effects]`), and for every program the program of the instruction before its first
-  one, i.e. its caller (`caller` in the dump's proto record).
-  - The script is taken from the interpreter its output came from (`pipeline.script_programs`).
-    A build can make programs on other interpreters that are helpers (routines of the build)
-    while the script runs on the first interpreter; the first of those helpers used to be lifted
-    as "the script".  The `start-up code:` line then names them as helpers.  The script's own
-    program can in turn call routines of the first interpreter, and the last VM instruction before
-    its output is then in one of those (seen in v15.1 and v15.2 corpus builds whose script is a
-    program on the second interpreter): a program the output came from is followed through its
-    callers, and where that chain passes a program on another interpreter, the output counts for
-    that program's interpreter.
+  one, i.e. its caller (`caller` in the dump's proto record).  With the closures of the programs
+  on other interpreters known (`binds=1` or `exercise=1`, which devm's traced run always passes)
+  it also places each line of output and request, and the place a stopped run was stopped, on its
+  VM call chain (`watch.under`): the innermost program of another interpreter on the Lua stack of
+  the thread that ran the last VM instruction (a VM call is a call of the callee's closure, and
+  Luau has no tail calls), or none (`[under] the VM call chains of the script's output and
+  requests: under program N (count), ..., under no program of another interpreter (count)`;
+  `[where] the run was stopped in program N, under program M of another interpreter` / `, on
+  another interpreter` / `, under no program of another interpreter`).  A function that a mock
+  function calls back runs on that function's own thread (`cwrap`), so its chain starts there.
+  - The script is taken from the interpreter its output came from (`pipeline.script_programs`,
+    `pipeline.script_votes`).  A build can make programs on other interpreters that are helpers
+    (routines of the build) while the script runs on the first interpreter; the first of those
+    helpers used to be lifted as "the script".  The `start-up code:` line then names them as
+    helpers.  The script's own program can in turn call routines of the first interpreter, and the
+    last VM instruction before its output is then in one of those (seen in v15.1 and v15.2 corpus
+    builds whose script is a program on the second interpreter): the `[under]` line places that
+    output under the script's program.  Without that line a program the output came from is
+    followed through its first callers, and where that chain passes a program on another
+    interpreter, the output counts for that program's interpreter -- weaker evidence: a caller is
+    only the program of the instruction before a program's first one, which can be a helper that
+    happened to run just before.
+  - The evidence is weighed: every line of output and request counts once, and an interpreter
+    other than the first is taken only when more of it points there than at the first interpreter
+    (the one with the most, if several).  One program among several, say one first called from a
+    helper, does not decide, and a tie keeps the first program.  When not all of it points at the
+    first interpreter, the `start-up code:` line gives the counts.
+  - A run that did not end and showed no output and no request is placed by the program it was
+    stopped in, the same way: by its call chain where the `[where]` line gives it, else through its
+    first callers.  Without any of this evidence (a run that ended without output) the payload
+    stays the first program on another interpreter.
   - On the first interpreter, the programs the output came from (for a script that showed
     nothing: the program the run was stopped in, `[where]`) are followed through their callers to
     the first program (`pipeline.entered_candidate`): the program below it on that chain is the
@@ -261,12 +293,13 @@ lazily decoded constants.
   recognised by what it is handed, so a build whose tamper response looks different is stopped
   by the time limits, after it has damaged the state.
 
-The shape this was built for: a key-system loader whose script runs on the first interpreter, in
-a program the start-up code enters at the end of its run.  Without a key it reports the missing
-key and hands its own code arrays to Luraph's tamper response, which scrambles them and then loops
-for ever in VM code (no wait, no environment access, no new instruction).  Without the watch such
-a run goes on until the last-resort limit and fails; with it, the run stops at the tamper
-response and the script's program is lifted.
+Taken together: a run that never ends -- the script waits for something the mock never delivers,
+sits in its own loop, or the run ends up in Luraph's tamper response, which loops for ever in VM
+code without new instructions, waits or environment access -- went on until the last-resort limit
+and failed.  With the watch the run is stopped (by a limit, or at the tamper response's entry),
+the state at that moment is dumped, the program the script runs in is chosen from the run's
+evidence (above), and the result is lifted from it, PARTIAL, with the reason in its report; a run
+that showed nothing of the script still fails.
 
 ## Environment fidelity (newer factory builds)
 
@@ -417,10 +450,12 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
   does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.  A failed
   harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`, at most 600
-  characters: the last four `[oracle]`, `[budget]`, `[timeout]`, `[stalled]`, `[error]` lines and
-  always the error itself, the last line without a `[tag]`, whole when they fit and otherwise
-  sharing the room, the longest cut first; then the lines before, while they fit; without the
-  per-access `[global]` / `[call]` trace lines).  A traced run that does not end is normally
+  characters: the last four verdict lines -- `[oracle]`, `[budget]`, `[timeout]`, `[stalled]`,
+  `[end]`, `[error]`, `[fail]` -- and always the error itself, the last line without a `[tag]`,
+  whole when they fit and otherwise sharing the room, the longest cut first; then the lines
+  before, while they fit; without the per-access `[global]` / `[call]` trace lines.  Those up to
+  five lines need 27 characters at their shortest, `...` each and ` | ` between them; a limit
+  below that cuts the joined line to the limit).  A traced run that does not end is normally
   stopped by the harness itself and lifted (see "A script that does not end"); one that showed
   nothing of the script fails with its `[stalled]` line, and one that still did not end at the
   last-resort limit of 1800 s says so in a `[timeout]` line.
