@@ -74,7 +74,12 @@ run stopped inside Luraph's start-up code: nothing is lifted (the lift would
 be the start-up program, not the script) and the result is the trace, PARTIAL
 with that reason (a v15.0 container of the public corpus: prints, then fails in
 its own loader). If the run finished, the root is lifted and reported PARTIAL
-("main function not identified"). Not for v15.2 (one function holds both).
+("main function not identified"). Not for v15.2 (one function holds both):
+its lift from the program the VM entered first is PARTIAL with "the output
+includes Luraph's start-up code"; when the spin watchdog stopped that run (the
+start-up code's tamper loop), the result line says first that only Luraph's
+start-up code was recovered and the run did not get past it, and the lifted
+file says so in its header (`driver.kept_lift_lacks`, `header_note`).
 The IR and everything after the walk are shared (`ir.py`, `backend.lower`, CLAUDE.md).
 
 - **Capture** (`driver.patch_entries` + `envlog.luau` `CHAIN.dumpProtos`):

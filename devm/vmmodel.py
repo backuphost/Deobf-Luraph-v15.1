@@ -1088,11 +1088,19 @@ _TRACE_TAGS = ('[global] ', '[call] ', '[proto] ', '[gread] ', '[gwrite] ')
 _VERDICT_TAGS = ('[oracle]', '[budget]', '[timeout]', '[end]', '[error]', '[fail]')
 
 
+def _clip(line, n):
+    """line cut to at most n characters, the cut marked with '...'."""
+    return line if len(line) <= n else line[:max(n - 3, 0)] + '...'
+
+
 def harness_tail(stderr, limit=600):
     """The meaningful end of a failed harness run's stderr, as one line for a failure message: the
-    per-access trace lines and the harness's own traceback dropped, the last verdict lines ([oracle],
-    [budget], [timeout], [end], [error], [fail]) kept, then the last other lines (the error and where
-    it happened) up to about `limit` characters, in their order, joined by ' | '."""
+    per-access trace lines and the harness's own traceback dropped; the last four verdict lines
+    ([oracle], [budget], [timeout], [end], [error], [fail]), each cut to about limit / 4 characters;
+    the last line that is neither (the error itself, where it happened), always, in the room the
+    verdicts leave (at least limit / 4); then the other lines before it, latest first, while the whole
+    stays within `limit`.  In their order, joined by ' | ' (at most about limit * 1.3 characters:
+    devm.run prints 1000 of a failure message)."""
     lines, skip = [], False
     for line in stderr.split('\n'):
         line = line.strip()
@@ -1105,17 +1113,20 @@ def harness_tail(stderr, limit=600):
         if skip or line.startswith(_TRACE_TAGS):
             continue
         lines.append(line)
-    keep = {i for i, l in enumerate(lines) if l.startswith(_VERDICT_TAGS)}
-    keep = set(sorted(keep)[-4:])
-    size = sum(min(len(lines[i]), limit) + 3 for i in keep)
-    for i in range(len(lines) - 1, -1, -1):
-        if i in keep:
-            continue
-        if keep and size + len(lines[i]) > limit:
+    verdicts = [i for i, l in enumerate(lines) if l.startswith(_VERDICT_TAGS)][-4:]
+    others = [i for i, l in enumerate(lines) if not l.startswith(_VERDICT_TAGS)]
+    keep = {i: _clip(lines[i], limit // 4) for i in verdicts}
+    size = sum(len(t) + 3 for t in keep.values())
+    if others:
+        last = others.pop()
+        keep[last] = _clip(lines[last], max(limit - size, limit // 4))
+        size += len(keep[last]) + 3
+    for i in reversed(others):
+        if size + len(lines[i]) > limit:
             break
-        keep.add(i)
-        size += min(len(lines[i]), limit) + 3
-    return ' | '.join(lines[i][:limit] for i in sorted(keep)) or '(no output)'
+        keep[i] = lines[i]
+        size += len(lines[i]) + 3
+    return ' | '.join(keep[i] for i in sorted(keep)) or '(no output)'
 
 
 def run_oracle(model, workdir, tag, options=()):

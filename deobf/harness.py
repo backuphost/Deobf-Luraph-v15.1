@@ -146,7 +146,8 @@ def p2d_miss(body, cache_path):
     if "\x00P2DMISS" not in body:
         return body
     print("[!] this script derives keys from a Path2D call the offline model does not cover\n"
-          "    (e.g. a Frame sized with Scale); run it once with --studio (writes %s)" % cache_path,
+          "    (e.g. a Frame sized with Scale, or GetBoundingRect of a path with fewer than 2 points); run it\n"
+          "    once with --studio (writes %s)" % cache_path,
           file=sys.stderr)
     return body.replace("\x00P2DMISS\n", "")
 

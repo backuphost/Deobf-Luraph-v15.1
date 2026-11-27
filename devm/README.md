@@ -150,10 +150,18 @@ exactly rather than approximately:
 * the executed copy is one line (line numbers in its own error messages are compared);
 * Path2D geometry is a float32 model in the engine's order of operations, ported from the
   Studio-verified model of the "deobf" Luraph deobfuscator; the float32 bit patterns are key bytes.
+  A UDim holds what the engine stores (deobf's Studio-verified `datatypes.luau`): float32 Scale,
+  int32 Offset truncated toward zero, `UDim2:Lerp` offsets rounded; the curve is measured against
+  the parent Frame as it is when asked.
   `GetBoundingRect` is the box of the control polygon (every point and the tangent handles that
   shape a segment) widened by `Thickness`/2, in the parent's pixels: the plausible rule, shared
-  with deobf and not measured in Roblox (the v15.1/v15.2 start-up code seen calls it without
-  reading the Rect); a path with fewer than 2 points still gets a logged stand-in;
+  with deobf and not measured in Roblox.  The candidates were the box of the points only, the
+  exact box of the curve or the control-polygon box (adopted); widened by 0, `Thickness`/2
+  (adopted) or `Thickness`; in Frame-local (adopted) or absolute coordinates; the start-up code
+  seen (v15.1/v15.2) calls it but never reads the Rect, so no run tells them apart.  The Rect is
+  a locked userdata (`Min`, `Max`, `Width`, `Height`; other members and assignments raise); a
+  path with fewer than 2 points gets a logged stand-in of type Rect.  UDim, UDim2 and Vector2
+  are still plain tables with an open metatable (`type` says "table"), unlike Roblox's;
 * executor-style globals (`identifyexecutor`, `iscclosure`, `islclosure`) exist, as in the
   reference environment the key material was compared against.
 
@@ -269,9 +277,10 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   non-zero status: `unsupported target` (a build for Lua 5.3/5.4 or LuaJIT: `normalize.foreign_dialect`
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
   does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.  A failed
-  harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`: the `[oracle]`,
-  `[budget]`, `[timeout]`, `[error]` lines and the last error, without the per-access `[global]` /
-  `[call]` trace lines), printed up to 1000 characters; a traced run stopped at its time limit
+  harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`: the last four
+  `[oracle]`, `[budget]`, `[timeout]`, `[error]` lines, each cut to 150 characters, and always the
+  last error line, without the per-access `[global]` / `[call]` trace lines), printed up to 1000
+  characters; a traced run stopped at its time limit
   (a script that waits for ever, e.g. for a key) says so in a `[timeout]` line.
 * **Containers.**  With `devm/container_static.py` in the tree the container is read without
   running it; otherwise by the sandboxed probe.  Either way the run executes the shipped file.

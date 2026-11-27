@@ -883,10 +883,31 @@ return function(G, fnames, libnames, opts)
 	M.Instance = Instance
 
 	-- UDim / UDim2 / Vector2 with real arithmetic (Luraph's bootstrap derives key material from
-	-- Path2D geometry, so these have to compute, not just exist)
+	-- Path2D geometry, so these have to compute, not just exist).  A UDim holds what the engine
+	-- stores, as in the deobf engine's Studio-verified model (deobf/datatypes.luau): Scale is a
+	-- float32, Offset an int32 truncated toward zero (NaN and out of range: -2^31); every
+	-- constructor, operator and Lerp goes through udim(), and UDim2:Lerp rounds the offsets
+	-- (floor(x + 0.5)).  The GUI layout and the Path2D model below read these stored values.
+	local F32B = buffer.create(4)
+	local function f32(x)
+		buffer.writef32(F32B, 0, x)
+		return buffer.readf32(F32B, 0)
+	end
+	local function numArg(x)
+		if rawType(x) == "string" then return tonumber(x) or x end
+		return x
+	end
+	local function int32(x)
+		if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
+		return x < 0 and math.ceil(x) or math.floor(x)
+	end
 	local UDimMT, UDim2MT, Vec2MT = {}, {}, {}
 	local function udim(s, o)
-		local t = setmetatable({ Scale = s or 0, Offset = o or 0 }, UDimMT)
+		-- (a value that is not a number is kept as it is: the mock does not know Roblox's error)
+		s, o = numArg(s or 0), numArg(o or 0)
+		if rawType(s) == "number" then s = f32(s) end
+		if rawType(o) == "number" then o = int32(o) end
+		local t = setmetatable({ Scale = s, Offset = o }, UDimMT)
 		typeNames[t] = "UDim"
 		return t
 	end
@@ -894,7 +915,12 @@ return function(G, fnames, libnames, opts)
 	UDimMT.__sub = function(a, b) return udim(a.Scale - b.Scale, a.Offset - b.Offset) end
 	UDimMT.__unm = function(a) return udim(-a.Scale, -a.Offset) end
 	UDimMT.__eq = function(a, b) return a.Scale == b.Scale and a.Offset == b.Offset end
-	UDimMT.__tostring = function(a) return a.Scale .. ", " .. a.Offset end
+	UDimMT.__tostring = function(a)
+		if rawType(a.Scale) == "number" and rawType(a.Offset) == "number" then
+			return string.format("%.9g, %d", a.Scale, a.Offset)
+		end
+		return tostring(a.Scale) .. ", " .. tostring(a.Offset)
+	end
 	local function udim2(xs, xo, ys, yo)
 		local t = setmetatable({ X = udim(xs, xo), Y = udim(ys, yo) }, UDim2MT)
 		t.Width, t.Height = t.X, t.Y
@@ -907,12 +933,15 @@ return function(G, fnames, libnames, opts)
 	UDim2MT.__sub = function(a, b)
 		return udim2(a.X.Scale - b.X.Scale, a.X.Offset - b.X.Offset, a.Y.Scale - b.Y.Scale, a.Y.Offset - b.Y.Offset)
 	end
+	UDim2MT.__unm = function(a) return udim2(-a.X.Scale, -a.X.Offset, -a.Y.Scale, -a.Y.Offset) end
 	UDim2MT.__eq = function(a, b) return a.X == b.X and a.Y == b.Y end
 	UDim2MT.__tostring = function(a) return "{" .. tostring(a.X) .. "}, {" .. tostring(a.Y) .. "}" end
 	UDim2MT.__index = {
 		Lerp = function(a, b, t)
-			return udim2(a.X.Scale + (b.X.Scale - a.X.Scale) * t, a.X.Offset + (b.X.Offset - a.X.Offset) * t,
-				a.Y.Scale + (b.Y.Scale - a.Y.Scale) * t, a.Y.Offset + (b.Y.Offset - a.Y.Offset) * t)
+			t = numArg(t)
+			local function off(x, y) return math.floor(x + (y - x) * t + 0.5) end
+			return udim2(a.X.Scale + (b.X.Scale - a.X.Scale) * t, off(a.X.Offset, b.X.Offset),
+				a.Y.Scale + (b.Y.Scale - a.Y.Scale) * t, off(a.Y.Offset, b.Y.Offset))
 		end,
 	}
 	local function vec2(x, y)
@@ -1358,13 +1387,9 @@ return function(G, fnames, libnames, opts)
 		--   GetLength: adaptive bisection per segment (chord a, half chords b; b - a < 1e-5 -> b)
 		--   arc-length queries: s = f32(t * L), then 32 RK4 steps of du/ds = 1/|B'(u)|
 		-- Luraph feeds the float32 bit patterns of these results into its decryption key.
-		local FB = buffer.create(4)
-		local function f32(x)
-			buffer.writef32(FB, 0, x)
-			return buffer.readf32(FB, 0)
-		end
+		-- (u: a UDim2 as the engine stores it, float32 Scale and int32 Offset: see udim())
 		local function resolve(u, W, H)
-			return f32(f32(f32(u.X.Scale) * W) + u.X.Offset), f32(f32(f32(u.Y.Scale) * H) + u.Y.Offset)
+			return f32(f32(u.X.Scale * W) + u.X.Offset), f32(f32(u.Y.Scale * H) + u.Y.Offset)
 		end
 		local function coeffs(sg)
 			local n = #sg // 2
@@ -1559,18 +1584,42 @@ return function(G, fnames, libnames, opts)
 			needParent(self)
 			return length(segments(self))
 		end)
-		-- Rect: Min / Max corners, Width / Height (float32, as the engine stores them)
-		local RectMT = {}
+		-- Rect: Min / Max corners, Width / Height (float32, as the engine stores them).  A userdata
+		-- like the engine's value (newproxy, as the mock's Instances and Random are): type() says
+		-- "userdata", getmetatable() "The metatable is locked" (an executor's getrawmetatable gets
+		-- the real one, rawMT), an unknown member raises "X is not a valid member of Rect" and an
+		-- assignment raises (the texts follow the engine's other datatypes; not checked in Studio
+		-- for Rect).
+		local rectFields = setmetatable({}, { __mode = "k" })
+		local function rectIndex(r, k)
+			local v = rectFields[r][k]
+			if v ~= nil then return v end
+			error(tostring(k) .. " is not a valid member of Rect", 2)
+		end
+		local function rectNewindex(r, k)
+			if rawType(k) == "string" and rectFields[r][k] ~= nil then error(k .. " cannot be assigned to", 2) end
+			error(tostring(k) .. " is not a valid member of Rect", 2)
+		end
+		local function rectEq(a, b)
+			local x, y = rectFields[a], rectFields[b]
+			return x ~= nil and y ~= nil and x.Min == y.Min and x.Max == y.Max
+		end
+		local function rectTostring(r)
+			local f = rectFields[r]
+			return string.format("%.9g, %.9g, %.9g, %.9g", f.Min.X, f.Min.Y, f.Max.X, f.Max.Y)
+		end
 		local function rect(x0, y0, x1, y1)
-			local t = setmetatable({ Min = vec2(x0, y0), Max = vec2(x1, y1), Width = f32(x1 - x0), Height = f32(y1 - y0) }, RectMT)
-			typeNames[t] = "Rect"
-			return t
+			local r = newproxy(true)
+			local mt = getmetatable(r)
+			rectFields[r] = { Min = vec2(x0, y0), Max = vec2(x1, y1), Width = f32(x1 - x0), Height = f32(y1 - y0) }
+			mt.__index, mt.__newindex, mt.__eq, mt.__tostring = rectIndex, rectNewindex, rectEq, rectTostring
+			mt.__type = "Rect"
+			mt.__metatable = "The metatable is locked"
+			rawMT[r] = mt
+			typeNames[r] = "Rect"
+			seal(mt)
+			return r
 		end
-		RectMT.__eq = function(a, b) return a.Min == b.Min and a.Max == b.Max end
-		RectMT.__tostring = function(a)
-			return string.format("%.9g, %.9g, %.9g, %.9g", a.Min.X, a.Min.Y, a.Max.X, a.Max.Y)
-		end
-		seal(RectMT)
 		-- The box of the curve's control polygon (each point and the tangent handles that shape a
 		-- segment) widened by half the stroke (Thickness, pixels) on every side, in the parent's
 		-- pixels.  The engine's rule is not documented beyond "encloses the path, expanded by its

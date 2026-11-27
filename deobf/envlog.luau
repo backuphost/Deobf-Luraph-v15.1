@@ -1235,7 +1235,15 @@ do
 		return 0
 	end
 	-- UDim2 proxy -> {sx, ox, sy, oy} as the engine stores it (float32 Scale,
-	-- int32 Offset): from its datatype model twin, else the constructor's arguments
+	-- int32 Offset): from its datatype model twin, else the constructor's
+	-- arguments (stored the same way: offsets truncated toward zero)
+	local function off32(x)
+		if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
+		return x < 0 and math.ceil(x) or math.floor(x)
+	end
+	local function stored(u)
+		return { f32(u[1]), off32(u[2]), f32(u[3]), off32(u[4]) }
+	end
 	function M.udim2(p)
 		if not isP(p) then return nil end
 		local rv = REALV[p]
@@ -1253,14 +1261,14 @@ do
 			if c.fn == "new" then
 				if isP(a[1]) or isP(a[2]) then
 					local x, y = INFO[a[1]] and INFO[a[1]].ctor, INFO[a[2]] and INFO[a[2]].ctor
-					return { x and num(x.args[1]) or 0, x and num(x.args[2]) or 0, y and num(y.args[1]) or 0,
-						y and num(y.args[2]) or 0 }
+					return stored({ x and num(x.args[1]) or 0, x and num(x.args[2]) or 0, y and num(y.args[1]) or 0,
+						y and num(y.args[2]) or 0 })
 				end
-				return { num(a[1]), num(a[2]), num(a[3]), num(a[4]) }
+				return stored({ num(a[1]), num(a[2]), num(a[3]), num(a[4]) })
 			elseif c.fn == "fromScale" then
-				return { num(a[1]), 0, num(a[2]), 0 }
+				return stored({ num(a[1]), 0, num(a[2]), 0 })
 			elseif c.fn == "fromOffset" then
-				return { 0, num(a[1]), 0, num(a[2]) }
+				return stored({ 0, num(a[1]), 0, num(a[2]) })
 			end
 			return nil
 		end
@@ -1460,7 +1468,9 @@ do
 		end
 		return segs[1], 0
 	end
-	-- the curve of a Path2D's point list (needs the parent Frame's size now)
+	-- the curve of a Path2D's point list in its parent Frame's size as it is now:
+	-- built for every query (M.answer), so a resize or a new parent after
+	-- SetControlPoints counts, as in devm (rbxmock.lua measures at query time)
 	function M.curve(path)
 		local inf = INFO[path]
 		inf.p2dSegs, inf.p2dPts = nil, nil
@@ -1506,6 +1516,7 @@ do
 	-- the engine's answer as a replay-cache record (p2dEncode format), or nil
 	function M.answer(path, name, t)
 		local inf = INFO[path]
+		M.curve(path)
 		local segs = inf.p2dSegs
 		if not segs then return nil end
 		local W, H = inf.p2dW, inf.p2dH
@@ -1817,7 +1828,6 @@ local function onCall(p, ...)
 	if not NATIVE and sinfo and sinfo.className == "Path2D" and name == "SetControlPoints" then
 		sinfo.p2dPoints = R.type(a1) == "table" and not isP(a1) and table.clone(a1) or nil
 		sinfo.p2dSet = true
-		CHAIN.p2d.curve(self)
 	end
 	-- the point list edits (in range: the engine's errors for others are not known)
 	if not NATIVE and sinfo and sinfo.className == "Path2D" and sinfo.p2dPoints and R.type(a1) == "number"
@@ -1836,7 +1846,6 @@ local function onCall(p, ...)
 		end
 		if edited then
 			emit({ text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")" })
-			CHAIN.p2d.curve(self)
 			return
 		end
 	end
@@ -1878,6 +1887,12 @@ local function onCall(p, ...)
 				rec = r
 				R.insert(P2D_LOG, p2dKey(name, args) .. "\t" .. r .. "\tmodel")
 			end
+		end
+		if not rec and name == "GetBoundingRect" then
+			-- no model answer (fewer than 2 points, a Frame sized with Scale): a
+			-- stand-in of the method's type, as in devm, and the run says so
+			P2D_MISS = true
+			return callP(calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")", "boundingRect", "Rect")
 		end
 		if not rec then P2D_MISS = true end
 		if rec then

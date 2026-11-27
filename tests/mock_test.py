@@ -23,6 +23,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DEVM = os.environ.get('MOCK_DEVM_DIR') or os.path.join(ROOT, 'devm')
 sys.path.insert(0, ROOT)
+sys.path.append(HERE)     # (path2d_cases.py)
+
+from path2d_cases import PATH2D_LATE, PATH2D_LATE_WANT, PATH2D_STORED, PATH2D_STORED_WANT  # noqa: E402
 
 
 def find_luau():
@@ -394,6 +397,54 @@ show("mixed", box(r), r.Width, r.Height)
         self.assertEqual(got.get('curve'), '19.5,9.5,180.5,50.5|19.5, 9.5, 180.5, 50.5|true')
         self.assertEqual(got.get('mixed'), '84.5,29.5,220.5,190.5|136|161')
         self.assertNotIn('GetBoundingRect() has no model', log)
+
+    def test_stored_udim_values(self):
+        # The same script and hand-computed numbers as the deobf engine's check (tests/path2d_cases.py,
+        # PATH2D_STORED; tests/deobf_corpus.py): both environments store a UDim as the engine does (float32 Scale, int32 Offset truncated toward
+        # zero) and UDim2:Lerp rounds the offsets, so a Path2D gives the same Rect and length in both.
+        got, log = run(PATH2D_STORED.replace('print(', 'show('))
+        for tag, want in PATH2D_STORED_WANT.items():
+            parts = got.get(tag, '').split('|')
+            self.assertEqual(parts[:-1], want[:-1], (tag, parts, log))
+            self.assertAlmostEqual(float(parts[-1]), want[-1], delta=0.005, msg=tag)
+        got, log = run('''
+show("udim", UDim.new(0.5, -2.7).Offset, UDim.new(0.1, 0).Scale, (UDim.new(1, 2.9) + UDim.new(0, 0.5)).Offset, (-UDim.new(0, 3.9)).Offset)
+show("udim2", tostring(UDim2.new(0.1, 1.9, 0, -1.9)), UDim2.fromOffset(4.5, -4.5).X.Offset, UDim2.fromScale(0.3, 0).X.Scale)
+show("unm", tostring(-UDim2.new(0.25, 3, 0.5, -4)), UDim2.new(0, 2.5, 0, 0) == UDim2.fromOffset(2, 0))
+''')
+        self.assertEqual(got.get('udim'), '-2|0.10000000149011612|2|-3', log)
+        self.assertEqual(got.get('udim2'), '{0.100000001, 1}, {0, -1}|4|0.30000001192092896')
+        self.assertEqual(got.get('unm'), '{-0.25, -3}, {-0.5, 4}|true')
+
+    def test_measured_at_query_time(self):
+        # The same script and numbers as the deobf engine's check (tests/path2d_cases.py, PATH2D_LATE):
+        # the curve is measured
+        # against the parent Frame as it is when asked (points set before the parent and before a
+        # resize); a path of one point gets a stand-in of type Rect, said in the log.
+        got, log = run(PATH2D_LATE.replace('print(', 'show('))
+        for tag, want in PATH2D_LATE_WANT.items():
+            parts = got.get(tag, '').split('|')
+            self.assertEqual(parts, [str(w) for w in want], (tag, parts, log))
+        self.assertIn('[stub] permissive stand-ins handed out where the mock has no Roblox answer: Path2D:GetBoundingRect()', log)
+
+    def test_rect_value(self):
+        # a Rect is a userdata like the engine's: locked metatable, no unknown members, read-only
+        got, log = run('''
+local f = Instance.new("Frame"); f.Size = UDim2.fromOffset(100, 50)
+local p = Instance.new("Path2D"); p.Parent = f
+p:SetControlPoints({ Path2DControlPoint.new(UDim2.fromOffset(10, 20)), Path2DControlPoint.new(UDim2.fromOffset(30, 40)) })
+local r = p:GetBoundingRect()
+show("type", type(r), typeof(r), getmetatable(r), r == p:GetBoundingRect(), r ~= nil)
+show("foo", err(function() return r.Foo end))
+show("set", err(function() r.Width = 5 end), r.Width)
+show("new", err(function() r.Foo = 5 end))
+''')
+        self.assertEqual(got.get('type'), 'userdata|Rect|The metatable is locked|true|true', log)
+        self.assertTrue(got.get('foo', '').endswith('Foo is not a valid member of Rect'), got.get('foo'))
+        a, b = got.get('set', '|').split('|')
+        self.assertTrue(a.endswith('Width cannot be assigned to'), a)
+        self.assertEqual(b, '21')
+        self.assertTrue(got.get('new', '').endswith('Foo is not a valid member of Rect'), got.get('new'))
 
 
 @unittest.skipUnless(LUAU, 'needs bin/luau')
