@@ -666,6 +666,7 @@ local function p2dEncode(v)
 	if t == "number" then return R.fmt("n:%.17g", v) end
 	if t == "UDim2" then return R.fmt("u:%.17g,%.17g,%.17g,%.17g", v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset) end
 	if t == "Vector2" then return R.fmt("v:%.17g,%.17g", v.X, v.Y) end
+	if t == "Rect" then return R.fmt("r:%.17g,%.17g,%.17g,%.17g", v.Min.X, v.Min.Y, v.Max.X, v.Max.Y) end
 	if t == "nil" then return "z:" end
 	return nil
 end
@@ -689,6 +690,18 @@ local function p2dDecode(str, text)
 		local p = exprP(text, "Vector2", "vector")
 		INFO[p].props.X, INFO[p].props.Y = nums[1], nums[2]
 		INFO[p].props.Magnitude = math.sqrt(nums[1] * nums[1] + nums[2] * nums[2])
+		return p
+	end
+	if kind == "r" then
+		-- a Rect: members and methods from its datatype model twin (datatypes.luau)
+		local p = exprP(text, "Rect", "rect")
+		local lib = __ROBLOX and __ROBLOX.datatypes and __ROBLOX.datatypes.Rect
+		local ok, r = R.pcall(function() return lib.new(nums[1], nums[2], nums[3], nums[4]) end)
+		if ok and r ~= nil then
+			REALV[p] = r
+		else
+			INFO[p].props.Width, INFO[p].props.Height = nums[3] - nums[1], nums[4] - nums[2]
+		end
 		return p
 	end
 	return nil
@@ -1194,9 +1207,10 @@ local NO_NATIVE_METHOD = { Clone = 1, Destroy = 1, Remove = 1, GetChildren = 1, 
 	ClearAllChildren = 1, IsA = 1, Connect = 1, Once = 1, Wait = 1, GetPropertyChangedSignal = 1,
 	GetAttributeChangedSignal = 1, IsDescendantOf = 1, IsAncestorOf = 1, GetFullName = 1 }
 ---------------------------------------------------------------------------
--- Offline Path2D model (bit-exact float32 reproduction of the engine; see
--- research/path2d/README.md). Used when no recorded answer exists.
---   points: pixel = f32(f32(scale*W) + offset) in the parent Frame's size;
+-- Offline Path2D model (bit-exact float32 reproduction of the engine for
+-- lengths, positions and tangents). Used when no recorded answer exists.
+--   points: pixel = f32(f32(scale*W) + offset) in the parent Frame's size
+--   (scale float32, offset int32: as the UDim2 stores them);
 --   segment i: P0, [P0+right_i], [P3+left_{i+1}], P3 (handles that are 0 px
 --   are left out: cubic / quadratic / linear); power basis, Horner in f32.
 --   GetLength: per segment, adaptive bisection in t: chord a, half chords
@@ -1204,6 +1218,7 @@ local NO_NATIVE_METHOD = { Clone = 1, Destroy = 1, Remove = 1, GetChildren = 1, 
 --   tree; segment lengths summed in order.
 --   ArcLength variants: s = f32(t*L), segment by cumulative lengths (first
 --   with s <= end), local u = s'/len for lines. Curves: CHAIN.p2d.arcU.
+--   GetBoundingRect: CHAIN.p2d.rect (a plausible rule, not measured).
 ---------------------------------------------------------------------------
 do
 	local FB = buffer.create(4)
@@ -1217,33 +1232,75 @@ do
 
 	local function num(x)
 		if R.type(x) == "number" then return x end
+		-- (a numeric string is its number, as the engine's constructors take it; devm too)
+		if R.type(x) == "string" then return R.tonumber(x) or 0 end
 		return 0
 	end
-	-- UDim2 proxy -> {sx, ox, sy, oy}
+	-- UDim2 proxy -> {sx, ox, sy, oy} as the engine stores it (float32 Scale,
+	-- int32 Offset): from its datatype model twin, else the constructor's
+	-- arguments (stored the same way: offsets truncated toward zero)
+	local function off32(x)
+		if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
+		-- (truncated toward zero; a value in (-1, 0) gives 0, not -0: an int32 has no -0)
+		x = x < 0 and math.ceil(x) or math.floor(x)
+		if x == 0 then return 0 end
+		return x
+	end
+	local function stored(u)
+		return { f32(u[1]), off32(u[2]), f32(u[3]), off32(u[4]) }
+	end
+	local function isUDim(v) return isP(v) and INFO[v].tname == "UDim" end
+	-- UDim proxy -> scale, offset (as given; stored() rounds them): its model twin, its
+	-- constructor's arguments, else its members (a replayed engine answer)
+	local function udimParts(v)
+		if not isUDim(v) then return 0, 0 end
+		local rv = REALV[v]
+		if rv ~= nil then
+			local ok, sc, of = R.pcall(function() return rv.Scale, rv.Offset end)
+			if ok and R.type(sc) == "number" and R.type(of) == "number" then return sc, of end
+		end
+		local inf = INFO[v]
+		local c = inf.ctor
+		if c and c.ns == "UDim" then
+			if c.fn == "new" then return num(c.args[1]), num(c.args[2]) end
+			return 0, 0
+		end
+		local pr = inf.props or {}
+		return num(pr.Scale), num(pr.Offset)
+	end
 	function M.udim2(p)
 		if not isP(p) then return nil end
+		local rv = REALV[p]
+		if rv ~= nil then
+			local ok, u = R.pcall(function() return { rv.X.Scale, rv.X.Offset, rv.Y.Scale, rv.Y.Offset } end)
+			if ok and R.type(u[1]) == "number" and R.type(u[2]) == "number" and R.type(u[3]) == "number"
+				and R.type(u[4]) == "number" then
+				return u
+			end
+		end
 		local inf = INFO[p]
 		local c = inf.ctor
 		if c and c.ns == "UDim2" then
 			local a = c.args
 			if c.fn == "new" then
-				if isP(a[1]) or isP(a[2]) then
-					local x, y = INFO[a[1]] and INFO[a[1]].ctor, INFO[a[2]] and INFO[a[2]].ctor
-					return { x and num(x.args[1]) or 0, x and num(x.args[2]) or 0, y and num(y.args[1]) or 0,
-						y and num(y.args[2]) or 0 }
+				-- UDim2.new(UDim, UDim), else the four numbers (a numeric string is its number)
+				if isUDim(a[1]) or isUDim(a[2]) then
+					local xs, xo = udimParts(a[1])
+					local ys, yo = udimParts(a[2])
+					return stored({ xs, xo, ys, yo })
 				end
-				return { num(a[1]), num(a[2]), num(a[3]), num(a[4]) }
+				return stored({ num(a[1]), num(a[2]), num(a[3]), num(a[4]) })
 			elseif c.fn == "fromScale" then
-				return { num(a[1]), 0, num(a[2]), 0 }
+				return stored({ num(a[1]), 0, num(a[2]), 0 })
 			elseif c.fn == "fromOffset" then
-				return { 0, num(a[1]), 0, num(a[2]) }
+				return stored({ 0, num(a[1]), 0, num(a[2]) })
 			end
 			return nil
 		end
 		local X, Y = inf.props and inf.props.X, inf.props and inf.props.Y
 		if isP(X) and isP(Y) then
 			local xp, yp = INFO[X].props, INFO[Y].props
-			return { num(xp.Scale), num(xp.Offset), num(yp.Scale), num(yp.Offset) }
+			return stored({ num(xp.Scale), num(xp.Offset), num(yp.Scale), num(yp.Offset) })
 		end
 		return nil
 	end
@@ -1260,16 +1317,30 @@ do
 	local function resolve(u, W, H)
 		return f32(f32(u[1] * W) + u[2]), f32(f32(u[3] * H) + u[4])
 	end
-	-- control point proxies -> list of segments {x0,y0, x1,y1, ...} (pixels)
+	-- control point proxy -> position, left tangent, right tangent ({sx, ox, sy, oy})
+	function M.cpParts(cp)
+		if not isP(cp) then return nil end
+		local c = INFO[cp].ctor
+		if c and c.ns == "Path2DControlPoint" then
+			local zero = { 0, 0, 0, 0 }
+			return c.args.n >= 1 and M.udim2(c.args[1]) or zero, c.args.n >= 2 and M.udim2(c.args[2]) or zero,
+				c.args.n >= 3 and M.udim2(c.args[3]) or zero
+		end
+		local rv = REALV[cp]
+		if rv == nil then return nil end
+		local ok, a, b, d = R.pcall(function()
+			local function u(x) return { x.X.Scale, x.X.Offset, x.Y.Scale, x.Y.Offset } end
+			return u(rv.Position), u(rv.LeftTangent), u(rv.RightTangent)
+		end)
+		if ok then return a, b, d end
+		return nil
+	end
+	-- control point proxies -> list of segments {x0,y0, x1,y1, ...} (pixels), and
+	-- the points {px, py, lx, ly, rx, ry} (pixels; tangents relative)
 	function M.segments(cps, W, H)
 		local pts = {}
 		for i, cp in R.ipairs(cps) do
-			local c = isP(cp) and INFO[cp].ctor
-			if not c or c.ns ~= "Path2DControlPoint" then return nil end
-			local zero = { 0, 0, 0, 0 }
-			local pos = c.args.n >= 1 and M.udim2(c.args[1]) or zero
-			local left = c.args.n >= 2 and M.udim2(c.args[2]) or zero
-			local right = c.args.n >= 3 and M.udim2(c.args[3]) or zero
+			local pos, left, right = M.cpParts(cp)
 			if not pos or not left or not right then return nil end
 			local px, py = resolve(pos, W, H)
 			local lx, ly = resolve(left, W, H)
@@ -1289,7 +1360,7 @@ do
 			R.insert(s, b[1]); R.insert(s, b[2])
 			segs[i] = M.coeffs(s)
 		end
-		return segs
+		return segs, pts
 	end
 	-- power basis coefficients (f32, same association as the engine)
 	function M.coeffs(s)
@@ -1422,14 +1493,64 @@ do
 		end
 		return segs[1], 0
 	end
+	-- the curve of a Path2D's point list in its parent Frame's size as it is now:
+	-- built for every query (M.answer), so a resize or a new parent after
+	-- SetControlPoints counts, as in devm (rbxmock.lua measures at query time)
+	function M.curve(path)
+		local inf = INFO[path]
+		inf.p2dSegs, inf.p2dPts = nil, nil
+		local pts = inf.p2dPoints
+		local W, H = M.frameSize(path)
+		if CFG.p2d_debug then
+			local par = inf.props and inf.props.Parent
+			local sz = isP(par) and INFO[par].props and INFO[par].props.Size
+			R.print("P2DDBG W,H", W, H, "pts", R.type(pts), "parent", isP(par), "size", isP(sz),
+				isP(sz) and R.tostring(INFO[sz].ctor and INFO[sz].ctor.fn), isP(sz) and INFO[sz].text)
+		end
+		if W and pts then
+			local ok, segs, xy = R.pcall(M.segments, pts, W, H)
+			if CFG.p2d_debug then R.print("P2DDBG segments", ok, R.tostring(segs)) end
+			if ok and segs and #segs > 0 then
+				inf.p2dSegs, inf.p2dPts, inf.p2dW, inf.p2dH = segs, xy, W, H
+			end
+		end
+	end
+	-- GetBoundingRect -> {minX, minY, maxX, maxY}: the box of the curve's control
+	-- polygon (every point and the tangent handles that shape a segment, as the
+	-- segments above build them), widened by half the stroke (Thickness, pixels,
+	-- default 1) on every side; pixels in the parent Frame's space, float32.
+	-- Chosen as the plausible engine rule, not measured (CLAUDE.md, Path2D).
+	function M.rect(inf)
+		local pts = inf.p2dPts
+		local T = inf.props.Thickness
+		if T == nil then T = 1 end
+		if R.type(T) ~= "number" or not pts or #pts < 2 then return nil end
+		local lx, ly, hx, hy = math.huge, math.huge, -math.huge, -math.huge
+		local function add(x, y)
+			lx, hx = math.min(lx, x), math.max(hx, x)
+			ly, hy = math.min(ly, y), math.max(hy, y)
+		end
+		for i, q in R.ipairs(pts) do
+			add(q[1], q[2])
+			if i > 1 then add(f32(q[1] + q[3]), f32(q[2] + q[4])) end
+			if i < #pts then add(f32(q[1] + q[5]), f32(q[2] + q[6])) end
+		end
+		local e = f32(f32(T) / 2)
+		return { f32(lx - e), f32(ly - e), f32(hx + e), f32(hy + e) }
+	end
 	-- the engine's answer as a replay-cache record (p2dEncode format), or nil
 	function M.answer(path, name, t)
 		local inf = INFO[path]
+		M.curve(path)
 		local segs = inf.p2dSegs
 		if not segs then return nil end
 		local W, H = inf.p2dW, inf.p2dH
 		if name == "GetLength" then
 			return R.fmt("n:%.17g", M.length(segs))
+		end
+		if name == "GetBoundingRect" then
+			local r = M.rect(inf)
+			return r and R.fmt("r:%.17g,%.17g,%.17g,%.17g", r[1], r[2], r[3], r[4])
 		end
 		if R.type(t) ~= "number" then return nil end
 		local c, u
@@ -1730,23 +1851,27 @@ local function onCall(p, ...)
 
 	-- offline: replay recorded Path2D answers
 	if not NATIVE and sinfo and sinfo.className == "Path2D" and name == "SetControlPoints" then
-		-- the offline model needs the curve (and the parent Frame's size now)
-		sinfo.p2dSegs = nil
 		sinfo.p2dPoints = R.type(a1) == "table" and not isP(a1) and table.clone(a1) or nil
 		sinfo.p2dSet = true
-		local W, H = CHAIN.p2d.frameSize(self)
-		if CFG.p2d_debug then
-			local par = sinfo.props and sinfo.props.Parent
-			local sz = isP(par) and INFO[par].props and INFO[par].props.Size
-			R.print("P2DDBG W,H", W, H, "a1", R.type(a1), isP(a1), "parent", isP(par), "size", isP(sz),
-				isP(sz) and R.tostring(INFO[sz].ctor and INFO[sz].ctor.fn), isP(sz) and INFO[sz].text)
+	end
+	-- the point list edits (in range: the engine's errors for others are not known)
+	if not NATIVE and sinfo and sinfo.className == "Path2D" and sinfo.p2dPoints and R.type(a1) == "number"
+		and a1 == math.floor(a1) then
+		local pts = sinfo.p2dPoints
+		local edited = false
+		if name == "UpdateControlPoint" and a1 >= 1 and a1 <= #pts and args.n >= 2 then
+			pts[a1] = args[2]
+			edited = true
+		elseif name == "InsertControlPoint" and a1 >= 1 and a1 <= #pts + 1 and args.n >= 2 then
+			R.insert(pts, a1, args[2])
+			edited = true
+		elseif name == "RemoveControlPoint" and a1 >= 1 and a1 <= #pts then
+			R.remove(pts, a1)
+			edited = true
 		end
-		if W and R.type(a1) == "table" and not isP(a1) then
-			local ok, segs = R.pcall(CHAIN.p2d.segments, a1, W, H)
-			if CFG.p2d_debug then R.print("P2DDBG segments", ok, R.tostring(segs)) end
-			if ok and segs and #segs > 0 then
-				sinfo.p2dSegs, sinfo.p2dW, sinfo.p2dH = segs, W, H
-			end
+		if edited then
+			emit({ text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")" })
+			return
 		end
 	end
 	-- engine answers that need no curve (Studio): the point list (a fresh
@@ -1759,6 +1884,14 @@ local function onCall(p, ...)
 		elseif name == "GetControlPoints" and (sinfo.p2dPoints or not sinfo.p2dSet) then
 			emit({ text = calleeText .. "()" })
 			return table.clone(sinfo.p2dPoints or {})
+		elseif name == "GetControlPoint" and sinfo.p2dPoints and R.type(a1) == "number"
+			and isP(sinfo.p2dPoints[a1]) then
+			-- the stored point: a new value each call (same constructor and model twin)
+			local src = sinfo.p2dPoints[a1]
+			local cp = callP(calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")", "controlPoint",
+				INFO[src].tname)
+			INFO[cp].ctor, REALV[cp] = INFO[src].ctor, REALV[src]
+			return cp
 		elseif (name == "GetLength" or name == "GetBoundingRect" or (R.type(name) == "string"
 			and R.find(name, "OnCurve", 1, true))) and not isP(sinfo.props.Parent) then
 			emit({ text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")" })
@@ -1780,6 +1913,12 @@ local function onCall(p, ...)
 				R.insert(P2D_LOG, p2dKey(name, args) .. "\t" .. r .. "\tmodel")
 			end
 		end
+		if not rec and name == "GetBoundingRect" then
+			-- no model answer (fewer than 2 points, a Frame sized with Scale): a
+			-- stand-in of the method's type, as in devm, and the run says so
+			P2D_MISS = true
+			return callP(calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")", "boundingRect", "Rect")
+		end
 		if not rec then P2D_MISS = true end
 		if rec then
 			local text = calleeText .. "(" .. fmtArgs(R.unpack(args, 1, args.n)) .. ")"
@@ -1792,6 +1931,7 @@ local function onCall(p, ...)
 			if n == 1 and isP(vals[1]) then
 				local cp = callP(text, R.match(name, "^Get(%u%w*)$") or "result", INFO[vals[1]].tname)
 				INFO[cp].props = INFO[vals[1]].props
+				REALV[cp] = REALV[vals[1]]
 				return cp
 			end
 			emit({ text = text })

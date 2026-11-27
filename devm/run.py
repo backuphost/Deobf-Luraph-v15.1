@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 
-from . import beautify, bootstrap, cleanup, container, ircfg, lifter, normalize, opaque, pe, pipeline, structure, unidata, vmmodel
+from . import beautify, bootstrap, cleanup, container, ircfg, lifter, normalize, opaque, pe, pipeline, runvals, structure, unidata, vmmodel
 
 sys.setrecursionlimit(100000)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -239,7 +239,7 @@ def v152_generation(model):
     return any(l[2][0][0] == 'local' and vmmodel._outlined_test(l[2], l[2][0]) for l in model.loops)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True, stall=None, stall_wait=None, stall_run=None, beat=None, tamper_stop=None):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -365,7 +365,11 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
         # code decrypts itself too.
-        stage.harness_options = (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
+        # (a script that does not end is stopped by the harness and its state lifted where it was:
+        # vmmodel.STALL; beat=<s> logs what the run is doing every <s> seconds)
+        stage.harness_options = vmmodel.stall_options(stall=stall, stallwait=stall_wait, stallrun=stall_run,
+                                                     tamper=None if tamper_stop is None else int(bool(tamper_stop))) + \
+            (['beat=%d' % beat] if beat else []) + (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
         # (a script in its shipped layout keeps its source's control flow: nothing to unflatten.
         # Luraph v15.2 does flatten: its start-up code and the script's main function share one
         # state machine, see README "Luraph v15.2")
@@ -408,6 +412,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             log('[%s] round %d: %d more branch arms of the script did not run; probing %d in all' % (tag, rnd, len(new), len(allpokes)))
             stage.harness_options = base + ['poke=' + pf]
             text = stage.run_traced()
+            # (the run values and the calls handed the register array are those of the last lift, the text's)
+            _keep_runvals(list(getattr(stage, 'hints', ())))
         text = name_vm_object(cleanup.tidy(text))
         if stage.errors:
             # (not every such instruction is in the result: code behind a cut opaque test or
@@ -470,6 +476,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             text = lift_program(stage, data, tag, log, oneline, 'script', replayed=False)
             if route == 'a' or not stage.errors or not in_place or single or not unknown_keyfns(data):
                 return text
+            # (the note on the calls handed the register array is this text's: the second try lifts again)
+            handed_a = [n for n in LAST_RUN['notes'] if n.startswith('[runvals-handed] ')]
             # The lift has errors, and the dump holds key functions the harness could not
             # evaluate.  Builds whose init decrypts the script data with a key it derives (Luraph
             # v14.8) patch their own operands with values of those functions; the second-stage
@@ -492,13 +500,14 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                         if b_errs < a_errs and b_nodes >= a_nodes:
                             log('[%s] result of the second-stage route kept: %d instructions with %d lift errors, against %d with %d '
                                 'from the state at the hand-over' % (tag, b_nodes, b_errs, a_nodes, a_errs))
-                            LAST_RUN['notes'] = [n for n in LAST_RUN['notes'] if n.startswith('[http]')]
+                            LAST_RUN['notes'] = [n for n in LAST_RUN['notes'] if n.startswith(('[http]', '[runvals-handed] '))]
                             return text2
                         log('[%s] result from the state at the hand-over kept (%d instructions, %d lift errors; second-stage '
                             'route: %d, %d)' % (tag, a_nodes, a_errs, b_nodes, b_errs))
             except (Exception, TimeLimit) as e:      # whatever goes wrong in the second try, the first result stands
                 log('[%s] second-stage route not usable (%s): result from the state at the hand-over kept' % (
                     tag, (type(e).__name__ + ' ' + str(e)).strip().split('\n')[0][:160]))
+            _keep_handed(handed_a)
             return text
         if any(n.startswith('[dumpnew]') for n in stage.run_notes):
             # the init did hand over; what did not get done is the dump of the state (every lazy
@@ -602,6 +611,26 @@ def hidden_head(errors, oracle, text):
     return '-- LIFT ERROR: %s.  Their lift errors: %s' % (what, '; '.join(texts[:12])), cold
 
 
+def _keep_handed(notes):
+    """put the note on the calls handed the register array of the text that is the result (runvals.handed_note; a
+    list with the note, or None, or empty) in place of any earlier one in LAST_RUN"""
+    _keep_runvals([n for n in notes if n], ('[runvals-handed] ',))
+
+
+def _keep_runvals(hints, kinds=('[runvals',)):
+    """replace the run notes of `kinds` in LAST_RUN by those of `hints` (the ones of the lift whose text is the
+    result), where the first of them stood (else at the end)"""
+    new = [h for h in hints if h.startswith(kinds)]
+    notes = LAST_RUN['notes']
+    old = [i for i, n in enumerate(notes) if n.startswith(kinds)]
+    if [notes[i] for i in old] == new:
+        return
+    at = old[0] if old else len(notes)
+    rest = [n for i, n in enumerate(notes) if i not in set(old)]
+    at -= sum(1 for i in old if i < at)
+    LAST_RUN['notes'] = rest[:at] + new + rest[at:]
+
+
 def lift_program(stage, data, tag, log, oneline, what, replayed=True):
     """Lift and decompile the program a dump was taken at the start of (proto-table layout):
     the dump of the native bootstrap replay, or the one taken when the VM's own init handed over.
@@ -650,6 +679,9 @@ def lift_program(stage, data, tag, log, oneline, what, replayed=True):
     for kind, c in sorted(kinds.items(), key=lambda kv: -kv[1])[:15]:
         log('    lift errors by kind: %4d x %s' % (c, kind))
     stage.protos, stage.errors = protos, errs
+    # (no run values here, but a call handed its caller's register array leaves the result PARTIAL all the same:
+    # the note of this lift replaces that of an earlier one, see _keep_handed)
+    _keep_handed([runvals.handed_note(protos)])
     ircfg.UNFLATTEN = not oneline
     try:
         text, stats = decompile(stage, L, protos)
@@ -724,6 +756,23 @@ def main(argv=None):
                          'auto = a, then b when the init does not hand over')
     ap.add_argument('--budget', type=int, default=None, help='route a: VM instructions the init may run before it is stopped')
     ap.add_argument('--run-timeout', type=int, default=None, help='route a: seconds the run may take')
+    ap.add_argument('--stall', type=int, default=None, metavar='S',
+                    help='factory layout (v15): a script that does not end (a key system waiting for its key, a GUI '
+                         'script in its event loop) is stopped once its own code has run this many seconds without a VM '
+                         'instruction running for the first time, and the state at that moment is lifted; the result is '
+                         'PARTIAL (default %d; 0: off)' % vmmodel.STALL['stall'])
+    ap.add_argument('--stall-wait', type=int, default=None, metavar='S',
+                    help='... or once it has waited this many seconds in task.wait / wait / an event\'s :Wait() without '
+                         'new code (nothing really waits in the mock, so these are counted; default %d)' % vmmodel.STALL['stallwait'])
+    ap.add_argument('--stall-run', type=int, default=None, metavar='S',
+                    help='... or this many seconds after its own code started, new code or not (default %d)' % vmmodel.STALL['stallrun'])
+    ap.add_argument('--no-tamper-stop', dest='tamper_stop', action='store_false', default=None,
+                    help='factory layout (v15): do not stop the traced run at the entry of Luraph\'s tamper response (a '
+                         'VM function handed two or more code arrays of another program); it then scrambles them and '
+                         'loops for ever, and the time limits above stop it')
+    ap.add_argument('--beat', type=int, default=None, metavar='S',
+                    help='diagnosis: the traced run logs what it is doing every S seconds ([beat] lines in the harness\'s '
+                         'stderr, serve/stderr.txt in the work directory)')
     ap.add_argument('--no-diagnosis', action='store_true',
                     help='route a: when the init does not hand over, do not run it a second time with call logging '
                          '(the run that names the last mocked calls in the failure message)')
@@ -750,7 +799,7 @@ def main(argv=None):
 
     stop_on_signals()
     try:
-        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis)
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis, stall=a.stall, stall_wait=a.stall_wait, stall_run=a.stall_run, beat=a.beat, tamper_stop=a.tamper_stop)
     except Terminated as e:
         if vmmodel.SERVER is not None:
             vmmodel.SERVER.close()
@@ -760,10 +809,11 @@ def main(argv=None):
         print('devm: %s: %s' % (e.stage, e.reason))
         sys.exit(1)
     except (pe.PEError, RuntimeError, bootstrap.BootstrapError, SyntaxError, subprocess.TimeoutExpired) as e:
-        msg = ' '.join(str(e).split())[:400]
+        stage = failure_stage(e)
+        # (a failed run's message carries the end of the harness output, vmmodel.harness_tail: room for it)
+        msg = ' '.join(str(e).split())[:1000 if stage == 'run failed' else 400]
         if isinstance(e, SyntaxError):
             msg = 'the text does not parse as Luau (%s)' % msg
-        stage = failure_stage(e)
         if msg.startswith(stage + ': '):
             msg = msg[len(stage) + 2:]
         print('devm: %s: %s' % (stage, msg))
@@ -811,7 +861,15 @@ HEAD_MARK = 'recovered by devm (python -m devm.run)'      # first line of a file
 SINGLE_ROOT_LINE = 'the VM has a single root program'
 STARTUP_LINE = 'start-up code: '
 HINT_LINE = '  hint: '
+# pipeline.entered_program: the result is the program Luraph's start-up code entered, not the first program
+ENTRY_LINE = 'script program: '
 PARSE_PREFIX = '  the text does not parse: '
+# runvals.notes: calls whose effect on their caller's variables the run did not prove (PARTIAL)
+RUNVALS_LINE = '  values not shown: '
+# ... and values shown whose proof could not be completed: assumed, said at each value (PARTIAL)
+RUNVALS_ASSUMED_LINE = '  values assumed: '
+# runvals.handed_note: calls handed their caller's register array, whatever was shown after them (PARTIAL)
+RUNVALS_HANDED_LINE = '  variables handed to calls: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
 
 
@@ -865,10 +923,17 @@ def run_report(notes):
     import re
     out = []
     for n in notes:
-        m = re.match(r'\[oracle\] script (returned|stopped: .*?) after (\d+) instructions', n)
+        m = re.match(r'\[oracle\] script (returned|stopped: .*?|did not end\b.*?) after (\d+) instructions', n)
         if m:
             out.append('traced run: the script %s (%s VM instructions)' % (
-                'returned' if m.group(1) == 'returned' else 'stopped with "%s"' % m.group(1)[len('stopped: '):], m.group(2)))
+                'returned' if m.group(1) == 'returned' else
+                'did not end and was stopped, see the [stalled] line' if m.group(1).startswith('did not end') else
+                'stopped with "%s"' % m.group(1)[len('stopped: '):], m.group(2)))
+    # a script that waits or loops for ever: the harness stopped it (vmmodel.STALL) and the state at
+    # that moment is what was lifted
+    for n in notes:
+        if n.startswith('[stalled] '):
+            out.append(n)
     single = any(n.startswith('[root]') for n in notes)
     for n in notes:
         m = re.match(r'\[dumpnew\] the script starts at interpreter entry (\d+) \((\d+) VM instructions', n)
@@ -896,8 +961,20 @@ def run_report(notes):
             out.append('  ' + n[len('[env] '):])
         elif n.startswith('[hint]'):
             out.append(HINT_LINE + n[len('[hint] '):])
+        elif n.startswith('[entry] '):
+            out.append(ENTRY_LINE + n[len('[entry] '):])
         elif n.startswith('[cut] '):
             out.append('  note: ' + n[len('[cut] '):])
+        elif n.startswith('[runvals] '):
+            # (pipeline / runvals.py: values the run proves, shown where the lifted code would show
+            # something else: not a defect)
+            out.append('  note: ' + n[len('[runvals] '):])
+        elif n.startswith('[runvals-missing] '):
+            out.append(RUNVALS_LINE + n[len('[runvals-missing] '):])
+        elif n.startswith('[runvals-assumed] '):
+            out.append(RUNVALS_ASSUMED_LINE + n[len('[runvals-assumed] '):])
+        elif n.startswith('[runvals-handed] '):
+            out.append(RUNVALS_HANDED_LINE + n[len('[runvals-handed] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
     said = [n for n in notes if n.startswith('[script]')]
     for n in said[:12]:
@@ -923,6 +1000,21 @@ KEY_MIX = re.compile(r'(?m)^.*\b(v\d+) - \1 % 1\b.*$')
 HIDDEN_HEAD = re.compile(r'^-- LIFT ERROR: (up to )?(\d+) instruction\(s\) (that the traced run executed )?did not lift and')
 
 
+# the register array of the calling code where it is printed as a value (structure.Expr prints ('regs',) as
+# `({})`; a new table is printed `{}`, and `({})` only as the table of an index, a field or a method)
+REGS_VALUE = re.compile(r'(?<![\w)\]}])\(\{\}\)(?![\[.:])')
+
+
+_NOT_CODE = re.compile(r'--\[(=*)\[.*?(?:\]\1\]|\Z)|--[^\n]*|"(?:\\.|[^"\\\n])*(?:"|$)|\'(?:\\.|[^\'\\\n])*(?:\'|$)'
+                       r'|\[(=*)\[.*?(?:\]\2\]|\Z)', re.S | re.M)
+
+
+def _code_only(text):
+    """text with its comments left out and each of its strings written `""` (in source order: a quote inside
+    a comment, or `--` inside a string, is not taken for one)"""
+    return _NOT_CODE.sub(lambda m: '' if m.group(0).startswith('--') else '""', text)
+
+
 def report(text, returned=None, notes=None, parse=None):
     """What is left unrecovered in a result, in plain words.  `returned`: the traced run went to
     the script's end; `notes`: the run notes (LAST_RUN; None: read both off the head of a file
@@ -941,15 +1033,37 @@ def report(text, returned=None, notes=None, parse=None):
                 head_notes.append('[startup] ' + lines[0][len('--   ' + STARTUP_LINE):])
             elif lines[0].startswith('--   ' + HINT_LINE):
                 head_notes.append('[hint] ' + lines[0][len('--   ' + HINT_LINE):])
+            elif lines[0].startswith('--   [stalled] '):
+                head_notes.append(lines[0][len('--   '):])
+            elif lines[0].startswith('--   ' + ENTRY_LINE):
+                head_notes.append('[entry] ' + lines[0][len('--   ' + ENTRY_LINE):])
+            elif lines[0].startswith('--   ' + RUNVALS_LINE):
+                head_notes.append('[runvals-missing] ' + lines[0][len('--   ' + RUNVALS_LINE):])
+            elif lines[0].startswith('--   ' + RUNVALS_ASSUMED_LINE):
+                head_notes.append('[runvals-assumed] ' + lines[0][len('--   ' + RUNVALS_ASSUMED_LINE):])
+            elif lines[0].startswith('--   ' + RUNVALS_HANDED_LINE):
+                head_notes.append('[runvals-handed] ' + lines[0][len('--   ' + RUNVALS_HANDED_LINE):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
         notes = head_notes
     single_root = any(n.startswith('[single-root]') for n in notes)
     startup = any(n.startswith('[startup]') for n in notes)
+    # the traced run did not end: the harness stopped it (vmmodel.STALL)
+    stalled = any(n.startswith('[stalled]') for n in notes)
+    # the result is the program Luraph's start-up code entered (pipeline.entered_program): the first
+    # program's code before that call is not in it
+    entry = next((n for n in notes if n.startswith('[entry]')), None)
     # pipeline's hint: the proto taken for the script is tiny and calls nothing but pure library
     # functions, while the first program did all the work (the script is probably that program)
     hint = next((n for n in notes if n.startswith('[hint]')), None)
+    # calls that wrote into their caller's variables (or helpers of the build whose results the
+    # script keeps) where the run proved no value: a variable may show its earlier value (runvals.notes)
+    unshown = [n[len('[runvals-missing] '):] for n in notes if n.startswith('[runvals-missing] ')]
+    # ... and values shown whose proof could not be completed (runvals.ASSUMED, at each of them)
+    assumed = [n for n in notes if n.startswith('[runvals-assumed] ')]
+    # ... and calls handed their caller's register array (runvals.handed_note: the calls the lift found)
+    handed = [n for n in notes if n.startswith('[runvals-handed] ')]
     unparsed = parse is not None and parse[0] is False
     # instructions without a marker, said in a head line of the text (not one more marker)
     hidden = [HIDDEN_HEAD.match(ln) for ln in lines[:2]]
@@ -966,7 +1080,20 @@ def report(text, returned=None, notes=None, parse=None):
     flags = len(re.findall(r'exit\d+ = true', text))
     # placeholders the printer writes where it has no value or text to show
     ups = sum(1 for ln in lines if re.search(r'\bUPVAL_\d', ln))
-    holes = len(re.findall(r'nil --\[\[', code))
+    # (not the values runvals.show_run_values marks as not shown: the "values not shown" line counts those)
+    marks = code.count('nil --[[%s]]' % runvals.MARK)
+    # (every such comment begins with runvals.ASSUMED_HEAD and says what could not be checked)
+    amarks = code.count('--[[%s' % runvals.ASSUMED_HEAD)
+    # ... and the values of the run whose proof was completed (runvals.PROVED)
+    pmarks = code.count('--[[%s]]' % runvals.PROVED)
+    # the register array of the calling code, printed `({})` as a value (an argument, a variable's value: not as
+    # the table of an index or a method, `({})[k]`, which is also how a new table nothing keeps is printed), outside
+    # strings and comments: a call handed it can change any of the caller's variables (whether or not runvals ran or
+    # found the call: runvals.handed_note counts the calls themselves)
+    regsvals = len(REGS_VALUE.findall(_code_only(code))) if '({})' in code else 0
+    # (... in the text, or named by the notes on such values)
+    akinds = sorted(set(re.findall(r'--\[\[(%s[^\]]*)\]\]' % re.escape(runvals.ASSUMED_HEAD), '\n'.join([code] + assumed))))
+    holes = len(re.findall(r'nil --\[\[', code)) - marks
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
     # values the lifter could only name by where the dump holds them, and arguments / registers
     # it could not connect to a variable
@@ -994,8 +1121,14 @@ def report(text, returned=None, notes=None, parse=None):
     out = []
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed):
+            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry or unshown
+            or marks or assumed or amarks or handed or regsvals):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
+        if pmarks:
+            out.append('  note: %d value(s) in the text are the run\'s after a call of a helper of the build, where the '
+                       'function called was checked to depend only on the constants it is handed (by the rules in '
+                       'devm/README.md, which are not a proof): each carries the comment --[[%s]]' % (
+                           pmarks, runvals.PROVED))
         return out + unchecked + traps
     out.append('result: PARTIAL')
     if unparsed:
@@ -1014,12 +1147,53 @@ def report(text, returned=None, notes=None, parse=None):
         else:
             out.append('  %s instruction(s) did not lift and have no LIFT ERROR marker: they are in code the text does not '
                        'contain (its first line lists the errors)' % m.group(2))
+    if stalled:
+        out.append('  the script did not end (see the [stalled] line above): the run was stopped and the state at that moment '
+                   'lifted; what it would have done later (code it would load, fetch or decrypt after the wait) is not in the result')
+    if entry:
+        m, r = re.match(r'\[entry\] program (\d+) ', entry), re.search(r'--root (\d+)', entry)
+        out.append('  the result is %s on its own, which the VM\'s first program called at the end of its run: the first '
+                   'program\'s code before that call is not in it (Luraph\'s start-up code, and any part of the script\'s '
+                   'top level Luraph put there); --root %s lifts the first program' % (
+                       'program ' + m.group(1) if m else 'a program', r.group(1) if r else 1))
     if startup:
         out.append('  the result is the VM\'s first program, which begins with Luraph\'s start-up code: the script was not '
                    'found as a program of its own (what the run shows about it is in the start-up code line above)')
     if single_root:
         out.append('  the result is the VM\'s root program including Luraph\'s start-up code, lifted from the state before '
                    'it ran: what that code decodes at run time is still encoded, and the script is not separated from it')
+    if unshown or marks:
+        out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
+                   'the run does not show one value for some of them (see the "values not shown" line%s above): after '
+                   'those calls a variable the call may have set is printed `nil --[[%s]]` (%d in the text), or the text '
+                   'keeps the call, and the constants handed to them stay encrypted' % (
+                       len(unshown), 's' if len(unshown) > 1 else '', runvals.MARK, marks))
+    if handed or regsvals:
+        m = re.match(r'\[runvals-handed\] (\d+) ', handed[0]) if handed else None
+        out.append('  %s handed the variables of the code that calls them (its register array: printed `({})` %d time(s) '
+                   'in the text, as a value)%s: what they change is shown only as far as the run saw it, so the result is '
+                   'not complete, also where every value they changed is shown' % (
+                       '%s call(s) are' % m.group(1) if m else 'calls are', regsvals,
+                       ' (see the "variables handed to calls" line above)' if handed else ''))
+    if pmarks:
+        out.append('  %d value(s) in the text are the run\'s after a call, where the function called was checked to depend '
+                   'only on the constants it is handed (by the rules in devm/README.md, which are not a proof; see its '
+                   'known gaps): each carries the comment --[[%s]]%s' % (
+                       pmarks, runvals.PROVED, '; %d more are only assumed (below)' % amarks if amarks else ''))
+    if (assumed or amarks) and akinds in ([], [runvals.ASSUMED]):
+        out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
+                   'the values shown after them are the run\'s, assumed, not proved, to depend only on what the call is '
+                   'handed: the code of the function called that ran did not all lift (see the "values assumed" line%s '
+                   'above): %d value(s) in the text carry the comment --[[%s]]' % (
+                       len(assumed), 's' if len(assumed) > 1 else '', amarks, runvals.ASSUMED))
+    elif assumed or amarks:
+        out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
+                   'the values shown after them are the run\'s, assumed, not proved, to depend only on what the call is '
+                   'handed: the check could not be completed (see the "values assumed" line%s above): %d value(s) in the '
+                   'text carry %s' % (
+                       len(assumed), 's' if len(assumed) > 1 else '', amarks,
+                       'the comment --[[%s]]' % akinds[0] if len(akinds) == 1 else
+                       'one of the comments %s' % ', '.join('--[[%s]]' % c for c in akinds)))
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
     if blank:

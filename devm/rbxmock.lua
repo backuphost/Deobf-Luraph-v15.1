@@ -234,6 +234,9 @@ return function(G, fnames, libnames, opts)
 	-- Like Roblox, every read of a signal property yields a new wrapper object: two reads are
 	-- equal under == (shared __eq) but are different table keys, and so are their method closures.
 	local sigCore = setmetatable({}, { __mode = "k" })
+	-- events that fire every frame in Roblox (the harness's watch counts a wait on them as one frame)
+	local frameSignals = { Heartbeat = true, RenderStepped = true, Stepped = true, PreRender = true, PreSimulation = true,
+		PostSimulation = true, PreAnimation = true }
 	local function sigEq(a, b) return sigCore[a] ~= nil and sigCore[a] == sigCore[b] end
 	local function newSignal(name)
 		local conns = {}
@@ -273,6 +276,10 @@ return function(G, fnames, libnames, opts)
 					return namedY(k, function(co, self)
 						if sigCore[self] ~= core then error("Expected ':' not '.' calling member function " .. k, 2) end
 						if M.mainThread and co ~= M.mainThread then return YIELD end
+						-- (the main thread goes on at once: tell the harness's watch on a run that does not
+						-- end what was waited for: one frame for the per-frame events, and for any other
+						-- event a long time, since nothing here ever fires it)
+						if M.onWait then M.onWait(name .. ":Wait()", frameSignals[name] and 1 / 60 or 60) end
 						return nil
 					end)
 				end
@@ -883,10 +890,34 @@ return function(G, fnames, libnames, opts)
 	M.Instance = Instance
 
 	-- UDim / UDim2 / Vector2 with real arithmetic (Luraph's bootstrap derives key material from
-	-- Path2D geometry, so these have to compute, not just exist)
+	-- Path2D geometry, so these have to compute, not just exist).  A UDim holds what the engine
+	-- stores, as in the deobf engine's Studio-verified model (deobf/datatypes.luau): Scale is a
+	-- float32, Offset an int32 truncated toward zero (NaN and out of range: -2^31); every
+	-- constructor, operator and Lerp goes through udim(), and UDim2:Lerp rounds the offsets
+	-- (floor(x + 0.5)).  The GUI layout and the Path2D model below read these stored values.
+	local F32B = buffer.create(4)
+	local function f32(x)
+		buffer.writef32(F32B, 0, x)
+		return buffer.readf32(F32B, 0)
+	end
+	local function numArg(x)
+		if rawType(x) == "string" then return tonumber(x) or x end
+		return x
+	end
+	local function int32(x)
+		if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
+		-- (truncated toward zero; a value in (-1, 0) gives 0, not -0: an int32 has no -0)
+		x = x < 0 and math.ceil(x) or math.floor(x)
+		if x == 0 then return 0 end
+		return x
+	end
 	local UDimMT, UDim2MT, Vec2MT = {}, {}, {}
 	local function udim(s, o)
-		local t = setmetatable({ Scale = s or 0, Offset = o or 0 }, UDimMT)
+		-- (a value that is not a number is kept as it is: the mock does not know Roblox's error)
+		s, o = numArg(s or 0), numArg(o or 0)
+		if rawType(s) == "number" then s = f32(s) end
+		if rawType(o) == "number" then o = int32(o) end
+		local t = setmetatable({ Scale = s, Offset = o }, UDimMT)
 		typeNames[t] = "UDim"
 		return t
 	end
@@ -894,7 +925,12 @@ return function(G, fnames, libnames, opts)
 	UDimMT.__sub = function(a, b) return udim(a.Scale - b.Scale, a.Offset - b.Offset) end
 	UDimMT.__unm = function(a) return udim(-a.Scale, -a.Offset) end
 	UDimMT.__eq = function(a, b) return a.Scale == b.Scale and a.Offset == b.Offset end
-	UDimMT.__tostring = function(a) return a.Scale .. ", " .. a.Offset end
+	UDimMT.__tostring = function(a)
+		if rawType(a.Scale) == "number" and rawType(a.Offset) == "number" then
+			return string.format("%.9g, %d", a.Scale, a.Offset)
+		end
+		return tostring(a.Scale) .. ", " .. tostring(a.Offset)
+	end
 	local function udim2(xs, xo, ys, yo)
 		local t = setmetatable({ X = udim(xs, xo), Y = udim(ys, yo) }, UDim2MT)
 		t.Width, t.Height = t.X, t.Y
@@ -907,12 +943,15 @@ return function(G, fnames, libnames, opts)
 	UDim2MT.__sub = function(a, b)
 		return udim2(a.X.Scale - b.X.Scale, a.X.Offset - b.X.Offset, a.Y.Scale - b.Y.Scale, a.Y.Offset - b.Y.Offset)
 	end
+	UDim2MT.__unm = function(a) return udim2(-a.X.Scale, -a.X.Offset, -a.Y.Scale, -a.Y.Offset) end
 	UDim2MT.__eq = function(a, b) return a.X == b.X and a.Y == b.Y end
 	UDim2MT.__tostring = function(a) return "{" .. tostring(a.X) .. "}, {" .. tostring(a.Y) .. "}" end
 	UDim2MT.__index = {
 		Lerp = function(a, b, t)
-			return udim2(a.X.Scale + (b.X.Scale - a.X.Scale) * t, a.X.Offset + (b.X.Offset - a.X.Offset) * t,
-				a.Y.Scale + (b.Y.Scale - a.Y.Scale) * t, a.Y.Offset + (b.Y.Offset - a.Y.Offset) * t)
+			t = numArg(t)
+			local function off(x, y) return math.floor(x + (y - x) * t + 0.5) end
+			return udim2(a.X.Scale + (b.X.Scale - a.X.Scale) * t, off(a.X.Offset, b.X.Offset),
+				a.Y.Scale + (b.Y.Scale - a.Y.Scale) * t, off(a.Y.Offset, b.Y.Offset))
 		end,
 	}
 	local function vec2(x, y)
@@ -1183,9 +1222,16 @@ return function(G, fnames, libnames, opts)
 	--     (the box starts at the far edge and has the absolute size)
 	--   size = scale * content + offset * k, k = product of the UIScale of all ancestors;
 	--     clamped to the UISizeConstraint (MinSize / MaxSize times k), then times the own UIScale
-	--   position = content origin + scale * content + offset * k - AnchorPoint * size
+	--   position = parent's AbsolutePosition + content origin + scale * content + offset * k
+	--     - AnchorPoint * size
 	--   Rotation turns an object and its descendants about its centre; AbsolutePosition is the
 	--     turned centre minus half the (unturned) size
+	-- Single precision, as the engine computes (its Vector2 and UDim hold float32; a UDim's Scale
+	-- is a float32, udim()): every operation of these rules is rounded to float32 (f32), in the
+	-- order written above, so AbsoluteSize / AbsolutePosition are float32 values (a Frame of Scale
+	-- 0.1 in 1920 pixels is 192 wide, not 192.0000029 as in double precision; Luraph's numbers are
+	-- floor(value * 100)).  The order of the engine's operations was not measured; values a few
+	-- float32 steps off a different order would give are within the probe's tolerance.
 	-- Not modelled, and said so in the run's log when met: layouts (UIListLayout, UIGridLayout, ...),
 	-- UIAspectRatioConstraint, AutomaticSize, SizeConstraint, ScrollingFrame canvases, BillboardGui /
 	-- SurfaceGui.  A ScreenGui that is not in the game has no size here (0, 0), and an object without
@@ -1222,11 +1268,16 @@ return function(G, fnames, libnames, opts)
 		local function num(v, default) return rawType(v) == "number" and v or default end
 		local function ownScale(d)
 			local u = modifier(d, "UIScale")
-			return u and num(u.props.Scale, 1) or 1
+			return u and f32(num(u.props.Scale, 1)) or 1
 		end
+		-- float32 arithmetic: each operation rounded as the engine's single-precision math rounds it
+		local function add(a, b) return f32(a + b) end
+		local function sub(a, b) return f32(a - b) end
+		local function mul(a, b) return f32(a * b) end
+		-- pixels of a UDim in an extent: f32(f32(scale * extent) + f32(offset * k))
 		local function udimPx(v, extent, k)
 			if typeNames[v] ~= "UDim" then return 0 end
-			return num(v.Scale, 0) * extent + num(v.Offset, 0) * k
+			return add(mul(num(v.Scale, 0), extent), mul(num(v.Offset, 0), k))
 		end
 		local function inGame(inst)
 			local p = inst
@@ -1237,7 +1288,8 @@ return function(G, fnames, libnames, opts)
 			end
 			return false
 		end
-		-- -> width, height, centre x, centre y, rotation (degrees), scale handed to children
+		-- -> width, height, AbsolutePosition x, y, rotation (degrees), scale handed to children
+		-- (all float32, see above)
 		local function layout(inst, depth)
 			local d = data[inst]
 			local kind = guiKind(d.props.ClassName)
@@ -1248,8 +1300,8 @@ return function(G, fnames, libnames, opts)
 					-- the viewport the mock uses elsewhere (Camera.ViewportSize) below the top bar
 					-- (GuiService:GetGuiInset); AbsolutePosition does not count the bar
 					local w, h, top = vec2Props.ViewportSize[1], vec2Props.ViewportSize[2], 58
-					if d.props.IgnoreGuiInset == true then return w, h, w / 2, h / 2 - top, 0, s end
-					return w, h - top, w / 2, (h - top) / 2, 0, s
+					if d.props.IgnoreGuiInset == true then return w, h, 0, -top, 0, s end
+					return w, h - top, 0, 0, 0, s
 				end
 				if d.props.ClassName ~= "ScreenGui" then
 					note("env", "GUI layout: " .. d.props.ClassName .. " is not modelled; its AbsoluteSize is (0, 0) here")
@@ -1260,9 +1312,9 @@ return function(G, fnames, libnames, opts)
 			-- against an empty box at the origin)
 			local parent = d.props.Parent
 			local pd = parent and data[parent]
-			local pw, ph, pcx, pcy, prot, k = 0, 0, 0, 0, 0, 1
+			local pw, ph, px, py, prot, k = 0, 0, 0, 0, 0, 1
 			if pd and guiKind(pd.props.ClassName) then
-				pw, ph, pcx, pcy, prot, k = layout(parent, depth + 1)
+				pw, ph, px, py, prot, k = layout(parent, depth + 1)
 			else
 				pd = nil
 			end
@@ -1271,31 +1323,38 @@ return function(G, fnames, libnames, opts)
 			local pad = pd and modifier(pd, "UIPadding")
 			if pad then
 				l, t = udimPx(pad.props.PaddingLeft, pw, k), udimPx(pad.props.PaddingTop, ph, k)
-				cw = pw - l - udimPx(pad.props.PaddingRight, pw, k)
-				ch = ph - t - udimPx(pad.props.PaddingBottom, ph, k)
-				if cw < 0 then l, cw = l + cw, -cw end
-				if ch < 0 then t, ch = t + ch, -ch end
+				cw = sub(sub(pw, l), udimPx(pad.props.PaddingRight, pw, k))
+				ch = sub(sub(ph, t), udimPx(pad.props.PaddingBottom, ph, k))
+				if cw < 0 then l, cw = add(l, cw), -cw end
+				if ch < 0 then t, ch = add(t, ch), -ch end
 			end
 			local w, h = 0, 0
 			local size = d.props.Size
 			if typeNames[size] == "UDim2" then
-				w, h = size.X.Scale * cw + size.X.Offset * k, size.Y.Scale * ch + size.Y.Offset * k
+				w, h = udimPx(size.X, cw, k), udimPx(size.Y, ch, k)
 			end
 			local con = modifier(d, "UISizeConstraint")
 			if con then
 				local mn, mx = con.props.MinSize, con.props.MaxSize
-				if typeNames[mx] == "Vector2" then w, h = math.min(w, mx.X * k), math.min(h, mx.Y * k) end
-				if typeNames[mn] == "Vector2" then w, h = math.max(w, mn.X * k), math.max(h, mn.Y * k) end
+				if typeNames[mx] == "Vector2" then
+					w, h = math.min(w, mul(f32(num(mx.X, math.huge)), k)), math.min(h, mul(f32(num(mx.Y, math.huge)), k))
+				end
+				if typeNames[mn] == "Vector2" then
+					w, h = math.max(w, mul(f32(num(mn.X, 0)), k)), math.max(h, mul(f32(num(mn.Y, 0)), k))
+				end
 			end
 			local s = ownScale(d)
-			w, h = w * s, h * s
+			w, h = mul(w, s), mul(h, s)
+			-- the position in the parent's box: content origin + Position - AnchorPoint * size
 			local x, y = l, t
 			local pos = d.props.Position
 			if typeNames[pos] == "UDim2" then
-				x, y = l + pos.X.Scale * cw + pos.X.Offset * k, t + pos.Y.Scale * ch + pos.Y.Offset * k
+				x, y = add(l, udimPx(pos.X, cw, k)), add(t, udimPx(pos.Y, ch, k))
 			end
 			local an = d.props.AnchorPoint
-			if typeNames[an] == "Vector2" then x, y = x - an.X * w, y - an.Y * h end
+			if typeNames[an] == "Vector2" then
+				x, y = sub(x, mul(f32(num(an.X, 0)), w)), sub(y, mul(f32(num(an.Y, 0)), h))
+			end
 			local auto, sc = d.props.AutomaticSize, d.props.SizeConstraint
 			if (auto ~= nil and tostring(auto) ~= "Enum.AutomaticSize.None") or (sc ~= nil and tostring(sc) ~= "Enum.SizeConstraint.RelativeXY") then
 				note("env", "GUI layout: AutomaticSize and SizeConstraint are not modelled; AbsoluteSize / AbsolutePosition ignore them")
@@ -1303,11 +1362,19 @@ return function(G, fnames, libnames, opts)
 			if pd and pd.props.ClassName == "ScrollingFrame" then
 				note("env", "GUI layout: the canvas of a ScrollingFrame is not modelled; its children are laid out in its window")
 			end
-			-- centre relative to the parent's centre, turned with the parent
-			local rx, ry = x + w / 2 - pw / 2, y + h / 2 - ph / 2
+			local rot = add(prot, f32(num(d.props.Rotation, 0)))
+			if prot == 0 then
+				return w, h, add(px, x), add(py, y), rot, mul(k, s)
+			end
+			-- in a turned parent: the centre relative to the parent's centre, turned with the parent,
+			-- minus half the (unturned) size
+			local hw, hh = mul(w, 0.5), mul(h, 0.5)
+			local rx, ry = sub(add(x, hw), mul(pw, 0.5)), sub(add(y, hh), mul(ph, 0.5))
 			local a = math.rad(prot)
-			local ca, sa = math.cos(a), math.sin(a)
-			return w, h, pcx + rx * ca - ry * sa, pcy + rx * sa + ry * ca, prot + num(d.props.Rotation, 0), k * s
+			local ca, sa = f32(math.cos(a)), f32(math.sin(a))
+			local cx = add(add(px, mul(pw, 0.5)), sub(mul(rx, ca), mul(ry, sa)))
+			local cy = add(add(py, mul(ph, 0.5)), add(mul(rx, sa), mul(ry, ca)))
+			return w, h, sub(cx, hw), sub(cy, hh), rot, mul(k, s)
 		end
 		P.layout = function(inst) return layout(inst, 0) end
 		local make = vec2
@@ -1318,8 +1385,8 @@ return function(G, fnames, libnames, opts)
 		end
 		computed.AbsolutePosition = function(inst, d)
 			if not guiKind(d.props.ClassName) then return nil end
-			local w, h, cx, cy = layout(inst, 0)
-			return make(cx - w / 2, cy - h / 2)
+			local _, _, x, y = layout(inst, 0)
+			return make(x, y)
 		end
 		computed.AbsoluteRotation = function(inst, d)
 			if not guiKind(d.props.ClassName) then return nil end
@@ -1358,13 +1425,9 @@ return function(G, fnames, libnames, opts)
 		--   GetLength: adaptive bisection per segment (chord a, half chords b; b - a < 1e-5 -> b)
 		--   arc-length queries: s = f32(t * L), then 32 RK4 steps of du/ds = 1/|B'(u)|
 		-- Luraph feeds the float32 bit patterns of these results into its decryption key.
-		local FB = buffer.create(4)
-		local function f32(x)
-			buffer.writef32(FB, 0, x)
-			return buffer.readf32(FB, 0)
-		end
+		-- (u: a UDim2 as the engine stores it, float32 Scale and int32 Offset: see udim())
 		local function resolve(u, W, H)
-			return f32(f32(f32(u.X.Scale) * W) + u.X.Offset), f32(f32(f32(u.Y.Scale) * H) + u.Y.Offset)
+			return f32(f32(u.X.Scale * W) + u.X.Offset), f32(f32(u.Y.Scale * H) + u.Y.Offset)
 		end
 		local function coeffs(sg)
 			local n = #sg // 2
@@ -1386,7 +1449,8 @@ return function(G, fnames, libnames, opts)
 			end
 			return c
 		end
-		local function segments(self)
+		-- the control points in pixels: { x, y, left dx, left dy, right dx, right dy }
+		local function points(self)
 			local W, H = absSize(self)
 			local pts = {}
 			for i, cp in ipairs(data[self].points or {}) do
@@ -1395,6 +1459,10 @@ return function(G, fnames, libnames, opts)
 				local rx, ry = resolve(cp.RightTangent, W, H)
 				pts[i] = { px, py, lx, ly, rx, ry }
 			end
+			return pts
+		end
+		local function segments(self)
+			local pts = points(self)
 			local segs = {}
 			for i = 1, #pts - 1 do
 				local a, b = pts[i], pts[i + 1]
@@ -1554,12 +1622,73 @@ return function(G, fnames, libnames, opts)
 			needParent(self)
 			return length(segments(self))
 		end)
+		-- Rect: Min / Max corners, Width / Height (float32, as the engine stores them).  A userdata
+		-- like the engine's value (newproxy, as the mock's Instances and Random are): type() says
+		-- "userdata", getmetatable() "The metatable is locked" (an executor's getrawmetatable gets
+		-- the real one, rawMT), an unknown member raises "X is not a valid member of Rect" and an
+		-- assignment raises (the texts follow the engine's other datatypes; not checked in Studio
+		-- for Rect).
+		-- (the corners are kept as numbers and Min / Max make a new Vector2 on every read, as the
+		-- engine's value does: a write to r.Min.X does not reach the Rect)
+		local rectFields = setmetatable({}, { __mode = "k" })
+		local rectMembers = { Min = true, Max = true, Width = true, Height = true }
+		local function rectIndex(r, k)
+			local f = rectFields[r]
+			if k == "Min" then return vec2(f.x0, f.y0) end
+			if k == "Max" then return vec2(f.x1, f.y1) end
+			if k == "Width" or k == "Height" then return f[k] end
+			error(tostring(k) .. " is not a valid member of Rect", 2)
+		end
+		local function rectNewindex(r, k)
+			if rawType(k) == "string" and rectMembers[k] then error(k .. " cannot be assigned to", 2) end
+			error(tostring(k) .. " is not a valid member of Rect", 2)
+		end
+		local function rectEq(a, b)
+			local x, y = rectFields[a], rectFields[b]
+			return x ~= nil and y ~= nil and x.x0 == y.x0 and x.y0 == y.y0 and x.x1 == y.x1 and x.y1 == y.y1
+		end
+		local function rectTostring(r)
+			local f = rectFields[r]
+			return string.format("%.9g, %.9g, %.9g, %.9g", f.x0, f.y0, f.x1, f.y1)
+		end
+		local function rect(x0, y0, x1, y1)
+			local r = newproxy(true)
+			local mt = getmetatable(r)
+			rectFields[r] = { x0 = x0, y0 = y0, x1 = x1, y1 = y1, Width = f32(x1 - x0), Height = f32(y1 - y0) }
+			mt.__index, mt.__newindex, mt.__eq, mt.__tostring = rectIndex, rectNewindex, rectEq, rectTostring
+			mt.__type = "Rect"
+			mt.__metatable = "The metatable is locked"
+			rawMT[r] = mt
+			typeNames[r] = "Rect"
+			seal(mt)
+			return r
+		end
+		-- The box of the curve's control polygon (each point and the tangent handles that shape a
+		-- segment) widened by half the stroke (Thickness, pixels) on every side, in the parent's
+		-- pixels.  The engine's rule is not documented beyond "encloses the path, expanded by its
+		-- rendered thickness": this is the plausible one, the same as the second engine's
+		-- (deobf/envlog.luau, CHAIN.p2d.rect), not one measured in Roblox.
 		m("GetBoundingRect", function(self)
 			needParent(self)
-			-- (which rectangle the engine reports - of the curve or of its control points, in which
-			-- space - is not known here: no model, the answer is a stand-in and the log says so)
-			note("stub", "Path2D:GetBoundingRect() has no model in the mock: answered with a permissive stand-in")
-			return stub("Path2D:GetBoundingRect()", "Rect")
+			local pts = points(self)
+			if #pts < 2 then
+				note("stub", "Path2D:GetBoundingRect() of a path without a segment has no model in the mock: answered with a permissive stand-in")
+				return stub("Path2D:GetBoundingRect()", "Rect")
+			end
+			local T = data[self].props.Thickness
+			if type(T) ~= "number" then T = 1 end
+			local lx, ly, hx, hy = math.huge, math.huge, -math.huge, -math.huge
+			local function add(x, y)
+				lx, hx = math.min(lx, x), math.max(hx, x)
+				ly, hy = math.min(ly, y), math.max(hy, y)
+			end
+			for i, q in ipairs(pts) do
+				add(q[1], q[2])
+				if i > 1 then add(f32(q[1] + q[3]), f32(q[2] + q[4])) end
+				if i < #pts then add(f32(q[1] + q[5]), f32(q[2] + q[6])) end
+			end
+			local e = f32(f32(T) / 2)
+			return rect(f32(lx - e), f32(ly - e), f32(hx + e), f32(hy + e))
 		end)
 		m("GetPositionOnCurve", function(self, t)
 			needParent(self)
@@ -2089,13 +2218,20 @@ return function(G, fnames, libnames, opts)
 		-- (luaL_argerror form, no "got <type>").  Luraph's start-up code calls spawn, defer and delay
 		-- without arguments inside xpcall; before this the message was that of the mock's own
 		-- coroutine.create with a position inside rbxmock.lua.
+		-- (P.onSpawn: the harness notes where the code that started the thread runs, see harness.lua
+		-- watch.spawned; the thread's own stack does not show it.  In P, not M: a field of M changes
+		-- the order in which the script's environment is filled, which scripts can see)
+		local function started(co)
+			if P.onSpawn then P.onSpawn(co) end
+			return co
+		end
 		local function run(f, ...)
 			if type(f) == "thread" then
-				resume(f, ...)
+				resume(started(f), ...)
 				return f
 			end
 			if type(f) ~= "function" then error("invalid argument #1 to 'spawn' (function or thread expected)", 2) end
-			local co = coroutine.create(f)
+			local co = started(coroutine.create(f))
 			resume(co, ...)
 			return co
 		end
@@ -2104,7 +2240,7 @@ return function(G, fnames, libnames, opts)
 			if type(f) ~= "thread" and type(f) ~= "function" then
 				error("invalid argument #1 to 'defer' (function or thread expected)", 2)
 			end
-			local co = type(f) == "thread" and f or coroutine.create(f)
+			local co = started(type(f) == "thread" and f or coroutine.create(f))
 			queue[#queue + 1] = { co, ... }
 			return co
 		end)
@@ -2115,7 +2251,7 @@ return function(G, fnames, libnames, opts)
 			if type(f) ~= "thread" and type(f) ~= "function" then
 				error("invalid argument #2 to 'delay' (function or thread expected)", 2)
 			end
-			return type(f) == "thread" and f or coroutine.create(f)
+			return started(type(f) == "thread" and f or coroutine.create(f))
 		end)
 		-- What a wait returns is the time that really passed (documentation of task.wait and wait): at
 		-- least what was asked for, at least one step of the scheduler (task.wait resumes on the next
@@ -2144,8 +2280,11 @@ return function(G, fnames, libnames, opts)
 				for _, item in ipairs(q) do
 					if coroutine.status(item[1]) == "suspended" then resume(unpack(item)) end
 				end
-				if legacy then return waited(t, step), os.clock() end       -- (elapsed, elapsedTime())
-				return waited(t, step)
+				local w = waited(t, step)
+				-- (what the main thread waited, for the harness's watch on a run that does not end)
+				if M.onWait then M.onWait(legacy and "wait()" or "task.wait()", w) end
+				if legacy then return w, os.clock() end       -- (elapsed, elapsedTime())
+				return w
 			end
 		end
 		local waitImpl = waiter(1 / 30, true)
@@ -2210,6 +2349,7 @@ return function(G, fnames, libnames, opts)
 			end
 			local text = string.gsub(string.sub(table.concat(parts, " ", 1, n), 1, 300), "[%c]", " ")
 			note("script", kind .. ": " .. text, true)
+			if M.onSay then M.onSay() end
 		end
 	end
 	M.warn = named("warn", said("warn"))

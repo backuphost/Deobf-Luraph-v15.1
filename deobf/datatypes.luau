@@ -382,7 +382,10 @@ end
 local function int32(x)
 	x = num(x)
 	if x ~= x or x >= 2147483648 or x < -2147483648 then return -2147483648 end
-	return x < 0 and math.ceil(x) or math.floor(x)
+	-- (truncated toward zero; a value in (-1, 0) gives 0, not -0: an int32 has no -0)
+	x = x < 0 and math.ceil(x) or math.floor(x)
+	if x == 0 then return 0 end
+	return x
 end
 
 local newUDim
@@ -543,8 +546,9 @@ local V2Lib = {
 local newRect = valueType("Rect", function(f, k)
 	if k == "Min" then return v2(f.lo) end
 	if k == "Max" then return v2(f.hi) end
-	if k == "Width" then return f.hi.x - f.lo.x end
-	if k == "Height" then return f.hi.y - f.lo.y end
+	-- (float32 like the corners: the engine subtracts in float)
+	if k == "Width" then return f32(f.hi.x - f.lo.x) end
+	if k == "Height" then return f32(f.hi.y - f.lo.y) end
 	return nil
 end, {
 	__eq = function(a, b) return TYPE[a] == TYPE[b] and VAL[a].lo == VAL[b].lo and VAL[a].hi == VAL[b].hi end,
