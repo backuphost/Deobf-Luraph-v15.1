@@ -1186,6 +1186,25 @@ def stall_options(options=(), **given):
     return out
 
 
+def read_oracle(path):
+    """The oracle file the harness writes (harness.lua writeOracle): {(pid, loop, pc): record}, with
+    register numbers as ints, strings decoded and the successors as a set of (loop, pc)."""
+    with open(path) as f:
+        raw = json.load(f)
+    out = {}
+    for k, rec in raw.items():
+        pid, loop, pc = (int(x) for x in k.split(':'))
+        rec['r'] = {int(i): v for i, v in rec['r'].items()}
+        # strings (hex) and booleans the registers held on every visit
+        rec['s'] = {int(i): bytes.fromhex(v).decode('latin-1') if isinstance(v, str) else v
+                    for i, v in (rec.get('s') or {}).items()}
+        # registers that held the activation's own register array on every visit
+        rec['a'] = {int(i) for i in rec.get('a') or ()}
+        rec['succ'] = {tuple(x) for x in rec['succ']}
+        out[(pid, loop, pc)] = rec
+    return out
+
+
 def run_oracle(model, workdir, tag, options=()):
     """Run the script to its end with per-instruction recording.  A script that does not end is
     stopped by the harness (STALL) and its state taken where it was; the note list then has the
@@ -1193,8 +1212,10 @@ def run_oracle(model, workdir, tag, options=()):
 
     Returns (dump of the VM state at the end, oracle, note) where oracle maps (pid, loop, pc) of
     every executed instruction to a dict: r/v = numbers held by registers / interpreter locals on
-    entry (same on every visit), vers = [(step, instruction text)] per version executed, final =
-    the instruction text at the end of the run."""
+    entry (same on every visit), s = strings and booleans held by registers on entry (same on every
+    visit of the script's own run; not for code only the exercise pass ran), a = registers that held
+    the activation's own register array on every visit (likewise), vers = [(step, instruction text)]
+    per version executed, final = the instruction text at the end of the run."""
     patched = os.path.join(workdir, tag + '.step.lua')
     outjson = os.path.join(workdir, tag + '.end.json')
     with open(patched, 'w', encoding='latin-1') as f:
@@ -1225,14 +1246,7 @@ def run_oracle(model, workdir, tag, options=()):
                                                                       '[started]', '[watch]'))]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
         raise RuntimeError('oracle run failed: ' + harness_tail(r.stderr))
-    with open(outjson + '.oracle') as f:
-        raw = json.load(f)
-    out = {}
-    for k, rec in raw.items():
-        pid, loop, pc = (int(x) for x in k.split(':'))
-        rec['r'] = {int(i): v for i, v in rec['r'].items()}
-        rec['succ'] = {tuple(x) for x in rec['succ']}
-        out[(pid, loop, pc)] = rec
+    out = read_oracle(outjson + '.oracle')
     with open(outjson) as f:
         dump = json.load(f)
     if os.path.exists(outjson + '.snaps'):

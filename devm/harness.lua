@@ -609,6 +609,8 @@ local baseGlobals = {}
 local httpMap, httpMapPath = nil, nil    -- httpmap=<file> of `<url substring><TAB><reply body>` lines
 local httpReply = nil      -- canned reply for game:HttpGet / HttpPost (option httpreply=<number>)
 local orc, orcNames = {}, {}
+-- the oracle keeps strings up to this length (longer ones are left out: a buffer, a chunk of code)
+local ORC_STR = 4096
 local orcLast = setmetatable({}, { __mode = "k" })
 -- the instruction at pc as text: every numeric field of the proto's code arrays
 local insNames = {}
@@ -762,13 +764,19 @@ local function writeOracle()
 		for n, x in rec.v do
 			if x == x and math.abs(x) ~= math.huge then v[#v + 1] = string.format('"%s":%.17g', n, x) end
 		end
+		-- strings (hex, as the dump writes them) and booleans held on every visit
+		local sb, own = {}, {}
+		for i, x in rec.s do
+			sb[#sb + 1] = string.format('"%d":%s', i, type(x) == "string" and '"' .. hex(x) .. '"' or (x and "true" or "false"))
+		end
+		for i in rec.own do own[#own + 1] = string.format("%d", i) end
 		local vs = {}
 		for i, t in rec.vers do vs[i] = string.format('[%d,"%s"]', rec.steps[i], t) end
 		local sc = {}
 		for k2 in rec.succ do sc[#sc + 1] = string.format("[%d,%d]", k2 // 2 ^ 24, k2 % 2 ^ 24) end
-		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"sv":%d,"r":{%s},"v":{%s},"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
-			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, rec.probe and 1 or 0, rec.sv or 0, table.concat(r, ","), table.concat(v, ","), table.concat(vs, ","),
-			rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","))
+		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"sv":%d,"r":{%s},"v":{%s},"s":{%s},"a":[%s],"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
+			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, rec.probe and 1 or 0, rec.sv or 0, table.concat(r, ","), table.concat(v, ","), table.concat(sb, ","),
+			table.concat(own, ","), table.concat(vs, ","), rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","))
 	end
 	writefile(outPath .. ".oracle", "{" .. table.concat(parts, ",\n") .. "}")
 end
@@ -1409,10 +1417,22 @@ function watch.step(th, pid, loop, pc, regs, names, ...)
 				local last = ring[(stepCount - 1) % ringN]
 				protos[pid].caller = last and last // 2 ^ 32 or 0
 			end
-			local r, v = {}, {}
+			local r, v, sb, own = {}, {}, {}, {}
+			-- (strings and booleans as well, but not of code that only the exercise or probe pass ran:
+			-- the lifter shows such values in place of what it cannot follow, and only a value of the
+			-- script's own run may stand there; and the registers that hold the activation's own
+			-- register array, which a call handed one of them can write into)
+			local real = not probing and not watch.exercising
 			for i = 0, 1023 do
 				local x = rawget(regs, i)
-				if type(x) == "number" then r[i] = x end
+				local tx = type(x)
+				if tx == "number" then
+					r[i] = x
+				elseif real and (tx == "boolean" or (tx == "string" and #x <= ORC_STR)) then
+					sb[i] = x
+				elseif real and tx == "table" and rawequal(x, regs) then
+					own[i] = true
+				end
 			end
 			if names then
 				local list = orcNames[names]
@@ -1424,9 +1444,9 @@ function watch.step(th, pid, loop, pc, regs, names, ...)
 				for i, n in list do
 					if type(vals[i]) == "number" then v[n] = vals[i] end
 				end
-				rec = { r = r, v = v, n = 1, names = list }
+				rec = { r = r, v = v, s = sb, own = own, n = 1, names = list }
 			else
-				rec = { r = r, v = v, n = 1 }
+				rec = { r = r, v = v, s = sb, own = own, n = 1 }
 			end
 			rec.vers = { ver }
 			rec.steps = { stepCount }
@@ -1447,6 +1467,12 @@ function watch.step(th, pid, loop, pc, regs, names, ...)
 			rec.last = stepCount
 			for i, x in rec.r do
 				if rawget(regs, i) ~= x then rec.r[i] = nil end
+			end
+			for i, x in rec.s do
+				if rawget(regs, i) ~= x then rec.s[i] = nil end
+			end
+			for i in rec.own do
+				if not rawequal(rawget(regs, i), regs) then rec.own[i] = nil end
 			end
 			if rec.names then
 				local vals = { ... }
