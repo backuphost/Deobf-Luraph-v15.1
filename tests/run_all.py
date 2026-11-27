@@ -8,8 +8,19 @@
   interpreter   bin/luau and bin/luau-ast run and carry both patches (build_luau.py --check)
   static        the static tool's own suite (tests/static_all.py)
   devm          devm's container, model and harness checks for Luraph v15.2 (tests/devm_v152.py)
+  devm-lift     devm's evaluator and lifter on the handler spellings of v14 interpreters (tests/devm_lift_v14.py)
+  devm-v14      devm's loop-head normaliser, v14 model and hand-over route (tests/devm_v14.py; with
+                LURAPH_CORPUS set also one file per v14 layout of the sample corpus)
+  devm-v15      devm's traced-run snapshots and jump hubs for the v15.1 corpus builds (tests/devm_v15_corpus.py)
+  mock          the mock Roblox environment answers like Roblox (tests/mock_test.py)
   structurer    deobf's structurer against random control-flow graphs (research/structure_fuzz.py)
   frontend      deob.py picks the right engine and reports truthfully (tests/allinone_test.py)
+  codecs        the static container decoder and the Zstandard decoders (tests/codecs_test.py)
+  diffcheck     devm.diffcheck tells same from different on scripts changed on purpose (tests/diffcheck_test.py)
+  deobf         the second engine's result line, time limit, process hygiene, lifter fixes; with
+                LURAPH_CORPUS set also two files of the public corpus (tests/deobf_corpus.py)
+  recognise     header forms, main-statement shapes, verdicts and exit codes on miniature inputs; with
+                LURAPH_CORPUS set, also a few files per version of the sample corpus (tests/frontend_corpus.py)
 
 Everything needs the interpreter (./setup.sh).  Exit status 0 when every check passes.
 """
@@ -29,8 +40,16 @@ def checks(full):
         ("interpreter", [PY, "build_luau.py", "--check"], {}, 120),
         ("static", [PY, "-B", "tests/static_all.py"] + ([] if full else ["--quick"]), {}, 1800),
         ("devm", [PY, "-B", "tests/devm_v152.py"], {}, 600),
+        ("devm-lift", [PY, "-B", "tests/devm_lift_v14.py"], {}, 1800),
+        ("devm-v14", [PY, "-B", "tests/devm_v14.py"], {}, 900),
+        ("devm-v15", [PY, "-B", "tests/devm_v15_corpus.py"], {}, 600),
+        ("mock", [PY, "-B", "tests/mock_test.py"], {}, 600),
         ("structurer", [PY, "-B", "deobf/research/structure_fuzz.py", "0", "3000" if full else "500"], {}, 1800),
         ("frontend", [PY, "-B", "tests/allinone_test.py"], {"ALLINONE_FULL": "1"} if full else {}, 3600),
+        ("codecs", [PY, "-B", "tests/codecs_test.py"], {}, 1800),
+        ("diffcheck", [PY, "-B", "tests/diffcheck_test.py"], {}, 900),
+        ("deobf", [PY, "-B", "tests/deobf_corpus.py"], {}, 1800),
+        ("recognise", [PY, "-B", "tests/frontend_corpus.py"], {}, 1800),
     ]
     if full:
         out.insert(3, ("devm-full", [PY, "-B", "tests/devm_v152.py", "V152Full", "Layer3Full"],

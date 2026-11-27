@@ -344,6 +344,19 @@ def main():
         # two loops, one nested in a function inside the other's handler
         ('local c,pc,a={},1,0 while true do local op=c[pc];%s;local g=function(d,q)local a;while true do '
          'local op=d[q];%s;q=q+1 end end;pc=pc+1 end' % (tree, tree), [(4, True), (4, True)]),
+        # the first test computed into a local first (v15.1): `local T = OP >= 10; if T then`
+        ('local c,pc,a={},1,0 while true do local op=c[pc];local j=op>=10;if j then local k=op<11;if k then a=1 '
+         'else a=2 end else local m=op<4;if m then a=3 elseif op==7 then a=4 end end;pc=pc+1 end', [(4, True)]),
+        ('local c,pc,a={},1,0 while true do local op=c[pc];local j=10<op;if j then %s end;pc=pc+1 end' % tree,
+         [(5, True)]),
+        # ... but the local must come from a comparison that names the opcode, and the `if` test it
+        ('local c,pc,a,z={},1,0,5 while true do local op=c[pc];local j=z>=10;if j then %s end;pc=pc+1 end' % tree,
+         []),
+        ('local c,pc,a={},1,0 while true do local op=c[pc];local j=op+10;if j then %s end;pc=pc+1 end' % tree, []),
+        ('local c,pc,a,q={},1,0,1 while true do local op=c[pc];local j=op>=10;if q then %s end;pc=pc+1 end' % tree,
+         []),
+        ('local c,pc,a={},1,0 while true do local op=c[pc];local j,k=op>=10,1;if j then %s end;pc=pc+1 end' % tree,
+         []),
     ]
     for text, want in loops:
         root_, errs_ = luascope.parse(text, ast)

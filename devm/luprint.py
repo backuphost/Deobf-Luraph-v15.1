@@ -29,6 +29,8 @@ class SrcPrinter:
             return '(' + s + ')' if s.startswith('-') and prec > PREC['unary'] else s
         if t == 'str':
             return lua_string(e[1])
+        if t == 'istr':
+            return e[1]
         if t == 'name':
             return e[1]
         if t == 'paren':

@@ -2736,6 +2736,14 @@ class ProtoCFG:
         for key, node in self.pir.nodes.items():
             make(node.tree, key)
         self.entry = self.pir.entry
+        # A jump to an instruction the lifter never produced (its final pruning tolerates such
+        # targets), or a function without its first instruction: a marked stub in the text, so
+        # that the gap of one function does not stop the whole result.
+        missing = {s for b in list(self.blocks.values()) for s in b.succs() if s not in self.blocks}
+        if self.entry not in self.blocks:
+            missing.add(self.entry)
+        for key in sorted(missing, key=repr):
+            make(([('error', 'jump to an instruction that was not lifted')], ('ret', [], None)), key)
 
     def compute_preds(self):
         for b in self.blocks.values():
@@ -3219,6 +3227,17 @@ class ProtoCFG:
             self.nparams = n
             b.stmts = b.stmts[n:]
             self.param_regs = list(range(1, n + 1))
+        # An argument beyond the parameters is one of the varargs: v14 interpreters fetch it from
+        # their argument table at a fixed position (`R[a] = args[first_vararg]`), which the
+        # evaluator can only give as "argument number i".
+        np = self.nparams
+
+        def fix(e):
+            return ('varargn', e[1] - np) if e[0] == 'arg' and e[1] > np else e
+        for blk in self.blocks.values():
+            if any("('arg', " in repr(st) for st in blk.stmts + [blk.term]):
+                blk.stmts = [map_stmt(st, fix) for st in blk.stmts]
+                blk.term = map_stmt(blk.term, fix)
         for blk in self.blocks.values():
             for st in blk.stmts + [blk.term]:
                 for e in stmt_exprs(st)[0]:

@@ -221,6 +221,28 @@ def _local_key(node):
     return None
 
 
+def _outlined_test(body, op):
+    """`local OP = CODE[PC]; local T = OP >= 10; if T then ...`: the first test of the dispatch
+    tree computed into a local first (an interpreter of the v15.1 builds; devm/vmmodel.py
+    _outlined_test accepts the same).  `body` is the loop's statements, `op` the opcode's
+    declaration key.  The statement after the fetch must declare exactly one local from a
+    comparison that names the opcode, and the statement after it be an `if` on that local."""
+    if len(body) < 3:
+        return False
+    s1, s2 = body[1], body[2]
+    if s1.get('type') != 'AstStatLocal' or s2.get('type') != 'AstStatIf':
+        return False
+    vars_, values = s1.get('vars') or [], s1.get('values') or []
+    if len(vars_) != 1 or len(values) != 1:
+        return False
+    t = values[0]
+    if t.get('type') != 'AstExprBinary' or t.get('op') not in _COMPARE_OPS:
+        return False
+    if op not in (_local_key(t.get('left')), _local_key(t.get('right'))):
+        return False
+    return _local_key(s2.get('condition')) == (vars_[0].get('location'), vars_[0].get('name'))
+
+
 def dispatch_loops(node, min_cases=DISPATCH_MIN_CASES):
     """The interpreter dispatch loops below `node`: [{'node': the AstStatWhile, 'cases': n,
     'declared': bool}], in no particular order.
@@ -232,12 +254,19 @@ def dispatch_loops(node, min_cases=DISPATCH_MIN_CASES):
             if OP < 73 then ...             --   a local declared before the loop also occurs
                                             --   (Luraph v15.2), 'declared' is then False
 
+    or, with the first test computed into a local first (v15.1, see _outlined_test):
+
+        while true do
+            local OP = CODE[PC]
+            local T = OP >= 10
+            if T then ...
+
     The shape is the one devm/vmmodel.py looks for (first statement binds from `CODE[PC]`,
-    second statement is an `if`).  On top of it the loop must be a decision tree on the
-    opcode: OP is compared with at least `min_cases` different number constants somewhere in
-    the loop ('cases' is that count; which variable a comparison names is taken from the
-    parser's binding, not from its spelling).  That keeps ordinary script loops out, e.g.
-    `while true do local item = queue[head]; if item == nil then break end ... end`."""
+    second statement is an `if`, or the outlined test).  On top of it the loop must be a
+    decision tree on the opcode: OP is compared with at least `min_cases` different number
+    constants somewhere in the loop ('cases' is that count; which variable a comparison names
+    is taken from the parser's binding, not from its spelling).  That keeps ordinary script
+    loops out, e.g. `while true do local item = queue[head]; if item == nil then break end ... end`."""
     out = []
     stack = [node]
     while stack:
@@ -254,7 +283,7 @@ def dispatch_loops(node, min_cases=DISPATCH_MIN_CASES):
         if cond.get('type') != 'AstExprConstantBool' or cond.get('value') is not True:
             continue
         body = (n.get('body') or {}).get('body') or []
-        if len(body) < 2 or body[1].get('type') != 'AstStatIf':
+        if len(body) < 2:
             continue
         s0 = body[0]
         values, vars_ = s0.get('values') or [], s0.get('vars') or []
@@ -271,6 +300,8 @@ def dispatch_loops(node, min_cases=DISPATCH_MIN_CASES):
         val = values[0]
         if (val.get('type') != 'AstExprIndexExpr' or not _local_key(val.get('expr'))
                 or not _local_key(val.get('index'))):
+            continue
+        if body[1].get('type') != 'AstStatIf' and not (declared and _outlined_test(body, op)):
             continue
         consts = set()
         inner = [body]

@@ -40,5 +40,5 @@ class Generic(Obfuscator):
         job.write(job.trace_path, text)
         if strings is not None:
             job.write(job.path(".strings.txt"), strings)
-        trace.status_line(body)
+        trace.status_line(body, job)
         return job.trace_path

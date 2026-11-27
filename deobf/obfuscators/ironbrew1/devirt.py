@@ -2546,7 +2546,8 @@ class FunctionLifter:
                 lines, params = ["error(\"devirt: could not lift closure: %s\")" % str(ex).replace("\"", "'")], ["..."]
             self.memo[key] = (lines, params)
         f = CG.FuncE(["function(%s)" % ", ".join(params)] + ["\t" + ln for ln in lines] + ["end"])
-        f.captures = set(upnames.values())
+        # (a list, not a set: variables.declare lists the names in this order)
+        f.captures = list(dict.fromkeys(upnames.values()))
         return f
 
 

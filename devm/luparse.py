@@ -9,6 +9,7 @@ Expressions
   ('func', Func) ('bin', op, a, b) ('un', op, a)
   ('table', [(kind, key, value)])   kind: 'pos' | 'kv'
   ('ifexpr', cond, a, b) ('paren', e)
+  ('istr', source text of a Luau interpolated string)
 Statements
   ('local', [names], [exprs]) ('assign', [targets], [exprs])
   ('opassign', op, target, expr) ('callstmt', expr) ('do', body)
@@ -55,6 +56,7 @@ TOKEN_RE = re.compile(r'''
   | (?P<name>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<lstr>\[(?P<seq>=*)\[.*?\](?P=seq)\])
   | (?P<str>"(?:[^"\\\n]|\\.|\\\n)*"|'(?:[^'\\\n]|\\.|\\\n)*')
+  | (?P<istr>`(?:[^`\\{]|\\.|\{(?:[^{}`"']|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|\{[^{}`]*\})*\})*`)
   | (?P<op>\.\.\.|\.\.=|\.\.|==|~=|<=|>=|//=|//|::|->|\+=|-=|\*=|/=|%=|\^=|[-+*/%^\#<>=(){}\[\];:,.?|&])
 ''', re.S | re.X)
 
@@ -84,7 +86,7 @@ def unescape(s):
             i += 1
             while i < n and s[i] in ' \t\r\n':
                 i += 1
-        elif c == 'u':
+        elif c == 'u' and s[i + 1:i + 2] == '{' and '}' in s[i + 2:i + 12]:
             j = s.index('}', i)
             cp = int(s[i + 2:j], 16)
             out.append(chr(cp).encode('utf-8').decode('latin-1')); i = j + 1
@@ -135,6 +137,10 @@ def tokenize(src):
             toks.append(('str', body, line, pos))
         elif kind == 'str':
             toks.append(('str', unescape(text[1:-1]), line, pos))
+        elif kind == 'istr':
+            # a Luau interpolated string: kept as its source text (only functions the protection
+            # left as plain Lua can hold one; nothing here evaluates it)
+            toks.append(('istr', text, line, pos))
         else:
             toks.append(('op', text, line, pos))
         line += text.count('\n')
@@ -461,16 +467,16 @@ class Parser:
                 if t[1] == '(' or t[1] == '{':
                     e = ('call', e, self.callargs())
                     continue
-            elif t[0] == 'str':
+            elif t[0] in ('str', 'istr'):
                 e = ('call', e, self.callargs())
                 continue
             return e
 
     def callargs(self):
         t = self.peek()
-        if t[0] == 'str':
+        if t[0] in ('str', 'istr'):
             self.next()
-            return [('str', t[1])]
+            return [(t[0], t[1])]
         if t[0] == 'op' and t[1] == '{':
             return [self.tablecons()]
         self.expect('op', '(')
@@ -511,6 +517,9 @@ class Parser:
         if k == 'str':
             self.next()
             return ('str', t[1])
+        if k == 'istr':
+            self.next()
+            return ('istr', t[1])
         if k == 'kw':
             v = t[1]
             if v == 'nil':

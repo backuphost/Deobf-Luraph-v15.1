@@ -15,11 +15,20 @@ class BootstrapError(Exception):
     pass
 
 
-def _func_end(lines, i, indent):
+def _func_end(lines, i, indent, item=False):
+    """Index of the line that ends the function whose head is line i (indented by `indent`), or
+    None.  The printer closes a function that is a table-constructor item one level further out
+    (`\t[5] = function()` ... `end,`): item=True."""
+    if item:
+        want = (indent[:-1] + 'end,', indent[:-1] + 'end')
+        for j in range(i + 1, len(lines)):
+            if lines[j] in want:
+                return j
+        return None
     for j in range(i + 1, len(lines)):
         if lines[j].startswith(indent + 'end') and len(lines[j]) - len(lines[j].lstrip('\t')) == len(indent):
             return j
-    raise BootstrapError('unterminated function at line %d' % (i + 1))
+    return None
 
 
 def patch(text):
@@ -27,13 +36,17 @@ def patch(text):
     info = {'crash': 0, 'fixkey': 0}
 
     # -- tamper routine
-    head = re.compile(r'^(\t*)(local )?(\w+) = function\(\)$')
+    # (a local, or a slot of one of the init's tables: `p7[3] = function()`, and as an item of a
+    # table constructor: `[3] = function()`)
+    head = re.compile(r'^(\t*)(?:(?:local )?\w+(?:\[[^\]=]*\]|\.\w+)*|(\[[^\]=]*\])) = function\(\)$')
     spans = []
     for i, ln in enumerate(lines):
         m = head.match(ln)
         if not m:
             continue
-        j = _func_end(lines, i, m.group(1))
+        j = _func_end(lines, i, m.group(1), item=m.group(2) is not None and m.group(1) != '')
+        if j is None:
+            continue
         body = lines[i + 1:j]
         spin = any(body[k].strip() == 'while true do' and body[k + 1].strip() == 'end' for k in range(len(body) - 1))
         if spin and any('string.rep(" ", 8)' in b for b in body):

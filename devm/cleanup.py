@@ -4,9 +4,10 @@ derived from what they are initialised with (services, required modules, instanc
 Bytecode carries no local names, so this is cosmetic: every generated name (v12, p3) is unique in
 the file, which makes a token-level rename safe.
 """
+import math
 import re
 
-from . import opaque
+from . import luparse, opaque, pe
 
 KEYWORDS = {
     'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'if', 'in', 'local', 'nil', 'not',
@@ -22,7 +23,8 @@ RESERVED = KEYWORDS | {
 
 TOKEN = re.compile(r'''
     (?P<comment>--\[(=*)\[.*?\]\2\]|--[^\n]*)
-  | (?P<string>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\[(=*)\[.*?\]\4\]|`(?:\\.|[^`\\])*`)
+  | (?P<string>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\[(=*)\[.*?\]\4\])
+  | (?P<tick>`)
   | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<other>.)
 ''', re.S | re.X)
@@ -30,12 +32,156 @@ TOKEN = re.compile(r'''
 GEN = re.compile(r'^[vp]\d+$')
 
 
-def tokens(text):
+def token_spans(text):
+    """[(kind, text, start)] of the whole text (kinds: comment, string, ident, other; `other` is one
+    character).  A backtick string comes out in pieces: its literal parts are `string` tokens (the
+    first starts with the backtick, a part before an interpolation ends with its `{`) and the
+    expressions inside `{...}` are tokens like any other, so that a name read only there counts as
+    read, and a rename reaches it.  The pieces concatenate to the text."""
     out = []
-    for m in TOKEN.finditer(text):
-        kind = m.lastgroup
-        out.append([kind, m.group(0)])
-    return out
+    pos = 0
+    while True:
+        for m in TOKEN.finditer(text, pos):
+            if m.lastgroup == 'tick':
+                pos = m.start()
+                break
+            out.append((m.lastgroup, m.group(0), m.start()))
+        else:
+            return out
+        pos = _interp(text, pos, out)
+
+
+def _interp(text, pos, out):
+    """The backtick string at text[pos] into out (see token_spans); returns the position after it."""
+    n = len(text)
+    seg = pos
+    j = pos + 1
+    while j < n:
+        c = text[j]
+        if c == '\\':
+            j += 2
+        elif c == '`':
+            out.append(('string', text[seg:j + 1], seg))
+            return j + 1
+        elif c == '{':
+            out.append(('string', text[seg:j + 1], seg))
+            j = _interp_expr(text, j + 1, out)
+            seg = j         # (the `}` starts the next literal part)
+            j += 1
+        else:
+            j += 1
+    if seg < n:
+        out.append(('string', text[seg:], seg))      # (not closed: the rest of the text)
+    return n
+
+
+def _interp_expr(text, pos, out):
+    """The tokens of the expression of an interpolation, from pos up to its closing `}` (returns
+    the position of that brace, or the end of the text)."""
+    depth = 0
+    while pos < len(text):
+        if text[pos] == '`':
+            pos = _interp(text, pos, out)
+            continue
+        m = TOKEN.match(text, pos)
+        s = m.group(0)
+        if s == '{':
+            depth += 1
+        elif s == '}':
+            if not depth:
+                return pos
+            depth -= 1
+        out.append((m.lastgroup, s, pos))
+        pos = m.end()
+    return pos
+
+
+def tokens(text):
+    return [[kind, s] for kind, s, _ in token_spans(text)]
+
+
+def ident_counts(text):
+    """How often each name occurs as a token (comments and string literals left out, the
+    expressions of backtick interpolations counted)."""
+    return _uses(text)[0]
+
+
+def spanned_lines(text):
+    """Indexes of the lines a token that runs over a line break touches (a long comment or long
+    string, a string continued with a backslash, a backtick string): their text is not all code,
+    or not all of the code is on the line."""
+    return _uses(text)[1]
+
+
+def _uses(text):
+    """(ident_counts, spanned_lines) in one pass over the tokens."""
+    count = {}
+    out = set()
+    line = 0
+    for kind, s, _at in token_spans(text):
+        if kind == 'ident':
+            count[s] = count.get(s, 0) + 1
+        elif '\n' in s:
+            k = s.count('\n')
+            if not s.isspace():
+                out.update(range(line, line + k + 1))
+            line += k
+    return count, out
+
+
+def drop_block_semicolons(text):
+    """structure.Printer.emit and the source printer put `;` in front of a statement that starts
+    with `(` (it would continue the statement before it).  Where a later pass removed the statement
+    before (dead constants, opaque tests), the `;` can end up first in a block, which Luau does not
+    parse (it has no empty statement).  Drops a `;` whose previous token (comments aside) opens a
+    block -- do, then, else, repeat, the `)` that ends a function's parameter list -- or is another
+    `;`, or that starts the text; every other `;` stays (it keeps two statements apart)."""
+    if ';' not in text:
+        return text
+    spans = token_spans(text)
+    sig = [t for t in spans if t[0] != 'comment' and not (t[0] == 'other' and t[1].isspace())]
+    drop = set()
+    for j, (kind, s, at) in enumerate(sig):
+        if kind != 'other' or s != ';':
+            continue
+        if j == 0:
+            drop.add(at)
+            continue
+        pkind, ps, _ = sig[j - 1]
+        if pkind == 'ident' and ps in ('do', 'then', 'else', 'repeat') or pkind == 'other' and ps == ';' \
+                or pkind == 'other' and ps == ')' and _ends_params(sig, j - 1):
+            drop.add(at)
+    if not drop:
+        return text
+    return ''.join(s for _k, s, at in spans if at not in drop)
+
+
+def _ends_params(sig, j):
+    """sig[j] (a `)`) closes the parameter list of `function(...)`, `function name(...)` or
+    `function a.b:c(...)`."""
+    depth = 0
+    while j >= 0:
+        kind, s, _ = sig[j]
+        if kind == 'other' and s == ')':
+            depth += 1
+        elif kind == 'other' and s == '(':
+            depth -= 1
+            if not depth:
+                break
+        j -= 1
+    j -= 1
+    if j < 0:
+        return False
+    if sig[j][:2] == ('ident', 'function'):
+        return True
+    # a function name: NAME {'.' NAME} [':' NAME]
+    while j >= 0 and sig[j][0] == 'ident' and sig[j][1] not in KEYWORDS:
+        j -= 1
+        if j >= 0 and sig[j][:2] in (('other', '.'), ('other', ':')):
+            j -= 1
+            continue
+        break
+    return j >= 0 and sig[j][:2] == ('ident', 'function')
 
 
 def camel(name, lower=True):
@@ -151,6 +297,7 @@ def tidy(text):
     text = '\n'.join(ln for ln in text.split('\n') if not re.match(r'^\s*\(\{\}\)\[\d+\] = [-\w.]+$', ln))
     text = _loop_artifacts(text)
     text = opaque.strip(text)
+    text = drop_dead_constants(text)
     text = drop_unused(text)
     for _ in range(4):
         new = rename(text)
@@ -158,28 +305,307 @@ def tidy(text):
             break
         text = new
     from . import renamer       # (imports this module)
-    return renamer.humanize(text)
+    # (last: the passes above remove statements, and a `;(` statement can be first in its block then)
+    return drop_block_semicolons(renamer.humanize(text))
 
 
 def drop_unused(text):
     while True:
-        toks = tokens(text)
-        count = {}
-        for kind, s in toks:
-            if kind == 'ident':
-                count[s] = count.get(s, 0) + 1
+        count, inside = _uses(text)
         lines = text.split('\n')
         keep = []
         changed = False
-        for ln in lines:
+        for i, ln in enumerate(lines):
             m = re.match(r'^\s*local (v\d+)(?: = nil)?$', ln)
-            if m and count.get(m.group(1)) == 1:
+            if m and count.get(m.group(1)) == 1 and i not in inside:
                 changed = True
                 continue
             keep.append(ln)
         text = '\n'.join(keep)
         if not changed:
             return text
+
+
+class _NotConst(Exception):
+    pass
+
+
+# Library functions that have no effect and depend on nothing but their arguments (with their
+# Luau behaviour on the arguments _const_value accepts)
+_STRING_PURE = ('string.unpack', 'string.packsize', 'string.byte', 'string.len', 'string.sub', 'string.char', 'string.rep')
+
+
+def _lua_number(v):
+    return pe.is_num(v)
+
+
+def _str_sub(s, i=1, j=-1):
+    n = len(s)
+    i = int(i)
+    j = int(j)
+    i = max(n + i + 1, 1) if i < 0 else max(i, 1)
+    j = n + j + 1 if j < 0 else min(j, n)
+    return s[i - 1:j] if i <= j else ''
+
+
+# (bin/luau: a size in a format is at most 2^30 -- "size specifier is too large" -- and so is the
+# whole of string.packsize -- "format result too large")
+_FMT_MAX = 1 << 30
+
+
+def _format_ok(fmt, unpack):
+    """A format of string.unpack / string.packsize that Luau accepts as pe.lua_unpack /
+    pe.lua_packsize read it: integer sizes 1..16 ("integral size out of limits"), sizes and the
+    total within _FMT_MAX.  unpack: integers wider than 8 bytes are refused too (Luau raises
+    unless the extra bytes only extend the sign, which pe.lua_unpack does not check)."""
+    sizes = {'b': 1, 'B': 1, 'h': 2, 'H': 2, 'l': 8, 'L': 8, 'j': 4, 'J': 4, 'T': 4, 'f': 4, 'd': 8, 'n': 8, 'x': 1}
+    total = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        i += 1
+        j = i
+        while j < len(fmt) and fmt[j].isdigit():
+            j += 1
+        if c in 'iIc' and j > i:
+            n = int(fmt[i:j])
+            i = j
+            if n > _FMT_MAX or c != 'c' and not 1 <= n <= (8 if unpack else 16):
+                return False
+        elif c in 'iI':
+            n = 4
+        elif c in sizes:
+            n = sizes[c]
+        elif c in '<=> ':
+            n = 0
+        else:
+            return False        # (c without its count, alignment, variable-length: not read here)
+        total += n
+        if total > _FMT_MAX:
+            return False
+    return True
+
+
+def _call_pure(name, args):
+    """The results of a pure library call on constants; _NotConst where it would raise in Luau or
+    is not one this evaluator knows."""
+    if name in ('bit32.band', 'bit32.bor', 'bit32.bxor', 'bit32.btest') and not args:
+        # (valid in Luau: the empty AND is all ones, the empty OR / XOR zero)
+        return pe.fold_pure(name, [])
+    if name in ('string.unpack', 'string.packsize'):
+        # (pe.fold_pure ignores string.unpack's third argument, where it starts reading)
+        if len(args) != (2 if name == 'string.unpack' else 1) or not isinstance(args[0], str) \
+                or not _format_ok(args[0], name == 'string.unpack'):
+            raise _NotConst()
+    if name in pe.PURE:
+        if not args or not all(_lua_number(a) and math.isfinite(a) for a in args):
+            raise _NotConst()
+        if name.startswith('math.') and name not in ('math.max', 'math.min') and len(args) != 1:
+            raise _NotConst()
+        if name in ('bit32.lshift', 'bit32.rshift', 'bit32.arshift', 'bit32.lrotate', 'bit32.rrotate') and len(args) != 2:
+            raise _NotConst()
+        if name in ('bit32.extract', 'bit32.replace'):
+            # (Luau raises on a field outside 0..31)
+            at = 1 if name == 'bit32.extract' else 2
+            if not at < len(args) <= at + 2:
+                raise _NotConst()
+            f, w = args[at], args[at + 1] if len(args) > at + 1 else 1
+            if not (0 <= f <= 31 and 1 <= w and f + w <= 32):
+                raise _NotConst()
+    elif name == 'string.sub':
+        if not (1 <= len(args) <= 3 and isinstance(args[0], str) and all(_lua_number(a) and math.isfinite(a) for a in args[1:])):
+            raise _NotConst()
+        return [_str_sub(*args)]
+    elif name == 'string.char':
+        if not all(_lua_number(a) and a == int(a) and 0 <= a <= 255 for a in args):
+            raise _NotConst()
+        return [''.join(chr(int(a)) for a in args)]
+    elif name == 'string.rep':
+        if len(args) != 2 or not isinstance(args[0], str) or not _lua_number(args[1]) or not math.isfinite(args[1]) \
+                or len(args[0]) * max(0, int(args[1])) > 1 << 16:
+            raise _NotConst()
+        return [args[0] * max(0, int(args[1]))]
+    elif not _pure_name(name):
+        raise _NotConst()
+    try:
+        r = pe.fold_pure(name, list(args))
+    except Exception:
+        raise _NotConst()
+    if r is None:
+        raise _NotConst()
+    return r
+
+
+def _truthy(v):
+    return v is not None and v is not False
+
+
+def _const_value(e, multi=False):
+    """The value of an expression made of literals, arithmetic, comparisons, and/or/not and calls
+    of pure library functions on such values; _NotConst for anything else or for what would raise
+    at run time.  multi: the list of values (a call can give several)."""
+    k = e[0]
+    if k == 'call' and e[1][0] == 'index' and e[1][1][0] == 'name' and e[1][2][0] == 'str':
+        name = e[1][1][1] + '.' + e[1][2][1]
+        if not _pure_name(name):
+            raise _NotConst()
+        args = []
+        for i, a in enumerate(e[2]):
+            if i == len(e[2]) - 1:
+                args += _const_value(a, multi=True)
+            else:
+                args.append(_const_value(a))
+        r = _call_pure(name, args)
+        return r if multi else (r[0] if r else None)
+    if k == 'num':
+        v = e[1]
+    elif k == 'str':
+        v = e[1]
+    elif k == 'nil':
+        v = None
+    elif k in ('true', 'false'):
+        v = k == 'true'
+    elif k == 'paren':
+        v = _const_value(e[1])
+    elif k == 'index' and e[1] == ('name', 'math') and e[2] in (('str', 'pi'), ('str', 'huge')):
+        v = math.pi if e[2][1] == 'pi' else math.inf
+    elif k == 'un':
+        x = _const_value(e[2])
+        if e[1] == 'not':
+            v = not _truthy(x)
+        elif e[1] == '-' and _lua_number(x):
+            v = -x
+        elif e[1] == '#' and isinstance(x, str):
+            v = len(x)
+        else:
+            raise _NotConst()
+    elif k == 'bin':
+        op = e[1]
+        if op in ('and', 'or'):
+            x = _const_value(e[2])
+            if (op == 'and') != _truthy(x):
+                return [x] if multi else x
+            v = _const_value(e[3])
+        else:
+            x, y = _const_value(e[2]), _const_value(e[3])
+            if op in ('==', '~='):
+                v = (x == y and type(x) is type(y) or _lua_number(x) and _lua_number(y) and x == y) == (op == '==')
+            elif op == '..':
+                if not all(isinstance(z, str) or _lua_number(z) and math.isfinite(z) for z in (x, y)):
+                    raise _NotConst()
+                v = ''.join(z if isinstance(z, str) else str(z) if isinstance(z, int) or z == int(z) and abs(z) < 1e15
+                            else '%.14g' % z for z in (x, y))
+            elif op in ('<', '<=', '>', '>='):
+                if not (_lua_number(x) and _lua_number(y) or isinstance(x, str) and isinstance(y, str)):
+                    raise _NotConst()
+                v = x < y if op == '<' else x <= y if op == '<=' else x > y if op == '>' else x >= y
+            elif op in ('+', '-', '*', '/', '%', '//', '^'):
+                if not (_lua_number(x) and _lua_number(y)):
+                    raise _NotConst()
+                try:
+                    if op == '+':
+                        v = x + y
+                    elif op == '-':
+                        v = x - y
+                    elif op == '*':
+                        v = x * y
+                    elif op == '^':
+                        try:
+                            v = float(x) ** float(y)
+                        except (OverflowError, ZeroDivisionError):
+                            v = math.inf        # (Luau: inf, no error)
+                    elif y == 0:
+                        v = math.nan if op == '%' or x == 0 or x != x else math.copysign(math.inf, x) * math.copysign(1, y)
+                    elif op == '/':
+                        v = x / y
+                    elif op == '//':
+                        q = x / y
+                        v = math.floor(q) if math.isfinite(q) else q
+                    else:
+                        q = x / y
+                        v = x - math.floor(q) * y if math.isfinite(q) else math.nan
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    raise _NotConst()
+                if isinstance(v, complex):
+                    raise _NotConst()
+                if isinstance(v, int) and abs(v) >= 2 ** 53:
+                    v = float(v)        # (Luau numbers are doubles)
+            else:
+                raise _NotConst()
+    else:
+        raise _NotConst()
+    return [v] if multi else v
+
+
+_DEAD_DEF = re.compile(r'^\t*local (v\d+) = (.+)$')
+
+
+def dead_constant_lines(text):
+    """Indexes of the lines `local vN = E` where vN is read nowhere and E is made of literals,
+    arithmetic, comparisons, and/or/not and calls of pure library functions on constants: the
+    values Luraph v14 programs compute for the self-patches of their code (the lifter folds those
+    into the instructions they patch; the register assignment is left with no reader).
+    Returns (removable, left): removable when E evaluates without an error (dropping the line then
+    changes nothing a script can see), left when it has that shape but does not evaluate here.
+    (Lines a long comment or a string runs over are neither: dropping one would take part of that
+    token with it, or the line is not code.)"""
+    count, inside = _uses(text)
+    removable, left = [], []
+    for i, ln in enumerate(text.split('\n')):
+        m = _DEAD_DEF.match(ln)
+        if not m or count.get(m.group(1)) != 1 or not re.search(r'\d', m.group(2)) or i in inside:
+            continue
+        try:
+            # (the parser reads source bytes as latin-1, which is how the escapes come out; a
+            # character the printer wrote as itself is its UTF-8 bytes in the file)
+            p = luparse.Parser(m.group(2).encode('utf-8', 'surrogatepass').decode('latin-1'))
+            e = p.expr()
+            if p.peek()[0] != 'eof':
+                continue
+        except Exception:
+            continue
+        if not _const_shape(e):
+            continue
+        try:
+            _const_value(e)
+        except Exception:       # (_NotConst, or anything the evaluator did not expect: keep the line)
+            left.append(i)
+            continue
+        removable.append(i)
+    return removable, left
+
+
+def _const_shape(e):
+    """E has the shape of a constant expression (literals, operators, library calls on them)."""
+    k = e[0]
+    if k in ('num', 'str', 'nil', 'true', 'false'):
+        return True
+    if k == 'paren':
+        return _const_shape(e[1])
+    if k == 'un':
+        return _const_shape(e[2])
+    if k == 'bin':
+        return _const_shape(e[2]) and _const_shape(e[3])
+    if k == 'index':
+        return e[1] == ('name', 'math') and e[2] in (('str', 'pi'), ('str', 'huge'))
+    if k == 'call':
+        f = e[1]
+        return f[0] == 'index' and f[1][0] == 'name' and f[2][0] == 'str' and _pure_name(f[1][1] + '.' + f[2][1]) \
+            and all(_const_shape(a) for a in e[2])
+    return False
+
+
+def _pure_name(name):
+    return name in pe.PURE or name in _STRING_PURE or name in ('math.modf', 'math.round')
+
+
+def drop_dead_constants(text):
+    """Drops the removable lines of dead_constant_lines (see there)."""
+    drop, _left = dead_constant_lines(text)
+    if not drop:
+        return text
+    gone = set(drop)
+    return '\n'.join(ln for i, ln in enumerate(text.split('\n')) if i not in gone)
 
 
 def rename(text):

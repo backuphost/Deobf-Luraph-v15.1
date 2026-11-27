@@ -546,13 +546,17 @@ class Namer:
             if "new" in info:
                 continue
             base = self.base_name(info)
+            stem = base
             if not base or not re.match(r"^[A-Za-z_]\w*$", base) or base in reserved:
+                # the name of a global or a keyword: `game_` for the first
+                # local, then plain numbers (`v2`, `v3`, not `v_2`, `v_3`)
+                stem = base if base and re.match(r"^[A-Za-z_]\w*$", base) else "v"
                 base = (base or "v") + "_"
                 if not re.match(r"^[A-Za-z_]\w*$", base):
-                    base = "v"
+                    base = stem = "v"
             n = 1
             while True:
-                cand = base if n == 1 else "%s%d" % (base, n)
+                cand = base if n == 1 else "%s%d" % (stem, n)
                 if cand not in reserved and self.fits(cand, info, taken):
                     break
                 n += 1

@@ -68,8 +68,14 @@ The script's main proto becomes top-level code: the proto the bootstrap root
 (pid 1) called last, unless the root emitted statements itself after it (a
 probe helper) (`CHAIN.rootCallee` -> `root_callee` in the dump,
 `devirt._vm_roots`). Fallback: root of the VM whose first closure was made
-**last**. The IR and everything after the walk are shared (`ir.py`,
-`backend.lower`, CLAUDE.md).
+**last**. When that fallback is the bootstrap root itself (`__seq` 1, no
+`root_callee`: `devirt.script_not_reached`) and the run did not finish, the
+run stopped inside Luraph's start-up code: nothing is lifted (the lift would
+be the start-up program, not the script) and the result is the trace, PARTIAL
+with that reason (a v15.0 container of the public corpus: prints, then fails in
+its own loader). If the run finished, the root is lifted and reported PARTIAL
+("main function not identified"). Not for v15.2 (one function holds both).
+The IR and everything after the walk are shared (`ir.py`, `backend.lower`, CLAUDE.md).
 
 - **Capture** (`driver.patch_entries` + `envlog.luau` `CHAIN.dumpProtos`):
   at the closure maker, `__PA[proto]` records (once per proto, table ops only)
@@ -184,6 +190,15 @@ probe helper) (`CHAIN.rootCallee` -> `root_callee` in the dump,
     `@` may appear at any step: child protos of never-run code exist only as
     such results, and their constants are requested through them
     (`105,U,13@2578,25,12@1`).
+  - **The walk must converge.** A call result left unread in a register around a loop (a pack)
+    is part of the walk state under its temp's name, which carries the visit number: every round
+    is a new state whose call makes a new pack. `_walk` counts the pack sets per state without
+    packs (`PACK_VARIANTS_MAX`; whole lifts have one) and then drops the differing packs from
+    the states by the instruction that made them (`pack_sites`, `pack_site()`), like
+    `pack_unstable`, and restarts. Backstop: `WalkLimit` (an `Unsupported`: the closure becomes a
+    marked stub, a root falls back to the trace) when a walk passes `WALK_NODES_PER_PC` states
+    per instruction or `WALK_LIMIT`. Before, such a function walked to 400,000 states and
+    `structure.merge_equivalent` then never finished.
   - Request walks (`lf.walk_only`, `_walk_one`) don't stop at a constant that
     isn't decoded yet: closure op / index / call through one give a
     `Missing(None)`; a branch on one stops the path (forking walks into junk).

@@ -20,6 +20,8 @@ import time
 import urllib.request
 import zipfile
 
+import limits
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(HERE, "bin")
 LUAU_URL = "https://github.com/luau-lang/luau/releases/latest/download/luau-windows.zip"
@@ -205,7 +207,7 @@ def _communicate(cmd, timeout, stall):
     prints nothing for `stall` seconds (the runtime's heartbeat stopped: the
     script spins without touching the environment). (stdout, stderr) bytes,
     or a TimeoutExpired."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = limits.spawn(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     parts = {1: [], 2: []}
     last = [time.time()]
 
@@ -230,6 +232,7 @@ def _communicate(cmd, timeout, stall):
                 raise subprocess.TimeoutExpired(cmd, now - t0)
             time.sleep(0.1)
     finally:
+        limits.reap(proc)       # (also when this thread is interrupted: no harness left running)
         for t in threads:
             t.join(5)
     return b"".join(parts[1]), b"".join(parts[2])
@@ -240,8 +243,10 @@ def run_once(luau, source, cfg, hpath, timeout, keep, chunks=None):
     with open(hpath, "w", encoding="latin-1", newline="\n") as f:
         f.write(build_harness(source, cfg, chunks))
     try:
-        out, errb = _communicate([luau, hpath], timeout, STALL if cfg.get("heartbeat") else None)
+        out, errb = _communicate([luau, hpath], limits.clamp(timeout), STALL if cfg.get("heartbeat") else None)
     except subprocess.TimeoutExpired as e:
+        if limits.expired():
+            return None, "time limit of %d s reached during a traced run" % limits.LIMIT[0]
         return None, "timed out after %ds (script is stuck in a loop the tracer cannot see)" % e.timeout
     finally:
         if not keep and os.path.exists(hpath):
@@ -279,12 +284,11 @@ class HarnessServer:
     END = b"\x00ENVLOG-END"
 
     def __init__(self, luau, source, cfg, chunks):
-        import tempfile
-        self.dir = tempfile.mkdtemp(prefix="deobf_serve_")
+        self.dir = limits.temp_dir("deobf_serve_")
         with open(os.path.join(self.dir, "harness.luau"), "w", encoding="latin-1", newline="\n") as f:
             f.write(build_harness(source, dict(cfg, serve=True), chunks))
-        self.proc = subprocess.Popen([luau], cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT)
+        self.proc = limits.spawn([luau], cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
         self.buf = b""
         self.eof = False
         self.nreq = 0
@@ -316,7 +320,7 @@ class HarnessServer:
     def reply(self, timeout):
         """The next response (the text between ENVLOG-BEGIN and ENVLOG-END), or
         (None, error)."""
-        self.deadline = time.time() + timeout
+        self.deadline = time.time() + limits.clamp(timeout)
         try:
             start = 0
             while self.END not in self.buf[start:]:
@@ -366,11 +370,8 @@ class HarnessServer:
         return m.group(1)
 
     def close(self):
-        if self.proc.poll() is None:
-            self.proc.kill()
-            self.proc.wait()
-        import shutil
-        shutil.rmtree(self.dir, ignore_errors=True)
+        limits.reap(self.proc)
+        limits.remove_temp(self.dir)
 
 
 def trace_text(body):

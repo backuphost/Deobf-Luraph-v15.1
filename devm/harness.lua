@@ -2,6 +2,81 @@
 -- usage: luau harness.lua <patched_sample.lua> <out.json>
 local samplePath, outPath = ...
 local _G = getfenv() -- the CLI runs scripts in a sandboxed thread: script globals live here, not in the real _G
+
+-- ---------------------------------------------------------------- the engine's libraries, kept apart
+-- The script shares the engine's library tables (string, table, math, ...; string is also what the
+-- string metatable's __index is).  The engine freezes them, but in executor mode the script has the
+-- executor's setreadonly / make_writeable (as on a real executor) and can unfreeze them and replace
+-- their functions.  So this file never calls through them once the script can run: the names below
+-- are private copies, taken here, before the mock or the script are loaded, and never handed out.
+-- rbxmock.lua runs with the same copies (mockEnv).  Whatever a script does to the shared tables
+-- changes neither what the harness and the mock write nor what they compute.  sharedLib keeps the
+-- shared tables themselves: the copies the script is given are made from them.
+local LIB_NAMES = { "string", "table", "math", "bit32", "buffer", "coroutine", "os", "utf8", "debug" }
+local sharedLib, privateLibs = {}, {}
+local string, table, math, bit32, buffer, coroutine, os, utf8, debug
+do
+	local clone, freeze = _G.table.clone, _G.table.freeze
+	for _, n in ipairs(LIB_NAMES) do
+		sharedLib[n] = _G[n]
+		privateLibs[n] = freeze(clone(_G[n]))
+	end
+	local P = privateLibs
+	string, table, math, bit32, buffer = P.string, P.table, P.math, P.bit32, P.buffer
+	coroutine, os, utf8, debug = P.coroutine, P.os, P.utf8, P.debug
+end
+local tostring, type, select, pcall, unpack, error = tostring, type, select, pcall, unpack, error
+
+-- ---------------------------------------------------------------- the CLI's own functions
+-- The CLI (luau_cli.patch) gives this file real file access (readfile, writefile), its stderr
+-- (ewrite, and __LPH_RUNMAIN, which is the same C function), C closures (cwrap), a scheduler
+-- resume (resumetop), the vector metatable (setvectormetatable), executor natives (__LPH_NATIVE)
+-- and the CLI's module loader (require, which reads and runs files from disk).  They are kept in
+-- locals here and taken out of every global table once the mock is built (hideHostGlobals): the
+-- script's world never sees them.  In executor mode the script gets the mock's stand-ins for
+-- readfile / writefile; in plain-client mode they are nil, as in Roblox.
+local readfile, writefile, cwrap = readfile, writefile, cwrap
+local hostRunmain, hostNative = __LPH_RUNMAIN, __LPH_NATIVE
+local HOST_NAMES = { "readfile", "writefile", "ewrite", "cwrap", "resumetop", "setvectormetatable", "__LPH_RUNMAIN",
+	"__LPH_NATIVE", "require", "loadfile", "dofile", "callgrind" }
+local realGlobals = getmetatable(_G) and rawget(getmetatable(_G), "__index")
+if type(realGlobals) ~= "table" then realGlobals = nil end
+-- Everything this file writes to stderr goes through ewrite below.  The Python side reads that log
+-- line by line and trusts lines by their leading tag ("[oracle] script returned ...", "[http] ...").
+-- Text that comes from the script (an URL, a member name, an error message, a chunk name in a
+-- stack trace) is part of the line the harness or the mock started, never a line of its own:
+-- characters other readers take for a line end become "?", and a line after the first one of a
+-- write that would read as a tagged log line (or as NOT REACHED / COMPILE ERROR) is indented by
+-- one space.  (Stack frames, "[C] ..." and "[string "..."]:n ...", are left as they are.)
+local ewrite = ewrite      -- (the CLI's: replaced by the checked writer below)
+do
+	-- (only the private copies above: nothing the script can reach or replace)
+	local hostEwrite = ewrite
+	local find, gsub = string.find, string.gsub
+	local function tagged(line)
+		if find(line, "^%[") then
+			return not (find(line, "^%[C%]") or find(line, '^%[string "'))
+		end
+		return find(line, "^NOT REACHED") ~= nil or find(line, "^COMPILE ERROR") ~= nil
+			or find(line, "^LAYER COMPILE ERROR") ~= nil
+	end
+	local function clean(s, all)
+		s = gsub(s, "[%z\1-\8\11-\31\127]", "?")
+		s = gsub(s, "\226\128[\168\169]", "?")      -- U+2028, U+2029
+		s = gsub(s, "\194\133", "?")                -- U+0085
+		if all and tagged(s) then s = " " .. s end
+		if find(s, "\n", 1, true) then
+			s = gsub(s, "\n([^\n]+)", function(line)
+				if tagged(line) then return "\n " .. line end
+				return nil
+			end)
+		end
+		return s
+	end
+	-- all=true: text that is the script's from its first character (an error message), so its
+	-- first line is treated like the others
+	ewrite = function(s, all) return hostEwrite(clean(tostring(s), all)) end
+end
 local layers = { select(3, ...) }
 local layerIdx = 0
 local traceMode = string.sub(outPath, -6) == ".trace"
@@ -163,14 +238,24 @@ end
 -- ---------------------------------------------------------------- hooks
 local protos = {}
 local done = false
+local lazyInsn = false       -- lazyinsn=1, see forceLazy
+local interpFid = {}         -- interp=<function id> (one per interpreter of the VM), see findConstFns
 local quietSteps = 0
 local quietHooks = false     -- VM code run by the harness itself (reading constant pools) is not traced
 
 -- Constant tables can carry an __index hook that decrypts entries on first use; touch every
 -- pending entry so the dump only ever sees plain values.
+local lazyForced, lazyStuck = 0, 0
+local forcing = false        -- true while forceLazy reads: __LPH_W / __LPH_OVER then stop a read that does not end
+local function readField(t, k)
+	return t[k]
+end
 local function forceLazy(root)
 	local seen, queue = {}, { root }
 	local qi = 1
+	local N = rawget(_G, "__LPH_N")
+	local wasQ, wasB = N and N.q, N and N.b
+	forcing = true
 	while qi <= #queue do
 		local t = queue[qi]
 		qi += 1
@@ -178,7 +263,32 @@ local function forceLazy(root)
 		if type(mt) == "table" and type(rawget(mt, "__index")) == "function" and type(rawget(t, 0)) == "table" then
 			local keys = {}
 			for k in next, rawget(t, 0) do keys[#keys + 1] = k end
-			for _, k in ipairs(keys) do pcall(function() return t[k] end) end
+			for _, k in ipairs(keys) do
+				-- The hook is code of the script's loader (a decoder loop) or VM code.  Called for a
+				-- key it does not expect it may never return: loops of the loader are counted while
+				-- N.q is set (__LPH_W), VM instructions against a budget of their own (__LPH_OVER).
+				quietSteps = 0
+				if N then N.q = true; N.b = N.s + 2000000 end
+				local ok, err = pcall(readField, t, k)
+				lazyForced += 1
+				if not ok and err == "__LPH_POOL_BUDGET" then
+					lazyStuck += 1
+					break
+				end
+			end
+		elseif lazyInsn and type(mt) == "table" and type(rawget(mt, "__index")) == "function" then
+			-- lazyinsn=1 (one table per instruction, Luraph v14.0 - v14.2): the instruction table
+			-- itself carries the hook; a constant not decoded yet is a nil field among its 7 or 8.
+			-- Only tables that look like an instruction (nothing but small array fields) are read.
+			local small = true
+			for k in next, t do
+				if type(k) ~= "number" or k < 0 or k > 9 or k ~= math.floor(k) then small = false break end
+			end
+			if small then
+				for k = 1, 8 do
+					if rawget(t, k) == nil then pcall(function() return t[k] end) end
+				end
+			end
 		end
 		for k, v in next, t do
 			if type(v) == "table" and not seen[v] and not libnames[v] and v ~= envTable then
@@ -187,6 +297,8 @@ local function forceLazy(root)
 			end
 		end
 	end
+	forcing = false
+	if N then N.q, N.b = wasQ, wasB end
 end
 
 -- Constant pools.  In some builds a proto's constant table is {[-1] = pool, [-2] = index array} with
@@ -374,6 +486,27 @@ end
 -- The bootstrap installs tables of small functions that ignore their arguments and return a fixed
 -- number (runtime "key" material for self-modifying code). Record their values so the lifter can
 -- fold calls to them.
+-- In a native replay of the lifted init these are functions of the layer.  When the VM ran its own
+-- init (dumpnew=1) they are closures of the VM: functions made by one of its interpreters
+-- (interp=<function id>).  Those are called like a lazy constant is read: VM instructions against
+-- a budget, loops of the loader under the watchdog.
+local function isKeyFn(v)
+	if string.sub(debug.info(v, "s"), 1, 5) == "layer" then return true end
+	local id = fidOf[v]
+	return id ~= nil and interpFid[id] == true
+end
+local function callKeyFn(f, ...)
+	local N = rawget(_G, "__LPH_N")
+	if not N or not fidOf[f] then return pcall(f, ...) end
+	local wasQ, wasB, wasForcing = N.q, N.b, forcing
+	forcing = true
+	quietSteps = 0
+	N.q, N.b = true, N.s + 200000
+	local r = table.pack(pcall(f, ...))
+	forcing = wasForcing
+	N.q, N.b = wasQ, wasB
+	return unpack(r, 1, r.n)
+end
 local function findConstFns(root)
 	local seen, queue = {}, { root }
 	local qi = 1
@@ -382,7 +515,7 @@ local function findConstFns(root)
 		qi += 1
 		local n, all = 0, true
 		for k, v in next, t do
-			if type(v) == "function" and type(k) == "number" and string.sub(debug.info(v, "s"), 1, 5) == "layer" then
+			if type(v) == "function" and type(k) == "number" and isKeyFn(v) then
 				n += 1
 			else
 				all = false
@@ -395,8 +528,8 @@ local function findConstFns(root)
 		if all and n >= 2 then
 			local vals = {}
 			for k, f in next, t do
-				local ok1, a, extra = pcall(f, 1, 2, 3, 4)
-				local ok2, b = pcall(f, 977, 13, 40961, 7)
+				local ok1, a, extra = callKeyFn(f, 1, 2, 3, 4)
+				local ok2, b = callKeyFn(f, 977, 13, 40961, 7)
 				if ok1 and ok2 and type(a) == "number" and a == b and extra == nil then
 					constFns[f] = { k = k, value = a }
 				else
@@ -413,7 +546,13 @@ end
 local function finish(root)
 	if done then return end
 	done = true
+	local t0 = os.clock()
 	forceLazy(root)
+	if lazyForced >= 1000 or lazyStuck > 0 then
+		-- (large scripts have hundreds of thousands of constants, each decoded by VM code)
+		ewrite(string.format("[dump] %d lazy constants read in %.1f s%s\n", lazyForced, os.clock() - t0,
+			lazyStuck > 0 and string.format("; %d table(s) with a hook that did not return for a pending key: left as they were", lazyStuck) or ""))
+	end
 	findConstFns(root)
 	emit("{")
 	emit('"root":' .. ser(root) .. ",")
@@ -505,13 +644,20 @@ local function codeVersion(pid)
 		local p = protos[pid]
 		if not p or type(p.vars) ~= "table" then return 0 end
 		cs = { names = {}, tabs = {}, shadow = {}, base = {}, vers = {}, cur = 0 }
+		-- The proto's own tables.  A lazy view of one of them (`P = setmetatable({[0] = K}, decode)`:
+		-- key 0 holds the proto's own operand array) is not a table of the loader: that array is
+		-- followed below under its own name, per proto.
+		local direct = {}
+		for _, v in next, p.vars do
+			if type(v) == "table" then direct[v] = true end
+		end
 		for name, v in next, p.vars do
 			if type(name) == "string" and type(v) == "table" and not libnames[v] and v ~= envTable then
 				-- (not a constant table's {[-1] = pool, [-2] = index array}: that array is the
 				-- proto's own and is followed as one of its code arrays)
 				local own = rawget(v, -1) ~= nil or rawget(v, -2) ~= nil
 				for k2, w in next, v do
-					if type(w) == "table" and not own and not sharedBase[w] and (type(k2) == "number" or type(k2) == "string") then
+					if type(w) == "table" and not own and not direct[w] and not sharedBase[w] and (type(k2) == "number" or type(k2) == "string") then
 						local copy, n = {}, 0
 						for k, x in next, w do
 							if type(k) == "number" and type(x) == "number" then
@@ -587,8 +733,12 @@ local function writeSnaps()
 			end
 		end
 		if #ent > 0 then
-			sh[#sh + 1] = string.format('{"name":"%s","key":%s,"base":{%s}}', e.name,
-				type(e.key) == "number" and string.format("%d", e.key) or '"' .. e.key .. '"', table.concat(ent, ","))
+			-- "tid": the table's id in the dump that follows (the lifter matches the entry by it:
+			-- the same name and key lead to a different table in every proto)
+			local tid = string.match(ser(e.tbl), '^{"t":(%d+)}$')
+			sh[#sh + 1] = string.format('{"name":"%s","key":%s,%s"base":{%s}}', e.name,
+				type(e.key) == "number" and string.format("%d", e.key) or '"' .. e.key .. '"',
+				tid and '"tid":' .. tid .. "," or "", table.concat(ent, ","))
 		end
 	end
 	parts[#parts + 1] = '"shared":[' .. table.concat(sh, ",") .. "]"
@@ -624,7 +774,77 @@ end
 --   __LPH_S    protos replaced by a no-op                         branch decision is to be inverted
 --   __LPH_X    instruction numbers whose decision is inverted
 --   __LPH_R    ring of the last instructions (pid, loop, pc)
-__LPH_N = { c = 0, s = 0, f = false, t = 1, q = false }
+--   __LPH_N.w  dumpnew=1: the proto whose entry is the dump point (set by __LPH_MARK)
+--   __LPH_N.b  instruction budget of the counting hook (budget=<n>; __LPH_OVER is called beyond it)
+__LPH_N = { c = 0, s = 0, f = false, t = 1, q = false, w = nil, b = math.huge }
+-- dumpnew=1 (proto-table layout, see Model.patched_source(newproto=True)): the loader's call of the
+-- VM's first program, Luraph's own init, goes through __LPH_MARK.  What that program returns is the
+-- proto of the script; the interpreter-entry hooks compare their proto with it.
+local markSteps = nil
+function __LPH_MARK(p, ...)
+	if type(p) == "table" then
+		__LPH_N.w = p
+		markSteps = __LPH_N.s
+		ewrite("[handover] the VM's first program returned a proto after " .. __LPH_N.s .. " instructions\n")
+	else
+		ewrite("[handover] the VM's first program returned " .. typeof(p) .. ", not a proto (" .. __LPH_N.s .. " instructions)\n")
+	end
+	return p, ...
+end
+-- dumpnew=1 for a loader that runs a single root program (Luraph v14.9: no first-program call to
+-- mark; the root program is Luraph's start-up code, which builds the script's program itself and
+-- calls it).  The entry hooks call __LPH_ENTER for every proto that is not in __LPH_T.  At the
+-- first entry, the root program's, everything reachable from its proto goes into __LPH_T: that is
+-- the root program.  The first proto entered later that is not in it did not exist when the root
+-- program started: the script.
+local rootSeen = false
+function __LPH_ENTER(proto, names, n, ...)
+	if quietHooks or type(proto) ~= "table" then return nil end
+	if not rootSeen then
+		rootSeen = true
+		local queue, qi, count = { proto }, 1, 1
+		__LPH_T[proto] = true
+		while qi <= #queue do
+			local t = queue[qi]
+			qi += 1
+			for k, v in next, t do
+				if type(v) == "table" and __LPH_T[v] == nil and not libnames[v] and v ~= envTable then
+					__LPH_T[v] = true
+					count += 1
+					queue[#queue + 1] = v
+				end
+			end
+		end
+		ewrite("[root] the VM's root program starts (" .. count .. " tables of program data)\n")
+		return nil
+	end
+	__LPH_N.w = proto
+	markSteps = __LPH_N.s
+	ewrite("[handover] the root program entered a program that did not exist when it started, after " .. __LPH_N.s .. " instructions\n")
+	return __LPH_RUN(names, n, ...)
+end
+-- the counting hook ran out of budget: the program spins (Luraph's tamper response is an endless
+-- loop) or waits
+function __LPH_OVER()
+	if forcing then error("__LPH_POOL_BUDGET", 0) end
+	if aborted then error(ABORT, 0) end
+	ewrite("[budget] stopped after " .. __LPH_N.s .. " VM instructions" ..
+		(rootSeen and ": the root program entered no program other than its own" or
+		__LPH_N.w == nil and ": the VM's first program has not returned" or ": the script's proto was never entered") .. "\n")
+	abort()
+end
+-- proto-table layout, step hook: a number per proto table, given out by the closure maker
+local pidOf, pidN = setmetatable({}, { __mode = "k" }), 0
+function __LPH_PID(proto)
+	if type(proto) ~= "table" then return 0 end
+	local id = pidOf[proto]
+	if not id then
+		pidN += 1
+		id = pidN
+		pidOf[proto] = id
+	end
+	return id
+end
 -- __LPH_N.q: the harness itself is calling into the loader (servePools); __LPH_W is called from every
 -- loop of the loader then and stops one that does not end (garbage in, endless decoding)
 function __LPH_W()
@@ -686,6 +906,9 @@ while layers[1] and string.match(layers[1], "^%w+=%d+$") do
 	elseif k == "exercise" then exercise = tonumber(v) ~= 0
 	elseif k == "mfplog" then mfpLog = tonumber(v) ~= 0
 	elseif k == "dumpnew" then dumpNew = tonumber(v) ~= 0
+	elseif k == "lazyinsn" then lazyInsn = tonumber(v) ~= 0
+	elseif k == "interp" then interpFid[tonumber(v)] = true
+	elseif k == "budget" then __LPH_N.b = tonumber(v)
 	elseif k == "binds" then recordBinds = tonumber(v) ~= 0
 	elseif k == "tb" then tbPid = tonumber(v)
 	elseif k == "depth" then extraDepth = tonumber(v)
@@ -991,29 +1214,11 @@ function __LPH_RUN(names, n, ...)
 		return nil
 	end
 	if dumpNew then
-		-- dumpnew=1 (sample patched with newproto): this is called for closures of protos not in
-		-- __LPH_T only.  The first call registers every table of the first program; a later call
-		-- whose proto and code arrays are all new means the bootstrap has started the script.
-		local first = next(__LPH_T) == nil
-		local fresh = 0
-		for _, v in env do
-			if type(v) == "table" and not __LPH_T[v] then fresh += 1 end
-		end
-		local queue = {}
-		for _, v in env do if type(v) == "table" then queue[#queue + 1] = v end end
-		local qi = 1
-		while qi <= #queue do
-			local t = queue[qi]
-			qi += 1
-			if not __LPH_T[t] and not libnames[t] and t ~= envTable then
-				__LPH_T[t] = true
-				for _, v in next, t do
-					if type(v) == "table" and not __LPH_T[v] then queue[#queue + 1] = v end
-				end
-			end
-		end
-		if first or fresh < 4 then return nil end
-		ewrite("[dumpnew] the script starts at interpreter entry " .. runCount .. "\n")
+		-- dumpnew=1 (sample patched with newproto): the hook calls this for the proto __LPH_MARK
+		-- recorded only, i.e. when the VM's init has returned and the script's main function starts
+		if __LPH_N.w == nil then return nil end
+		ewrite("[dumpnew] the script starts at interpreter entry " .. runCount .. " (" .. __LPH_N.s .. " VM instructions, " ..
+			tostring(markSteps) .. " of them the init)\n")
 	elseif runCount < dumpAt then return nil end
 	local root = { kind = "run", vars = env }
 	finish(root)
@@ -1100,8 +1305,41 @@ local function clike(impl)
 end
 _G.__LPH_CLIKE = clike
 local here = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]*$") or "."
-local mock = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))()(_G, fnames, libnames)
+-- (the mock writes its log lines through the same checked writer; it reads ewrite, cwrap,
+-- resumetop and setvectormetatable from the table given to it while it is being built, and never later)
+rawset(_G, "ewrite", ewrite)
+-- The mock's code runs with the private library copies (see sharedLib above): its environment
+-- reads them first and everything else from this thread's globals, where its global writes go too.
+-- Chunks it loads (the API table, the zstd decoder) get the same environment.
+local mockEnv = setmetatable({}, { __index = _G, __newindex = _G })
+for n, lib in pairs(privateLibs) do rawset(mockEnv, n, lib) end
+rawset(mockEnv, "loadstring", function(text, name)
+	local f, e = loadstring(text, name)
+	if f then setfenv(f, mockEnv) end
+	return f, e
+end)
+local mockChunk = assert(loadstring(readfile(here .. "/rbxmock.lua"), "=rbxmock"))
+setfenv(mockChunk, mockEnv)
+local mock = mockChunk()(_G, fnames, libnames, { here = here, readfile = readfile })
 mockRef = mock
+-- Take the CLI's functions out of every global table: this thread's (where the harness and the
+-- mock look up their globals) and the engine's own, behind it (read-only: opened for this with
+-- the executor native, when the CLI has it).  From here on only the locals above have them.
+local function hideHostGlobals()
+	for _, n in ipairs(HOST_NAMES) do rawset(_G, n, nil) end
+	if realGlobals then
+		local setro = hostNative and hostNative.setreadonly
+		local frozen = table.isfrozen(realGlobals)
+		if frozen and setro then pcall(setro, realGlobals, false) end
+		if not table.isfrozen(realGlobals) then
+			for _, n in ipairs(HOST_NAMES) do rawset(realGlobals, n, nil) end
+			if frozen and setro then pcall(setro, realGlobals, true) end
+		end
+	end
+end
+hideHostGlobals()
+if executorEnv then mock.priv.executorLibs() end
+if _G.__LPH_CALLLOG then mock.priv.live = true end
 if scriptPath then mock.placeScript(scriptPath) end
 mock.serverSide = serverSide
 mock.mfpDelta = mfpDelta
@@ -1210,16 +1448,64 @@ local function rbxLib(name)
 	rbxLibs[name] = lib
 	return lib
 end
+-- Names the script read that nothing defines.  Roblox answers nil for them, and so does the mock:
+-- only the datatype libraries Roblox really has are made on demand (a table for every capitalised
+-- name let a key-system loader post `SCRIPT_KEY`, a table, as its request body).
+local undefinedRead = {}
 -- The script's environment is a plain table, as in Roblox: reading an existing global must not run
 -- a metamethod (scripts measure the remaining C stack, and a Lua __index handler costs a level).
 -- Only names that are not predefined fall through to the lazy Roblox-library fallback.
+-- (the mock's own bookkeeping is not part of the script's world: scripts enumerate the global
+-- table behind their environment and look at every name they find, and what is in here writes
+-- the run's log)
+local mockInternal = { onHttp = true, onMfp = true, onMfpExpected = true, mfpDelta = true, mfpCalls = true, ctorCalls = true,
+	enumName = true, lib = true, newInstance = true, serverSide = true, stub = true, typeNames = true,
+	vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true,
+	priv = true }
+-- What a lookup may take from this thread's globals: the engine's standard library (whatever the
+-- engine's global table holds once the CLI's functions are out of it) and the hooks the
+-- instrumented copies call (__LPH_*).  Never the harness's own globals (its tables, the run-end
+-- hook, the call logger), whatever their names.
+local stdNames = {}
+for _, n in ipairs({ "assert", "collectgarbage", "error", "gcinfo", "getfenv", "getmetatable", "ipairs", "loadstring",
+	"newproxy", "next", "pairs", "pcall", "print", "rawequal", "rawget", "rawlen", "rawset", "select", "setfenv",
+	"setmetatable", "tonumber", "tostring", "type", "typeof", "unpack", "xpcall", "_VERSION", "bit32", "buffer",
+	"coroutine", "debug", "math", "os", "string", "table", "utf8", "vector" }) do stdNames[n] = true end
+if realGlobals then
+	for k in pairs(realGlobals) do
+		if type(k) == "string" and string.sub(k, 1, 2) ~= "__" then stdNames[k] = true end
+	end
+end
+stdNames._G = nil
+for _, n in ipairs(HOST_NAMES) do stdNames[n] = nil end
+local HOOK_DENY = { __LPH_RUNMAIN = true, __LPH_NATIVE = true, __LPH_AFTER = true, __LPH_CALLLOG = true, __LPH_CLIKE = true }
+local function shareable(k)
+	if type(k) ~= "string" then return false end
+	if stdNames[k] then return true end
+	return string.sub(k, 1, 6) == "__LPH_" and not HOOK_DENY[k]
+end
+-- `ewrite` as the script sees it: what it is given goes into the run's log as a [script] line,
+-- like print (the probe scripts of the tests report through it); never a line of its own.
+local scriptEwrite = function(...)
+	local okt, text = pcall(tostring, (...))
+	text = okt and type(text) == "string" and text or "?"
+	text = string.gsub(string.gsub(string.sub(text, 1, 2000), "\n$", ""), "%c", " ")
+	mock.priv.note("script", "ewrite: " .. text, true)
+end
+if cwrap then scriptEwrite = cwrap("ewrite", scriptEwrite) end
 local fallback = setmetatable({}, {
 	__index = function(t, k)
 		if traceMode and string.sub(tostring(k), 1, 5) ~= "__LPH" then ewrite("[global] " .. tostring(k) .. "\n") end
-		local v = mock[k]
-		if v == nil then v = _G[k] end
-		if v == nil and type(k) == "string" and string.match(k, "^%u") and k ~= "LPH_NO_VIRTUALIZE" and string.sub(k, 1, 4) ~= "LPH_" then
+		local v = nil
+		if not mockInternal[k] then v = mock[k] end
+		if v == nil and k == "ewrite" then v = scriptEwrite end
+		if v == nil and shareable(k) then v = _G[k] end
+		if v == nil and type(k) == "string" and mock.priv.knownLib(k) then
 			v = rbxLib(k)
+		end
+		if v == nil and type(k) == "string" and string.sub(k, 1, 5) ~= "__LPH" and not undefinedRead[k] then
+			undefinedRead[k] = true
+			mock.priv.note("script", "undefined global read: " .. string.sub(k, 1, 60))
 		end
 		return v
 	end,
@@ -1238,27 +1524,37 @@ function populateSandbox()
 	-- same iteration sequence as the reference environment's pairs(math).
 	do
 		local mathCopy = {}
-		for k, v in pairs(math) do mathCopy[k] = v end
+		for k, v in pairs(sharedLib.math) do mathCopy[k] = v end
 		libnames[mathCopy] = "math"
 		rawset(sandbox, "math", mathCopy)
 	end
+	-- require: the CLI's own loader reads and runs files from disk.  The script gets Roblox's
+	-- require instead: the game's ModuleScripts do not exist here, so a module is a permissive
+	-- stand-in (as any member the mock has no answer for), and a string is refused as Roblox does.
+	local require
+	do
+		local function impl(m)
+			if type(m) == "string" then error("Attempted to call require with invalid argument(s).", cwrap and 0 or 2) end
+			return mock.stub("require(" .. tostring(m) .. ")")
+		end
+		require = cwrap and cwrap("require", impl) or impl
+		fnames[require] = "require"
+	end
+	-- (the names go in in this order: scripts walk the table behind their environment, and the
+	-- order next() gives depends on the order the keys came in)
 	for _, n in ipairs({ "assert", "error", "gcinfo", "getmetatable", "next", "newproxy", "print", "rawequal", "rawget",
 		"rawset", "rawlen", "select", "setmetatable", "tonumber", "tostring", "type", "typeof", "ipairs", "pairs",
 		"pcall", "xpcall", "unpack", "require", "string", "table", "bit32", "buffer", "coroutine", "os",
 		"utf8", "debug", "vector", "_VERSION", "loadstring",
 		"__LPH_RUN", "__LPH_PROTO", "__LPH_CLOS", "__LPH_REG", "__LPH_F", "__LPH_STEP", "__LPH_C", "__LPH_FIXKEY",
-		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T",
+		"__LPH_N", "__LPH_S", "__LPH_X", "__LPH_R", "__LPH_T", "__LPH_MARK", "__LPH_OVER", "__LPH_PID", "__LPH_ENTER",
 		"__LPH_CRASH", "__LPH_ENV", "__LPH_MAIN", "__LPH_CARRY" }) do
 		local v = _G[n]
+		if n == "require" then v = require end
 		if v ~= nil then rawset(sandbox, n, v) end
 	end
-	-- (the mock's own bookkeeping is not part of the script's world: scripts enumerate the
-	-- global table behind their environment and look at every name they find)
-	local internal = { onHttp = true, onMfp = true, onMfpExpected = true, mfpDelta = true, mfpCalls = true, ctorCalls = true,
-		enumName = true, lib = true, newInstance = true, serverSide = true, stub = true, typeNames = true,
-		vectorTypeName = true, mainThread = true, recentStubs = true, recentN = true, placeScript = true, rawMT = true }
 	for k, v in pairs(mock) do
-		if type(k) == "string" and not internal[k] then rawset(sandbox, k, v) end
+		if type(k) == "string" and not mockInternal[k] then rawset(sandbox, k, v) end
 	end
 	for _, n in ipairs({ "game", "workspace", "script", "Enum", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim",
 		"UDim2", "Rect", "Random", "task", "wait", "spawn", "delay", "tick", "time", "warn", "shared", "_G",
@@ -1268,7 +1564,7 @@ function populateSandbox()
 		-- executor-specific globals probed by environment-fingerprinting scripts
 		"math_floor_precision" }) do
 		if rawget(sandbox, n) == nil then
-			local v = fallback[n]
+			local v = n == "_G" and {} or fallback[n]
 			if v ~= nil then rawset(sandbox, n, v) end
 		end
 	end
@@ -1316,17 +1612,6 @@ function populateSandbox()
 		for _, n in ipairs({ "setclipboard", "toclipboard" }) do
 			if rawget(globals, n) == nil then rawset(globals, n, function() end) end
 		end
-		-- require(ModuleScript): the game's modules do not exist here; hand out a permissive stub
-		do
-			local realRequire = rawget(globals, "require")
-			local function impl(m)
-				if type(m) == "string" and realRequire then return realRequire(m) end
-				return mock.stub("require(" .. tostring(m) .. ")")
-			end
-			local f = cwrap and cwrap("require", impl) or impl
-			fnames[f] = "require"
-			rawset(globals, "require", f)
-		end
 		-- the rest of the usual executor API, inert: hooks install nothing, fire* do nothing
 		local genv = setmetatable({}, { __index = globals })
 		local noop = function() end
@@ -1350,6 +1635,8 @@ function populateSandbox()
 		for n, f in pairs(ex) do
 			if rawget(globals, n) == nil then rawset(globals, n, f) end
 		end
+		-- (the other usual name of identifyexecutor)
+		if rawget(globals, "getexecutorname") == nil then rawset(globals, "getexecutorname", rawget(globals, "identifyexecutor")) end
 		-- Metatable and read-only access, part of every executor's API (the "UNC" set).  They are
 		-- C closures like an executor's own (cwrap), and work on the mock's objects: mock
 		-- metatables are locked, the mock keeps the real ones in mock.rawMT.
@@ -1407,7 +1694,7 @@ function populateSandbox()
 			-- `clonefunction(f) ~= f`).  Lua closures are cloned by the VM (__LPH_NATIVE); a C
 			-- function gets a C trampoline.  Without the native the function itself is returned.
 			do
-				local nat = _G.__LPH_NATIVE and _G.__LPH_NATIVE.clonefunction
+				local nat = hostNative and hostNative.clonefunction
 				more.clonefunction = function(...)
 					local f = ...
 					if type(f) ~= "function" then argErr(1, "clonefunction", "function", f, select("#", ...)) end
@@ -1430,8 +1717,8 @@ function populateSandbox()
 			-- (__LPH_NATIVE): only those see behind a lock the script itself put on a table
 			-- (`setmetatable({}, {__metatable = "locked"})`, which scripts use to test the
 			-- executor) and can lift table.freeze.  The Lua versions above are the fallback.
-			local native = _G.__LPH_NATIVE or {}
-			if not _G.__LPH_NATIVE then
+			local native = hostNative or {}
+			if not hostNative then
 				ewrite("[env] this luau binary predates the executor natives of devm/luau_cli.patch (__LPH_NATIVE): " ..
 					"getrawmetatable, setrawmetatable, setreadonly and clonefunction are approximations, and a script " ..
 					"that tests them (key-system loaders do) stops in its executor check; rebuild the CLI with the patch\n")
@@ -1544,7 +1831,7 @@ do
 		return table.concat(parts)
 	end
 	local u = {}
-	for k, v in pairs(utf8) do u[k] = v end
+	for k, v in pairs(sharedLib.utf8) do u[k] = v end
 	-- insertion order fixes the iteration order of the table, which scripts hash: the same order
 	-- as the reference environment (graphemes, nfcnormalize, nfdnormalize after the built-ins)
 	u.graphemes = true
@@ -1590,7 +1877,7 @@ end
 -- buffer writes fed with mock objects (where Roblox would have produced a number) must not throw
 do
 	local b = {}
-	for k, v in pairs(buffer) do b[k] = v end
+	for k, v in pairs(sharedLib.buffer) do b[k] = v end
 	for _, k in ipairs({ "writeu8", "writei8", "writeu16", "writei16", "writeu32", "writei32", "writef32", "writef64" }) do
 		local real = buffer[k]
 		local size = (string.find(k, "64") and 8) or (string.find(k, "32") and 4) or (string.find(k, "16") and 2) or 1
@@ -1625,16 +1912,23 @@ mock.setfenv = function(f, env)
 	if type(f) == "number" and f > 0 then f += 1 end
 	return realSetfenv(f, env)
 end
+-- (the harness's globals, the mock's environment and the engine's own global table are never handed
+-- to the script: they are what a function of the harness, of the mock or a thread the script did
+-- not make has)
+local function ownEnv(env)
+	if env == _G or env == mockEnv or (realGlobals and env == realGlobals) then return sandbox end
+	return env
+end
 mock.getfenv = function(f)
 	if foreign(f) then return sandbox end
 	if f == nil then f = 1 end
+	if f == 0 then return sandbox end
 	if type(f) == "number" and f > 0 then
 		local ok, env = pcall(realGetfenv, f + 2)
 		if not ok then return sandbox end
-		if env == _G then return sandbox end
-		return env
+		return ownEnv(env)
 	end
-	return realGetfenv(f)
+	return ownEnv(realGetfenv(f))
 end
 fnames[mock.setfenv] = "setfenv"
 -- debug.info must describe harness/mock functions the way it describes the C functions they
@@ -1645,7 +1939,7 @@ fnames[mock.setfenv] = "setfenv"
 do
 	local realInfo = debug.info
 	local d = {}
-	for k, v in pairs(mock.debug or debug) do d[k] = v end
+	for k, v in pairs(mock.debug or sharedLib.debug) do d[k] = v end
 	local function mockLua(src)
 		return src ~= "[C]" and not isScriptSrc(src)
 	end
@@ -1762,9 +2056,7 @@ if cwrap then
 			if byLevel and cGlobals then return cGlobals end
 			return sandbox
 		end
-		local env = realGetfenv(f)
-		if env == _G then return sandbox end
-		return env
+		return ownEnv(realGetfenv(f))
 	end)
 	mock.setfenv = nativeT("setfenv", function(co, f, env)
 		if type(env) ~= "table" then
@@ -1887,7 +2179,16 @@ function _G.__LPH_CRASH()
 end
 
 local src = readfile(samplePath)
-local fn, err = loadstring(src, "=sample")
+-- The mock has to know the script's main thread: task.wait / signal:Wait() suspend every other
+-- thread of the script (rbxmock.lua), and Luraph's start-up code (v15.x) checks that a spawned
+-- thread that waits is suspended.  A copy instrumented for a factory VM says so at its first proto
+-- (__LPH_PROTO).  Every other text (an unmodified file, a recovered script, a copy with the
+-- proto-table hooks, which do not mark the thread) is given a call of __LPH_MAIN in front of its
+-- first token: same line, no frame left on the stack, and the answers are the same in every kind of run.
+local fn, err
+local markMain = not string.find(src, "__LPH_PROTO", 1, true) and not string.find(src, "__LPH_MAIN", 1, true)
+if markMain then fn = loadstring("__LPH_MAIN();" .. src, "=sample") end
+if not fn then fn, err = loadstring(src, "=sample") end
 if not fn then
 	ewrite("COMPILE ERROR: " .. tostring(err) .. "\n")
 	error("compile")
@@ -1940,7 +2241,8 @@ end
 if carrierPath then
 	if not chunkSrcPath then error("carrier= needs chunksrc=") end
 	chunkPatched, chunkOrig = src, readfile(chunkSrcPath)
-	fn, err = loadstring(readfile(carrierPath), "=sample")
+	-- (the carrier starts the chunk in its own thread: the same mark, unless the chunk's hooks set it)
+	fn, err = loadstring((markMain and "__LPH_MAIN();" or "") .. readfile(carrierPath), "=sample")
 	if not fn then
 		ewrite("COMPILE ERROR (carrier): " .. tostring(err) .. "\n")
 		error("compile")
@@ -2108,7 +2410,8 @@ local function pokePass()
 		" fields of executed instructions put back)\n")
 end
 
-function __LPH_AFTER(ok, message)
+local function afterRun(ok, message)
+	if mock.priv and mock.priv.flush then mock.priv.flush() end       -- what the script printed, read and was handed (rbxmock.lua)
 	if carrierPath and chunkLoads == 0 then
 		ewrite("[carrier] the script never handed the expected chunk text to loadstring: nothing was instrumented\n")
 	end
@@ -2145,7 +2448,7 @@ function __LPH_AFTER(ok, message)
 		return
 	end
 	if not ok and not aborted then
-		ewrite(tostring(message) .. "\n")
+		ewrite(tostring(message) .. "\n", true)       -- (the script's text from its first character)
 		ewrite("[end] error after " .. math.max(stepCount, __LPH_N.s) .. " instructions, " .. __LPH_N.c .. " closure entries\n")
 	end
 	if traceMode then
@@ -2157,7 +2460,16 @@ function __LPH_AFTER(ok, message)
 		error("hook not reached")
 	end
 end
-if __LPH_RUNMAIN then
+-- Called by the CLI once the script's main thread has ended.  The CLI would print an error
+-- raised in here to stderr as it is; it goes through the checked writer instead.
+function __LPH_AFTER(ok, message)
+	local okA, err = pcall(afterRun, ok, message)
+	if not okA then
+		ewrite(tostring(err) .. "\n", true)
+		error("the harness's end-of-run step failed (see the line above)", 0)
+	end
+end
+if hostRunmain then
 	-- depth=<n>: run the script n C calls deeper (a ModuleScript inside n nested requires)
 	for _ = 1, extraDepth do
 		local inner = fn

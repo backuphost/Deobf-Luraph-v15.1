@@ -1,6 +1,7 @@
 """End-to-end driver: source -> (hook + dump) -> lift -> decompile, repeated per VM layer."""
 import json
 import os
+import re
 import subprocess
 
 from . import vmmodel, pe, lifter, structure, luprint
@@ -22,7 +23,7 @@ class Stage:
         m = self.model
         self.log('[%s] interpreter at line %d, %d dispatch loop(s), %s' % (
             self.tag, m.interp.line, len(m.loops), 'factory' if m.factory_style else 'proto-table'))
-        raw = vmmodel.run_dump(m, self.workdir, self.tag, self.layers)
+        raw = vmmodel.run_dump(m, self.workdir, self.tag, self.layers, timeout=getattr(self, 'dump_timeout', 600))
         self.dump = pe.Dump(raw, m)
         if m.factory_style:
             self.lifter = lifter.FactoryLifter(m, self.dump)
@@ -59,6 +60,11 @@ def _run_traced(self):
     self.run_notes = notes
     for n in notes:
         self.log('[%s]   %s' % (self.tag, n))
+    if not raw['protos']:
+        # no function of the VM was ever created: the script stopped inside Luraph's loader (a VM
+        # chunk run without the buffer its container passes to it stops at its first read)
+        how = next((n[len('[oracle] '):] for n in notes if n.startswith('[oracle] ')), 'the run recorded nothing')
+        raise RuntimeError('run failed: the VM never started: %s (a chunk cut out of a container needs its data: --chunk-arg)' % how)
     self.dump = pe.Dump(raw, m)
     self.dump.server = vmmodel.SERVER
     if vmmodel.SERVER is not None:
@@ -98,13 +104,18 @@ def _run_traced(self):
     self.errors = errs
     self.conflicts = [(k, c) for k, p in protos.items() for c in p.conflicts]
     self.hints = []
+    if not payload:
+        self.hints.append(startup_note(notes, forced, first_root, len(m.interps)))
     if payload and not forced:
         # The proto taken for the script is the first one on the second interpreter.  Where that
         # interpreter only runs a helper, next to nothing is lifted while the run shows the first
         # program doing all the work: say so (the choice itself is left alone, --root decides).
         ran_first = sum(1 for k in oracle if isinstance(k[0], int) and 0 < k[0] <= len(self.lifter.records)
                         and self.lifter.records[k[0] - 1][0] == boot)
-        if nodes < 50 and ran_first > 1000:
+        # (A small script is small too -- a test script is a handful of instructions next to the
+        # 20,000 of Luraph's start-up code -- so size alone says nothing.  A helper of the build
+        # is arithmetic: the hint is for a function that calls nothing but pure library functions.)
+        if nodes < 50 and ran_first > 1000 and not _calls_out(protos):
             self.hints.append('[hint] the function taken for the script (proto %d, on the second interpreter) has only %d '
                               'instructions, while the first program executed %d: the script is probably the first '
                               'program; run again with --root %d' % (root, nodes, ran_first, first_root))
@@ -116,6 +127,150 @@ def _run_traced(self):
 
 
 Stage.run_traced = _run_traced
+
+
+def startup_note(notes, forced, first_root, interps):
+    """The run note for a factory-layout result that is the VM's first program: Luraph's start-up
+    code (environment checks, key derivation, decryption), possibly with the script's top level
+    flattened into it (v15.2 builds without a payload interpreter).  What the run shows about
+    where the script is goes with it.
+
+    (The v14.9 rule of the proto-table layout, a program entered that was not reachable from the
+    root program's tables when it started, has no counterpart here: every program of a factory
+    build is a closure the factory makes at run time.  The interpreter a program runs on is the
+    evidence: the script is the first program of an interpreter other than the first one.)"""
+    if forced:
+        return ('[startup] --root %d: the result is the VM\'s first program, which begins with Luraph\'s start-up code; '
+                'the script is not separated from it' % first_root)
+    said = [n for n in notes if n.startswith('[script] ') and re.match(r'\[script\] (?:print|warn):', n)]
+    asked = [n for n in notes if n.startswith('[http]')]
+    shown = ', '.join(x for x in (
+        '%d line(s) of output' % len(said) if said else '',
+        '%d request(s)' % len(asked) if asked else '') if x)
+    head = ('[startup] the run created no program on an interpreter other than the first one (%d modelled): the result is '
+            'the VM\'s first program, which begins with Luraph\'s start-up code.  ' % interps)
+    if shown:
+        return head + ('The script\'s top level ran inside that program (the run shows %s from it), but it is not '
+                       'separated from the start-up code' % shown)
+    if any(n.startswith('[oracle] script returned') for n in notes):
+        return head + ('The run returned and shows nothing the script did (no output, no request): where the script is '
+                       'was not found (it may not have run at all: a key check, a server reply or an environment check)')
+    return head + ('The run was stopped before the script showed anything (no output, no request): where the script '
+                   'is was not found')
+
+_PURE_LIBS = ('bit32.', 'math.', 'string.', 'buffer.', 'table.', 'utf8.')
+
+
+def _calls_out(protos):
+    """True when a lifted instruction calls anything other than a pure library function."""
+    for p in protos.values():
+        for node in p.nodes.values():
+            stack = [node.tree] if node.tree else []
+            while stack:
+                stmts, term = stack.pop()
+                for st in stmts:
+                    if st[0] == 'call' and not (isinstance(st[2], tuple) and st[2][0] == 'kfn' and str(st[2][1]).startswith(_PURE_LIBS)):
+                        return True
+                if term[0] == 'br':
+                    stack += [term[2], term[3]]
+                elif term[0] == 'forbr':
+                    stack += [term[3], term[4]]
+    return False
+
+
+def _dump_script(self, options=(), budget=None, timeout=None):
+    """Proto-table layout, route A.  The VM's first program is Luraph's own init; it returns the
+    proto of the script.  The harness lets the VM run that init and dumps the state when the
+    returned proto is entered (vmmodel.run_dump_script).  Nothing of the script itself runs.
+
+    The copy that is executed (self.run_model) keeps the protected call around the dispatch
+    loops: inits compare stack frames.  The lifter's model (self.model) is the inlined text;
+    function ids of the dump are translated (self.fid_map).
+    Returns the dump (as run_dump gives it), or None when the init did not hand over
+    (self.run_notes says how the run ended)."""
+    import json
+    import re
+    m = self.model
+    rm = getattr(self, 'run_model', None) or m
+    self.log('[%s] interpreter at line %d, %d dispatch loop(s) in %d interpreter(s), proto-table%s' % (
+        self.tag, m.interp.line, len(m.loops), len(m.interps), ', one table per instruction' if m.insn_tables else ''))
+    # what the init works through: the VM text (it holds the script data of a plain file) and, for
+    # a container, the data the container hands to the chunk
+    size = len(rm.src)
+    arg = getattr(getattr(self, 'carrier', None), 'chunk_arg', None)
+    if arg and os.path.exists(arg):
+        size += os.path.getsize(arg)
+    if not budget:
+        # Instructions the init may run.  Inits seen take up to 2 instructions per byte of the file
+        # where the init deserializes the script itself (v14.0 - v14.2: 2.36 million for 2.2 MB) and
+        # 11 to 32 per byte of data where it decrypts it (v14.8, v14.9: 82 million for 2.5 MB); a
+        # failed check never ends.
+        budget = max(12000000, 60 * size)
+    if not timeout:
+        # (time for the budget at 400,000 counted instructions a second, which is what a busy
+        # machine does, plus the dump: every lazy constant of the script is decoded, 25 to 50 s per
+        # megabyte)
+        timeout = max(150, budget // 400000 + 50 * size // 1000000)
+    text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag, options, budget=budget, timeout=timeout)
+    self.run_notes = notes
+    for n in notes:
+        self.log('[%s]   %s' % (self.tag, n))
+    if text is None:
+        return None
+    fid_map = getattr(self, 'fid_map', None)
+    if fid_map is not None:
+        text = re.sub(r'"fid":(\d+)', lambda x: '"fid":%d' % fid_map.get(int(x.group(1)), 10 ** 6), text)
+    return json.loads(text)
+
+
+Stage.dump_script = _dump_script
+
+
+def _last_calls(self, options=(), budget=12000000, timeout=120):
+    """After a hand-over that did not happen: the same run once more with call logging, to say
+    which mocked calls the init made last (the probe it failed is usually among them).
+    Returns one line, or None when that run told nothing."""
+    rm = getattr(self, 'run_model', None) or self.model
+    try:
+        _text, notes = vmmodel.run_dump_script(rm, self.workdir, self.tag + '.calls', options, budget=budget, timeout=timeout, calls=True)
+    except Exception:
+        return None
+    for n in notes:
+        if n.startswith('[calls] '):
+            return n[len('[calls] '):]
+    return None
+
+
+Stage.last_calls = _last_calls
+
+
+def _run_script(self, options=(), budget=None, timeout=None):
+    """dump_script, then a plain lift of the script's program (no key-function search, no
+    opaque-predicate cuts: run.deobfuscate does those).  Returns the decompiled text or None."""
+    import re
+    raw = self.dump_script(options, budget=budget, timeout=timeout)
+    if raw is None:
+        return None
+    m = self.model
+    self.dump = pe.Dump(raw, m)
+    self.lifter = lifter.TableProtoLifter(m, self.dump)
+    protos = self.lifter.lift_all(self.lifter.root_key)
+    nodes = sum(len(p.nodes) for p in protos.values())
+    errs = [(k, e) for k, p in protos.items() for e in p.errors]
+    conf = [(k, c) for k, p in protos.items() for c in p.conflicts]
+    self.log('[%s] script: lifted %d protos, %d instructions, %d errors, %d temp conflicts' % (
+        self.tag, len(protos), nodes, len(errs), len(conf)))
+    self.protos = protos
+    self.errors = errs
+    self.conflicts = conf
+    d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
+    self.text = d.run()
+    self.stats = d.stats
+    self.log('[%s] decompiled: %d lines, %d unstructured' % (self.tag, self.text.count('\n'), d.stats['unstructured']))
+    return self.text
+
+
+Stage.run_script = _run_script
 
 
 def _poke_list(self):

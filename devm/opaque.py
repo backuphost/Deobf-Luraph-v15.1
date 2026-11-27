@@ -89,7 +89,7 @@ def strip(text):
             if nxt == new:
                 break
             new = nxt
-        for fn in (_drop_dead_copies, _inline_fn_alias, _iife_params, _fold_fn_truth, _drop_empty_ifs, _drop_dead_opaque_stores, _drop_callback_opaque):
+        for fn in (_drop_dead_copies, _inline_fn_alias, _fold_type_tests, _drop_blind_key_arith, _fold_call_keys, _iife_params, _fold_fn_truth, _drop_empty_ifs, _drop_dead_opaque_stores, _drop_callback_opaque):
             for _ in range(500):
                 nxt = fn(new)
                 if nxt == new:
@@ -1071,6 +1071,277 @@ def _iife_params(text):
         if changed:
             return '\n'.join(lines)
     return text
+
+
+_FN_OPEN = re.compile(r'\bfunction\b[^()\n]*\([^()\n]*\)$')
+_PLAIN = r'[A-Za-z_]\w*'
+_KEY_STMT = re.compile(r'(\t*)(local )?((?:%s, )*%s) = ' % (_PLAIN, _PLAIN))
+
+
+def _own_returns(lines, j, i):
+    """Line numbers of the `return` statements of the function whose header is line j and whose
+    `end` is line i; those of functions inside it are not its own."""
+    out, inner = [], []
+    for x in range(j + 1, i):
+        ln = lines[x]
+        ind = _indent(ln)
+        if inner and ind == inner[-1] and re.match(r'\t*end\b', ln):
+            inner.pop()
+        if not inner and re.match(r'\t*return\b', ln):
+            out.append(x)
+        if _FN_OPEN.search(ln):
+            inner.append(ind)
+    return out
+
+
+def _fold_call_keys(text):
+    """Luraph's per-call key (v15.2): a function gets one more parameter, every caller passes a
+    literal number for it, the function hands `bit32.bxor(key, C)` back as an extra first result
+    and the caller compares that with the number it has to be:
+
+        local v4 = (function(p1, p2) ... return bit32.bxor(p2, 271828182) end)("ready", 161803398)
+        if v4 == 429336656 then return end        -- (161803398 ~ 271828182)
+
+    Parameter, argument and extra result are removed.  The variable that received the result is
+    the number it always is: a test of it is decided, and where the decided test leaves its block
+    (`return`, `break`, `continue`) the statements behind it never run and go with it.
+
+    Only where every call site is in view (a function called on the spot, or one that is only
+    ever called by name), the key has no other use, and every `return` of the function has the
+    extra result: a function whose callers were not lifted keeps its arithmetic (run.report then
+    says so)."""
+    lines = text.split('\n')
+    starts = [0]
+    for ln in lines:
+        starts.append(starts[-1] + len(ln) + 1)
+
+    def line_of(pos):
+        lo, hi = 0, len(lines) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= pos:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    named = None
+    for j, ln in enumerate(lines):
+        h = re.search(r'\(function\(([^()\n]*)\)$', ln)
+        d = _FN_DEF.fullmatch(ln) if not h else None
+        if not h and not d:
+            continue
+        ind = _indent(ln)
+        i = next((x for x in range(j + 1, len(lines)) if _indent(lines[x]) == ind and lines[x].strip()), None)
+        if i is None or not re.match(r'\t*end\b', lines[i]):
+            continue
+        params = [x.strip() for x in (h.group(1) if h else d.group(4)).split(',') if x.strip()]
+        # the call sites: (start of the callee expression, index of `(`)
+        if h:
+            if not lines[i].startswith('\t' * ind + 'end)('):
+                continue
+            sites = [(starts[j] + h.start(), starts[i] + ind + 4)]
+            pspan = (starts[j] + h.start(1), starts[j] + h.end(1))
+        else:
+            if lines[i].strip() != 'end':
+                continue
+            if named is None:
+                named = _functions(text)
+            name = d.group(1) or d.group(2) or d.group(3)
+            f = named.get(name)
+            if f is None or len(f['defs']) != 1 or any(not c for c in f['calls']):
+                continue
+            sites = [(c[0][0] - 1 - len(name), c[0][0] - 1) for c in f['calls']]
+            pspan = (starts[j] + d.start(4), starts[j] + d.end(4))
+        rets = _own_returns(lines, j, i)
+        if not rets or _indent(lines[rets[-1]]) != ind + 1:
+            continue
+        # (the function ends in its last return: no way out without the extra result)
+        if any(lines[x].strip() and _indent(lines[x]) <= ind + 1 and not re.match(r'\t*(?:end\b|[\]})])', lines[x])
+               for x in range(rets[-1] + 1, i)):
+            continue
+        for k, prm in enumerate(params):
+            if not re.fullmatch(r'p\d+', prm):
+                continue
+            got = [re.fullmatch(r'\t*return bit32\.bxor\(%s, (\d+)\)(?:, (.*))?' % prm, lines[x]) for x in rets]
+            if not all(got) or len({g.group(1) for g in got}) != 1:
+                continue
+            if sum(len(re.findall(r'\b%s\b' % prm, lines[x])) for x in range(j, i + 1)) != 1 + len(rets):
+                continue
+            c = int(got[0].group(1))
+            edits, keyvars, ok = [], [], True
+            for callee, paren in sites:
+                args, close = _call_args(text, paren)
+                if args is None or len(args) <= k or not re.fullmatch(r'\s*\d{7,}\s*', text[args[k][0]:args[k][1]]):
+                    ok = False
+                    break
+                a = line_of(callee)
+                b = line_of(close)
+                if starts[b + 1] - 1 != close + 1:
+                    ok = False          # (the call is part of a larger expression)
+                    break
+                head = text[starts[a]:callee]
+                st = _KEY_STMT.fullmatch(head)
+                if not st and head.strip('\t'):
+                    ok = False          # (`return f(...)`, an argument, a table item: the result travels on)
+                    break
+                tabs = head[:len(head) - len(head.lstrip('\t'))]
+                value = int(text[args[k][0]:args[k][1]]) ^ c
+                if st:
+                    targets = st.group(3).split(', ')
+                    if st.group(2) and not re.fullmatch(r'v\d+', targets[0]):
+                        ok = False
+                        break
+                    keep = targets[1:]
+                    new_head = tabs + (st.group(2) or '') + ', '.join(keep) + ' = ' if keep else tabs
+                    if st.group(2):
+                        keyvars.append((targets[0], value))
+                    edits.append((close + 1, close + 1, '\n%s%s%s = %d' % (tabs, st.group(2) or '', targets[0], value)))
+                else:
+                    new_head = tabs
+                if new_head == tabs and text[callee] == '(':
+                    # (see structure.Printer.emit: a statement that starts with `(` continues the one before it)
+                    prev = next((lines[x].strip() for x in range(a - 1, -1, -1) if lines[x].strip()), '')
+                    if prev and not re.search(r'(\b(do|then|else|repeat)|\))$', prev) or prev.endswith(')') and not _FN_OPEN.search(prev):
+                        new_head += ';'
+                edits.append((starts[a], callee, new_head))
+                x0, x1 = args[k]
+                while x0 < x1 and text[x0] in ' \t\n':
+                    x0 += 1
+                if k + 1 < len(args):
+                    x1 = args[k + 1][0]
+                    while text[x1:x1 + 1] == ' ':
+                        x1 += 1
+                elif k > 0:
+                    x0 = args[k - 1][1]
+                edits.append((x0, x1, ''))
+            if not ok:
+                continue
+            edits.append((pspan[0], pspan[1], ', '.join(params[:k] + params[k + 1:])))
+            for x, g in zip(rets, got):
+                tabs = '\t' * _indent(lines[x])
+                if g.group(2) is not None:
+                    edits.append((starts[x], starts[x] + len(lines[x]), tabs + 'return ' + g.group(2)))
+                elif x == i - 1:
+                    edits.append((starts[x], starts[x + 1], ''))        # (the function's last statement)
+                else:
+                    edits.append((starts[x], starts[x] + len(lines[x]), tabs + 'return'))
+            for a, b, rep in sorted(edits, reverse=True):
+                text = text[:a] + rep + text[b:]
+            return _decide_key_tests(text, keyvars)
+    return text
+
+
+def _decide_key_tests(text, keyvars):
+    """The tests of variables that _fold_call_keys found to be one number each."""
+    lines = text.split('\n')
+    for name, value in keyvars:
+        # (a local of the lifted text has one name per variable; it must get its value here only)
+        if sum(1 for ln in lines if re.match(r'\t*(?:local )?(?:[\w.]+, )*%s(?:, [\w.]+)* (?:[-+*/%%^]|\.\.)?= ' % name, ln)
+               or re.match(r'\t*for [\w, ]*\b%s\b' % name, ln)) != 1:
+            continue
+        while True:
+            for i, ln in enumerate(lines):
+                g = re.fullmatch(r'(\t*)if %s ([=~]=) (\d+) then' % name, ln)
+                if g:
+                    break
+            else:
+                break
+            ind = len(g.group(1))
+            truth = (value == int(g.group(3))) == (g.group(2) == '==')
+            lines[i] = '%sif %s then' % (g.group(1), 'true' if truth else 'false')
+            end = next((x for x in range(i + 1, len(lines)) if lines[x].strip() and _indent(lines[x]) <= ind), None)
+            if not truth or end is None or lines[end] != g.group(1) + 'end':
+                continue        # (_fold_const_ifs takes it from here)
+            arm = lines[i + 1:end]
+            last = next((x for x in reversed(arm) if _indent(x) == ind + 1), '')
+            if not re.fullmatch(r'\t*(?:return\b.*|break|continue)', last):
+                continue
+            # the arm always runs and leaves: what follows in this block is never reached
+            stop = next((x for x in range(end + 1, len(lines)) if lines[x].strip() and _indent(lines[x]) < ind), len(lines))
+            arm = [x[1:] for x in arm]
+            if ind == 0 and arm and arm[-1] == 'return':
+                arm.pop()       # (the end of the script)
+            lines[i:stop] = arm
+        n = sum(len(re.findall(r'\b%s\b' % name, ln)) for ln in lines)
+        if n == 1:
+            lines = [ln for ln in lines if not re.fullmatch(r'\t*(?:local )?%s = %d' % (name, value), ln)]
+    return '\n'.join(lines)
+
+
+_TYPE_TEST = re.compile(r'\btype\((\d+(?:\.\d+)?)\) ([=~]=) "(\w+)"')
+_BLIND_TOK = re.compile(r'\s*(?:(?P<nil>nil(?: --\[\[\w+\]\])?)|(?P<num>\d+\.?\d*(?:[eE][-+]?\d+)?)|(?P<var>v\d+)|bit32\.\w+|//|[-+*/%^(),])')
+
+
+def _fold_type_tests(text):
+    """`if type(0) == "buffer" then`: the type of a number literal is known (an opaque test in
+    front of a junk arm; _fold_const_ifs removes the arm)."""
+    def fold(m):
+        return 'true' if (m.group(3) == 'number') == (m.group(2) == '==') else 'false'
+    return '\n'.join(_TYPE_TEST.sub(fold, ln) if re.match(r'\t*(?:if|elseif|while) ', ln) and 'type(' in ln else ln
+                     for ln in text.split('\n'))
+
+
+def _drop_blind_key_arith(text):
+    """Key arithmetic on an interpreter local the lifter has no value for:
+
+        local v8 = nil --[[OPENUPS]] % 4294967296
+        local v9 = bit32.bxor(v8 - v8 % 1, 398765431)
+
+    The interpreter of these builds mixes a key it keeps in one of its locals into values nothing
+    reads.  Where the lifter knows the key the result is a constant and _fold_consts removes it;
+    where it does not, the unknown is printed as nil.  A chain of locals made of numbers, bit32,
+    arithmetic and such an unknown, with a large literal in it and no reader outside the chain,
+    is that arithmetic and is removed."""
+    lines = text.split('\n')
+    cand = {}       # variable -> (line, variables its value is made of, has an unknown and a large literal)
+    for i, ln in enumerate(lines):
+        m = re.fullmatch(r'\t*local (v\d+) = (.+)', ln)
+        if not m or m.group(1) in cand:
+            continue
+        pos, rhs, refs, unknown, big = 0, m.group(2), set(), False, False
+        while pos < len(rhs):
+            t = _BLIND_TOK.match(rhs, pos)
+            if not t:
+                break
+            if t.group('var'):
+                refs.add(t.group('var'))
+            elif t.group('nil'):
+                unknown = True
+            elif t.group('num') and float(t.group('num')) >= 2 ** 24:
+                big = True
+            pos = t.end()
+        if pos == len(rhs):
+            cand[m.group(1)] = (i, refs, unknown and big)
+    if not any(c[2] for c in cand.values()):
+        return text
+    own = {c[0]: nm for nm, c in cand.items()}
+    readers = {}
+    for i, ln in enumerate(lines):
+        for nm in set(re.findall(r'\bv\d+\b', ln)):
+            if nm in cand and own.get(i) != nm:
+                readers.setdefault(nm, set()).add(own.get(i))
+    # the chains: made of chain members only, read by chain members only, started by an unknown
+    chain = set(cand)
+    shrunk = True
+    while shrunk:
+        shrunk = False
+        for nm in list(chain):
+            if not cand[nm][1] <= chain or any(r is None or r not in chain for r in readers.get(nm, ())):
+                chain.discard(nm)
+                shrunk = True
+    live = {nm for nm in chain if cand[nm][2]}
+    grew = True
+    while grew:
+        grew = False
+        for nm in chain - live:
+            if cand[nm][1] & live:
+                live.add(nm)
+                grew = True
+    if not live:
+        return text
+    drop = {cand[nm][0] for nm in live}
+    return '\n'.join(ln for i, ln in enumerate(lines) if i not in drop)
 
 
 def _drop_dead_copies(text):

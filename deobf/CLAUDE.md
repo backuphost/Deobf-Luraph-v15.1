@@ -69,7 +69,6 @@ sit in the plugin's folder (Luraph's `options.txt`).
 ## Usage
 
 ```
-# from the Decompiler folder
 python deobf/deob.py samples/source1-obfuscated.lua  # -> samples/output/source1-obfuscated.lua
 python deobf/deob.py <script> --detect           # prints NAME<tab>confidence<tab>label
 python deobf/deob.py <script> --obfuscator NAME  # skip detection
@@ -77,31 +76,31 @@ python deobf/deob.py <script> --no-devirt        # fast: behaviour trace only
 python deobf/deob.py <script> --debug            # all intermediate files in <input folder>/output/
 ```
 
-- Exit status 0 with a result file, 1 on failure. For the bot: run one
-  `deob.py` subprocess per upload (with a timeout, `-o` into a temp folder);
-  modules keep global state (Path2D cache, `LAST_RAW`), so don't import and
-  call it in a long-lived process.
-- Scripts that read settings from `_G`/`getgenv()` or check game state stop
-  early (e.g. `kick("You didn't add username or webhook")`). Drive them further
-  with `--cfg "prelude=rawset(G,'webhook','x') setprop(game,'PlaceId',123)"`
-  (Luau run before the script, untraced; `G`, `genv`, `shared`, `game`, `env`,
-  `setprop(proxy, key, value)`) and `--cfg falsy=name1,name2` (calls of those
-  method/function names return `false`).
-- Path2D answers come from the offline engine model (`envlog.luau`
-  `CHAIN.p2d`, bit-exact; `research/path2d/README.md`); "N Path2D answers
-  computed by the offline engine model".
-- `--studio` (rarely needed) serves each harness on `127.0.0.1:34889` via a
-  `*.studio_loader.luau` (MCP `execute_luau`); engine Path2D answers go to
-  `<script>.path2d` (preferred offline). **Danger:** an endless-loop tamper
-  response freezes Studio: evaluate just the Path2D calls instead.
+- Exit status 0 with a result file, 1 on failure. **Last line** (stdout): `result: complete` or
+  `result: PARTIAL: <what is missing>` (`Job.lacks()`: unlifted blocks, unstructured jumps, a run
+  the tracer had to stop, ...; a behaviour trace is always PARTIAL); nothing produced: status 1,
+  last stderr line `deobf: <reason>` (`deob.run`). `--time-limit S` (default 3600) bounds the command
+  (`limits.py`: harness timeouts are cut to the time left, the lift thread is given up at the
+  deadline and the trace is written, without its tidy pass if late). Harness processes are
+  started with `limits.spawn`: none outlives the engine, even when it is killed.
+- For the bot: one `deob.py` subprocess per upload (`-o` into a temp folder); modules keep
+  global state (Path2D cache, `LAST_RAW`), so don't import and call it in a long-lived process.
+- Scripts that read settings from `_G`/`getgenv()` or check game state stop early (e.g.
+  `kick("You didn't add username or webhook")`). Drive them further with `--cfg
+  "prelude=rawset(G,'webhook','x') setprop(game,'PlaceId',123)"` (Luau run before the script,
+  untraced; `G`, `genv`, `shared`, `game`, `env`, `setprop(proxy, key, value)`) and `--cfg
+  falsy=name1,name2` (calls of those method/function names return `false`).
+- Path2D answers come from the offline engine model (`envlog.luau` `CHAIN.p2d`, bit-exact;
+  `research/path2d/README.md`); "N Path2D answers computed by the offline engine model".
+- `--studio` (rarely needed) serves each harness on `127.0.0.1:34889` via a `*.studio_loader.luau`
+  (MCP `execute_luau`); engine Path2D answers go to `<script>.path2d` (preferred offline).
+  **Danger:** an endless-loop tamper response freezes Studio: evaluate just the Path2D calls instead.
 - Other options (`--raw FILE`, `--keep-harness`, `--input-text`, `--strings`,
   plugin options, ...): `deob.py --help`.
-- **PyPy**: inputs over `PYPY_MIN_SIZE` (350 KB) re-exec under PyPy (`pypy3`
-  on PATH or winget's `PyPy.PyPy.3.11`). Lifting ~2x faster warm, but JIT
-  warmup costs ~4 s: pays off only on big scripts.
-- The trace's tidy/fold pass only runs when the trace is written (`--debug`,
-  `--no-devirt`, or lifting failed); on a 250k-statement trace it takes
-  minutes. `DEOB_PRETIDY=FILE` saves its input.
+- **PyPy**: inputs over `PYPY_MIN_SIZE` (350 KB) re-exec under PyPy (`pypy3` on PATH or winget's
+  `PyPy.PyPy.3.11`). Lifting ~2x faster warm, but JIT warmup costs ~4 s: pays off only on big scripts.
+- The trace's tidy/fold pass only runs when the trace is written (`--debug`, `--no-devirt`, or
+  lifting failed); on a 250k-statement trace it takes minutes. `DEOB_PRETIDY=FILE` saves its input.
 - `python deobf/names.py file` renames locals in any lifted file.
 
 ## Adding an obfuscator
@@ -197,7 +196,7 @@ IR module as parameter `D`. `backend.lower`: `structure.build_cfg` ->
   given to a local whose scope overlaps another one with that name, so no
   shadowing; `local f = function` counts from its statement start since
   localfuncs turns it into `local function f`; numbered in declaration
-  order; globals are never reused) names from use: `x or default` after `x`,
+  order; globals are never reused: `game_`, then `game2`) names from use: `x or default` after `x`,
   `f("RouterClient")` after the string, `require(x:WaitForChild("M"))` ->
   `M`, `t[k](...)` -> `handlers`. `localfuncs.py`: `local f = function` ->
   `local function f`.
@@ -265,7 +264,7 @@ hold for every change to the shared runtime:
 - **Never wrap `getfenv`, `pcall`, `setmetatable`,** or anything a VM calls per instruction: the extra frame breaks the depth probe.
 - **C stack budget and waits (`--cfg top_thread`, set by the Luraph driver for v15.2).** The script thread then starts with no parent thread (`resumetop` of the patched runtime: nCcalls 1 as under Roblox's scheduler; `coroutine.resume` starts it one C call deeper), and a wait or a signal's `Wait` yields every thread but the main one (V15_2.md). A hook function called from VM code must not use `for k, v in next, t` (a C level); table operations and generalized `for` are free.
 - **Fake C functions** (`nativeFn`) are trampolines whose env is set to the script's globals, because `getfenv(cfunc)` must equal `getfenv(0)`. Keep `debug.info`/`setfenv` out of the trampolines (their stack-level math depends on it).
-- **Instance questions with a known answer** (key-system loaders test them): `IsA` follows the API class tree for an instance of a known class (game, workspace, services, `Instance.new`; a class guessed from a child's name keeps the default `true` when the tree says no); `IsDescendantOf`/`IsAncestorOf` follow the known hierarchy (`CHAIN.descends`), an unknown parent chain keeps `true`.
+- **Instance questions with a known answer** (key-system loaders test them): `IsA` follows the API class tree for an instance of a known class (game, workspace, services, `Instance.new`; a class guessed from a child's name keeps the default `true` when the tree says no); `IsDescendantOf`/`IsAncestorOf` follow the known hierarchy (`CHAIN.descends`), an unknown parent chain keeps `true`. An instance the script made (`Instance.new`) has exactly what the script gave it: tags (`AddTag`/`RemoveTag`/`HasTag`/`GetTags`, also the CollectionService forms), attributes (`SetAttribute`/`GetAttribute`/`GetAttributes`) and children by class (`FindFirstChildOfClass`: that class itself; `FindFirstChildWhichIsA`: the class tree); on an instance of the place only what the script set is known, the rest stays the guess. Luraph v15.1/v15.2 probe these on a Folder they make (a truthy stand-in = tamper loop).
 - **Executor functions scripts test:** `getrawmetatable`/`setrawmetatable` see behind a script-made `__metatable` lock and `clonefunction` returns a new function (runtime natives `__LPH_NATIVE` of devm/luau_cli.patch; approximations without them); `request` reads its option fields raw and raises for a non-string `Url`/`Method`/`Body`/header (a proxy counts as a string).
 - **Checks the environment already satisfies:** game/service Name/Parent,
   `tostring(instance)`; a new signal object per index (`==` true, `rawequal`
@@ -343,9 +342,7 @@ hold for every change to the shared runtime:
   runs: while a register is open (captured, not yet closed by the VM's close
   op), assignments to it must not be inlined away or copy-propagated
   (`codegen.open_registers`, forward dataflow).
-- Inlining a call into a later statement must keep evaluation order inside
-  that statement too (`call_before`) and must not cross a redefinition of a
-  register the call reads.
+- Inlining a call into a later statement must keep evaluation order inside that statement too (`call_before`) and must not cross a redefinition of a register the call reads. `simplify_block` sweeps strictly first: a call does not cross the definition of another operand of its use statement (else `f(a(), g())` became `local g2 = g; f(a(), g2())`); the relaxed sweep only runs when the strict ones change nothing. A sweep from the last definition backwards is wrong: it moves `r1 / 2`, `#r1` away before their operand.
 - A call or `...` used as a single value in the last position of an argument
   list / return / table constructor must be parenthesized (`g((f()))`).
 - `for` header expressions are evaluated once, at the loop prep (`ForPrep`
@@ -354,7 +351,7 @@ hold for every change to the shared runtime:
   moves in the loop header (`r2 = nil`) run before every header evaluation:
   copy them after the prep and onto every back edge (`_moves_to_latches`).
 - Dead multret packs are dropped before folding (`drop_dead_packs`); a pack
-  read after it is no longer tracked becomes a real `table.unpack`/`table.move`.
+  read after it is no longer tracked becomes a real `table.unpack`/`table.move`; `codegen.fold_shifted_packs` folds the call handler's form of it (`P.n = K + P.n - 1; table.move(P, 1, P.n, K, P); P[1] = a; f(table.unpack(P, 1, P.n))`) back into `f(a, g())`.
   A long-lived unread pack (entry `r = pack(...)`) killed in a loop splits it into
   two latch copies (raw `C_1()`, `exitTo`): Luraph's `_walk` drops it (`pack_unstable`), restarts.
 - Walk nodes are keyed by the state key, so one pc can have copies.
@@ -369,11 +366,12 @@ hold for every change to the shared runtime:
   substitutes the prep values into the header compares (constant bounds:
   a plain jump). Never make it a `for`: the structurer copied a latch-less
   loop ~100k times (27 MB); left alone, the header reads the VM's hidden
-  loop slots (`M_1 <= 0`, undefined names).
+  loop slots (`M_1 <= 0`, undefined names). Generic `for` likewise
+  (`_run_once_forin`): the hidden iterator's one call becomes `f(s, ctl)`.
 - Luau's 200-active-locals limit: `variables.limit_locals` -> `fit_locals`:
   small closed `do ... end` segments (`wrap_segments`) when their estimate
   (`dry=True`) fits, else `split_block` (one closed prefix, e.g. a loader and
-  the script it runs, with the locals crossing the cut declared in front).
+  the script it runs, with the locals crossing the cut declared in front, in declaration order: never iterate a `set` of names into the output, its order differs per process).
   `backend.lower` retries with smaller budgets while `peak_locals` is over
   the limit (a full top level leaves nested blocks no room). Call temps kept
   as `local tN = table.pack(call)` count as locals there (`declared_here`,
@@ -396,13 +394,11 @@ hold for every change to the shared runtime:
   a loop to another exit -> `exitTo = k break` + dispatch after the loop
   (`unify_exits`); a block reached again -> its region (up to the fork's join)
   copied per extra pred (`split_node`). Last resort: a `state` dispatch loop.
-- A register table (`t = {}` + stores) folds into a constructor across pure
-  moves; integer keys 1..n become positional items. `fold_tables` repeats
+- A register table (`t = {}` + stores) folds into a constructor across pure moves; integer keys 1..n become positional items; the fixed items in front of a multret SETLIST join it (`merge_setlist_items`: `{a, b, f()}`). An empty table moves down to its first store only when that is an array item and no closure holds the register (never for `M.name = v`: `local M = {}` stays where it is). A function that names its table (`M.f = function() M.g() end`) keeps all of M's functions out of the constructor (`table_self_ref`, idioms `self_named`). `fold_tables` repeats
   with copy propagation/simplify until nothing changes: an inner constructor
   sits in a temp register until simplify inlines it into the outer store
   (nested `{ {"PUSH", 7}, ... }`, webhook `embeds = { { ... } }`).
-- Nested constructors whose items contain calls can come out split
-  (`local t5 = {...}; ... t[1] = t5`): moving an item past a call isn't safe.
+- An array constructor whose LAST item is a single-valued call stays `local a, b = f(), g(); t = { a, b }`: `truncated_use` keeps `(g())` out and no earlier call may pass it.
 
 ## Checks
 
