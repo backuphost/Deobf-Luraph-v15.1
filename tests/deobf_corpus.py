@@ -203,6 +203,22 @@ def check_pack_site():
     assert devirt.pack_site("pack(T-12_5_2[1], T3_9_1[2...])") == "pack(T-12_2[1], T3_1[2...])"
 
 
+def check_not_reached_unknown():
+    """When the script's main function cannot be told (the check raises), not_reached says so (None):
+    the driver then adds the lack that the output may start with Luraph's start-up code, instead of
+    taking the lift for the script's."""
+    import contextlib
+    import io
+    from obfuscators.luraph_v15 import driver
+
+    class Job:
+        source_path = os.path.join(tempfile.gettempdir(), "no-such-dir-%d" % os.getpid(), "missing.lua")
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        got = driver.not_reached(Job(), Job.source_path + ".protos.json", [])
+    assert got is None, got
+    assert "could not tell the script's main function" in err.getvalue(), err.getvalue()
+
+
 def check_chunk_params():
     """The main function's parameters at the top level never give `local ... = ...`."""
     from obfuscators.luraph_v15 import devirt
@@ -593,6 +609,7 @@ def check_corpus_stopped_loader():
 CHECKS = [
     ("syntax-warnings", check_no_syntax_warnings),
     ("pack-site", check_pack_site),
+    ("not-reached-unknown", check_not_reached_unknown),
     ("chunk-params", check_chunk_params),
     ("run-once-forin", check_run_once_forin),
     ("operand-order", check_operand_order),

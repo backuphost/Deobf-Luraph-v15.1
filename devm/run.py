@@ -416,6 +416,17 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             log('[%s] %d instructions could not be lifted: %d marked LIFT ERROR in the output%s' % (
                 tag, len(stage.errors), shown,
                 ', the others in code the output does not contain (cut as unreachable)' if shown < len(stage.errors) else ''))
+            ran, cold = hidden_errors(stage.errors, stage.oracle, text)
+            if ran:
+                # Code that ran cannot have been unreachable: the result must not pass for complete
+                # (the same head line as lift_program writes for the proto-table layout)
+                texts = sorted({' '.join(str(e[1]).split())[:100] for _k, e in stage.errors
+                                if (_k, e[0][0], e[0][1]) in stage.oracle})
+                text = ('-- LIFT ERROR: %d instruction(s) that the traced run executed did not lift and have no marker in the '
+                        'text below.  Their lift errors: %s\n' % (ran, '; '.join(texts[:12]))) + text
+            if cold:
+                LAST_RUN['notes'].append('[cut] %d instruction(s) that never ran did not lift; the result does not contain the code '
+                                         'they are in (cut as never-executed junk or as unreachable)' % cold)
         return text
     # ---- proto-table layout (every Luraph v14 build)
     common = (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + \
@@ -543,6 +554,25 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         LAST_RUN['notes'] = ['[single-root] lifted from the state at the first interpreter entry']
         return cleanup.tidy(text1)
     return lift_program(stage, data, tag, log, oneline, 'real program')
+
+
+def hidden_errors(errors, oracle, text):
+    """Lift errors of the factory route that have no LIFT ERROR marker in the text: (in code the
+    traced run executed, in code that never ran).  Markers carry the error's message, not its
+    place: per message, the errors of code that ran are counted first among those without a
+    marker (which of them have one is not known, and code that ran must not be taken for cut)."""
+    import collections
+    marks = collections.Counter(' '.join(m.split()) for m in re.findall(r'LIFT ERROR: ([^\n]*)', text))
+    by_msg = {}
+    for k, e in errors:
+        ran = isinstance(e[0], tuple) and (k, e[0][0], e[0][1]) in oracle
+        by_msg.setdefault(' '.join(str(e[1]).split()), [0, 0])[0 if ran else 1] += 1
+    hidden_ran = hidden_cold = 0
+    for msg, (r, c) in by_msg.items():
+        hidden = max(0, r + c - marks.get(msg, 0))
+        hidden_ran += min(r, hidden)
+        hidden_cold += hidden - min(r, hidden)
+    return hidden_ran, hidden_cold
 
 
 def lift_program(stage, data, tag, log, oneline, what, replayed=True):
@@ -677,7 +707,7 @@ def main(argv=None):
     def write_result(text):
         """the result file: the report first (see below), then the text; returns the report lines"""
         lines = run_report(LAST_RUN['notes']) + report(text, returned=any(
-            n.startswith('[oracle] script returned') for n in LAST_RUN['notes']))
+            n.startswith('[oracle] script returned') for n in LAST_RUN['notes']), notes=LAST_RUN['notes'])
         head = ['-- %s, %s.  How the run went and what this file lacks:' % (os.path.basename(a.input), HEAD_MARK)]
         head += ['--   ' + ln for ln in lines]
         text = '\n'.join(head) + '\n' + text
@@ -744,6 +774,9 @@ def failure_stage(e):
 
 
 HEAD_MARK = 'recovered by devm (python -m devm.run)'      # first line of a file main() writes
+# (how run_report starts the lines of the run notes report() also reads off the head of a file)
+SINGLE_ROOT_LINE = 'the VM has a single root program'
+STARTUP_LINE = 'start-up code: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
 
 
@@ -767,9 +800,11 @@ def run_report(notes):
             out.append('the VM ran its own init (%s VM instructions) and handed over to the script; this result is a static '
                        'lift of the script\'s program from the state at that moment: the script itself did not run' % m.group(2))
         elif n.startswith('[single-root]'):
-            out.append('the VM has a single root program (no separate init that hands over): this result is a static lift of '
+            out.append(SINGLE_ROOT_LINE + ' (no separate init that hands over): this result is a static lift of '
                        'that program from the state at its first entry; nothing ran, and whatever Luraph\'s start-up code '
                        'in it would have decoded at run time is still as the file stores it')
+        elif n.startswith('[startup] '):
+            out.append(STARTUP_LINE + n[len('[startup] '):])
     reqs = [n for n in notes if n.startswith('[http]')]
     for n in reqs[:6]:
         out.append('  request: ' + re.sub(r' \[step \d+\]$', '', n[len('[http] '):]))
@@ -781,6 +816,8 @@ def run_report(notes):
             out.append('  ' + n[len('[env] '):])
         elif n.startswith('[hint]'):
             out.append('  ' + n[len('[hint] '):])
+        elif n.startswith('[cut] '):
+            out.append('  note: ' + n[len('[cut] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
     said = [n for n in notes if n.startswith('[script]')]
     for n in said[:12]:
@@ -801,18 +838,28 @@ KEY_LEFT = re.compile(r'(?m)^[ \t]*return bit32\.bxor\(p\d+, \d{7,}\)(?:,.*)?$')
 KEY_MIX = re.compile(r'(?m)^.*\b(v\d+) - \1 % 1\b.*$')
 
 
-def report(text, returned=None):
+def report(text, returned=None, notes=None):
     """What is left unrecovered in a result, in plain words.  `returned`: the traced run went to
-    the script's end (None: read it off the head of a file main() wrote)."""
+    the script's end; `notes`: the run notes (LAST_RUN; None: read both off the head of a file
+    main() wrote)."""
     lines = text.split('\n')
+    head_notes = []
     if lines and HEAD_MARK in lines[0]:
         # a file main() wrote: its head is an earlier report, not part of the result
         del lines[0]
         while lines and lines[0].startswith('--   '):
             if returned is None and lines[0].startswith('--   traced run: the script returned'):
                 returned = True
+            if lines[0].startswith('--   ' + SINGLE_ROOT_LINE):
+                head_notes.append('[single-root]')
+            elif lines[0].startswith('--   ' + STARTUP_LINE):
+                head_notes.append('[startup] ' + lines[0][len('--   ' + STARTUP_LINE):])
             del lines[0]
         text = '\n'.join(lines)
+    if notes is None:
+        notes = head_notes
+    single_root = any(n.startswith('[single-root]') for n in notes)
+    startup = any(n.startswith('[startup]') for n in notes)
     errs = text.count('LIFT ERROR')
     # (`(nil)[k]`, `(nil)(...)`, `t[nil]`, `nil .. x`; a call that passes nil, `f(nil)`, is ordinary code)
     blank = len(re.findall(r'(?m)^.*(?:\[nil\]|(?<![\w\)\]])\(nil\)[\[.(:]|= nil \.\.).*$', text))
@@ -838,6 +885,9 @@ def report(text, returned=None):
     # ... and the interpreter's own key arithmetic where it did not fold to a constant: a number
     # cut to 32 bits and to an integer by hand (`v = x % 4294967296; w = v - v % 1`)
     mixes = len(KEY_MIX.findall(code))
+    # ... and its dead arithmetic: constants computed into locals nothing reads (v14 self-patch
+    # values; cleanup.drop_dead_constants removes those it can show to be harmless)
+    dead = sum(len(x) for x in cleanup.dead_constant_lines(code))
     # Luraph's tamper response (structure.TRAP_NOTE labels the function): its calls mark the
     # protection's own checks, which a reader should not take for the script's
     traps = []
@@ -849,10 +899,16 @@ def report(text, returned=None):
     lines = max(1, text.count('\n'))
     out = []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes):
+            or keys or mixes or dead or single_root or startup):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + traps
     out.append('result: PARTIAL')
+    if startup:
+        out.append('  the result is the VM\'s first program, which begins with Luraph\'s start-up code: the script was not '
+                   'found as a program of its own (what the run shows about it is in the start-up code line above)')
+    if single_root:
+        out.append('  the result is the VM\'s root program including Luraph\'s start-up code, lifted from the state before '
+                   'it ran: what that code decodes at run time is still encoded, and the script is not separated from it')
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
     if blank:
@@ -887,6 +943,11 @@ def report(text, returned=None):
     if mixes:
         out.append('  %d lines of Luraph\'s key arithmetic are left (`v - v %% 1` on a value cut to 32 bits): numbers the '
                    'interpreter mixes into its keys, not part of the script' % mixes)
+    if dead:
+        out.append('  %d lines compute a constant into a local nothing reads (`local v = <literals, arithmetic, bit32 / '
+                   'string calls>`): Luraph\'s dead arithmetic, left because it does not evaluate here (an operand '
+                   'printed as nil, an unsupported format or call: removing a line that raises could change what the '
+                   'script does)' % dead)
     depth = max((len(ln) - len(ln.lstrip('\t')) for ln in text.split('\n')), default=0)
     if depth > 60:
         out.append('  nesting up to %d levels deep: a flattened function came out as a chain of nested blocks, '

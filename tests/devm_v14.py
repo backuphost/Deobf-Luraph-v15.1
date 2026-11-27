@@ -260,6 +260,67 @@ class SingleRoot(unittest.TestCase):
         self.assertFalse(any(n.startswith(('[handover]', '[budget]')) for n in notes), notes)
 
 
+class SingleRootReport(unittest.TestCase):
+    """A single root program lifted from its first entry holds Luraph's start-up code: never complete."""
+
+    def test_partial(self):
+        notes = ['[single-root] lifted from the state at the first interpreter entry']
+        lines = run.report('print("x")\n', notes=notes)
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('start-up code' in ln for ln in lines[1:]), lines)
+        # the same read off the head of a file main() wrote
+        head = ['-- x.lua, %s.  How the run went and what this file lacks:' % run.HEAD_MARK]
+        head += ['--   ' + ln for ln in run.run_report(notes) + lines]
+        self.assertEqual(run.report('\n'.join(head) + '\nprint("x")\n'), lines)
+        self.assertTrue(run.report('print("x")\n', notes=[])[0].startswith('result: complete'))
+
+
+class DeadConstants(unittest.TestCase):
+    """cleanup.drop_dead_constants: Luraph v14's self-patch values are computed into locals nothing
+    reads once the lifter has folded the patch (synthetic shapes and numbers)."""
+    JUNK = ('local v1 = game\n'
+            'local v2 = string.unpack("<i4", "\\007\\000\\000\\000") + 615 + 20811 + -21426\n'
+            'local v3 = bit32.lrotate(-61, 9) - 4294936000 + -1234\n'
+            'local v4 = 52 - string.packsize("i4 >h") + 300 + -346\n'
+            'local v5 = -150 <= string.byte("\\017\\201Q", 2, nil)\n'
+            'local v6 = 4321 + math.modf(2.5) + -4320\n'
+            'local v7 = bit32.bxor(77, 13, (string.byte("\\009", 1, nil))) > 999 and 1 or 2\n'
+            'local v9 = 1200 + string.byte("x\u00e9", 3) + -1400\n'
+            'local v10 = #("ab" .. 12 .. "c") * 3 - string.len(string.rep("z", 4))\n'           # (characters written as themselves: their UTF-8 bytes)
+            'while true do\n'
+            '\tlocal v8 = 9000 + bit32.countrz(640) + -8990\n'
+            '\tv1.Workspace.Part:Destroy()\n'
+            'end\n')
+
+    def test_dropped(self):
+        from devm import cleanup
+        self.assertEqual(cleanup.drop_dead_constants(self.JUNK),
+                         'local v1 = game\nwhile true do\n\tv1.Workspace.Part:Destroy()\nend\n')
+        self.assertTrue(run.report(cleanup.drop_dead_constants(self.JUNK))[0].startswith('result: complete'))
+
+    def test_kept(self):
+        from devm import cleanup
+        for line in ('local v2 = 5 + 3\nprint(v2)',                      # read
+                     'local v2 = string.byte("", 1) + 1',               # raises: nil + 1
+                     'local v2 = bit32.bxor("x", 1)',                   # raises
+                     'local v2 = string.unpack("<z", "ab")',            # a format the evaluator does not read
+                     'local v2 = f(1) + 2',                             # not a library function
+                     'local v2 = math.random(1, 5)',                    # not pure (and not counted below)
+                     'local v2 = string.char(300)',                     # raises
+                     'local v2 = x + 1'):                               # a variable
+            self.assertEqual(cleanup.drop_dead_constants(line), line)
+        # what is left is counted, and the result is not complete
+        lines = run.report('local v2 = string.byte("", 1) + 1\nprint(1)\n')
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('nothing reads' in ln for ln in lines[1:]), lines)
+        self.assertTrue(run.report(self.JUNK)[0] == 'result: PARTIAL')
+        self.assertTrue(run.report('local v2 = math.random(1, 5)\nprint(1)\n')[0].startswith('result: complete'))
+
+    def test_tidy(self):
+        from devm import cleanup
+        self.assertNotIn('string.packsize', cleanup.tidy(self.JUNK))
+
+
 class Dialect(unittest.TestCase):
     LUAU = ('local a = b ~= c; local s = "a ~ b << | &" -- x ~ y\nlocal t = [[ ~ ]]',
             'type T = A | B & C\nlocal x: Array<Array<number>> = {}\nlocal y = 1',

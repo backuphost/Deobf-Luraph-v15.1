@@ -366,44 +366,46 @@ class OpenUpvalueMap(unittest.TestCase):
 
 
 class CallKeys(unittest.TestCase):
-    """opaque._fold_call_keys on text as the structurer writes it."""
+    """opaque._fold_call_keys on text as the structurer writes it (synthetic shapes and numbers)."""
 
     def test_function_called_on_the_spot(self):
         from devm import opaque
-        text = ('local v2 = (function(p1, p2)\n\tprint("Hello, " .. p2)\n\treturn bit32.bxor(p1, 348384287)\n'
-                'end)(225884115, "World")\nif v2 == 431315916 then\n\treturn\nend\nlocal v3 = bit32.bxor(v2, 294707725)')
-        self.assertEqual(opaque.strip(text), '(function(p2)\n\tprint("Hello, " .. p2)\nend)("World")')
+        # (the key is the last parameter here; 161803398 ^ 271828182 == 429336656)
+        text = ('local v4 = (function(p1, p2)\n\twarn("status " .. p1)\n\treturn bit32.bxor(p2, 271828182)\n'
+                'end)("ready", 161803398)\nif v4 == 429336656 then\n\treturn\nend\nlocal v5 = bit32.bxor(v4, 141421356)')
+        self.assertEqual(opaque.strip(text), '(function(p1)\n\twarn("status " .. p1)\nend)("ready")')
         # behind another statement the call needs its `;`, and a test that does not hold is dropped
-        text2 = 'print(1)\n' + text.replace('431315916', '431315917') + '\nprint(2)'
-        self.assertEqual(opaque.strip(text2), 'print(1)\n;(function(p2)\n\tprint("Hello, " .. p2)\nend)("World")\nprint(2)')
+        text2 = 'print(1)\n' + text.replace('429336656', '429336657') + '\nprint(2)'
+        self.assertEqual(opaque.strip(text2), 'print(1)\n;(function(p1)\n\twarn("status " .. p1)\nend)("ready")\nprint(2)')
 
-    NAMED = ('local v25 = function(p5, p6, p7)\n\tlocal v50 = p5:Connect(p7)\n\tif not v50 then\n\t\treturn bit32.bxor(p6, 18485293)\n\tend\n'
-             '\treturn bit32.bxor(p6, 18485293), v50\nend\n'
-             'local v30, v31 = v25(a.Changed, 99887766, function(p9)\n\tprint(p9)\nend)\n'
-             'if v30 ~= 82721467 then\n\terror("tamper")\nend\nprint(v31)\n'
-             'v25(b.Changed, 12345678, print)\n'
-             'while true do\n\tlocal v40 = v25(b.Changed, 55555555, print)\n\tif v40 == 39167438 then\n\t\tbreak\n\tend\n\tprint("never")\nend\nprint("after")')
+    # (the key is the first parameter; 31415926 ^ 192837465 == 178333999, 14142135 ^ 192837465 == 195673582)
+    NAMED = ('local v8 = function(p3, p4, p5)\n\tlocal v9 = p4[p5]\n\tif v9 == nil then\n\t\treturn bit32.bxor(p3, 192837465)\n\tend\n'
+             '\treturn bit32.bxor(p3, 192837465), v9\nend\n'
+             'local v10, v11 = v8(31415926, cfg, function(p6)\n\tprint(p6)\nend)\n'
+             'if v10 ~= 178333999 then\n\terror("bad")\nend\nprint(v11)\n'
+             'v8(27182818, cfg, "mode")\n'
+             'while true do\n\tlocal v12 = v8(14142135, cfg, "size")\n\tif v12 == 195673582 then\n\t\tbreak\n\tend\n\tprint("never")\nend\nprint("after")')
 
     def test_function_called_by_name(self):
         from devm import opaque
         self.assertEqual(opaque.strip(self.NAMED), (
-            'local v25 = function(p5, p7)\n\tlocal v50 = p5:Connect(p7)\n\tif not v50 then\n\t\treturn\n\tend\n\treturn v50\nend\n'
-            'local v31 = v25(a.Changed, function(p9)\n\tprint(p9)\nend)\nprint(v31)\n'
-            'v25(b.Changed, print)\n'
-            'while true do\n\tv25(b.Changed, print)\n\tbreak\nend\nprint("after")'))
+            'local v8 = function(p4, p5)\n\tlocal v9 = p4[p5]\n\tif v9 == nil then\n\t\treturn\n\tend\n\treturn v9\nend\n'
+            'local v11 = v8(cfg, function(p6)\n\tprint(p6)\nend)\nprint(v11)\n'
+            'v8(cfg, "mode")\n'
+            'while true do\n\tv8(cfg, "size")\n\tbreak\nend\nprint("after")'))
 
     def test_left_alone(self):
         from devm import opaque
-        for text in (self.NAMED.replace('v25(b.Changed, 12345678, print)', 'return v25(b.Changed, 12345678, print)'),   # the result travels on
-                     self.NAMED.replace('v25(b.Changed, 12345678, print)', 'v25(b.Changed, key, print)'),               # not a literal
-                     self.NAMED.replace('v25(b.Changed, 12345678, print)', 'keep(v25)'),                                # the function travels
-                     self.NAMED.replace('\tlocal v50 = p5:Connect(p7)', '\tlocal v50 = p5:Connect(p7, p6)'),          # the key is used
-                     self.NAMED.replace('\t\treturn bit32.bxor(p6, 18485293)\n', '\t\treturn\n')):                # a way out without it
+        for text in (self.NAMED.replace('v8(27182818, cfg, "mode")', 'return v8(27182818, cfg, "mode")'),     # the result travels on
+                     self.NAMED.replace('v8(27182818, cfg, "mode")', 'v8(key, cfg, "mode")'),                 # not a literal
+                     self.NAMED.replace('v8(27182818, cfg, "mode")', 'keep(v8)'),                             # the function travels
+                     self.NAMED.replace('\tlocal v9 = p4[p5]', '\tlocal v9 = p4[p5 + p3]'),                 # the key is used
+                     self.NAMED.replace('\t\treturn bit32.bxor(p3, 192837465)\n', '\t\treturn\n')):       # a way out without it
             self.assertEqual(opaque._fold_call_keys(text), text)
 
     def test_report(self):
         from devm import run
-        left = 'local v25 = function(p5, p6, p7)\n\tlocal v50 = p5:Connect(p7)\n\treturn bit32.bxor(p6, 18485293), v50\nend\nprint(v25)\n'
+        left = 'local v8 = function(p3, p4)\n\tlocal v9 = p4.x\n\treturn bit32.bxor(p3, 192837465), v9\nend\nprint(v8)\n'
         lines = run.report(left)
         self.assertEqual(lines[0], 'result: PARTIAL')
         self.assertTrue(any('per-call' in ln for ln in lines[1:]), lines)
@@ -411,7 +413,7 @@ class CallKeys(unittest.TestCase):
 
     def test_report_key_arithmetic_left(self):
         from devm import run
-        text = 'local v2 = f()\nlocal v6 = bit32.band(v2, 65535) % 4294967296\nlocal v7 = v6 - v6 % 1 + 1912744306\nprint(1)\n'
+        text = 'local v3 = g()\nlocal v4 = bit32.band(v3, 255) % 4294967296\nlocal v5 = v4 - v4 % 1 + 246813579\nprint(1)\n'
         lines = run.report(text)
         self.assertEqual(lines[0], 'result: PARTIAL')
         self.assertTrue(any('key arithmetic' in ln for ln in lines[1:]), lines)
@@ -428,15 +430,64 @@ class CallKeys(unittest.TestCase):
         self.assertEqual(run.report(head + text), got)
 
 
+class StartupOnly(unittest.TestCase):
+    """The factory route lifts the VM's first program when the run made no program on another
+    interpreter: Luraph's start-up code, perhaps with the script's top level in it.  Never complete."""
+
+    def test_note(self):
+        from devm import pipeline
+        ran = ['[oracle] script returned after 900 instructions']
+        n = pipeline.startup_note(ran + ['[script] print: hi', '[http] GET https://example.invalid/x (no network) [step 5]'], None, 1, 3)
+        self.assertTrue(n.startswith('[startup] the run created no program on an interpreter other than the first one (3 modelled)'), n)
+        self.assertIn('top level ran inside that program (the run shows 1 line(s) of output, 1 request(s) from it)', n)
+        n = pipeline.startup_note(ran + ['[script] undefined globals read (nil, as in Roblox): x'], None, 1, 2)
+        self.assertIn('shows nothing the script did', n)
+        n = pipeline.startup_note(['[oracle] script stopped: boom after 5 instructions'], None, 1, 2)
+        self.assertIn('stopped before the script showed anything', n)
+        self.assertTrue(pipeline.startup_note(ran, 1, 1, 2).startswith('[startup] --root 1:'))
+
+    def test_report(self):
+        from devm import pipeline, run
+        notes = ['[oracle] script returned after 900 instructions', pipeline.startup_note(['[script] print: hi'], None, 1, 2)]
+        lines = run.report('print("hi")\n', notes=notes)
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('start-up code' in ln for ln in lines[1:]), lines)
+        rr = run.run_report(notes)
+        self.assertTrue(any(ln.startswith(run.STARTUP_LINE) for ln in rr), rr)
+        head = ['-- x.lua, %s.  How the run went and what this file lacks:' % run.HEAD_MARK] + ['--   ' + ln for ln in rr + lines]
+        self.assertEqual(run.report('\n'.join(head) + '\nprint("hi")\n'), lines)
+
+
+class HiddenErrors(unittest.TestCase):
+    """Factory route: instructions that did not lift and have no marker in the text."""
+
+    def test_count(self):
+        from devm import run
+        oracle = {(1, 1, 10): {}, (1, 1, 11): {}}
+        errors = [(1, ((1, 10), 'bad A')), (1, ((1, 11), 'bad B')), (1, ((1, 12), 'bad B')), (2, ((1, 3), 'bad C'))]
+        # nothing marked: two errors in code that ran, two in code that never did
+        self.assertEqual(run.hidden_errors(errors, oracle, 'print(1)'), (2, 2))
+        # one marker of B: which of the two it is is not known, the one that ran counts as hidden
+        self.assertEqual(run.hidden_errors(errors, oracle, '-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n'), (1, 1))
+        self.assertEqual(run.hidden_errors(errors, oracle, '-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n-- LIFT ERROR: bad B\n'), (0, 1))
+        self.assertEqual(run.hidden_errors(errors, oracle, '-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n-- LIFT ERROR: bad B\n'
+                                           '-- LIFT ERROR: bad C\n'), (0, 0))
+
+    def test_run_report(self):
+        from devm import run
+        self.assertEqual(run.run_report(['[cut] 3 instruction(s) that never ran did not lift']),
+                         ['  note: 3 instruction(s) that never ran did not lift'])
+
+
 class BlindKeyArithmetic(unittest.TestCase):
     """What the interpreter that runs the script leaves in a v15.1 result: key arithmetic on an
     interpreter local the lifter has no value for, and junk arms behind `type(<number>) == "buffer"`."""
     TEXT = ('local v1 = f()\n'
-            'local v2 = (121107783 + nil) % 4294967296\nlocal v3 = v2 - v2 % 1\nlocal v4 = bit32.bxor(v3, 55)\nprint(v4)\n'   # read by the script
+            'local v2 = (73519286 + nil) % 4294967296\nlocal v3 = v2 - v2 % 1\nlocal v4 = bit32.bxor(v3, 55)\nprint(v4)\n'   # read by the script
             'local v5 = nil --[[X]] % 4294967296\nlocal v6 = v5 + v1\n'             # mixed with a real value
             'local v7 = (nil + 5) % 7\n'                                             # no large literal: not key arithmetic
-            'local v8 = nil --[[OPENUPS]] % 4294967296\nlocal v9 = bit32.bxor(v8 - v8 % 1, 283475159)\n'
-            'if type(0) == "buffer" then\n\tlocal v10 = (121107783 + nil) % 4294967296\n\tprint(v10)\nend\n'
+            'local v8 = nil --[[OPENUPS]] % 4294967296\nlocal v9 = bit32.bxor(v8 - v8 % 1, 398765431)\n'
+            'if type(0) == "buffer" then\n\tlocal v10 = (73519286 + nil) % 4294967296\n\tprint(v10)\nend\n'
             'if type(0) ~= "number" then\n\tprint(1)\nelseif type(5) == "number" then\n\tprint(2)\nend\n'
             'if type(x) == "number" then\n\tprint(3)\nend')
 
@@ -444,12 +495,11 @@ class BlindKeyArithmetic(unittest.TestCase):
         from devm import opaque
         self.assertEqual(opaque.strip(self.TEXT), (
             'local v1 = f()\n'
-            'local v2 = (121107783 + nil) % 4294967296\nlocal v3 = v2 - v2 % 1\nlocal v4 = bit32.bxor(v3, 55)\nprint(v4)\n'
+            'local v2 = (73519286 + nil) % 4294967296\nlocal v3 = v2 - v2 % 1\nlocal v4 = bit32.bxor(v3, 55)\nprint(v4)\n'
             'local v5 = nil --[[X]] % 4294967296\nlocal v6 = v5 + v1\n'
             'local v7 = (nil + 5) % 7\n'
             'print(2)\n'
             'if type(x) == "number" then\n\tprint(3)\nend'))
-
 
 # The v15.0 shape: the function that makes a VM closure is a method of the VM object and a state machine.
 V150 = '''return setmetatable({m=function(v,R,R,R,g,g)local a,I,C=nil,0,R[1];

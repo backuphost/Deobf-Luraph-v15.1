@@ -1,6 +1,7 @@
 """End-to-end driver: source -> (hook + dump) -> lift -> decompile, repeated per VM layer."""
 import json
 import os
+import re
 import subprocess
 
 from . import vmmodel, pe, lifter, structure, luprint
@@ -103,6 +104,8 @@ def _run_traced(self):
     self.errors = errs
     self.conflicts = [(k, c) for k, p in protos.items() for c in p.conflicts]
     self.hints = []
+    if not payload:
+        self.hints.append(startup_note(notes, forced, first_root, len(m.interps)))
     if payload and not forced:
         # The proto taken for the script is the first one on the second interpreter.  Where that
         # interpreter only runs a helper, next to nothing is lifted while the run shows the first
@@ -124,6 +127,36 @@ def _run_traced(self):
 
 
 Stage.run_traced = _run_traced
+
+
+def startup_note(notes, forced, first_root, interps):
+    """The run note for a factory-layout result that is the VM's first program: Luraph's start-up
+    code (environment checks, key derivation, decryption), possibly with the script's top level
+    flattened into it (v15.2 builds without a payload interpreter).  What the run shows about
+    where the script is goes with it.
+
+    (The v14.9 rule of the proto-table layout, a program entered that was not reachable from the
+    root program's tables when it started, has no counterpart here: every program of a factory
+    build is a closure the factory makes at run time.  The interpreter a program runs on is the
+    evidence: the script is the first program of an interpreter other than the first one.)"""
+    if forced:
+        return ('[startup] --root %d: the result is the VM\'s first program, which begins with Luraph\'s start-up code; '
+                'the script is not separated from it' % first_root)
+    said = [n for n in notes if n.startswith('[script] ') and re.match(r'\[script\] (?:print|warn):', n)]
+    asked = [n for n in notes if n.startswith('[http]')]
+    shown = ', '.join(x for x in (
+        '%d line(s) of output' % len(said) if said else '',
+        '%d request(s)' % len(asked) if asked else '') if x)
+    head = ('[startup] the run created no program on an interpreter other than the first one (%d modelled): the result is '
+            'the VM\'s first program, which begins with Luraph\'s start-up code.  ' % interps)
+    if shown:
+        return head + ('The script\'s top level ran inside that program (the run shows %s from it), but it is not '
+                       'separated from the start-up code' % shown)
+    if any(n.startswith('[oracle] script returned') for n in notes):
+        return head + ('The run returned and shows nothing the script did (no output, no request): where the script is '
+                       'was not found (it may not have run at all: a key check, a server reply or an environment check)')
+    return head + ('The run was stopped before the script showed anything (no output, no request): where the script '
+                   'is was not found')
 
 _PURE_LIBS = ('bit32.', 'math.', 'string.', 'buffer.', 'table.', 'utf8.')
 

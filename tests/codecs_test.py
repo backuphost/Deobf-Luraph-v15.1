@@ -657,7 +657,7 @@ def container_v15(chunk, data, offset=36, order=(4, 3, 1, 0, 2), data_first=Fals
         'W={' + ','.join('[%s]=%s' % (quoted(k), quoted(v)) for k, v in table.items()) + '},', fields[0], ',',
         'q=function(g)local h,x,y=g.r,g.p,g.u;local a,b=h(g,x,%d),h(g,y,%d);' % (len(chunk), len(data)),
         'local f=g[42](g[56](a),g.N,nil);assert(f,"Luraph Decompression Error: ");return f(b);end,',
-        fields[1], ',r=function(g,q,Q)return q;end,l="[ -#y-~]"},{}):q()(...)', tail])
+        fields[1], ',r=function(g,q,Q)return q;end,l="[%a_]"},{}):q()(...)', tail])
 
 
 CHUNK = b'return(function(...)local t={...};' + synthetic(3000) + b'return t;end)(...);'

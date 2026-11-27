@@ -429,7 +429,10 @@ def run(job):
                 # the lifter needs the original source of every VM chunk
                 chunk_paths = [job.write(job.path(".chunk_%s.luau" % key), src, encoding="latin-1")
                                for key, src in raw_chunks.items()]
-                if "nested" not in shapes and not_reached(job, ppath, chunk_paths):
+                # (v15.2 "nested" shapes: one function holds Luraph's start-up code and the
+                # script's main function, the check below does not apply)
+                reached = "nested" if "nested" in shapes else not_reached(job, ppath, chunk_paths)
+                if reached is True:
                     if status != "finished":
                         # Nothing of the script to lift: the lift would be
                         # Luraph's start-up program, which is not the script.
@@ -446,6 +449,13 @@ def run(job):
                 else:
                     lifted_lacks, failure[0] = lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath,
                                                     chunk_paths)
+                    if lifted_lacks is not None and reached is None:
+                        lifted_lacks.append("the script's main function could not be identified: the output may "
+                                            "start with Luraph's start-up code")
+                    elif lifted_lacks is not None and reached == "nested":
+                        lifted_lacks.append("Luraph v15.2 keeps its start-up code and the script's main function in "
+                                            "one function: the output includes Luraph's start-up code, not "
+                                            "separated from the script")
     runner.finish()
     if devirt_on and lifted_lacks is not None and os.path.exists(dpath):
         # a lift full of calls to nil misread the VM: the trace is the better result
@@ -501,7 +511,8 @@ def run(job):
 def not_reached(job, ppath, chunk_paths):
     """True when the function the lift would start from is the program the
     VM entered first, Luraph's own start-up program, and the run recorded no
-    function of it as the script's main function (devirt.script_not_reached)."""
+    function of it as the script's main function (devirt.script_not_reached);
+    None when that could not be told."""
     from obfuscators.luraph_v15 import devirt
     try:
         return devirt.script_not_reached(job.source_path, ppath, chunk_paths)
@@ -510,7 +521,7 @@ def not_reached(job, ppath, chunk_paths):
             import traceback
             traceback.print_exc()
         print("[!] could not tell the script's main function (%s: %s)" % (type(e).__name__, e), file=sys.stderr)
-        return False
+        return None
 
 
 def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths):

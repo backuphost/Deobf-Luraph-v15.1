@@ -75,9 +75,14 @@ line per kind of thing that is missing:
 | `for loops without their loop statement`, `functions printed as a stub` | what the words say |
 | `lines of Luraph's key arithmetic are left` | `v - v % 1` on a value cut to 32 bits: numbers the interpreter mixes into its keys, where they did not fold to a constant |
 | `functions return a parameter xor-ed with a large literal` | Luraph's per-call keys (`return bit32.bxor(p, K), ...`) where they could not be folded because a caller is not in the result |
+| `lines compute a constant into a local nothing reads` | Luraph's dead arithmetic (`local v = <literals, arithmetic, bit32 / string calls>`, v14 self-patch values) that `cleanup.drop_dead_constants` left because it does not evaluate here (removing a line that raises would change the script) |
+| `the result is the VM's first program, which begins with Luraph's start-up code` | factory layout: the run made no program on a second interpreter, so the lift is the first program; the `start-up code:` line of the run says what the run shows about the script (its top level ran inside it but is not separated, or nothing of it showed) |
+| `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
+| `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 
-`run.report(text)` gives the second part for any result file (it skips a head written earlier).
+`run.report(text, notes=...)` gives the second part for any result file (it skips a head written
+earlier, and reads the start-up and single-root lines off it when no run notes are given).
 
 ### Factory layout: traced end-state lifting
 
@@ -214,7 +219,8 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   is entered that did not exist when the root program started (`__LPH_ENTER`).  A run that is
   stopped before that falls back to the second-stage route and, when the lifted root program holds
   no encrypted second stage, ends `devm: init did not hand over`; a root program that returns
-  without entering anything is the script itself and is lifted from its first entry.
+  without entering anything is taken for the script and lifted from its first entry, start-up code
+  included: that result is always PARTIAL (`[single-root]`).
 * **Key functions.**  From v14.8 on the script patches its own operands with the values of small
   functions the init installs.  At the hand-over they are closures of the VM; the harness calls
   each one twice under a budget and writes the value into the dump (`findConstFns`).
@@ -231,7 +237,17 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   decodes every lazy constant of the script.
 * **Lift errors without a marker.**  When instructions did not lift and the printed text has no
   marker for them (they sit in code the text does not contain), the text gets a head line
-  `-- LIFT ERROR: N instruction(s) did not lift ...` and the result is PARTIAL.
+  `-- LIFT ERROR: N instruction(s) did not lift ...` and the result is PARTIAL.  The factory layout
+  (v15) does the same for errors in code the traced run executed (`run.hidden_errors`: markers name
+  the error, not its place, so per message the executed ones count first); errors only in
+  never-executed code that was cut are a `note:` line of the report.
+* **Dead arithmetic.**  v14 programs compute the values they patch into their own code with
+  literals and pure library calls (`string.unpack`, `string.packsize`, `string.byte`, `bit32.*`,
+  `math.modf`).  The lifter folds the patch; the register assignment stays without a reader.
+  `cleanup.drop_dead_constants` drops `local vN = E` when vN is read nowhere and E (literals,
+  arithmetic, comparisons, and/or/not, calls of `bit32.*`, `math.floor/ceil/abs/min/max/modf/round`,
+  `string.unpack/packsize/byte/len/sub/char/rep` on constants) evaluates without an error; what is
+  left of that shape is counted by the report.
 * **Failures are one line.**  A run that writes no result ends with `devm: <stage>: <reason>` and a
   non-zero status: `unsupported target` (a build for Lua 5.3/5.4 or LuaJIT: `normalize.foreign_dialect`
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
@@ -439,8 +455,8 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   missing the arithmetic stays and the report says so (`functions return a parameter xor-ed with a
   large literal`, never `complete`).
 * **Key arithmetic on an interpreter local the lifter has no value for** shows as
-  `local v = (121107783 + nil) % 4294967296; local w = bit32.bxor(v - v % 1, 283475159)`: in code
-  that never ran (junk arms) the key was never set.  `opaque._drop_blind_key_arith` removes such
+  `local v = (73519286 + nil) % 4294967296; local w = bit32.bxor(v - v % 1, 398765431)` (numbers
+  made up): in code that never ran (junk arms) the key was never set.  `opaque._drop_blind_key_arith` removes such
   a chain when nothing reads it, `opaque._fold_type_tests` decides the opaque test
   `type(0) == "buffer"` in front of a junk arm.
 * **v15.0** is a third layout: the function that makes a VM closure is a method of the VM object,
@@ -452,6 +468,15 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
 * **The `--root` hint** ("the script is probably the first program") is only given when the
   function taken for the script calls nothing but pure library functions (a helper of the build);
   it used to be printed for every small script.
+* **No payload interpreter.**  When the run made no program on an interpreter other than the first
+  (the run never reached the script's interpreter: a key check, a server reply, a mock difference;
+  or a build such as the v15.2 example whose script's top level is flattened into the start-up
+  code), the first program is lifted and the result is PARTIAL: the run gets a `[startup]` note
+  (`pipeline.startup_note`) that says whether the run shows the script's effects (output, requests)
+  from inside that program -- its top level is in the result but not separated -- or nothing of it.
+  The same with `--root` set to the first program.  (The v14.9 rule of the proto-table layout, a
+  program entered that was not reachable from the root's tables when it started, has no
+  counterpart here: every factory program is a closure made at run time.)
 
 ### Names
 

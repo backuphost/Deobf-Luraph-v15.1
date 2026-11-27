@@ -699,7 +699,7 @@ class Builtins(unittest.TestCase):
         self.assertEqual(self.call('string.byte', 'abc', -1), [99])
         self.assertEqual(self.call('string.byte', 'abc', 5), [])
         self.assertEqual(self.call('string.packsize', '<i8'), [8])
-        self.assertEqual(self.call('string.packsize', '>>Lx=L<>'), [17])
+        self.assertEqual(self.call('string.packsize', '=<L>xL>'), [17])
         self.assertEqual(self.call('string.packsize', 'i3 B d'), [12])
         self.assertEqual(self.call('string.unpack', '<I2 x B', '\x01\x02\xff\x07'), [513, 7, 5])
 
@@ -798,7 +798,7 @@ R[A[pc]] = wrap(B[pc], {[%d] = {[%d] = R, [%d] = C[pc]}})
         f = pe.fold_pure
         self.assertEqual(f('bit32.band', [205, 7]), [5])
         self.assertEqual(f('string.byte', ['AB', 1, None]), [65])
-        self.assertEqual(f('string.packsize', ['>>H= >H  c243 =']), [247])
+        self.assertEqual(f('string.packsize', ['= >H<H  c100 >']), [104])
         self.assertEqual(f('string.packsize', ['c']), None)
         self.assertEqual(f('math.round', [2.5]), [3])
         self.assertEqual(f('math.round', [-2.5]), [-3])

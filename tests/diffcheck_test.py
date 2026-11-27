@@ -37,13 +37,13 @@ SAME, DIFFERENT, NOT_COMPARABLE = diffcheck.SAME, diffcheck.DIFFERENT, diffcheck
 # a script that touches most kinds of thing the comparison looks at
 GUI = '''local Players = game:GetService("Players")
 local player = Players.LocalPlayer
-local gui = Instance.new("ScreenGui")
-gui.Name = "Hub"
-gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
-local frame = Instance.new("Frame", gui)
+local hubGui = Instance.new("ScreenGui")
+hubGui.Name = "Hub"
+hubGui.ResetOnSpawn = false
+hubGui.Parent = player:WaitForChild("PlayerGui")
+local frame = Instance.new("Frame", hubGui)
 frame.Size = UDim2.new(0, 200, 0, 100)
-frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.BackgroundColor3 = Color3.fromRGB(28, 32, 36)
 local label = Instance.new("TextLabel")
 label.Text = "Loading"
 label.Parent = frame
@@ -57,7 +57,7 @@ print("first")
 print("second")
 getgenv().HubLoaded = true
 _G.Counter = (_G.Counter or 0) + 1
-shared.cfg = { speed = 16 }
+shared.cfg = { speed = 23 }
 MyGlobal = "set"
 for i = 1, 3 do
 	local p = Instance.new("Part")
@@ -69,7 +69,7 @@ conn:Disconnect()
 setclipboard("copied")
 player:Kick("bye")
 task.wait()
-print("done")
+print("run over")
 '''
 
 # what Luraph's start-up looks like from outside: probes on its own objects, error probes, the scheduler
@@ -136,7 +136,7 @@ class Plain(Base):
         self.assertEqual(v.data['matched'], 39)
 
     def test_changed_argument(self):
-        self.expect(DIFFERENT, GUI, mutate(GUI, 'Color3.fromRGB(30, 30, 30)', 'Color3.fromRGB(30, 31, 30)'), r'Color3\.fromRGB\(30, 31, 30\)')
+        self.expect(DIFFERENT, GUI, mutate(GUI, 'Color3.fromRGB(28, 32, 36)', 'Color3.fromRGB(28, 33, 36)'), r'Color3\.fromRGB\(28, 33, 36\)')
         self.expect(DIFFERENT, GUI, mutate(GUI, 'player:Kick("bye")', 'player:Kick("Bye")'), r'Kick')
         self.expect(DIFFERENT, GUI, mutate(GUI, '{ 2, 3 }', '{ 2, 4 }'), r'b=\{2, 4\}')
         self.expect(DIFFERENT, GUI, mutate(GUI, 'task.wait(0.5)', 'task.wait(0.25)'))
@@ -146,7 +146,7 @@ class Plain(Base):
         self.expect(DIFFERENT, GUI, mutate(GUI, 'conn:Disconnect()\n', ''))
         # the first call, the last call
         self.expect(DIFFERENT, GUI, mutate(GUI, 'game:GetService("Players")', 'game.Players'))
-        self.expect(DIFFERENT, GUI, mutate(GUI, 'print("done")\n', ''), r'the result returns, the original goes on')
+        self.expect(DIFFERENT, GUI, mutate(GUI, 'print("run over")\n', ''), r'the result returns, the original goes on')
 
     def test_added_call(self):
         self.expect(DIFFERENT, GUI, GUI + 'print("more")\n', r'the original returns, the result goes on')
@@ -156,13 +156,13 @@ class Plain(Base):
         self.expect(DIFFERENT, GUI, mutate(GUI, 'conn:Disconnect()\nsetclipboard("copied")', 'setclipboard("copied")\nconn:Disconnect()'))
 
     def test_changed_print_text(self):
-        v = self.expect(DIFFERENT, GUI, mutate(GUI, 'print("done")', 'print("Done")'), r'print\("Done"\)')
-        self.assertIn('print("done")', v.text())
+        v = self.expect(DIFFERENT, GUI, mutate(GUI, 'print("run over")', 'print("Run over")'), r'print\("Run over"\)')
+        self.assertIn('print("run over")', v.text())
 
     def test_changed_property_write(self):
-        self.expect(DIFFERENT, GUI, mutate(GUI, 'gui.ResetOnSpawn = false', 'gui.ResetOnSpawn = true'), r'ResetOnSpawn = true')
-        self.expect(DIFFERENT, GUI, mutate(GUI, 'p.Parent = workspace', 'p.Parent = gui'))
-        self.expect(DIFFERENT, GUI, mutate(GUI, 'label.Parent = frame', 'label.Parent = gui'))
+        self.expect(DIFFERENT, GUI, mutate(GUI, 'hubGui.ResetOnSpawn = false', 'hubGui.ResetOnSpawn = true'), r'ResetOnSpawn = true')
+        self.expect(DIFFERENT, GUI, mutate(GUI, 'p.Parent = workspace', 'p.Parent = hubGui'))
+        self.expect(DIFFERENT, GUI, mutate(GUI, 'label.Parent = frame', 'label.Parent = hubGui'))
 
     def test_the_executor_function_that_is_called(self):
         a = 'queue_on_teleport("x")\nsetfpscap(60)\nfireclickdetector(workspace)\n'
@@ -177,7 +177,7 @@ class Plain(Base):
     def test_changed_global(self):
         self.expect(DIFFERENT, GUI, mutate(GUI, 'getgenv().HubLoaded = true', 'getgenv().HubLoaded = false'), r'globals left behind differ')
         self.expect(DIFFERENT, GUI, mutate(GUI, 'MyGlobal = "set"', 'local MyGlobal = "set"'), r'globals left behind differ')
-        self.expect(DIFFERENT, GUI, mutate(GUI, 'speed = 16', 'speed = 17'), r'globals left behind differ')
+        self.expect(DIFFERENT, GUI, mutate(GUI, 'speed = 23', 'speed = 24'), r'globals left behind differ')
 
     def test_ending(self):
         a = 'print("a")\nerror("boom")\n'
@@ -209,7 +209,7 @@ class Plain(Base):
         self.expect(DIFFERENT, o3, r3, r'an expression that raises is evaluated after calls it preceded')
 
     def test_error_position_inside_a_printed_message(self):
-        a = 'local ok, err = pcall(function() local t = nil return t.Source end)\nwarn("UI Library failed to load: " .. tostring(err))\n'
+        a = 'local ok, err = pcall(function() local t = nil return t.Source end)\nwarn("panel setup failed: " .. tostring(err))\n'
         self.expect(SAME, a, '\n\n-- moved two lines down\n' + a)
         self.expect(DIFFERENT, a, mutate(a, 't.Source', 't.Sources'))
 
@@ -320,7 +320,7 @@ class StartUp(Base):
         self.assertEqual(v.data['matched'], v.data['result_events'])
 
     def test_differences_behind_the_start_up(self):
-        self.expect(DIFFERENT, STARTUP + GUI, mutate(GUI, 'print("done")', 'print("Done")'))
+        self.expect(DIFFERENT, STARTUP + GUI, mutate(GUI, 'print("run over")', 'print("Run over")'))
         self.expect(DIFFERENT, STARTUP + GUI, mutate(GUI, 'label.Text = "Loading"', 'label.Text = "loading"'))
         self.expect(DIFFERENT, STARTUP + GUI, mutate(GUI, 'setclipboard("copied")\n', ''))
 
@@ -485,7 +485,7 @@ class CommandLine(Base):
 
     def test_exit_status_and_json(self):
         import json
-        a, b = self.write(GUI), self.write(mutate(GUI, 'print("done")', 'print("Done")'))
+        a, b = self.write(GUI), self.write(mutate(GUI, 'print("run over")', 'print("Run over")'))
         code, out = self.run_tool(a, a)
         self.assertEqual(code, 0, out)
         self.assertTrue(out.startswith('diffcheck: SAME: '), out)

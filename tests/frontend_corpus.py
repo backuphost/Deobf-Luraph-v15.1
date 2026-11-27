@@ -72,8 +72,8 @@ class Header(unittest.TestCase):
             (HEADER + 'getgenv().key = "abc"\n' + FN_ARGS, ["code-after-header"]),
             (HEADER + '_VERSION = "Luau";\n' + FN_ARGS, ["code-after-header"]),
             ('getgenv().key = "abc";\n' + HEADER + FN_ARGS, ["code-before-header"]),
-            ("-- This file is licensed with Luarmor. Use the loadstring.\n"
-             "if not is_from_loader then warn('Use the loadstring, do not run this directly') return end;\n"
+            ("-- This file is licensed with Luarmor. Use the loader.\n"
+             "if not is_from_loader then warn('run me through the loader please') return end;\n"
              + HEADER + FN_ARGS, ["luarmor-comment", "luarmor-guard"]),
             (FN_ARGS + "\n" + HEADER, ["header-at-end"]),
             (HEADER.replace(" [https://lura.ph/]", "") + FN_ARGS, ["header-no-url"]),
@@ -285,7 +285,7 @@ class Tool(unittest.TestCase):
 
     def test_owner_statements_stay_guard_goes(self):
         text = ("-- This file is licensed with Luarmor.\n"
-                "if not is_from_loader then warn('Use the loadstring') return end;\n"
+                "if not is_from_loader then warn('through the loader') return end;\n"
                 + HEADER + 'getgenv().key = "abc"\n' + FN_ARGS)
         sc = deob.Scan(self.write("guard.lua", text), say=lambda *a, **k: None, allow_run=False)
         try:

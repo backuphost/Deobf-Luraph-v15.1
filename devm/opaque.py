@@ -1099,8 +1099,8 @@ def _fold_call_keys(text):
     literal number for it, the function hands `bit32.bxor(key, C)` back as an extra first result
     and the caller compares that with the number it has to be:
 
-        local v2 = (function(p1, p2) ... return bit32.bxor(p1, 348384287) end)(225884115, "World")
-        if v2 == 431315916 then return end
+        local v4 = (function(p1, p2) ... return bit32.bxor(p2, 271828182) end)("ready", 161803398)
+        if v4 == 429336656 then return end        -- (161803398 ~ 271828182)
 
     Parameter, argument and extra result are removed.  The variable that received the result is
     the number it always is: a test of it is decided, and where the decided test leaves its block
@@ -1285,8 +1285,8 @@ def _fold_type_tests(text):
 def _drop_blind_key_arith(text):
     """Key arithmetic on an interpreter local the lifter has no value for:
 
-        local v36 = nil --[[OPENUPS]] % 4294967296
-        local v37 = bit32.bxor(v36 - v36 % 1, 283475159)
+        local v8 = nil --[[OPENUPS]] % 4294967296
+        local v9 = bit32.bxor(v8 - v8 % 1, 398765431)
 
     The interpreter of these builds mixes a key it keeps in one of its locals into values nothing
     reads.  Where the lifter knows the key the result is a constant and _fold_consts removes it;
