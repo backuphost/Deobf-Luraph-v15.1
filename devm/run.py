@@ -412,6 +412,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             log('[%s] round %d: %d more branch arms of the script did not run; probing %d in all' % (tag, rnd, len(new), len(allpokes)))
             stage.harness_options = base + ['poke=' + pf]
             text = stage.run_traced()
+            # (the run values and the calls handed the register array are those of the last lift, the text's)
+            _keep_runvals(list(getattr(stage, 'hints', ())))
         text = name_vm_object(cleanup.tidy(text))
         if stage.errors:
             # (not every such instruction is in the result: code behind a cut opaque test or
@@ -474,6 +476,8 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
             text = lift_program(stage, data, tag, log, oneline, 'script', replayed=False)
             if route == 'a' or not stage.errors or not in_place or single or not unknown_keyfns(data):
                 return text
+            # (the note on the calls handed the register array is this text's: the second try lifts again)
+            handed_a = [n for n in LAST_RUN['notes'] if n.startswith('[runvals-handed] ')]
             # The lift has errors, and the dump holds key functions the harness could not
             # evaluate.  Builds whose init decrypts the script data with a key it derives (Luraph
             # v14.8) patch their own operands with values of those functions; the second-stage
@@ -496,13 +500,14 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
                         if b_errs < a_errs and b_nodes >= a_nodes:
                             log('[%s] result of the second-stage route kept: %d instructions with %d lift errors, against %d with %d '
                                 'from the state at the hand-over' % (tag, b_nodes, b_errs, a_nodes, a_errs))
-                            LAST_RUN['notes'] = [n for n in LAST_RUN['notes'] if n.startswith('[http]')]
+                            LAST_RUN['notes'] = [n for n in LAST_RUN['notes'] if n.startswith(('[http]', '[runvals-handed] '))]
                             return text2
                         log('[%s] result from the state at the hand-over kept (%d instructions, %d lift errors; second-stage '
                             'route: %d, %d)' % (tag, a_nodes, a_errs, b_nodes, b_errs))
             except (Exception, TimeLimit) as e:      # whatever goes wrong in the second try, the first result stands
                 log('[%s] second-stage route not usable (%s): result from the state at the hand-over kept' % (
                     tag, (type(e).__name__ + ' ' + str(e)).strip().split('\n')[0][:160]))
+            _keep_handed(handed_a)
             return text
         if any(n.startswith('[dumpnew]') for n in stage.run_notes):
             # the init did hand over; what did not get done is the dump of the state (every lazy
@@ -606,6 +611,26 @@ def hidden_head(errors, oracle, text):
     return '-- LIFT ERROR: %s.  Their lift errors: %s' % (what, '; '.join(texts[:12])), cold
 
 
+def _keep_handed(notes):
+    """put the note on the calls handed the register array of the text that is the result (runvals.handed_note; a
+    list with the note, or None, or empty) in place of any earlier one in LAST_RUN"""
+    _keep_runvals([n for n in notes if n], ('[runvals-handed] ',))
+
+
+def _keep_runvals(hints, kinds=('[runvals',)):
+    """replace the run notes of `kinds` in LAST_RUN by those of `hints` (the ones of the lift whose text is the
+    result), where the first of them stood (else at the end)"""
+    new = [h for h in hints if h.startswith(kinds)]
+    notes = LAST_RUN['notes']
+    old = [i for i, n in enumerate(notes) if n.startswith(kinds)]
+    if [notes[i] for i in old] == new:
+        return
+    at = old[0] if old else len(notes)
+    rest = [n for i, n in enumerate(notes) if i not in set(old)]
+    at -= sum(1 for i in old if i < at)
+    LAST_RUN['notes'] = rest[:at] + new + rest[at:]
+
+
 def lift_program(stage, data, tag, log, oneline, what, replayed=True):
     """Lift and decompile the program a dump was taken at the start of (proto-table layout):
     the dump of the native bootstrap replay, or the one taken when the VM's own init handed over.
@@ -654,6 +679,9 @@ def lift_program(stage, data, tag, log, oneline, what, replayed=True):
     for kind, c in sorted(kinds.items(), key=lambda kv: -kv[1])[:15]:
         log('    lift errors by kind: %4d x %s' % (c, kind))
     stage.protos, stage.errors = protos, errs
+    # (no run values here, but a call handed its caller's register array leaves the result PARTIAL all the same:
+    # the note of this lift replaces that of an earlier one, see _keep_handed)
+    _keep_handed([runvals.handed_note(protos)])
     ircfg.UNFLATTEN = not oneline
     try:
         text, stats = decompile(stage, L, protos)
@@ -840,6 +868,8 @@ PARSE_PREFIX = '  the text does not parse: '
 RUNVALS_LINE = '  values not shown: '
 # ... and values shown whose proof could not be completed: assumed, said at each value (PARTIAL)
 RUNVALS_ASSUMED_LINE = '  values assumed: '
+# runvals.handed_note: calls handed their caller's register array, whatever was shown after them (PARTIAL)
+RUNVALS_HANDED_LINE = '  variables handed to calls: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
 
 
@@ -943,6 +973,8 @@ def run_report(notes):
             out.append(RUNVALS_LINE + n[len('[runvals-missing] '):])
         elif n.startswith('[runvals-assumed] '):
             out.append(RUNVALS_ASSUMED_LINE + n[len('[runvals-assumed] '):])
+        elif n.startswith('[runvals-handed] '):
+            out.append(RUNVALS_HANDED_LINE + n[len('[runvals-handed] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
     said = [n for n in notes if n.startswith('[script]')]
     for n in said[:12]:
@@ -966,6 +998,21 @@ KEY_MIX = re.compile(r'(?m)^.*\b(v\d+) - \1 % 1\b.*$')
 # the head line deobfuscate / lift_program put in front of a text whose lift errors are not all
 # marked in it (not a marker itself)
 HIDDEN_HEAD = re.compile(r'^-- LIFT ERROR: (up to )?(\d+) instruction\(s\) (that the traced run executed )?did not lift and')
+
+
+# the register array of the calling code where it is printed as a value (structure.Expr prints ('regs',) as
+# `({})`; a new table is printed `{}`, and `({})` only as the table of an index, a field or a method)
+REGS_VALUE = re.compile(r'(?<![\w)\]}])\(\{\}\)(?![\[.:])')
+
+
+_NOT_CODE = re.compile(r'--\[(=*)\[.*?(?:\]\1\]|\Z)|--[^\n]*|"(?:\\.|[^"\\\n])*(?:"|$)|\'(?:\\.|[^\'\\\n])*(?:\'|$)'
+                       r'|\[(=*)\[.*?(?:\]\2\]|\Z)', re.S | re.M)
+
+
+def _code_only(text):
+    """text with its comments left out and each of its strings written `""` (in source order: a quote inside
+    a comment, or `--` inside a string, is not taken for one)"""
+    return _NOT_CODE.sub(lambda m: '' if m.group(0).startswith('--') else '""', text)
 
 
 def report(text, returned=None, notes=None, parse=None):
@@ -994,6 +1041,8 @@ def report(text, returned=None, notes=None, parse=None):
                 head_notes.append('[runvals-missing] ' + lines[0][len('--   ' + RUNVALS_LINE):])
             elif lines[0].startswith('--   ' + RUNVALS_ASSUMED_LINE):
                 head_notes.append('[runvals-assumed] ' + lines[0][len('--   ' + RUNVALS_ASSUMED_LINE):])
+            elif lines[0].startswith('--   ' + RUNVALS_HANDED_LINE):
+                head_notes.append('[runvals-handed] ' + lines[0][len('--   ' + RUNVALS_HANDED_LINE):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
@@ -1013,6 +1062,8 @@ def report(text, returned=None, notes=None, parse=None):
     unshown = [n[len('[runvals-missing] '):] for n in notes if n.startswith('[runvals-missing] ')]
     # ... and values shown whose proof could not be completed (runvals.ASSUMED, at each of them)
     assumed = [n for n in notes if n.startswith('[runvals-assumed] ')]
+    # ... and calls handed their caller's register array (runvals.handed_note: the calls the lift found)
+    handed = [n for n in notes if n.startswith('[runvals-handed] ')]
     unparsed = parse is not None and parse[0] is False
     # instructions without a marker, said in a head line of the text (not one more marker)
     hidden = [HIDDEN_HEAD.match(ln) for ln in lines[:2]]
@@ -1033,6 +1084,13 @@ def report(text, returned=None, notes=None, parse=None):
     marks = code.count('nil --[[%s]]' % runvals.MARK)
     # (every such comment begins with runvals.ASSUMED_HEAD and says what could not be checked)
     amarks = code.count('--[[%s' % runvals.ASSUMED_HEAD)
+    # ... and the values of the run whose proof was completed (runvals.PROVED)
+    pmarks = code.count('--[[%s]]' % runvals.PROVED)
+    # the register array of the calling code, printed `({})` as a value (an argument, a variable's value: not as
+    # the table of an index or a method, `({})[k]`, which is also how a new table nothing keeps is printed), outside
+    # strings and comments: a call handed it can change any of the caller's variables (whether or not runvals ran or
+    # found the call: runvals.handed_note counts the calls themselves)
+    regsvals = len(REGS_VALUE.findall(_code_only(code))) if '({})' in code else 0
     # (... in the text, or named by the notes on such values)
     akinds = sorted(set(re.findall(r'--\[\[(%s[^\]]*)\]\]' % re.escape(runvals.ASSUMED_HEAD), '\n'.join([code] + assumed))))
     holes = len(re.findall(r'nil --\[\[', code)) - marks
@@ -1064,8 +1122,12 @@ def report(text, returned=None, notes=None, parse=None):
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
             or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry or unshown
-            or marks or assumed or amarks):
+            or marks or assumed or amarks or handed or regsvals):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
+        if pmarks:
+            out.append('  note: %d value(s) in the text are the run\'s after a call of a helper of the build, proved to be '
+                       'what every execution of the call returns: each carries the comment --[[%s]]' % (
+                           pmarks, runvals.PROVED))
         return out + unchecked + traps
     out.append('result: PARTIAL')
     if unparsed:
@@ -1105,6 +1167,17 @@ def report(text, returned=None, notes=None, parse=None):
                    'those calls a variable the call may have set is printed `nil --[[%s]]` (%d in the text), or the text '
                    'keeps the call, and the constants handed to them stay encrypted' % (
                        len(unshown), 's' if len(unshown) > 1 else '', runvals.MARK, marks))
+    if handed or regsvals:
+        m = re.match(r'\[runvals-handed\] (\d+) ', handed[0]) if handed else None
+        out.append('  %s handed the variables of the code that calls them (its register array: printed `({})` %d time(s) '
+                   'in the text, as a value)%s: what they change is shown only as far as the run saw it, so the result is '
+                   'not complete, also where every value they changed is shown' % (
+                       '%s call(s) are' % m.group(1) if m else 'calls are', regsvals,
+                       ' (see the "variables handed to calls" line above)' if handed else ''))
+    if pmarks:
+        out.append('  %d value(s) in the text are the run\'s after a call, proved to be what every execution of the call '
+                   'writes or returns: each carries the comment --[[%s]]%s' % (
+                       pmarks, runvals.PROVED, '; %d more are only assumed (below)' % amarks if amarks else ''))
     if (assumed or amarks) and akinds in ([], [runvals.ASSUMED]):
         out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
                    'the values shown after them are the run\'s, assumed, not proved, to depend only on what the call is '

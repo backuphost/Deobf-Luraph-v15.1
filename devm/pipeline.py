@@ -172,6 +172,12 @@ def _run_traced(self):
     for n in runvals.notes(sites, helper_set, callers):
         self.log('[%s] %s' % (self.tag, n))
         self.hints.append(n)
+    # (a call handed its caller's register array -- one of the sites, or any call of the code that may be
+    # handed it -- makes the result PARTIAL, however many of its values are shown: run.report)
+    handed = runvals.handed_note(protos, sites)
+    if handed:
+        self.log('[%s] %s' % (self.tag, handed))
+        self.hints.append(handed)
     d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
     d.labels = runvals.labels(sites, helper_set, protos, callers)
     self.text = d.run()

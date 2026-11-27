@@ -15,7 +15,8 @@ would (no text of a protected file is in here).
 * A program hands its register array to a helper (`f(x, R, n)`, printed `f(x, ({}), n)`) that
   decodes a constant into one of the program's registers while the script runs (the probe does the
   decoding, as the run would).  The lifted text used to show the encrypted constant wherever the
-  program read that register; now the decoded value the run saw is put right after the call.  The
+  program read that register; now the decoded value the run saw is put right after the call, with a
+  comment that it is the run's (proved or assumed: no value is put in bare).  The
   helper is labelled as set aside as a helper of the build when the pipeline names it one (the label
   gives the evidence: another interpreter, its first caller), and the report has a
   note line.  The same for a helper whose result the program keeps in a register
@@ -38,6 +39,14 @@ would (no text of a protected file is in here).
   record covers the call; a field the library does not have is not the library's; `tostring`,
   calling code that did not all lift, another call only assumed, and a variable shared with a
   function that did not all lift make a value assumed, said in the comment at it (WhatTheCodeShows).
+* A call handed the caller's register array leaves the text PARTIAL however much is proved (the run note
+  on such calls and the printed `({})`, each alone, also without the run values); every value put in
+  carries a comment, and is the run's value right after the call; a register the run saw the call change
+  (`w`) is marked where nothing proves its value, also where the code does not resolve the function or
+  the register number, and after each of two such calls; a function of the interpreter's environment
+  that is no standard one is no constant, `tostring` handed to the helper makes the value assumed; a
+  shared register the call names is marked although another function assigns that variable;
+  `rawget` on a library table, and `table.foreach` (CallersVariables).
 """
 import json
 import os
@@ -89,6 +98,8 @@ elseif op == 26 then
 R[A[pc]](R[B[pc]], R[C[pc]], B[pc])
 """
 ENC, PLAIN = 'olleh', 'hello'       # what the program holds, and what the helper makes of it
+# the decoded value as the text shows it: never bare, with the comment that it is the run's (runvals.PROVED)
+SHOWN = '"%s" --[[%s]]' % (PLAIN, runvals.PROVED)
 
 
 def helper_into_regs():
@@ -297,7 +308,7 @@ class HelperIntoRegisters(unittest.TestCase):
         self.assertIn('"%s"' % ENC, text)
         self.assertIn('"%s"' % PLAIN, text)
         self.assertLess(text.index('"%s"' % ENC), text.index('"%s"' % PLAIN))
-        self.assertRegex(text, r'print\((?:"%s"|\w+) \.\. " world"\)' % PLAIN)
+        self.assertIn('print(%s .. " world")' % SHOWN, text)
         self.assertNotRegex(text, r'local (\w+) = "%s"\n(?:.*\n)*.*print\(\1 \.\. " world"\)' % ENC)
         # the helper is labelled as the build's, not the script's code
         self.assertIn('-- program %d: set aside as a helper of the build (on another interpreter than the program taken for '
@@ -306,12 +317,17 @@ class HelperIntoRegisters(unittest.TestCase):
         self.assertEqual(len(notes), 1, notes)
         self.assertTrue(notes[0].startswith('[runvals] 1 call(s) of program %d, set aside as a helper of the build' % self.m.helper),
                         notes)
-        self.assertIn('the text shows the values they wrote as the run saw them (1 value(s))', notes[0])
+        self.assertIn('the text shows the values they wrote as the run saw them (1 value(s), each with a comment: 1 '
+                      'proved, --[[%s]], 0 assumed)' % runvals.PROVED, notes[0])
         lines = run.run_report(notes)
         self.assertTrue(any(ln.startswith('  note: 1 call(s) of program %d, set aside as a helper of the build' % self.m.helper)
                             for ln in lines), lines)
+        # every value proved, and still not complete: what a call handed the register array changes is shown only as
+        # far as the run saw it (CallersVariables)
         report = run.report(text, notes=notes)
-        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertTrue(any('so the result is not complete, also where every value they changed is shown' in ln
+                            for ln in report), report)
 
     def test_printed_program_does_what_the_run_did(self):
         # the printed text, run with the helper's decoding, prints what the probe's run printed
@@ -394,7 +410,7 @@ class RegisterArrayFromARegister(unittest.TestCase):
     def test_handed_over_from_a_register(self):
         m, sites, text = self.show('regs')
         self.assertEqual([(s.kind, s.shown) for s in sites], [('regs', {2: PLAIN})])
-        self.assertRegex(text, r'print\((?:"%s"|\w+) \.\. " world"\)' % PLAIN)
+        self.assertIn('print(%s .. " world")' % SHOWN, text)
 
     def test_another_table_in_that_register(self):
         # R6 holds some other table at the call: not the register array, not a site
@@ -421,7 +437,11 @@ class HelperResult(unittest.TestCase):
         sites, notes, text = self.show(range(1, 9))
         self.assertEqual([(s.kind, s.shown) for s in sites], [('result', {1: PLAIN})])
         self.assertIn('"%s"' % PLAIN, text)
-        self.assertRegex(text, r'print\((?:"%s"|\w+) \.\. " world"\)' % PLAIN)
+        self.assertIn('print(%s .. " world")' % SHOWN, text)
+        # (no register array is handed here: a proved result alone leaves the text complete, said in a note)
+        report = run.report(text, notes=notes)
+        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertTrue(any(ln.startswith('  note: 1 value(s) in the text are the run\'s') for ln in report), report)
         # the call stays (as a statement), handed the encrypted constant
         self.assertRegex(text, r'(?m)^\s*(?:\w+|\(function\(\w+\)(?:.|\n)*?end\))\("%s"\)$' % ENC)
         self.assertIn('-- program %d: set aside as a helper of the build' % self.m.helper, text)
@@ -513,6 +533,8 @@ def show(main, helper, oracle, helpers):
 
 
 MARKED = 'nil --[[%s]]' % runvals.MARK
+# a variable a function shares, set to MARK right after the call that names it and printed so
+SHARED_MARKED_AFTER_CALL = r'\((\w+), \(\{\}\), 2\)\n\1 = %s\nreturn print\(\1 \.\. " world"\)' % re.escape(MARKED)
 ROUNDS = [1] + [2, 3, 4, 5, 6, 7, 8, 9] * 3 + [10]
 ROUNDS_NO_RESET = [1] + [2, 3, 4, 5, 6, 7, 8] * 3 + [9]
 
@@ -535,7 +557,7 @@ class EveryRegisterProved(unittest.TestCase):
         self.assertEqual(report[0], 'result: PARTIAL', report)
         self.assertNotIn('"x")', text)
         self.assertEqual([n.split(' ')[0] for n in notes], ['[runvals]', '[runvals-missing]'], notes)
-        self.assertIn('print("%s" .. %s)' % (PLAIN, MARKED), text)
+        self.assertIn('print(%s .. %s)' % (SHOWN, MARKED), text)
         self.assertTrue(any('values not shown' in ln and '(1 in the text)' in ln for ln in report), report)
         rec = own(oracle, 4)[(4, 0, 4)]
         self.assertEqual((rec['h'], rec['n'], rec['w']), (3, 3, {2, 9}))
@@ -562,7 +584,7 @@ class EveryRegisterProved(unittest.TestCase):
         oracle = loop_oracle(effects, ROUNDS_NO_RESET, self.WORK, vm=True)
         m, sites, notes, text, report = show(LOOP_TWO_NO_RESET, helper_into_regs(), oracle, True)
         self.assertEqual(report[0], 'result: PARTIAL', report)
-        self.assertIn('print("%s" .. %s)' % (PLAIN, MARKED), text)
+        self.assertIn('print(%s .. %s)' % (SHOWN, MARKED), text)
         self.assertEqual([(s.shown, s.unproved) for s in sites], [({2: PLAIN}, {9})])
 
 
@@ -597,9 +619,11 @@ class RegisterTheCallNames(unittest.TestCase):
         effects = dict(HelperIntoRegisters_EFFECTS)
         oracle = loop_oracle(effects, range(1, 9), 'R[n] = string.reverse(s); R[5] = {}', vm=True)
         m, sites, notes, text, report = show(MAIN_REGS, helper_into_regs(), oracle, True)
-        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertNotIn(MARKED, text)
         self.assertEqual([(s.shown, s.unproved) for s in sites], [({2: PLAIN}, set())])
         self.assertEqual(own(oracle, 4)[(4, 0, 3)]['w'], {2, 5})
+        # (PARTIAL all the same: the call is handed the register array)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
 
 
 # MAIN_REGS run once, as the probes of HelperIntoRegisters do it
@@ -628,11 +652,12 @@ class InputsAtRunTime(unittest.TestCase):
         self.assertEqual([(s.shown, s.unproved, s.ran, s.fixed) for s in sites], [({}, {2}, True, False)])
 
     def test_constant_input_is_shown(self):
-        # (the same probe with the constant: shown, complete)
+        # (the same probe with the constant: shown, proved; PARTIAL only because the call is handed the register array)
         oracle = loop_oracle(HelperIntoRegisters_EFFECTS, range(1, 9), 'R[n] = string.reverse(s)', vm=True)
         m, sites, notes, text, report = show(MAIN_REGS, helper_into_regs(), oracle, True)
-        self.assertEqual(report[0][:15], 'result: complet', report)
-        self.assertEqual([(s.shown, s.fixed) for s in sites], [({2: PLAIN}, True)])
+        self.assertEqual([(s.shown, s.fixed, s.assumed) for s in sites], [({2: PLAIN}, True, False)])
+        self.assertEqual(notes[0].split(' ')[0], '[runvals]')
+        self.assertEqual(report[0], 'result: PARTIAL', report)
 
     def test_result_kept(self):
         text = PROBE % {'decode': SAME, 'enc': ENC, 'call': CALL_RESULT, 'src': 1, 'order': ', '.join(map(str, range(1, 9)))}
@@ -695,10 +720,11 @@ R[A[pc]] = {}
 """
 
 
-def mini_more():
+def shared_handlers():
+    """37, 39 and 40 (above), written for the VM's upvalue cells"""
     m0 = Mini(HANDLERS, prologue='for i = 1, NP do R[i] = args[i] end', outer=PACKER)
     cells, base = m0.model.cells, m0.model.up_base
-    shared = """elseif op == 37 then
+    return """elseif op == 37 then
 R[A[pc]] = wrap(B[pc], {[%d] = {[%d] = R, [%d] = C[pc]}})
 elseif op == 39 then
 local c = U[%d + B[pc]]
@@ -707,7 +733,10 @@ elseif op == 40 then
 local c = U[%d + B[pc]]
 R[A[pc]] = c[%d][c[%d]]
 """ % (base, cells[0], cells[1], base, cells[0], cells[1], base, cells[0], cells[1])
-    return Mini(HANDLERS + MORE + shared, prologue='for i = 1, NP do R[i] = args[i] end', outer=PACKER)
+
+
+def mini_more():
+    return Mini(HANDLERS + MORE + shared_handlers(), prologue='for i = 1, NP do R[i] = args[i] end', outer=PACKER)
 
 
 def show_more(main, oracle, helpers=True):
@@ -796,16 +825,16 @@ class ProofOfTheCall(unittest.TestCase):
         self.unproved(main, eff, 'R[n] = string.reverse(s) .. ' + RUN_TIME, 'an upvalue')
 
     def test_helper_captures_a_constant(self):
-        # (control) the same with a constant in the shared variable: proved, shown, complete
+        # (control) the same with a constant in the shared variable: proved, shown (PARTIAL: handed the register array)
         main = [(1, 7, 'k', 0), (37, 1, helper_into_regs(), 7), (1, 2, ENC, 0), (20, 1, 2, 2), (3, 3, 'print', 0),
                 (1, 5, ' world', 0), (21, 4, 2, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
         eff = effects('regs[7] = "k"', 'regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)',
                       'regs[3] = print', 'regs[5] = " world"', 'regs[4] = regs[2] .. regs[5]', 'regs[3] = nil')
         oracle = loop_oracle(eff, range(1, 10), REVERSE, vm=True)
         m, sites, notes, text, report = show_more(main, oracle)
-        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
         self.assertEqual([(s.shown, s.fixed, s.assumed) for s in sites], [({2: PLAIN}, True, False)])
-        self.assertIn('print("%s" .. " world")' % PLAIN, text)
+        self.assertIn('print(%s .. " world")' % SHOWN, text)
 
     def test_helper_with_a_lift_error(self):
         # no rule fails, but the helper's code did not all lift: the run's value is shown, said to be assumed at
@@ -913,7 +942,8 @@ class WhichRecordCovers(unittest.TestCase):
 
     def test_two_calls_handed_the_register_array(self):
         # one instruction hands the register array to two calls (into R2, then R3): each call is a site, and after
-        # each the register it names is not shown
+        # each the register it names is not shown, nor one the run saw either of them change (w = {2}: which call
+        # changed it is not known; R3 ends as it began, the second call decodes the first one's result back)
         main = [(8, 1, helper_into_regs(), 0), (1, 2, ENC, 0), (1, 3, ENC, 0), (32, 1, 2, 2), (3, 4, 'print', 0),
                 (21, 5, 2, 3), (5, 4, 0, 0), (2, 4, 0, 0)]
         eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[3] = "%s"' % ENC,
@@ -922,10 +952,11 @@ class WhichRecordCovers(unittest.TestCase):
         oracle = loop_oracle(eff, range(1, 9), REVERSE, vm=True)
         m, sites, notes, text, report = show_more(main, oracle)
         self.assertEqual(report[0], 'result: PARTIAL', report)
-        self.assertEqual([(s.ran, s.marked) for s in sites], [(False, {2}), (False, {3})])
+        self.assertEqual(own(oracle, 4)[(4, 0, 4)]['w'], {2})
+        self.assertEqual([(s.ran, s.marked) for s in sites], [(False, {2}), (False, {2, 3})])
         self.assertNotIn('"%s"' % ENC, text.split('print(')[-1])
-        # (the second call is handed R2 as the first call left it: not shown either)
-        self.assertRegex(text, r'local (\w+) = %s\n(?:.*\n)*.*print\(\1 \.\. %s\)' % (re.escape(MARKED), re.escape(MARKED)))
+        # (the second call is handed R2 as the first call left it: not shown either; after it neither register is)
+        self.assertIn('(%s, ({}), 3)\nreturn print(%s .. %s)' % (MARKED, MARKED, MARKED), text)
 
 
 @unittest.skipUnless(have_luau(), 'needs bin/luau')
@@ -948,18 +979,32 @@ class SharedOrReadAgain(unittest.TestCase):
         self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, {2})])
 
     def test_changed_through_the_function_that_shares_it(self):
-        # (control) the function called shares R2 and assigns it through its upvalue: its text shows the change,
-        # and nothing is marked
+        # (control) the function called shares R2 and assigns it through its upvalue, and the call does not name R2 (it
+        # writes R9, which nothing reads): its text shows the change, and nothing is marked
+        main = [(1, 2, ENC, 0), (37, 1, helper_sets_its_upvalue(), 2), (20, 1, 2, 9), (3, 3, 'print', 0),
+                (1, 5, ' world', 0), (21, 4, 2, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+        eff = effects('regs[2] = "%s"' % ENC, 'regs[1] = helper', 'regs[1](regs[2], regs, 9)', 'regs[3] = print',
+                      'regs[5] = " world"', 'regs[4] = regs[2] .. regs[5]', 'regs[3] = nil')
+        oracle = loop_oracle(eff, range(1, 9), 'R[n] = string.reverse(s); R[2] = R[n]', vm=True)
+        self.assertEqual(own(oracle, 4)[(4, 0, 3)]['w'], {2, 9})
+        m, sites, notes, text, report = show_more(main, oracle)
+        self.assertNotIn(MARKED, text)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, set())])
+        self.assertEqual(notes, [])
+        self.assertRegex(text, r'\w+ = p1:reverse\(\)')
+
+    def test_named_and_changed_through_the_function_that_shares_it(self):
+        # the same call naming R2: it also writes R2 through the register array, which the text does not show (what it
+        # writes there need not be what it assigns through the upvalue): marked
         main = [(1, 2, ENC, 0), (37, 1, helper_sets_its_upvalue(), 2), (20, 1, 2, 2), (3, 3, 'print', 0),
                 (1, 5, ' world', 0), (21, 4, 2, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
         eff = effects('regs[2] = "%s"' % ENC, 'regs[1] = helper', 'regs[1](regs[2], regs, 2)', 'regs[3] = print',
                       'regs[5] = " world"', 'regs[4] = regs[2] .. regs[5]', 'regs[3] = nil')
         oracle = loop_oracle(eff, range(1, 9), REVERSE, vm=True)
         m, sites, notes, text, report = show_more(main, oracle)
-        self.assertNotIn(MARKED, text)
-        self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, set())])
-        self.assertEqual(notes, [])
-        self.assertRegex(text, r'\w+ = p1:reverse\(\)')
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, {2})])
+        self.assertRegex(text, SHARED_MARKED_AFTER_CALL)
 
     def test_read_again_in_the_same_instruction(self):
         # (N7) `R[A](R[B], R, 9); R[9] = R[9] .. "z"`: the next instruction saw what the instruction made of R9,
@@ -985,9 +1030,10 @@ class SharedOrReadAgain(unittest.TestCase):
                       'regs[3] = nil')
         oracle = loop_oracle(eff, range(1, 9), REVERSE, vm=True)
         m, sites, notes, text, report = show_more(main, oracle)
-        self.assertEqual(report[0][:15], 'result: complet', report)
         self.assertNotIn(MARKED, text)
         self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, set())])
+        self.assertEqual(notes, [])
+        self.assertEqual(report[0], 'result: PARTIAL', report)      # (handed the register array)
 
 
 def helper_reverse_plus_up():
@@ -1149,14 +1195,15 @@ class WhatTheCodeShows(unittest.TestCase):
 
 
     def test_captured_function_that_returns_a_constant(self):
-        # (control, P1c) the helper calls a function it shares, which returns a constant: proved, shown, complete
+        # (control, P1c) the helper calls a function it shares, which returns a constant: proved, shown with the comment
+        # that says so, PARTIAL only because the call is handed the register array
         g = proto([(1, 1, 'k', 0), (2, 1, 0, 0)])
         main = [(8, 6, g, 0), (37, 1, helper_calls_up(), 6), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
         eff = effects('regs[6] = function() end', 'regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)',
                       *PRINT_R2_RUN)
         m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. "k"', helpers=False)
-        self.assertEqual(report[0][:15], 'result: complet', report)
-        self.assertIn('print("hellok" .. " world")', text)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertIn('print("hellok" --[[%s]] .. " world")' % runvals.PROVED, text)
         self.assertEqual([(s.fixed, s.assumed) for s in sites], [(True, False)])
 
     def test_tostring_is_an_assumption(self):
@@ -1221,6 +1268,304 @@ class WhatTheCodeShows(unittest.TestCase):
         self.assertIn('did not all lift, so whether it changes that variable is not known', site.why)
 
 
+# More handlers for the programs below (with MORE and the shared-variable handlers of mini_more):
+# 47: R[A] = os.clock                       -- a function of the interpreter's environment that is no standard one
+# 48: R[A](R[B], R, C, R[A + 1])            -- a fourth argument from a register
+# 49: R[A] = tostring
+# 50: R[A] = R[B]
+# 51: R[A](R[B], R, R[C]); R[A](R[B], R, R[C] + 1)   -- two calls handed the array, register numbers read at run time
+# 52: R[A] = R[A](R[A + 1], R[A + 2])
+# 53: if R[C] then R[A](R[B], R, 2) end     -- a call handed the array in an arm of the instruction's branch
+SEVEN = """elseif op == 47 then
+R[A[pc]] = os.clock
+elseif op == 48 then
+R[A[pc]](R[B[pc]], R, C[pc], R[A[pc] + 1])
+elseif op == 49 then
+R[A[pc]] = tostring
+elseif op == 50 then
+R[A[pc]] = R[B[pc]]
+elseif op == 51 then
+R[A[pc]](R[B[pc]], R, R[C[pc]])
+R[A[pc]](R[B[pc]], R, R[C[pc]] + 1)
+elseif op == 52 then
+R[A[pc]] = R[A[pc]](R[A[pc] + 1], R[A[pc] + 2])
+elseif op == 53 then
+if R[C[pc]] then R[A[pc]](R[B[pc]], R, 2) end
+"""
+
+
+def mini_seven():
+    return Mini(HANDLERS + MORE + SEVEN + shared_handlers(), prologue='for i = 1, NP do R[i] = args[i] end', outer=PACKER)
+
+
+def show_seven(main, oracle, helpers=True):
+    m = mini_seven()
+    m.lift(proto(main))
+    m.root = m.lifter.root_key
+    m.helper = min((k for k in m.protos if k != m.root), default=None)
+    hs = {m.helper} if helpers and m.helper is not None else set()
+    sites = runvals.show_run_values(m.protos, own(oracle, m.root), hs)
+    notes = runvals.notes(sites, hs)
+    handed = runvals.handed_note(m.protos, sites)
+    notes += [handed] if handed else []
+    text = text_of(m, runvals.labels(sites, hs, m.protos))
+    return m, sites, notes, text, run.report(text, notes=notes)
+
+
+def helper_calls_arg4():
+    """function(s, R, n, f) R[n] = s:reverse() .. f() end"""
+    return proto([(23, 5, 1, 0), (50, 6, 4, 0), (45, 6, 0, 0), (21, 5, 5, 6), (22, 2, 3, 5), (2, 1, 0, 0)], nparams=4)
+
+
+def helper_rawget_of_the_library():
+    """function(s, R, n) R[n] = s:reverse() .. rawget(string, "n") end  (string.n, past the check of the members)"""
+    return proto([(23, 4, 1, 0), (3, 5, 'rawget', 0), (3, 6, 'string', 0), (1, 7, 'n', 0), (52, 5, 0, 0), (21, 4, 4, 5),
+                  (22, 2, 3, 4), (2, 1, 0, 0)], nparams=3)
+
+
+def helper_uses_table_foreach():
+    """function(s, R, n) local t = table; t.foreach({}, type); R[n] = s:reverse() end  (keys in `next` order)"""
+    return proto([(23, 4, 1, 0), (3, 6, 'table', 0), (41, 5, 6, 'foreach'), (46, 6, 0, 0), (3, 7, 'type', 0),
+                  (52, 5, 0, 0), (22, 2, 3, 4), (2, 1, 0, 0)], nparams=3)
+
+
+# Q1: a loop over a different encrypted constant every round, decoded by a VM function read from a global into a
+# register whose number is read at run time: R2 holds no one value before the call nor after it, the call names no
+# register, and only the run's record of the call (w = {2}, every visit seen) says it changed R2
+LOOP_RUN_TIME = [(3, 1, 'decode', 0), (3, 7, 'idx', 0), (3, 2, 'src', 0), (43, 1, 2, 7), (3, 3, 'print', 0),
+                 (1, 5, ' world', 0), (21, 4, 2, 5), (5, 3, 0, 0), (3, 6, 'more', 0), (7, 6, 2, 0), (2, 3, 0, 0)]
+LOOP_RUN_TIME_RUN = {1: 'regs[1] = helper', 2: 'regs[7] = 2', 3: 'round = round + 1; regs[2] = "%s" .. round' % ENC,
+                     4: 'regs[1](regs[2], regs, regs[7])', 5: 'regs[3] = print', 6: 'regs[5] = " world"',
+                     7: 'regs[4] = regs[2] .. regs[5]', 8: 'regs[3] = nil', 9: 'regs[6] = round < 3', 10: '', 11: ''}
+LOOP_RUN_TIME_STEPS = [1, 2] + [3, 4, 5, 6, 7, 8, 9, 10] * 3 + [11]
+# print(R5 .. " world"), for the programs that decode R5
+PRINT_R5 = [(3, 3, 'print', 0), (1, 8, ' world', 0), (21, 4, 5, 8), (5, 3, 0, 0), (2, 3, 0, 0)]
+PRINT_R5_RUN = ('regs[3] = print', 'regs[8] = " world"', 'regs[4] = regs[5] .. regs[8]', 'regs[3] = nil')
+
+
+@unittest.skipUnless(have_luau(), 'needs bin/luau')
+class CallersVariables(unittest.TestCase):
+    """A call handed its caller's register array can change any of the caller's variables.  What it changes is shown
+    only as far as the run saw it, so such a text is never complete, however many of the values are shown and
+    proved (the run note runvals.handed_note, and the printed `({})` that run.report counts, each enough alone).
+    Every value the run shows carries a comment that says what it is; a variable the call names or the run saw it
+    change is never printed with its value from before the call; a function of the interpreter's environment that
+    is no standard one is no constant; and a shared variable is exempt only where the change can be the shown
+    assignment of the function called."""
+
+    def run_it(self, main, eff, work, helpers=True, steps=None):
+        oracle = loop_oracle(eff, steps or range(1, len(eff) + 2), work, vm=True)
+        return (oracle,) + show_seven(main, oracle, helpers)
+
+    def test_the_run_saw_the_call_change_it(self):
+        # (the verifier's Q1) not "complete" with the encrypted value printed: R2 is marked after the call
+        oracle, m, sites, notes, text, report = self.run_it(LOOP_RUN_TIME, LOOP_RUN_TIME_RUN, REVERSE, helpers=False,
+                                                            steps=LOOP_RUN_TIME_STEPS)
+        rec = own(oracle, m.root)[(m.root, 0, 4)]
+        self.assertEqual((rec['h'], rec['n'], rec['w']), (3, 3, {2}))
+        self.assertNotIn(2, rec.get('s', {}))
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2}, False)])
+        self.assertRegex(text, r'\(src, \(\{\}\), \w+\)\n\t\w+ = print\(%s \.\. " world"\)' % re.escape(MARKED))
+        self.assertNotIn('print(src .. " world")', text)
+
+    def test_two_calls_the_run_saw_change_it(self):
+        # (Q1b) the same with two calls handed the array in one instruction: R2 is marked after each
+        main = list(LOOP_RUN_TIME)
+        main[3] = (51, 1, 2, 7)
+        eff = dict(LOOP_RUN_TIME_RUN)
+        eff[4] = 'regs[1](regs[2], regs, regs[7]); regs[1](regs[2], regs, regs[7] + 1)'
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=False, steps=LOOP_RUN_TIME_STEPS)
+        self.assertEqual(own(oracle, m.root)[(m.root, 0, 4)]['w'], {2, 3})
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([s.marked for s in sites], [{2}, {2}])
+        self.assertRegex(text, r'\(src, \(\{\}\), \w+\)\n\t\w+\(%s, \(\{\}\), \w+ \+ 1\)\n\t\w+ = print\(%s \.\. '
+                               r'" world"\)' % (re.escape(MARKED), re.escape(MARKED)))
+
+    def test_shared_function_of_the_environment(self):
+        # (Q7) the helper shares a register that holds os.clock and calls it: no constant, so nothing is proved
+        main = [(47, 7, 0, 0), (37, 1, helper_calls_up(), 7), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[7] = os.clock', 'regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)',
+                      *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. tostring(os.clock())')
+        self.assertIn('os.clock', text)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2}, False)])
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+        self.assertNotIn('"hello', text)
+
+    def test_function_of_the_environment_handed_to_the_helper(self):
+        # (Q7b) os.clock handed to the helper as an argument: what it is handed is not constant
+        main = [(8, 1, helper_calls_arg4(), 0), (47, 2, 0, 0), (1, 9, ENC, 0), (48, 1, 9, 9), (3, 3, 'print', 0),
+                (1, 5, ' world', 0), (21, 4, 9, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+        eff = effects('regs[1] = helper', 'regs[2] = os.clock', 'regs[9] = "%s"' % ENC, 'regs[1](regs[9], regs, 9, regs[2])',
+                      'regs[3] = print', 'regs[5] = " world"', 'regs[4] = regs[9] .. regs[5]', 'regs[3] = nil')
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. tostring(os.clock())')
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved, s.fixed, s.why) for s in sites],
+                         [({}, {9}, False, 'what it is handed is not constant')])
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+    def test_tostring_handed_to_the_helper(self):
+        # (Q7d) tostring handed as an argument: the value is the run's, assumed (ASSUMED_LIB at the value), PARTIAL
+        main = [(8, 1, helper_calls_arg4(), 0), (49, 2, 0, 0), (1, 9, ENC, 0), (48, 1, 9, 9), (3, 3, 'print', 0),
+                (1, 5, ' world', 0), (21, 4, 9, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+        eff = effects('regs[1] = helper', 'regs[2] = tostring', 'regs[9] = "%s"' % ENC, 'regs[1](regs[9], regs, 9, regs[2])',
+                      'regs[3] = print', 'regs[5] = " world"', 'regs[4] = regs[9] .. regs[5]', 'regs[3] = nil')
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. tostring({})')
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.fixed, s.assumed, s.comment) for s in sites], [(True, True, runvals.ASSUMED_LIB)])
+        self.assertIn('it is handed tostring', sites[0].why)
+        self.assertRegex(text, r'print\("hellotable: [^"]*" --\[\[%s\]\] \.\. " world"\)' % re.escape(runvals.ASSUMED_LIB))
+
+    def test_named_shared_register_another_function_assigns(self):
+        # (Q10) the helper decodes R5 through the register array (it names it); R5 is shared with X, which assigns it
+        # through its upvalue but is never called: the change is not X's, and R5 is marked
+        main = [(1, 5, ENC, 0), (37, 6, sets_its_upvalue_to_a_global(), 5), (8, 1, helper_into_regs(), 0),
+                (20, 1, 5, 5)] + PRINT_R5
+        eff = effects('regs[5] = "%s"' % ENC, 'regs[6] = function() end', 'regs[1] = helper', 'regs[1](regs[5], regs, 5)',
+                      *PRINT_R5_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=False)
+        self.assertEqual(own(oracle, m.root)[(m.root, 0, 4)]['w'], {5})
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        site = [s for s in sites if s.kind == 'regs'][0]
+        self.assertEqual((site.shown, site.unproved), ({}, {5}))
+        self.assertRegex(text, r'\((\w+), \(\{\}\), 5\)\n\1 = %s\nreturn print\(\1 \.\. " world"\)' % re.escape(MARKED))
+
+    def test_named_register_proved(self):
+        # (Q10b, control) the same without X: proved, shown with the comment that it is the run's, and PARTIAL (the call
+        # is handed the register array)
+        main = [(1, 5, ENC, 0), (1, 6, 0, 0), (8, 1, helper_into_regs(), 0), (20, 1, 5, 5)] + PRINT_R5
+        eff = effects('regs[5] = "%s"' % ENC, 'regs[6] = 0', 'regs[1] = helper', 'regs[1](regs[5], regs, 5)',
+                      *PRINT_R5_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE, helpers=False)
+        self.assertEqual([(s.shown, s.fixed, s.assumed) for s in sites], [({5: PLAIN}, True, False)])
+        self.assertIn('print(%s .. " world")' % SHOWN, text)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+
+    def test_every_value_proved_and_still_partial(self):
+        # the call proved and every value it changed shown: the note on the calls handed the register array, its line in
+        # the report and in the head of a written file, and PARTIAL from that note alone and from the text alone
+        oracle = loop_oracle(HelperIntoRegisters_EFFECTS, range(1, 9), REVERSE, vm=True)
+        m, sites, notes, text, report = show_seven(MAIN_REGS_SEVEN, oracle)
+        self.assertEqual([(s.shown, s.unproved, s.fixed, s.assumed) for s in sites], [({2: PLAIN}, set(), True, False)])
+        handed = [n for n in notes if n.startswith('[runvals-handed] ')]
+        self.assertEqual(len(handed), 1, notes)
+        self.assertTrue(handed[0].startswith('[runvals-handed] 1 call(s) are handed the variables of the code that calls '
+                                             'them'), handed)
+        self.assertIn('shown only as far as the run saw it', handed[0])
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertTrue(any(ln.startswith('  1 call(s) are handed the variables of the code that calls them (its register '
+                                          'array: printed `({})` 1 time(s) in the text') for ln in report), report)
+        self.assertTrue(any('1 value(s) in the text are the run\'s after a call, proved' in ln for ln in report), report)
+        lines = run.run_report(notes)
+        self.assertTrue(any(ln.startswith(run.RUNVALS_HANDED_LINE + '1 call(s)') for ln in lines), lines)
+        head = ['-- case.lua, %s.  How the run went and what this file lacks:' % run.HEAD_MARK]
+        head += ['--   ' + ln for ln in lines + report]
+        self.assertEqual(run.report('\n'.join(head) + '\n' + text)[0], 'result: PARTIAL')
+        # (each alone: the note with a text that shows nothing of it, the text with no notes)
+        self.assertEqual(run.report('print("x")\n', notes=handed)[0], 'result: PARTIAL')
+        self.assertEqual(run.report('\n'.join(head[:1] + ['--   ' + ln for ln in run.run_report(handed)]) +
+                                    '\nprint("x")\n')[0], 'result: PARTIAL')
+        self.assertEqual(run.report(text)[0], 'result: PARTIAL')
+
+    def test_no_run_values_and_no_site(self):
+        # runvals not run at all (the proto-table layout has no traced run), or a call it does not treat as a site (one in
+        # an arm of a branch): the printed register array, and the note on the calls the code hands it, each make the
+        # text PARTIAL
+        m = lift(MAIN_REGS, helper_into_regs())
+        text = text_of(m)
+        self.assertRegex(text, r'\(\w+, \(\{\}\), 2\)')
+        report = run.report(text)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertTrue(any(ln.startswith('  calls are handed the variables of the code that calls them (its register '
+                                          'array: printed `({})` 1 time(s) in the text') for ln in report), report)
+        self.assertEqual(len(runvals.handed(m.protos)), 1)
+        # a call in an arm: no site, but a call the code hands the array
+        main = [(8, 1, helper_into_regs(), 0), (1, 2, ENC, 0), (3, 7, 'flag', 0), (53, 1, 2, 7)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[7] = true',
+                      'if regs[7] then regs[1](regs[2], regs, 2) end', *PRINT_R2_RUN)
+        oracle = loop_oracle(eff, range(1, len(eff) + 2), REVERSE, vm=True)
+        m, sites, notes, text, report = show_seven(main, oracle)
+        self.assertEqual(sites, [])
+        self.assertTrue(notes and notes[-1].startswith('[runvals-handed] 1 call(s)'), notes)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual(run.report('print("x")\n', notes=notes)[0], 'result: PARTIAL')
+
+    def test_every_value_put_in_has_a_comment(self):
+        # whatever the proof found, no value runvals puts in is bare, and each is what the run had in that register at the
+        # next instruction (right after the call, the instruction writing nothing after it)
+        cases = [
+            (MAIN_REGS_SEVEN, HelperIntoRegisters_EFFECTS, REVERSE, None),                  # proved
+            ([(8, 1, helper_with_a_lift_error(), 0)] + MAIN_REGS_SEVEN[1:], HelperIntoRegisters_EFFECTS, REVERSE,
+             runvals.ASSUMED),                                                                # assumed
+            ([(8, 1, helper_tostring_of_a_table(), 0)] + MAIN_REGS_SEVEN[1:], HelperIntoRegisters_EFFECTS,
+             'R[n] = string.reverse(s) .. tostring({})', runvals.ASSUMED_LIB),              # assumed (lib)
+        ]
+        seen = 0
+        for main, eff, work, comment in cases:
+            oracle = loop_oracle(eff, range(1, len(eff) + 2), work, vm=True)
+            m = mini_seven()
+            m.lift(proto(main))
+            m.root = m.lifter.root_key
+            before = {k: n.tree for k, n in m.protos[m.root].nodes.items()}
+            sites = runvals.show_run_values(m.protos, own(oracle, m.root), set())
+            for k, n in m.protos[m.root].nodes.items():
+                for st in n.tree[0]:
+                    if st in before[k][0] or st[0] != 'set':
+                        continue
+                    e = st[2]
+                    self.assertIn(e[0], ('runval', 'opaque'), st)
+                    if e[0] == 'runval':
+                        self.assertEqual(e[2], comment or runvals.PROVED, st)
+                        site = [s for s in sites if s.key == k][0]
+                        rec2 = own(oracle, m.root)[(m.root,) + tuple(next(iter(own(oracle, m.root)[(m.root,) + k]['succ'])))]
+                        self.assertEqual(runvals._values(rec2)[st[1][1]], e[1])
+                        self.assertEqual(site.shown[st[1][1]], e[1])
+                        seen += 1
+            text = text_of(m)
+            for v in {e for s in sites for e in s.shown.values()}:
+                lit = structure.lua_string(v)
+                for at in [i for i in range(len(text)) if text.startswith(lit, i)]:
+                    self.assertTrue(text.startswith(lit + ' --[[', at), (v, text))
+        self.assertEqual(seen, 3)
+        # ... and the same for a helper whose result the program keeps
+        sites, notes, text = HelperResult_show(range(1, 9))
+        self.assertIn('print(%s .. " world")' % SHOWN, text)
+
+    def test_rawget_on_a_library_table(self):
+        # (nit) rawget(string, "n") reads a field the library does not have past the check of its members: not proved
+        main = [(8, 1, helper_rawget_of_the_library(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. '
+                                                                       'tostring(rawget(string, "n"))')
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2}, False)])
+        self.assertIn('rawget or rawset', sites[0].why)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+    def test_table_foreach_is_an_assumption(self):
+        # (nit) table.foreach goes through a table's keys in `next` order: the value is assumed
+        main = [(8, 1, helper_uses_table_foreach(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        oracle, m, sites, notes, text, report = self.run_it(main, eff, REVERSE)
+        self.assertEqual([(s.shown, s.fixed, s.assumed, s.comment) for s in sites],
+                         [({2: PLAIN}, True, True, runvals.ASSUMED_LIB)])
+        self.assertIn('table.foreach', sites[0].why)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+
+
+# MAIN_REGS with the helper filled in (for mini_seven, which lifts the code as given)
+MAIN_REGS_SEVEN = [(8, 1, helper_into_regs(), 0)] + MAIN_REGS[1:]
+
+
+def HelperResult_show(order):
+    m = lift(MAIN_RESULT, helper_returns())
+    oracle, _err = probe_oracle(order, CALL_RESULT, SAME, 1)
+    sites = runvals.show_run_values(m.protos, rekey(oracle, m.root), {m.helper})
+    return sites, runvals.notes(sites, {m.helper}), text_of(m, runvals.labels(sites, {m.helper}, m.protos))
+
+
 class Pure(unittest.TestCase):
     """runvals on hand-made oracle records (no interpreter needed)"""
 
@@ -1242,6 +1587,33 @@ class Pure(unittest.TestCase):
         after = {'n': 1, 'p': 0, 'r': {}, 's': {2: PLAIN}, 'succ': {(0, 5)}}
         sites = runvals.show_run_values(m.protos, {(m.root, 0, 3): rec, (m.root, 0, 4): after}, {m.helper})
         self.assertEqual(sites[0].shown, {})
+
+    def test_printed_register_array(self):
+        # run.report counts the register array printed as a value, `({})`, outside strings and comments; `({})[k]`, which
+        # is also how a new table nothing keeps is printed, is not counted
+        for text, partial in [('f(x, ({}), 2)\n', True), ('local t = ({})\n', True), ('g(({}))\n', True),
+                              ('return ({})\n', True), (';({})[1] = 2\n', False), ('local n = ({}).n\n', False),
+                              ('print("a ({}) b")\n', False), ('print(1) -- ({})\n', False),
+                              ('print(1 --[[ ({}) ]])\n', False), ('print("it\'s", "--", ({}))\n', True),
+                              ('print(1 --[[the run\'s value after the call]], ({}))\n', True)]:
+            self.assertEqual(run.report(text)[0], 'result: PARTIAL' if partial else
+                             'result: complete (no unlifted instructions, no missing constants, all control flow structured)',
+                             text)
+
+    def test_notes_of_the_last_lift(self):
+        # the run notes on run values and on calls handed the register array are those of the lift whose text is the
+        # result (devm.run: after the probe rounds of a traced run, and when a second route lifts again)
+        keep = run.LAST_RUN['notes']
+        try:
+            run.LAST_RUN['notes'] = ['[http] a', '[runvals] old', '[runvals-handed] 2 old', '[cut] b']
+            run._keep_runvals(['[entry] x', '[runvals-missing] new', '[runvals-handed] 1 new'])
+            self.assertEqual(run.LAST_RUN['notes'], ['[http] a', '[runvals-missing] new', '[runvals-handed] 1 new', '[cut] b'])
+            run._keep_handed([None])
+            self.assertEqual(run.LAST_RUN['notes'], ['[http] a', '[runvals-missing] new', '[cut] b'])
+            run._keep_handed(['[runvals-handed] 3 again'])
+            self.assertEqual(run.LAST_RUN['notes'], ['[http] a', '[runvals-missing] new', '[cut] b', '[runvals-handed] 3 again'])
+        finally:
+            run.LAST_RUN['notes'] = keep
 
     def test_probe_records_are_not_the_run(self):
         m = lift(MAIN_REGS, helper_into_regs())
