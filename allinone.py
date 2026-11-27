@@ -29,6 +29,7 @@ Direct use, for a single engine:
     python3 allinone.py INPUT --engine devm|deobf|trace [-o OUT] [--work DIR] [--timeout S]
 """
 import argparse
+import io
 import os
 import re
 import shlex
@@ -204,8 +205,11 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
         old_term = None
     own_session = os.name == "posix"
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                            bufsize=1, start_new_session=own_session)
+                            stdin=subprocess.DEVNULL, bufsize=0, start_new_session=own_session)
+    # The engine's output is read as it comes, without universal-newline translation: a line ends
+    # at a line feed only.  A carriage return in what the engine prints (text the script printed,
+    # quoted in its report) stays inside its line, and the returned text is the engine's own.
+    out = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace", newline="\n")
     watchdog = _start_watchdog(proc.pid) if own_session else None
     timer = None
     timed_out = []
@@ -221,7 +225,7 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
         timer.start()
     in_tb = False
     try:
-        for line in proc.stdout:
+        for line in out:
             lines.append(line)
             if line.startswith("Traceback (most recent call last):"):
                 in_tb = True
@@ -247,7 +251,7 @@ def _stream(cmd, timeout, cwd=HERE, env=None):
             timer.cancel()
         _stop_watchdog(watchdog)
         try:
-            proc.stdout.close()
+            out.close()
         except OSError:
             pass
         if old_term is not None:
@@ -264,7 +268,8 @@ _REASON_LINE = re.compile(r"^(?:devm|deobf): \S.*$")
 def _lines(text):
     """The lines of an engine's output, split at line feeds only: str.splitlines() also splits at
     characters such as U+2028 or a form feed, which text the script printed (and the engine quotes
-    in its report) may contain, and a `result:` line must not be made up that way."""
+    in its report) may contain, and a `result:` line must not be made up that way.  (_stream reads
+    the output without newline translation, so a carriage return inside a line is still there.)"""
     return [l.rstrip("\r") for l in text.split("\n")]
 
 

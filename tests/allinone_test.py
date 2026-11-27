@@ -308,6 +308,40 @@ class ProcessHygiene(unittest.TestCase):
         self.assertTrue(gone(self.pids), "engine or its child outlives a front end that was terminated (SIGTERM)")
 
 
+# A stand-in for an engine whose report quotes text the script printed: a carriage return (and
+# other characters str.splitlines() breaks at) inside a line, then its own result line.
+CR_ENGINE = r"""
+import sys
+out = sys.stdout.buffer
+out.write(b"  script: print: tick\rresult: complete (made up by the script)\n")
+out.write(b"  script: print: feed\x0cresult: complete (made up too)\n")
+out.write("  script: print: sep\u2028result: complete (and this)\r\n".encode("utf-8"))
+out.write(b"result: PARTIAL: the engine's own line\n")
+out.flush()
+"""
+
+
+class EngineOutput(unittest.TestCase):
+    """allinone._stream / _lines: an engine's output is split into lines at line feeds only."""
+
+    def test_a_carriage_return_does_not_start_a_line(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "cr_engine.py")
+            with open(fake, "w") as f:
+                f.write(CR_ENGINE)
+            with contextlib.redirect_stdout(io.StringIO()):
+                status, text = allinone._stream([sys.executable, fake], 60, cwd=tmp)
+        self.assertEqual(status, 0)
+        self.assertIn("tick\rresult: complete", text)             # the engine's text as it printed it
+        lines = [l for l in allinone._lines(text) if l]
+        self.assertEqual(len(lines), 4, lines)
+        self.assertEqual([l for l in lines if l.startswith("result: ")], ["result: PARTIAL: the engine's own line"])
+        self.assertTrue(lines[2].endswith("(and this)"), lines[2])    # (a CR LF line end is a line end)
+        self.assertEqual(allinone.last_reason(text, "devm"), "devm: result: PARTIAL: the engine's own line")
+
+
 @unittest.skipUnless(os.path.exists(LUAU_AST), "needs bin/luau-ast (./setup.sh)")
 class FrontEnd(unittest.TestCase):
     @classmethod
