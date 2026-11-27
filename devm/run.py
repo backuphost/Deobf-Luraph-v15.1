@@ -838,6 +838,8 @@ ENTRY_LINE = 'script program: '
 PARSE_PREFIX = '  the text does not parse: '
 # runvals.notes: calls whose effect on their caller's variables the run did not prove (PARTIAL)
 RUNVALS_LINE = '  values not shown: '
+# ... and values shown whose proof could not be completed: assumed, said at each value (PARTIAL)
+RUNVALS_ASSUMED_LINE = '  values assumed: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
 
 
@@ -939,6 +941,8 @@ def run_report(notes):
             out.append('  note: ' + n[len('[runvals] '):])
         elif n.startswith('[runvals-missing] '):
             out.append(RUNVALS_LINE + n[len('[runvals-missing] '):])
+        elif n.startswith('[runvals-assumed] '):
+            out.append(RUNVALS_ASSUMED_LINE + n[len('[runvals-assumed] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
     said = [n for n in notes if n.startswith('[script]')]
     for n in said[:12]:
@@ -988,6 +992,8 @@ def report(text, returned=None, notes=None, parse=None):
                 head_notes.append('[entry] ' + lines[0][len('--   ' + ENTRY_LINE):])
             elif lines[0].startswith('--   ' + RUNVALS_LINE):
                 head_notes.append('[runvals-missing] ' + lines[0][len('--   ' + RUNVALS_LINE):])
+            elif lines[0].startswith('--   ' + RUNVALS_ASSUMED_LINE):
+                head_notes.append('[runvals-assumed] ' + lines[0][len('--   ' + RUNVALS_ASSUMED_LINE):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
@@ -1005,6 +1011,8 @@ def report(text, returned=None, notes=None, parse=None):
     # calls that wrote into their caller's variables (or helpers of the build whose results the
     # script keeps) where the run proved no value: a variable may show its earlier value (runvals.notes)
     unshown = [n[len('[runvals-missing] '):] for n in notes if n.startswith('[runvals-missing] ')]
+    # ... and values shown whose proof could not be completed (runvals.ASSUMED, at each of them)
+    assumed = [n for n in notes if n.startswith('[runvals-assumed] ')]
     unparsed = parse is not None and parse[0] is False
     # instructions without a marker, said in a head line of the text (not one more marker)
     hidden = [HIDDEN_HEAD.match(ln) for ln in lines[:2]]
@@ -1023,6 +1031,7 @@ def report(text, returned=None, notes=None, parse=None):
     ups = sum(1 for ln in lines if re.search(r'\bUPVAL_\d', ln))
     # (not the values runvals.show_run_values marks as not shown: the "values not shown" line counts those)
     marks = code.count('nil --[[%s]]' % runvals.MARK)
+    amarks = code.count('--[[%s]]' % runvals.ASSUMED)
     holes = len(re.findall(r'nil --\[\[', code)) - marks
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
     # values the lifter could only name by where the dump holds them, and arguments / registers
@@ -1052,7 +1061,7 @@ def report(text, returned=None, notes=None, parse=None):
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
             or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry or unshown
-            or marks):
+            or marks or assumed or amarks):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + unchecked + traps
     out.append('result: PARTIAL')
@@ -1093,6 +1102,12 @@ def report(text, returned=None, notes=None, parse=None):
                    'those calls a variable the call may have set is printed `nil --[[%s]]` (%d in the text), or the text '
                    'keeps the call, and the constants handed to them stay encrypted' % (
                        len(unshown), 's' if len(unshown) > 1 else '', runvals.MARK, marks))
+    if assumed or amarks:
+        out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
+                   'the values shown after them are the run\'s, assumed, not proved, to depend only on what the call is '
+                   'handed: the code of the function called that ran did not all lift (see the "values assumed" line%s '
+                   'above): %d value(s) in the text carry the comment --[[%s]]' % (
+                       len(assumed), 's' if len(assumed) > 1 else '', amarks, runvals.ASSUMED))
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
     if blank:

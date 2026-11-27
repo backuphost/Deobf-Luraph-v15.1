@@ -2,7 +2,7 @@
 from .lifter import tree_ends
 
 PURE_LEAF = ('k', 'kfn', 'env', 'opaque', 'regs', 'arg', 'varargn', 'nargs', 'va', 'selfarg', 'v', 'forval', 'constfn',
-             'outer', 'upcell')
+             'outer', 'upcell', 'runval')
 
 
 import os
@@ -789,7 +789,7 @@ class ProtoCFG:
         loads feeding its self-modifying patches become dead once the patches are applied)."""
         # (a closure nothing reads is a function the script defines and never calls: that is the
         # author's code, not padding, and it stays)
-        PURE = ('k', 'outer', 'constfn', 'upcell', 'r', 'kfn', 'global', 'env', 'newtable', 'opaque')
+        PURE = ('k', 'outer', 'constfn', 'upcell', 'r', 'kfn', 'global', 'env', 'newtable', 'opaque', 'runval')
         captured = set()
         for b in self.blocks.values():
             for st in b.stmts + [b.term]:

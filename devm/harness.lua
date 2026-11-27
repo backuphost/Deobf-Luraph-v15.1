@@ -1486,7 +1486,7 @@ function watch.step(th, pid, loop, pc, regs, names, ...)
 					if not rawequal(x, y) and not (x ~= x and y ~= y) and type(i) == "number" then w[i] = true end
 				end
 				for i in next, snap do
-					if rawget(regs, i) == nil then w[i] = true end
+					if type(i) == "number" and rawget(regs, i) == nil then w[i] = true end
 				end
 				pend.rec.h += 1
 			elseif prev == nil and orcPrevRegs ~= nil and not probing and not watch.exercising then

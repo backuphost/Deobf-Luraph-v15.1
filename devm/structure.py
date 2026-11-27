@@ -1891,6 +1891,10 @@ class Printer:
             return '(function() return %s end)' % lua_number(e[1])
         if t == 'opaque':
             return 'nil --[[%s]]' % e[1]
+        if t == 'runval':
+            # a value of the traced run whose proof could not be completed, with what is assumed
+            # (runvals.ASSUMED) right at it
+            return self.expr(('k', e[1]), prec) + ' --[[%s]]' % e[2]
         if t == 'forval':
             return 'nil --[[forval]]'
         return 'nil --[[?%s]]' % t

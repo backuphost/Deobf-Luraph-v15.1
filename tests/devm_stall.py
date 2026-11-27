@@ -954,6 +954,26 @@ while true do task.wait(1) end
 '''
 
 
+# The start-up code (program 1), a routine of its interpreter (program 2) that a plain function runs in a busy
+# loop, and the script's program 3 on another interpreter.  THREADS_SCRIPT makes and calls program 3, whose code
+# after its first instruction is the %s; what the start-up code does before that goes between the two parts.
+THREADS_HEAD = '''
+local r0, r1, r2 = {}, {}, {}
+local boot = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(boot, 0, 1, r0)
+local routine = __LPH_PROTO(0, {"K"}, 1, {2})
+local spid = __LPH_PROTO(1, {"K"}, 1, {3})
+local function busy() while true do __LPH_STEP(routine, 0, 1, r2) end end
+'''
+THREADS_SCRIPT = '''
+local m = __LPH_REG(spid, function() return function()
+    __LPH_STEP(spid, 0, 1, r1)
+    %s
+end end)()
+m()
+'''
+
+
 def probe_evidence(dump, err):
     """(interpreter of each program, callers, notes) of a probe run, as pipeline.script_programs takes them"""
     from devm import pe
@@ -1182,6 +1202,44 @@ class CallChain(unittest.TestCase):
         self.assertIn('which of the two is not known, and nothing is lifted', line)
         self.assertNotIn('It spins in Luraph\'s start-up code', line)
         self.assertIn('[where] the run was stopped in program 2, not placed: on a thread whose call chain starts there', err)
+        self.assertIsNone(dump)
+
+    def test_busy_loop_the_script_deferred(self):
+        """(The verifier's probe T1.)  The script's program starts the busy loop with task.defer (it runs at the
+        main thread's next wait): placed under the script's program, a stop of its run with a dump, the payload
+        kept."""
+        took, err, dump, oracle = run_probe(THREADS_HEAD + THREADS_SCRIPT % 'task.defer(busy)\n    task.wait()',
+                                            *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('after the run made program 3 on another interpreter, in a loop of its VM code', line)
+        self.assertIn('[where] the run was stopped in program 2, under program 3 of another interpreter', err)
+        self.assertIsNotNone(dump)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(pipeline.script_programs(interps, [3], notes, callers), ([3], None))
+
+    def test_busy_loop_the_script_runs_in_a_coroutine(self):
+        """(T2.)  ... started with the script's coroutine library instead: the thread's start is not known; not
+        placed, the [stalled] line says which of the two is not known, nothing is lifted."""
+        took, err, dump, oracle = run_probe(THREADS_HEAD + THREADS_SCRIPT % 'coroutine.wrap(busy)()', *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('it was stopped on a thread whose start is not known', line)
+        self.assertIn('which of the two is not known, and nothing is lifted', line)
+        self.assertIn('[where] the run was stopped in program 2, not placed: on a thread whose call chain starts there', err)
+        self.assertIsNone(dump)
+
+    def test_busy_loop_the_start_up_code_deferred(self):
+        """(T3.)  The start-up code defers the busy loop before it makes the script's program, which then waits:
+        the loop is under no program of another interpreter (where the code that deferred it ran): a spin of the
+        start-up code, nothing lifted."""
+        took, err, dump, oracle = run_probe(THREADS_HEAD + 'task.defer(busy)\n' + THREADS_SCRIPT % 'task.wait()',
+                                            *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('[where] the run was stopped in program 2, under no program of another interpreter', err)
+        self.assertIn('It spins in Luraph\'s start-up code', line)
         self.assertIsNone(dump)
 
     def test_wait_loop_the_start_up_code_spawned(self):
