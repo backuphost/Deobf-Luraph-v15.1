@@ -393,6 +393,24 @@ def run_devm(inp, out, work=None, timeout=None, extra=()):
     elif ok and complete and parses(out) is False:
         complete = False
         why.append("the result does not parse (bin/luau-ast)")
+    if ok and not complete:
+        # what the final line has to say besides "see the report": a script that does not end was
+        # stopped and lifted where it was (its [stalled] line), and a result that is the VM's first
+        # program begins with Luraph's start-up code (its `start-up code:` line)
+        stall = next((l for l in report if l.startswith("[stalled] ")), None)
+        if stall:
+            why.append(stall[len("[stalled] "):])
+        if any(l.startswith("start-up code: ") for l in report):
+            why.append("the result is the VM's first program, which begins with Luraph's start-up code "
+                       "(the script is not separated from it)")
+        # (devm.run ENTRY_LINE, pipeline.entered_program: the program the start-up code entered at
+        # the end of its run, lifted without the first program's code before that call)
+        entry = next((l for l in report if l.startswith("script program: ")), None)
+        if entry:
+            m, r = re.match(r"script program: program (\d+) ", entry), re.search(r"--root (\d+)", entry)
+            why.append("the result is %s, without the code of the VM's first program before it called it "
+                       "(--root %s lifts that program)" % ("program " + m.group(1) if m else "a program the first one called",
+                                                            r.group(1) if r else 1))
     reason = None
     if not ok:
         reason = why[0] if why else ("devm: timed out after %d s" % timeout if status is None

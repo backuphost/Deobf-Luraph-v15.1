@@ -87,7 +87,7 @@ Exit status:
 | Code | Meaning |
 |---|---|
 | 0 | complete result written: the engine reports nothing missing (see "Limits" for what that does and does not mean) |
-| 6 | result written, but **partial**: the last line (`result: PARTIAL: ...`) and the report before it say what is missing (unlifted code, a run that stopped early, only a behaviour trace, a result that does not parse, or only the functions a form-A script kept as plain Lua while its main flow runs on the VM: with `--engine static` / `--no-run`, or when no engine recovered the script; also every `--force` export of a VM script: its plain functions, or else a skeleton of the VM, `result: PARTIAL: a VM skeleton, not the script's code (static)`) |
+| 6 | result written, but **partial**: the last line (`result: PARTIAL: ...`) and the report before it say what is missing (unlifted code, a run that stopped early, a script that did not end and was stopped (`result: PARTIAL: the script did not end: ... (devm)`), only a behaviour trace, a result that does not parse, or only the functions a form-A script kept as plain Lua while its main flow runs on the VM: with `--engine static` / `--no-run`, or when no engine recovered the script; also every `--force` export of a VM script: its plain functions, or else a skeleton of the VM, `result: PARTIAL: a VM skeleton, not the script's code (static)`) |
 | 4 | a VM-only script and no engine produced a result (or `--engine static` / `--no-run` on such a script); the last lines are the engines' own reasons |
 | 8 | Luraph, but it cannot be processed as given: cut-off or edited text, a payload that does not decode, a build for Lua 5.3/5.4 or LuaJIT, a VM chunk without its data; the last line says what and where |
 | 3 | static result written, but it failed its own syntax check |
@@ -213,6 +213,25 @@ which can only turn borderline results from complete into partial.
 - **Only what a run reached is known to be right.** Code that never ran is lifted statically; where
   it needs a key the run never produced it is marked (`LIFT ERROR`, a count in the report).
 - **Remote code and key systems**: see above.
+- **Scripts that do not end** (a key system waiting for its key, a GUI script in its event loop,
+  a loader that ends in Luraph's tamper response): `devm` stops the traced run once the script's
+  own code has run 90 s without anything new (`--stall`), has waited 600 s in `task.wait` / `wait`
+  / an event's `:Wait()` without anything new (`--stall-wait`; nothing really waits in the mock, so
+  these waits are counted), or 600 s after it started (`--stall-run`), and at once when it enters
+  Luraph's tamper response (`--no-tamper-stop` lets it run); options go through `--engine-args`.
+  What the script had built up to that moment is lifted and the result is **partial** (exit 6),
+  with a line `[stalled] the script did not end: it was stopped N s after <its first output, its
+  first request, ...>, <in what>; code it would load or fetch later is missing`.  A run stopped
+  in a busy loop before it showed anything of the script (no output, no request, no program on
+  another interpreter) is not written out: that is Luraph's start-up code, which is never
+  presented as the script, and the next engine is tried.  A run stopped *waiting* in a loop before
+  it showed anything else is lifted: the start-up code does not wait, so the waits are the script's
+  (a script that builds its window silently and then sits in its update loop); the result is the
+  VM's first program, labelled as beginning with the start-up code.  Where the script is a program
+  the start-up code entered at the end of its run, a run that did not end is lifted from that
+  program alone and says that the first program's code before the call is missing (`--root 1`
+  lifts it).  The defaults were checked on the sample corpus: see `devm/README.md`, "A script that
+  does not end".
 - **Names, comments, formatting** do not survive protection and cannot be recovered by any tool.
   Names are re-derived from use (`starterGui`, `getService`), the rest are numbered (`v12`).
 - **"complete" is the engine's own judgement**: no unlifted instruction, no missing constant, all

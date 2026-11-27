@@ -234,6 +234,9 @@ return function(G, fnames, libnames, opts)
 	-- Like Roblox, every read of a signal property yields a new wrapper object: two reads are
 	-- equal under == (shared __eq) but are different table keys, and so are their method closures.
 	local sigCore = setmetatable({}, { __mode = "k" })
+	-- events that fire every frame in Roblox (the harness's watch counts a wait on them as one frame)
+	local frameSignals = { Heartbeat = true, RenderStepped = true, Stepped = true, PreRender = true, PreSimulation = true,
+		PostSimulation = true, PreAnimation = true }
 	local function sigEq(a, b) return sigCore[a] ~= nil and sigCore[a] == sigCore[b] end
 	local function newSignal(name)
 		local conns = {}
@@ -273,6 +276,10 @@ return function(G, fnames, libnames, opts)
 					return namedY(k, function(co, self)
 						if sigCore[self] ~= core then error("Expected ':' not '.' calling member function " .. k, 2) end
 						if M.mainThread and co ~= M.mainThread then return YIELD end
+						-- (the main thread goes on at once: tell the harness's watch on a run that does not
+						-- end what was waited for: one frame for the per-frame events, and for any other
+						-- event a long time, since nothing here ever fires it)
+						if M.onWait then M.onWait(name .. ":Wait()", frameSignals[name] and 1 / 60 or 60) end
 						return nil
 					end)
 				end
@@ -2266,8 +2273,11 @@ return function(G, fnames, libnames, opts)
 				for _, item in ipairs(q) do
 					if coroutine.status(item[1]) == "suspended" then resume(unpack(item)) end
 				end
-				if legacy then return waited(t, step), os.clock() end       -- (elapsed, elapsedTime())
-				return waited(t, step)
+				local w = waited(t, step)
+				-- (what the main thread waited, for the harness's watch on a run that does not end)
+				if M.onWait then M.onWait(legacy and "wait()" or "task.wait()", w) end
+				if legacy then return w, os.clock() end       -- (elapsed, elapsedTime())
+				return w
 			end
 		end
 		local waitImpl = waiter(1 / 30, true)
@@ -2332,6 +2342,7 @@ return function(G, fnames, libnames, opts)
 			end
 			local text = string.gsub(string.sub(table.concat(parts, " ", 1, n), 1, 300), "[%c]", " ")
 			note("script", kind .. ": " .. text, true)
+			if M.onSay then M.onSay() end
 		end
 	end
 	M.warn = named("warn", said("warn"))

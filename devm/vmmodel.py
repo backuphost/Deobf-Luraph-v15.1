@@ -922,8 +922,11 @@ class Model:
         if (step or newproto) and self.oneline:
             # Watchdog for the loader's own loops (deserialiser state machines are not VM code, so
             # the per-instruction hook never sees them): the harness sets __LPH_N.q while it calls
-            # into the loader itself, and __LPH_W stops a loop that does not end.
+            # into the loader itself, and __LPH_W stops a loop that does not end.  The rounds are
+            # also counted (__LPH_N.l, no call): every __LPH_N.k rounds __LPH_L looks at a traced run
+            # that may not end (the script's functions Luraph keeps as plain Lua loop here too).
             spans = [(it.func.body_pos, it.func.end_pos) for it in self.interps]
+            watch = ' if __LPH_N.q then __LPH_W() end;__LPH_N.l=__LPH_N.l+1;if __LPH_N.l>__LPH_N.k then __LPH_L() end;'
             toks = [t for t in luparse.tokenize(self.src) if t[0] != 'eof']
             heads = []
             for t in toks:
@@ -933,9 +936,9 @@ class Model:
                     heads.append(t[1])
                 elif t[1] == 'do' and heads:
                     if heads.pop() == 'while' and not any(a <= t[3] < b for a, b in spans):
-                        edits.append((t[3] + 2, ' if __LPH_N.q then __LPH_W() end;'))
+                        edits.append((t[3] + 2, watch))
                 elif t[1] == 'repeat' and not any(a <= t[3] < b for a, b in spans):
-                    edits.append((t[3] + 6, ' if __LPH_N.q then __LPH_W() end;'))
+                    edits.append((t[3] + 6, watch))
         edits.sort(key=lambda x: -x[0])
         for pos, text in edits:
             src = src[:pos] + text + ' ' + src[pos:]
@@ -1047,7 +1050,9 @@ SERVER = None
 
 def start_server(cmd, workdir, limit=1800):
     """Run the harness until its dump is written and leave it serving; returns its stderr so far
-    (with a `[timeout]` line when it was stopped after `limit` seconds without a dump)."""
+    (with a `[timeout]` line when it was stopped after `limit` seconds without a dump).  A script
+    that does not end is normally stopped earlier by the harness itself, which then dumps and
+    serves as at an end (STALL); `limit` is the last resort, and a killed run has no dump."""
     global SERVER
     if SERVER is not None:
         SERVER.close()
@@ -1077,7 +1082,8 @@ def start_server(cmd, workdir, limit=1800):
     with open(errpath, errors='replace') as f:
         text = f.read()
     if stopped:
-        # (a script that waits for ever - for a key, an event, its own loop - ends here)
+        # (a script that waits for ever - for a key, an event, its own loop - and that the harness's
+        # own watch did not stop (STALL) ends here)
         text += '\n[timeout] the run was stopped after %d s without reaching its end\n' % limit
     return text
 
@@ -1085,7 +1091,7 @@ def start_server(cmd, workdir, limit=1800):
 # per-access lines of a traced run (each global read, call, new proto): thousands of them bury the reason
 _TRACE_TAGS = ('[global] ', '[call] ', '[proto] ', '[gread] ', '[gwrite] ')
 # the run's verdict lines: kept wherever they are
-_VERDICT_TAGS = ('[oracle]', '[budget]', '[timeout]', '[end]', '[error]', '[fail]')
+_VERDICT_TAGS = ('[oracle]', '[budget]', '[timeout]', '[stalled]', '[end]', '[error]', '[fail]')
 
 
 # a line the harness wrote with a tag ("[script] print: ...", "[stubs] ..."); an error text has none
@@ -1114,11 +1120,11 @@ def _share(lengths, room):
 def harness_tail(stderr, limit=600):
     """The meaningful end of a failed harness run's stderr, as one line of at most `limit` characters
     for a failure message: the per-access trace lines and the harness's own traceback dropped; the
-    last four verdict lines ([oracle], [budget], [timeout], [end], [error], [fail]) and the error
-    itself (the last line without a [tag]: the error and where it happened; else the last other
-    line), always, whole when they fit and otherwise sharing the room (the longest cut first, each
-    cut marked with '...'); then the other lines, latest first, while the whole stays within `limit`.
-    In their order, joined by ' | '."""
+    last four verdict lines ([oracle], [budget], [timeout], [stalled], [end], [error], [fail]) and
+    the error itself (the last line without a [tag]: the error and where it happened; else the last
+    other line), always, whole when they fit and otherwise sharing the room (the longest cut first,
+    each cut marked with '...'); then the other lines, latest first, while the whole stays within
+    `limit`.  In their order, joined by ' | '."""
     lines, skip = [], False
     for line in stderr.split('\n'):
         line = line.strip()
@@ -1149,8 +1155,39 @@ def harness_tail(stderr, limit=600):
     return ' | '.join(keep[i] for i in sorted(keep)) or '(no output)'
 
 
+# The traced run of a script that does not end (a key system waiting for its key, a GUI script in
+# its event loop, `while true do task.wait() end`): the harness stops it and takes the end-state
+# dump there (harness.lua, watch.tick).  Seconds of the run's processor time (/proc/self/stat; Luau's
+# os.clock is a wall clock):
+#   stall      after the script's own code started, this long without a VM instruction running
+#              for the first time (or a program being made); 4 x this before it started ends the
+#              run without a dump (Luraph's start-up code spinning: nothing of the script to lift)
+#   stallwait  this much waiting simulated by the mock (task.wait, wait, an event's :Wait())
+#              without new code
+#   stallrun   this long after the script's own code started, new code or not
+#   tamper     1: stop the run at the entry of Luraph's tamper response (a VM function handed two or
+#              more code arrays of another program, harness.lua watch.entered), before it scrambles
+#              them; 0: let it run (it then loops for ever and a time limit stops it)
+# 0 switches one off.  devm.run --stall / --stall-wait / --stall-run / --no-tamper-stop set them.
+STALL = {'stall': 90, 'stallwait': 600, 'stallrun': 600, 'tamper': 1}
+
+
+def stall_options(options=(), **given):
+    """the harness options of the watch on a run that does not end: STALL, with the values in
+    `given` (None: the default) and those already in `options` taking precedence"""
+    out = []
+    for k, v in STALL.items():
+        if any(str(o).startswith(k + '=') for o in options):
+            continue
+        v = given.get(k) if given.get(k) is not None else v
+        out.append('%s=%d' % (k, max(0, int(v))))
+    return out
+
+
 def run_oracle(model, workdir, tag, options=()):
-    """Run the script to its end with per-instruction recording.
+    """Run the script to its end with per-instruction recording.  A script that does not end is
+    stopped by the harness (STALL) and its state taken where it was; the note list then has the
+    harness's `[stalled]` line, which says why and for how long.
 
     Returns (dump of the VM state at the end, oracle, note) where oracle maps (pid, loop, pc) of
     every executed instruction to a dict: r/v = numbers held by registers / interpreter locals on
@@ -1168,7 +1205,9 @@ def run_oracle(model, workdir, tag, options=()):
     if not os.path.exists(nf):
         from . import unidata
         unidata.generate(nf)
-    cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] + list(options)
+    # (numeric options first: the harness reads `name=<digits>` options from the front of its list)
+    cmd = [find_luau(), os.path.join(HERE, 'harness.lua'), '-a', patched, outjson, 'oracle=1', 'dumpend=1'] + \
+        stall_options(options) + list(options)
     cmd += list(getattr(model, 'run_options', ()))      # carrier of a chunk the script loads itself (container.py)
     if model.oneline:
         # keep the run alive after the dump: the lifter asks it for lazily decoded constants
@@ -1180,7 +1219,8 @@ def run_oracle(model, workdir, tag, options=()):
         pass
     r.stderr = stderr
     note = [l for l in r.stderr.split('\n') if l.startswith('[oracle]')]
-    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive'))]
+    note += [l for l in r.stderr.split('\n') if l.startswith(('[http]', '[env]', '[script]', '[stub] permissive', '[stalled]', '[effects]', '[where]',
+                                                                      '[started]', '[watch]'))]
     if not os.path.exists(outjson) or not os.path.exists(outjson + '.oracle'):
         raise RuntimeError('oracle run failed: ' + harness_tail(r.stderr))
     with open(outjson + '.oracle') as f:

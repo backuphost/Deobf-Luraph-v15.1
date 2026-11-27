@@ -79,7 +79,9 @@ line per kind of thing that is missing:
 | `lines of Luraph's key arithmetic are left` | `v - v % 1` on a value cut to 32 bits: numbers the interpreter mixes into its keys, where they did not fold to a constant |
 | `functions return a parameter xor-ed with a large literal` | Luraph's per-call keys (`return bit32.bxor(p, K), ...`) where they could not be folded because a caller is not in the result |
 | `lines compute a constant into a local nothing reads` | Luraph's dead arithmetic (`local v = <literals, arithmetic, bit32 / string calls>`, v14 self-patch values) that `cleanup.drop_dead_constants` left because it does not evaluate here (removing a line that raises would change the script) |
-| `the result is the VM's first program, which begins with Luraph's start-up code` | factory layout: the run made no program on a second interpreter, so the lift is the first program; the `start-up code:` line of the run says what the run shows about the script (its top level ran inside it but is not separated, or nothing of it showed) |
+| `the result is the VM's first program, which begins with Luraph's start-up code` | factory layout: the run made no program on a second interpreter, or the script's output and requests came from the first interpreter's programs, so the lift is the first program; the `start-up code:` line of the run says what the run shows about the script (its top level ran inside it but is not separated, or nothing of it showed) |
+| `the result is program N on its own, which the VM's first program called at the end of its run` | factory layout, a run that did not end: the script's output (or the place the run was stopped) is in a program the first program entered at the end of its run, and that program was lifted without the first program's code before the call (Luraph's start-up code, and any part of the script's top level Luraph put there); `--root 1` lifts the first program (see "Which program is the script") |
+| `the script did not end` | factory layout: the traced run did not end (a key system that waits for its key, a GUI script in its event loop, Luraph's tamper response) and was stopped; the `[stalled]` line of the run says after how long and in what. What the script would have done later is not in the result (see "A script that does not end") |
 | `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
 | `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
@@ -137,6 +139,130 @@ Later findings on the two Luarmor samples (see `deobfuscated/loadstring5.lua`, `
 
 `antitamper.py` predates the inlined instrumentation and is not wired in.
 
+### A script that does not end
+
+The end-state dump is taken when the script ends, and many scripts never do: a key system waits
+for its key, a GUI script sits in its event loop (`while true do task.wait() end`,
+`RunService.Heartbeat:Wait()` in a loop), a loader that found no key calls Luraph's tamper
+response.  Nothing really waits in the mock (a wait of the main thread returns at once, so does an
+event's `:Wait()`), so such a script spins.  Before, the run went on until `start_server`'s limit
+of 1800 s killed it, and a killed process has no dump: `run failed`.  Now the harness watches the
+traced run (`harness.lua`, `watch`) and, when it stops it, ends the run as if the script had
+returned: `[stalled]` line, exercise pass, oracle, end-state dump, serve mode for the lifter's
+lazily decoded constants.
+
+* **The script's start.**  The watch works on the script's own code.  That has started when the
+  run makes a program on an interpreter other than the first one (the payload of two-interpreter
+  builds; a build's helper there counts too), or at the script's first line of output or first
+  request (builds whose script runs on the first interpreter, next to Luraph's start-up code).
+  The `[started]` line says which, and how many waits of the main thread came before it.
+* **Progress** is a VM instruction that runs for the first time (or in a new version of its code)
+  or a program that is made.  VM code is watched through the instruction hook; code that is not VM
+  code (the loader, and the script's functions Luraph keeps as plain Lua) through its `while` /
+  `repeat` loops, which count their rounds in the instrumented copy (`__LPH_N.l`, no call) and call
+  `__LPH_L` every 65,536 rounds (`Model.patched_source`).
+* **When the run is stopped** (seconds are the harness's processor time, utime + stime of
+  `/proc/self/stat`: Luau's `os.clock` is a wall clock, which would let a loaded machine reach the
+  limits after less work; where `/proc` cannot be read the wall clock is used and the `[watch]`
+  line says so.  The harness never sleeps):
+  - `--stall S` (default 90): after the start, S seconds without progress: the script loops over
+    code it has run before;
+  - `--stall-wait S` (default 600): S seconds of waiting the mock simulated without progress, from
+    the start of the run (Luraph's start-up code does not wait).  `task.wait(t)` and `wait(t)`
+    count what they report, a frame event's `:Wait()` (`Heartbeat`, `RenderStepped`, `Stepped`,
+    ...) one frame, and any other event's `:Wait()` 60 s, since nothing in the mock ever fires it:
+    a loop of waits that can never be satisfied stops after ten rounds instead of spinning, a
+    single one lets the script go on as before;
+  - `--stall-run S` (default 600): S seconds after the start, progress or not;
+  - **Luraph's tamper response** (`--no-tamper-stop` switches this off; harness option
+    `tamper=0`): a VM function that holds two or more code arrays of another program in its
+    registers (its caller loads its own arrays and passes them on) is stopped as soon as they are
+    there (checked at every instruction that runs for the first time: the function's first
+    instructions copy its arguments into the registers).  It would scramble those arrays and then
+    loop for ever rewriting bytes of the VM's bytecode buffer, which is what the lift of code that
+    never ran and the lazily decoded constants are read from: stopping later would lift a damaged
+    state.  The exercise pass does not enter it either.
+  0 switches a limit off.  The defaults are `vmmodel.STALL`; through `deob.py` the options go in
+  `--engine-args` (`--engine-args "--stall 300 --no-tamper-stop"`).  `--beat S` makes the harness
+  log what the run is doing every S seconds (`[beat]` lines in `serve/stderr.txt` of the work
+  directory).  Once the run is stopped, every VM instruction, plain-Lua loop round and wait of
+  the script raises the stop again, so a script that catches it with `pcall` cannot keep the run
+  going.
+* **The defaults, measured.**  Every factory-layout file of the public sample corpus (the 13
+  v15.1 and v15.2 files; v15.0 is refused and v14 builds take the proto-table route, which has no
+  traced end-state run) was run with and without the watch.  No run was stopped, by a limit or at
+  a tamper response: every run ended with the same `[oracle]` line and instruction count as
+  before, at about the same processor time (within the few per cent the runs differ by anyway).
+  The `[watch]` line of each run (`N s of processor time; the script started at N s (...); longest
+  stretch without new code: N s before the start, N s after it`) gave, measured as wall-clock time
+  on a loaded machine, so an upper bound: runs of 30 - 245 s, the script started 30 - 145 s into
+  them and ran at most 114 s after that; the longest stretch without new code was 26 s before the
+  start (`--stall` x 4 = 360) and 4 s after it (`--stall` 90); no run waited.  The trade-off: lower
+  limits would end a script that does not end sooner (and a run killed at the last-resort limit
+  has no dump at all), higher ones let a long run that ends on its own finish on a slower
+  machine; at these values the slowest corpus run has five times the room it needs, and a
+  `--stall` or `--stall-run` that is too low for a script shows in the result as a `[stalled]`
+  line, never as a silent cut.
+* **Before the start** the run is stopped in two ways, and they end differently:
+  - 4 x `--stall` seconds without progress (a busy loop, not a wait loop), or the tamper response:
+    the run ends *without* a dump.  It spins in Luraph's start-up code (an environment check that
+    failed loops for ever) or in code that shows nothing, and a lift would be the start-up code,
+    which is never written out as the script.  devm fails with `run failed: ... [stalled] the run
+    did not end and showed nothing of the script ...` and the front end tries the next engine.
+  - `--stall-wait` seconds of waiting: the state is dumped and lifted.  Luraph's start-up code does
+    not wait, so the waits are the script's own code on the first interpreter (its top level in
+    Luraph's main function, or a program that function entered): a script that builds its window
+    without a word and then sits in its update loop has all of that in the dump, and failing the
+    run would lose it.  The `[stalled]` line says `before it showed itself otherwise`, the result
+    is the first program with the `start-up code:` note (`the run was stopped while the script
+    waited, ...`), and it is PARTIAL.
+* **The report.**  `[stalled] the script did not end: it was stopped N s after <what showed the
+  start: its first line of output, its first request, the run made program N on another
+  interpreter>, <in what: waiting in task.wait() / Heartbeat:Wait() ..., in a loop of its VM
+  code, in a loop outside the VM's code, at the entry of Luraph's tamper response, still running>;
+  code it would load or fetch later is missing`, and the result is PARTIAL.  `deob.py` /
+  `allinone.py` keep that result (the second engine is not tried) and end with
+  `result: PARTIAL: the script did not end: ... (devm)`.
+* **Which program is the script.**  A run that does not end is often one that never reached the
+  script's interpreter, so the choice of the root matters more than before.  The harness notes
+  which program ran the last VM instruction before each line of the script's output and each
+  request (`[effects]`), and for every program the program of the instruction before its first
+  one, i.e. its caller (`caller` in the dump's proto record).
+  - The script is taken from the interpreter its output came from (`pipeline.script_programs`).
+    A build can make programs on other interpreters that are helpers (routines of the build)
+    while the script runs on the first interpreter; the first of those helpers used to be lifted
+    as "the script".  The `start-up code:` line then names them as helpers.
+  - On the first interpreter, the programs the output came from (for a script that showed
+    nothing: the program the run was stopped in, `[where]`) are followed through their callers to
+    the first program (`pipeline.entered_candidate`): the program below it on that chain is the
+    one the first program entered at the end of its run (it ran at most 32 new instructions after
+    that program started, and said nothing itself).
+  - **Only for a run that did not end** is that program lifted on its own
+    (`pipeline.entered_program`): the first program never came back from it, and everything the
+    first program did is ahead of the call -- Luraph's start-up code, which a lift of the first
+    program would put in front of the script.  The `script program:` line says so, and the result
+    is PARTIAL: the first program's code before the call is not in it, and where Luraph flattened
+    part of the script's top level into that program (v15.2), that part is missing too; `--root 1`
+    lifts the first program instead.
+  - A run that ended is lifted from the first program, with the `[startup]` note, which names the
+    entered program and `--root N` for it.  Lifting that program alone would drop whatever the
+    first program did before the call, and in a v15.2 build that is the script's top level when
+    its last statement calls the script's main function.
+  (A program's creator is not the evidence: closures of these builds are made while Luraph's
+  lazy-constant decoder, itself VM code, runs.)
+* **Limits.**  A script whose loop keeps running code it has not run before (every round new) is
+  only stopped by `--stall-run`; a plain-Lua `for` loop that never ends is not counted (only
+  `while` and `repeat` are) and is stopped by the last-resort limit; the tamper response is
+  recognised by what it is handed, so a build whose tamper response looks different is stopped
+  by the time limits, after it has damaged the state.
+
+The shape this was built for: a key-system loader whose script runs on the first interpreter, in
+a program the start-up code enters at the end of its run.  Without a key it reports the missing
+key and hands its own code arrays to Luraph's tamper response, which scrambles them and then loops
+for ever in VM code (no wait, no environment access, no new instruction).  Without the watch such
+a run goes on until the last-resort limit and fails; with it, the run stops at the tamper
+response and the script's program is lifted.
+
 ## Environment fidelity (newer factory builds)
 
 These builds answer a failed environment check by scrambling their own bytecode forever, and the
@@ -174,7 +300,8 @@ exactly rather than approximately:
 
 `harness.lua` options for diagnosing a failed check: `stub=<pid>` (suppress the tamper response),
 `watch=<pid>` (log the arguments of that proto's last calls, e.g. the comparison helper), `tb=<pid>`,
-`depth=<n>`.
+`depth=<n>`, `beat=<s>` (a `[beat]` line every s seconds: instructions, distinct ones, programs,
+loop rounds, waits, the last instructions).
 
 ### Two-interpreter builds: the payload
 
@@ -285,11 +412,13 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
   does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.  A failed
   harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`, at most 600
-  characters: the last four `[oracle]`, `[budget]`, `[timeout]`, `[error]` lines and always the
-  error itself, the last line without a `[tag]`, whole when they fit and otherwise sharing the
-  room, the longest cut first; then the lines before, while they fit; without the per-access
-  `[global]` / `[call]` trace lines); a traced run stopped at its time limit
-  (a script that waits for ever, e.g. for a key) says so in a `[timeout]` line.
+  characters: the last four `[oracle]`, `[budget]`, `[timeout]`, `[stalled]`, `[error]` lines and
+  always the error itself, the last line without a `[tag]`, whole when they fit and otherwise
+  sharing the room, the longest cut first; then the lines before, while they fit; without the
+  per-access `[global]` / `[call]` trace lines).  A traced run that does not end is normally
+  stopped by the harness itself and lifted (see "A script that does not end"); one that showed
+  nothing of the script fails with its `[stalled]` line, and one that still did not end at the
+  last-resort limit of 1800 s says so in a `[timeout]` line.
 * **Containers.**  With `devm/container_static.py` in the tree the container is read without
   running it; otherwise by the sandboxed probe.  Either way the run executes the shipped file.
 
@@ -515,7 +644,35 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   from inside that program -- its top level is in the result but not separated -- or nothing of it.
   The same with `--root` set to the first program.  (The v14.9 rule of the proto-table layout, a
   program entered that was not reachable from the root's tables when it started, has no
-  counterpart here: every factory program is a closure made at run time.)
+  counterpart here: every factory program is a closure made at run time.)  Two exceptions, read
+  off the run (see "A script that does not end", "Which program is the script"): when the
+  script's output came from the first interpreter while programs on other interpreters exist,
+  those are helpers and not the script; and when a run that did not end has that output in a
+  program the start-up code entered at the end of its run, that program is lifted on its own
+  (PARTIAL: the first program's code before the call is not in it).
+
+### One function made at several places
+
+Luraph's VM makes a closure wherever the code makes one, and some builds make a new closure of the
+same program at each place that calls it (a helper of the build, called on the spot at five
+places).  Printed as it runs, that is five copies of one function body,
+`(function(p1, ...) ... end)(...)`, each lifted and structured on its own.  The printer
+(`structure.Decompiler.run`, `HOIST_SHARED`) prints such a function once, as a local function at
+the top of the result (one comment line says why), and the places call it by name.  Only where
+that cannot change what the code does:
+
+* the function captures nothing: a closure without upvalues made here or there is the same
+  function;
+* every place calls it on the spot: none keeps it, so no one can compare two of them;
+* every place passes the same large literal numbers (10^6 and up): the text passes of
+  `opaque.py` fold Luraph's per-call keys and opaque numbers per call site of a function called on
+  the spot, and for a named function only where all callers agree;
+* a function it calls the same way is defined before it; functions that make each other, a
+  function that does not print as one (unstructured), or more than 195 locals at the top level
+  keep the printing as it was.
+
+The decision is taken after a first printing; the second one starts from fresh names.  The
+printing for `opaque.relift_params` (`DEVM_PROTO_IDS`) is never changed.  `tests/devm_print.py`.
 
 ### Names
 

@@ -12,6 +12,8 @@
   devm-v14      devm's loop-head normaliser, v14 model and hand-over route (tests/devm_v14.py; with
                 LURAPH_CORPUS set also one file per v14 layout of the sample corpus)
   devm-v15      devm's traced-run snapshots and jump hubs for the v15.1 corpus builds (tests/devm_v15_corpus.py)
+  devm-stall    a traced run that does not end is stopped, dumped and lifted; its report (tests/devm_stall.py)
+  devm-print    devm's printer: a function made afresh at each call is printed once (tests/devm_print.py)
   mock          the mock Roblox environment answers like Roblox (tests/mock_test.py)
   structurer    deobf's structurer against random control-flow graphs (research/structure_fuzz.py)
   frontend      deob.py picks the right engine and reports truthfully (tests/allinone_test.py)
@@ -43,6 +45,8 @@ def checks(full):
         ("devm-lift", [PY, "-B", "tests/devm_lift_v14.py"], {}, 1800),
         ("devm-v14", [PY, "-B", "tests/devm_v14.py"], {}, 900),
         ("devm-v15", [PY, "-B", "tests/devm_v15_corpus.py"], {}, 600),
+        ("devm-stall", [PY, "-B", "tests/devm_stall.py"], {}, 600),
+        ("devm-print", [PY, "-B", "tests/devm_print.py"], {}, 300),
         ("mock", [PY, "-B", "tests/mock_test.py"], {}, 600),
         ("structurer", [PY, "-B", "deobf/research/structure_fuzz.py", "0", "3000" if full else "500"], {}, 1800),
         ("frontend", [PY, "-B", "tests/allinone_test.py"], {"ALLINONE_FULL": "1"} if full else {}, 3600),
