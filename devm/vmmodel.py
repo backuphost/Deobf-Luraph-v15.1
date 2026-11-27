@@ -1045,8 +1045,9 @@ class PoolServer:
 SERVER = None
 
 
-def start_server(cmd, workdir):
-    """Run the harness until its dump is written and leave it serving; returns its stderr so far."""
+def start_server(cmd, workdir, limit=1800):
+    """Run the harness until its dump is written and leave it serving; returns its stderr so far
+    (with a `[timeout]` line when it was stopped after `limit` seconds without a dump)."""
     global SERVER
     if SERVER is not None:
         SERVER.close()
@@ -1059,7 +1060,8 @@ def start_server(cmd, workdir):
     errpath = os.path.join(sdir, 'stderr.txt')
     with open(errpath, 'w') as ef:
         proc = subprocess.Popen(cmd + ['serve=' + sdir], stdout=subprocess.DEVNULL, stderr=ef)
-    deadline = time.time() + 1800
+    deadline = time.time() + limit
+    stopped = False
     try:
         while time.time() < deadline and proc.poll() is None and not os.path.exists(os.path.join(sdir, 'ready')):
             time.sleep(0.2)
@@ -1071,8 +1073,13 @@ def start_server(cmd, workdir):
         atexit.register(SERVER.close)
     elif proc.poll() is None:
         proc.kill()
+        stopped = True
     with open(errpath, errors='replace') as f:
-        return f.read()
+        text = f.read()
+    if stopped:
+        # (a script that waits for ever - for a key, an event, its own loop - ends here)
+        text += '\n[timeout] the run was stopped after %d s without reaching its end\n' % limit
+    return text
 
 
 # per-access lines of a traced run (each global read, call, new proto): thousands of them bury the reason

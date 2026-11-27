@@ -321,6 +321,15 @@ class RunFailedMessage(unittest.TestCase):
         self.assertEqual(vmmodel.harness_tail('[budget] stopped after 9 VM instructions\n' + '[global] a\n' * 50),
                          '[budget] stopped after 9 VM instructions')
 
+    def test_stopped_run_says_so(self):
+        """A harness that does not end within the limit is stopped, and the tail says that it was."""
+        cmd = [sys.executable, '-c', 'import sys, time; sys.stderr.write("[global] a\\n[script] print: waiting\\n"); '
+               'sys.stderr.flush(); time.sleep(60)']
+        with tempfile.TemporaryDirectory() as d:
+            err = vmmodel.start_server(cmd, d, limit=2)
+        tail = vmmodel.harness_tail(err)
+        self.assertEqual(tail, '[script] print: waiting | [timeout] the run was stopped after 2 s without reaching its end')
+
     def test_main_prints_it(self):
         import contextlib
         import io

@@ -271,7 +271,8 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.  A failed
   harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`: the `[oracle]`,
   `[budget]`, `[timeout]`, `[error]` lines and the last error, without the per-access `[global]` /
-  `[call]` trace lines), printed up to 1000 characters.
+  `[call]` trace lines), printed up to 1000 characters; a traced run stopped at its time limit
+  (a script that waits for ever, e.g. for a key) says so in a `[timeout]` line.
 * **Containers.**  With `devm/container_static.py` in the tree the container is read without
   running it; otherwise by the sandboxed probe.  Either way the run executes the shipped file.
 
