@@ -836,6 +836,8 @@ HINT_LINE = '  hint: '
 # pipeline.entered_program: the result is the program Luraph's start-up code entered, not the first program
 ENTRY_LINE = 'script program: '
 PARSE_PREFIX = '  the text does not parse: '
+# runvals.notes: calls whose effect on their caller's variables the run did not prove (PARTIAL)
+RUNVALS_LINE = '  values not shown: '
 LAST_RUN = {'notes': []}       # what the traced run of the last deobfuscate() call reported
 
 
@@ -931,6 +933,12 @@ def run_report(notes):
             out.append(ENTRY_LINE + n[len('[entry] '):])
         elif n.startswith('[cut] '):
             out.append('  note: ' + n[len('[cut] '):])
+        elif n.startswith('[runvals] '):
+            # (pipeline / runvals.py: values the run proves, shown where the lifted code would show
+            # something else: not a defect)
+            out.append('  note: ' + n[len('[runvals] '):])
+        elif n.startswith('[runvals-missing] '):
+            out.append(RUNVALS_LINE + n[len('[runvals-missing] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
     said = [n for n in notes if n.startswith('[script]')]
     for n in said[:12]:
@@ -978,6 +986,8 @@ def report(text, returned=None, notes=None, parse=None):
                 head_notes.append(lines[0][len('--   '):])
             elif lines[0].startswith('--   ' + ENTRY_LINE):
                 head_notes.append('[entry] ' + lines[0][len('--   ' + ENTRY_LINE):])
+            elif lines[0].startswith('--   ' + RUNVALS_LINE):
+                head_notes.append('[runvals-missing] ' + lines[0][len('--   ' + RUNVALS_LINE):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
@@ -992,6 +1002,9 @@ def report(text, returned=None, notes=None, parse=None):
     # pipeline's hint: the proto taken for the script is tiny and calls nothing but pure library
     # functions, while the first program did all the work (the script is probably that program)
     hint = next((n for n in notes if n.startswith('[hint]')), None)
+    # calls that wrote into their caller's variables (or helpers of the build whose results the
+    # script keeps) where the run proved no value: the text shows the earlier value (runvals.notes)
+    unshown = [n[len('[runvals-missing] '):] for n in notes if n.startswith('[runvals-missing] ')]
     unparsed = parse is not None and parse[0] is False
     # instructions without a marker, said in a head line of the text (not one more marker)
     hidden = [HIDDEN_HEAD.match(ln) for ln in lines[:2]]
@@ -1036,7 +1049,7 @@ def report(text, returned=None, notes=None, parse=None):
     out = []
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry):
+            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry or unshown):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + unchecked + traps
     out.append('result: PARTIAL')
@@ -1071,6 +1084,11 @@ def report(text, returned=None, notes=None, parse=None):
     if single_root:
         out.append('  the result is the VM\'s root program including Luraph\'s start-up code, lifted from the state before '
                    'it ran: what that code decodes at run time is still encoded, and the script is not separated from it')
+    if unshown:
+        out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
+                   'the run shows no single value for some of them (see the "values not shown" line%s above): there the '
+                   'text shows the earlier value, or the call, with the constants handed to it still encrypted' % (
+                       len(unshown), 's' if len(unshown) > 1 else ''))
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
     if blank:

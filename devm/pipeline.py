@@ -128,6 +128,12 @@ def _run_traced(self):
         from . import opaque
         protos = opaque.relift_params(self.lifter, protos, root, self.native_text,
                                       log=lambda msg: self.log('[%s] %s' % (self.tag, msg)))
+    # Values the run proves where the lifted code would show something else: what a call handed its
+    # caller's register array wrote there (a helper of the build that decodes a constant into a
+    # register of the script's program), and the results of the build's helpers (runvals.py)
+    from . import runvals
+    helper_set = set(helpers or ())
+    sites = runvals.show_run_values(protos, oracle, helper_set)
     self.protos = protos
     self.oracle = oracle
     nodes = sum(len(p.nodes) for p in protos.values())
@@ -155,7 +161,11 @@ def _run_traced(self):
             self.hints.append('[hint] the function taken for the script (proto %d, on the second interpreter) has only %d '
                               'instructions, while the first program executed %d: the script is probably the first '
                               'program; run again with --root %d' % (root, nodes, ran_first, first_root))
+    for n in runvals.notes(sites, helper_set):
+        self.log('[%s] %s' % (self.tag, n))
+        self.hints.append(n)
     d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
+    d.labels = runvals.labels(sites, helper_set, protos)
     self.text = d.run()
     self.stats = d.stats
     self.log('[%s] decompiled: %d lines, %d unstructured' % (self.tag, self.text.count('\n'), d.stats['unstructured']))

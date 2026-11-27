@@ -2136,6 +2136,9 @@ class Decompiler:
         # printed once (key -> name, None until first used), in the order of first use
         self.on_spot, self.elsewhere = {}, set()
         self.hoist, self.hoist_used, self.hoist_deps, self.hoist_cur = {}, [], {}, None
+        # {program: comment} printed as the first line of that function's body (pipeline: the helpers
+        # of the build, runvals.labels)
+        self.labels = {}
 
     def proto_ast(self, key):
         """(params, vararg, ast)"""
@@ -2180,6 +2183,8 @@ class Decompiler:
             # (not the program lifted as the script: it can read its own arrays where Luraph's
             # crash code is compiled into it, but it is not the tamper response)
             ast.insert(0, ['comment', TRAP_NOTE])
+        if key in self.labels and key != self.root_key:
+            ast.insert(0, ['comment', self.labels[key]])
         return params, cfg.vararg, ast
 
     @staticmethod

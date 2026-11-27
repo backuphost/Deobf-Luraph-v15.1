@@ -85,6 +85,8 @@ line per kind of thing that is missing:
 | `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
 | `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
+| `note: N call(s) of program K, a helper of the build ...` | not a defect: calls handed their caller's register array (or a helper's results the script keeps) whose effect on the caller's variables the run proves; the values are shown after the calls (see "Values the run proves") |
+| `values not shown: ...` | such calls where the run shows no single value of what they wrote (code that did not run, values that differed between runs of the call): the text shows the earlier value there, and the constant handed to the call stays encrypted |
 
 `run.report(text, notes=...)` gives the second part for any result file (it skips a head written
 earlier, and reads the start-up, single-root and hint lines off it when no run notes are given;
@@ -679,6 +681,50 @@ that cannot change what the code does:
 
 The decision is taken after a first printing; the second one starts from fresh names.  The
 printing for `opaque.relift_params` (`DEVM_PROTO_IDS`) is never changed.  `tests/devm_print.py`.
+
+### Values the run proves (helpers that write into their caller's registers)
+
+Some builds decode their string constants at run time with a helper of the build: a routine on
+another interpreter (in the builds seen, the interpreter the script's program does not run on) that
+the script's code calls with an encrypted constant, its own register array and the number of a
+register, and that stores the plain string in that register (in the interpreter's terms a call
+`f(..., enc, R, n)`; devm prints the register array as `({})`).  Nothing in the lifted code of the
+caller writes register `n`, so the text used to show the encrypted constant wherever the script
+read it afterwards: a message built from it printed ciphertext where the run printed plain text.
+
+The traced run knows better.  The harness's oracle now keeps, for every instruction that ran, the
+strings and booleans each register held at every visit (`s`, next to the numbers of `r`; strings up
+to 4096 bytes; nothing for code only the exercise or probe pass ran) and which registers held the
+activation's own register array (`a`).  `runvals.show_run_values` (called by `pipeline` after the
+lift) looks at every call handed the register array (an argument that stands for it in the code, or
+one read from a register the run shows holding it) and, when every execution of that instruction
+went on to the same next instruction, puts `R[r] = V` right after the call for each register `r`
+that the instruction itself does not write after the call, that no function of the program captures
+by reference, that the next instruction saw holding `V` at every visit, and that did not hold `V`
+before the call.  The rest of the lift (expression folding, dead stores) works from there: the
+decoded value shows where the script reads it, and a register nothing reads gets nothing.  A
+helper of the build whose result the script keeps in a register (`R[a] = helper(enc)`) is treated
+the same way: the call stays as a statement, handed its constant, and the register gets the value
+the run saw.
+
+* Nothing is put where the run did not prove a value: an instruction that did not run, one followed
+  by more than one instruction, a register that held different values at different visits.  Calls
+  are kept: whether a helper has other effects is not known (its own lift can be incomplete).
+* Programs the pipeline names helpers of the build (programs on other interpreters while the
+  script's output came from the first interpreter, see "Which program is the script") are labelled
+  in the text, as the first line of their body: `-- program N: a helper of the build (Luraph's
+  routine on another interpreter than the script's program), not the script's code`, with what it
+  writes when it writes into its caller's registers.  A function the pipeline does not name a helper
+  gets no label (its values are shown all the same: the call wrote them).
+* The run notes: `note: N call(s) of program K, a helper of the build ... write into its variables:
+  after each of them the text shows the values they wrote as the run saw them`; and, where the run
+  shows no single value for what such calls wrote, `values not shown: ...`, which makes the result
+  PARTIAL (there the text shows the earlier value, and a constant handed to the call stays
+  encrypted).
+* `tests/devm_runvals.py`: the harness's records, and hand-written programs for the small VM of
+  `tests/devm_lift_v14.py` whose helper decodes a constant while the probe runs, with the negative
+  cases (values that differ per execution, a call that did not run, two successors, another table in
+  the register, a function of the script that keeps its result).
 
 ### Names
 
