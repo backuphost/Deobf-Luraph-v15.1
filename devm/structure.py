@@ -2155,7 +2155,9 @@ class Decompiler:
                 break
         self.stats['protos'] += 1
         self.stats['warnings'].extend(cfg.warnings)
-        if NOTE_TRAPS and loads_own_code(pir):
+        if NOTE_TRAPS and key != self.root_key and loads_own_code(pir):
+            # (not the program lifted as the script: it can read its own arrays where Luraph's
+            # crash code is compiled into it, but it is not the tamper response)
             ast.insert(0, ['comment', TRAP_NOTE])
         return params, cfg.vararg, ast
 

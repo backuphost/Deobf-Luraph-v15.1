@@ -80,13 +80,39 @@ def _run_traced(self):
     # --root overrides: in some builds the other interpreter only runs a helper of the build (a
     # keystream routine) and the script is the first program after all.
     forced = getattr(self, 'force_root', None)
+    helpers = entry = None
     if forced:
         payload = [forced] if forced != root else []
+    elif payload:
+        payload, helpers = script_programs([idx for idx, _ in self.lifter.records], payload, notes)
+        if helpers:
+            self.log('[%s] the script\'s output and requests came from programs of the first interpreter (%s), not from '
+                     'the %d program(s) on other interpreters (%s)' % (
+                         self.tag, ', '.join(str(p) for p in sorted(effect_programs(notes))), len(helpers),
+                         ', '.join(str(p) for p in helpers[:8]) + (', ...' if len(helpers) > 8 else '')))
+    if not forced and not payload:
+        # The script runs on the first interpreter.  Its top level can be part of Luraph's main
+        # function (the v15.2 example), or a program of its own that the start-up code enters at
+        # its end and never comes back from: then that program is the script.
+        callers = {}
+        for i, p in enumerate(raw['protos']):
+            c = self.dump.conv(p, '__LPH_PROTOS[%d]' % (i + 1)).h.get('caller')
+            if isinstance(c, (int, float)):
+                callers[i + 1] = int(c)
+        # (evidence of where the script runs: the programs its output and requests came from, or,
+        # for a script that showed nothing, the program the run was stopped in)
+        eff = effect_programs(notes)
+        entry = entered_program(eff or stopped_in(notes), callers, oracle, first_root,
+                                evidence='the script\'s output came from' if eff else 'the run was stopped in')
+        if entry:
+            payload = [entry[0]]
+            self.log('[%s] %s' % (self.tag, entry[1]))
     self.payload_root = payload[0] if payload else None
     if payload:
         root = payload[0]
         self.lifter.root_key = root
-        self.log('[%s] payload: proto %d is the script (protos 1..%d are the bootstrap)' % (self.tag, root, root - 1))
+        if not entry:
+            self.log('[%s] payload: proto %d is the script (protos 1..%d are the bootstrap)' % (self.tag, root, root - 1))
     protos = self.lifter.lift_all(root)
     if vmmodel.SERVER is not None:
         # functions that never ran decrypt themselves with numbers their callers pass: lift those
@@ -104,9 +130,11 @@ def _run_traced(self):
     self.errors = errs
     self.conflicts = [(k, c) for k, p in protos.items() for c in p.conflicts]
     self.hints = []
+    if entry:
+        self.hints.append('[entry] ' + entry[1])
     if not payload:
-        self.hints.append(startup_note(notes, forced, first_root, len(m.interps)))
-    if payload and not forced:
+        self.hints.append(startup_note(notes, forced, first_root, len(m.interps), helpers=helpers))
+    if payload and not forced and not entry:
         # The proto taken for the script is the first one on the second interpreter.  Where that
         # interpreter only runs a helper, next to nothing is lifted while the run shows the first
         # program doing all the work: say so (the choice itself is left alone, --root decides).
@@ -129,7 +157,89 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def startup_note(notes, forced, first_root, interps):
+def script_programs(interps, payload, notes):
+    """(payload, helpers): the programs on interpreters other than the first one (`payload`, in
+    order; `interps[i]` is the interpreter of program i + 1) narrowed to those on an interpreter
+    the script's output and requests came from (the harness's [effects] line).  A build can make
+    programs on other interpreters that are helpers (a hash routine) while the script's own code
+    runs on the first interpreter, its top level next to Luraph's start-up code: then no program
+    is left and `helpers` lists the ones set aside (the first program is lifted, with the
+    [startup] note).  Without the line the payload stays as it is."""
+    eff = effect_programs(notes)
+    where = {interps[p - 1] for p in eff if 0 < p <= len(interps)}
+    if not where:
+        return payload, None
+    take = [p for p in payload if interps[p - 1] in where]
+    return take, (payload if not take else None)
+
+
+# instructions of the first program that may run for the first time after the program it entered
+# started, for that program to count as the script (the start-up code's own epilogue)
+ENTRY_SLACK = 32
+
+
+def entered_program(effects, callers, oracle, first_root=1, evidence='the script\'s output came from'):
+    """(program, note) when the script is a program of its own on the first interpreter, else None.
+
+    `effects`: {program: count} of the [effects] line (or the program a run that did not end was
+    stopped in, `evidence` says which); `callers`: {program: the program that ran
+    the instruction before its first one} (harness.lua, the record's `caller`); `oracle`: the
+    traced run's records ((pid, loop, pc) -> {'vers': [[step, text], ...], ...}).  Each program the
+    script's output came from is followed through its callers to the first program; the program
+    below it on that chain is the one the start-up code entered.  It is the script when the first
+    program ran (next to) nothing new after it started: Luraph's start-up code handed over and
+    never came back.  Output from the first program itself, or a first program that went on with
+    code of its own (the script's top level in Luraph's main function, calling a function of the
+    script), leaves the first program as the result."""
+    if not effects or first_root in effects:
+        return None
+    below = {}
+    for p, n in effects.items():
+        seen, x = set(), p
+        while x in callers and callers[x] != first_root and x not in seen:
+            seen.add(x)
+            x = callers[x]
+        if callers.get(x) == first_root and x != first_root:
+            below[x] = below.get(x, 0) + n
+    if not below:
+        return None
+    first = {}
+    for (pid, _loop, _pc), rec in oracle.items():
+        if rec.get('vers'):
+            first[pid] = min(first.get(pid, rec['vers'][0][0]), rec['vers'][0][0])
+    cand = max(below, key=lambda x: (below[x], -first.get(x, 0)))
+    if cand not in first:
+        return None
+    after = sum(1 for (pid, _l, _p), rec in oracle.items()
+                if pid == first_root and rec.get('vers') and rec['vers'][0][0] > first[cand])
+    if after > ENTRY_SLACK:
+        return None
+    return cand, ('program %d is the script: the first program (Luraph\'s start-up code) called it at step %d and ran %s '
+                  'after that; %s program(s) %s, which run under it.  The start-up code is not in the result' % (
+                      cand, first[cand], 'no new instruction' if not after else '%d new instruction(s)' % after,
+                      evidence, ', '.join(str(p) for p in sorted(effects))))
+
+
+def stopped_in(notes):
+    """{program: 1} of the harness's [where] line (the program a run that did not end was stopped
+    in), {} without it"""
+    for n in notes:
+        m = re.match(r'\[where\] the run was stopped in program (\d+)$', n)
+        if m:
+            return {int(m.group(1)): 1}
+    return {}
+
+
+def effect_programs(notes):
+    """{program number: count} of the harness's [effects] line: the programs that ran the last VM
+    instruction before each line of the script's output and each request ({} without the line)"""
+    for n in notes:
+        if n.startswith('[effects] '):
+            return {int(a): int(b) for a, b in re.findall(r'(\d+) \((\d+)\)', n)}
+    return {}
+
+
+def startup_note(notes, forced, first_root, interps, helpers=None):
     """The run note for a factory-layout result that is the VM's first program: Luraph's start-up
     code (environment checks, key derivation, decryption), possibly with the script's top level
     flattened into it (v15.2 builds without a payload interpreter).  What the run shows about
@@ -147,8 +257,14 @@ def startup_note(notes, forced, first_root, interps):
     shown = ', '.join(x for x in (
         '%d line(s) of output' % len(said) if said else '',
         '%d request(s)' % len(asked) if asked else '') if x)
-    head = ('[startup] the run created no program on an interpreter other than the first one (%d modelled): the result is '
-            'the VM\'s first program, which begins with Luraph\'s start-up code.  ' % interps)
+    if helpers:
+        head = ('[startup] the script\'s output and requests came from programs of the first interpreter, not from the %d '
+                'program(s) the run made on other interpreters (%s: helpers): the result is the VM\'s first program, which '
+                'begins with Luraph\'s start-up code.  ' % (len(helpers), ', '.join(str(p) for p in helpers[:8]) +
+                                                             (', ...' if len(helpers) > 8 else '')))
+    else:
+        head = ('[startup] the run created no program on an interpreter other than the first one (%d modelled): the result is '
+                'the VM\'s first program, which begins with Luraph\'s start-up code.  ' % interps)
     if shown:
         return head + ('The script\'s top level ran inside that program (the run shows %s from it), but it is not '
                        'separated from the start-up code' % shown)

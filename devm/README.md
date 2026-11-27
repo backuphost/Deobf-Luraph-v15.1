@@ -79,7 +79,8 @@ line per kind of thing that is missing:
 | `lines of Luraph's key arithmetic are left` | `v - v % 1` on a value cut to 32 bits: numbers the interpreter mixes into its keys, where they did not fold to a constant |
 | `functions return a parameter xor-ed with a large literal` | Luraph's per-call keys (`return bit32.bxor(p, K), ...`) where they could not be folded because a caller is not in the result |
 | `lines compute a constant into a local nothing reads` | Luraph's dead arithmetic (`local v = <literals, arithmetic, bit32 / string calls>`, v14 self-patch values) that `cleanup.drop_dead_constants` left because it does not evaluate here (removing a line that raises would change the script) |
-| `the result is the VM's first program, which begins with Luraph's start-up code` | factory layout: the run made no program on a second interpreter, so the lift is the first program; the `start-up code:` line of the run says what the run shows about the script (its top level ran inside it but is not separated, or nothing of it showed) |
+| `the result is the VM's first program, which begins with Luraph's start-up code` | factory layout: the run made no program on a second interpreter, or the script's output and requests came from the first interpreter's programs, so the lift is the first program; the `start-up code:` line of the run says what the run shows about the script (its top level ran inside it but is not separated, or nothing of it showed) |
+| `the script did not end` | factory layout: the traced run did not end (a key system that waits for its key, a GUI script in its event loop, Luraph's tamper response) and was stopped; the `[stalled]` line of the run says after how long and in what. What the script would have done later is not in the result (see "A script that does not end") |
 | `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
 | `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
@@ -137,6 +138,92 @@ Later findings on the two Luarmor samples (see `deobfuscated/loadstring5.lua`, `
 
 `antitamper.py` predates the inlined instrumentation and is not wired in.
 
+### A script that does not end
+
+The end-state dump is taken when the script ends, and many scripts never do: a key system waits
+for its key, a GUI script sits in its event loop (`while true do task.wait() end`,
+`RunService.Heartbeat:Wait()` in a loop), a loader that found no key calls Luraph's tamper
+response.  Nothing really waits in the mock (a wait of the main thread returns at once, so does an
+event's `:Wait()`), so such a script spins.  Before, the run went on until `start_server`'s limit
+of 1800 s killed it, and a killed process has no dump: `run failed`.  Now the harness watches the
+traced run (`harness.lua`, `watch`) and, when it stops it, ends the run as if the script had
+returned: `[stalled]` line, exercise pass, oracle, end-state dump, serve mode for the lifter's
+lazily decoded constants.
+
+* **The script's start.**  The watch works on the script's own code.  That has started when a
+  program is made on an interpreter other than the first one (the payload of two-interpreter
+  builds), or at the script's first line of output or first request (builds whose script runs on
+  the first interpreter, next to Luraph's start-up code).
+* **Progress** is a VM instruction that runs for the first time (or in a new version of its code)
+  or a program that is made.  VM code is watched through the instruction hook; code that is not VM
+  code (the loader, and the script's functions Luraph keeps as plain Lua) through its `while` /
+  `repeat` loops, which count their rounds in the instrumented copy (`__LPH_N.l`, no call) and call
+  `__LPH_L` every 65,536 rounds (`Model.patched_source`).
+* **When the run is stopped** (seconds are the harness's processor time; it never sleeps):
+  - `--stall S` (default 90): after the start, S seconds without progress: the script loops over
+    code it has run before;
+  - `--stall-wait S` (default 600): S seconds of waiting the mock simulated without progress, from
+    the start of the run (Luraph's start-up code does not wait in loops).  `task.wait(t)` and
+    `wait(t)` count what they report, a frame event's `:Wait()` (`Heartbeat`, `RenderStepped`,
+    `Stepped`, ...) one frame, and any other event's `:Wait()` 60 s, since nothing in the mock ever
+    fires it: a loop of waits that can never be satisfied stops after ten rounds instead of
+    spinning, a single one lets the script go on as before;
+  - `--stall-run S` (default 600): S seconds after the start, progress or not;
+  - **Luraph's tamper response**: a VM function that holds two or more code arrays of another
+    program in its registers (its caller loads its own arrays and passes them on) is stopped as
+    soon as they are there (checked at every instruction that runs for the first time: the
+    function's first instructions copy its arguments into the registers).  It would scramble those
+    arrays and then loop for ever rewriting bytes of the VM's bytecode buffer, which is what the
+    lift of code that never ran and the lazily decoded constants are read from: stopping later
+    would lift a damaged state.  The exercise pass does not enter it either.
+  0 switches a limit off.  The defaults are `vmmodel.STALL`; `--beat S` makes the harness log what
+  the run is doing every S seconds (`[beat]` lines in `serve/stderr.txt` of the work directory).
+* **Before the start**, 4 x `--stall` seconds without progress, or the tamper response, end the
+  run *without* a dump: it spins in Luraph's start-up code (an environment check failed) or in code
+  that shows nothing, and a lift would be the start-up code, which is never written out as the
+  script.  devm fails with `run failed: ... [stalled] the run did not end and showed nothing of the
+  script ...` and the front end tries the next engine.
+* **The report.**  `[stalled] the script did not end: it was stopped N s after it started (<what
+  showed the start>), <in what: waiting in task.wait() / Heartbeat:Wait() ..., in a loop of its VM
+  code, in a loop outside the VM's code, at the entry of Luraph's tamper response, still running>;
+  code it would load or fetch later is missing`, and the result is PARTIAL.  `deob.py` /
+  `allinone.py` keep that result (the second engine is not tried) and end with
+  `result: PARTIAL: the script did not end: ... (devm)`.
+* **Which program is the script.**  A run that does not end is often one that never reached the
+  script's interpreter, so the choice of the root matters more than before.  The harness notes
+  which program ran the last VM instruction before each line of the script's output and each
+  request (`[effects]`), and for every program the program of the instruction before its first
+  one, i.e. its caller (`caller` in the dump's proto record).
+  - The script is taken from the interpreter its output came from (`pipeline.script_programs`).
+    A build can make programs on other interpreters that are helpers (a hash routine) while the
+    script runs on the first interpreter; the first of those helpers used to be lifted as "the
+    script".
+  - On the first interpreter, the programs the output came from (for a script that showed
+    nothing: the program the run was stopped in, `[where]`) are followed through their callers to
+    the first program (`pipeline.entered_program`).  When the program below it on that
+    chain was entered by the start-up code at its end (the first program ran at most 32 new
+    instructions after that program started) and the first program said nothing itself, that
+    program is the script and is lifted on its own, without the start-up code; the report says so
+    (`program N is the script: ...`).  Otherwise (the output came from the first program, or it
+    went on with code of its own: the script's top level in Luraph's main function, as in the
+    v15.2 example) the first program is lifted, with the `[startup]` note.
+  (A program's creator is not the evidence: closures of these builds are made while Luraph's
+  lazy-constant decoder, itself VM code, runs.)
+* **Limits.**  A script whose loop keeps running code it has not run before (every round new) is
+  only stopped by `--stall-run`; a plain-Lua `for` loop that never ends is not counted (only
+  `while` and `repeat` are) and is stopped by the last-resort limit; the tamper response is
+  recognised by what it is handed, so a build whose tamper response looks different is stopped
+  by the time limits, after it has damaged the state.
+
+Seen on a v15.2 key-system loader (the script runs on the first interpreter, in a program the
+start-up code enters at its end; two helpers on other interpreters): it prints a start message,
+reads a few executor globals and a key global, and, without a key, calls its own failure routine,
+which warns that a key is required and then passes its own code arrays to Luraph's tamper response.
+That function XOR-scrambles them and then rewrites bytes of the bytecode buffer in
+`while true do ... end`: a busy loop of VM code, no wait, no environment access, no new
+instruction.  Without the watch the run went on for 30 minutes and failed; with it the run stops
+at the tamper response and the script's program is lifted.
+
 ## Environment fidelity (newer factory builds)
 
 These builds answer a failed environment check by scrambling their own bytecode forever, and the
@@ -159,7 +246,8 @@ exactly rather than approximately:
 
 `harness.lua` options for diagnosing a failed check: `stub=<pid>` (suppress the tamper response),
 `watch=<pid>` (log the arguments of that proto's last calls, e.g. the comparison helper), `tb=<pid>`,
-`depth=<n>`.
+`depth=<n>`, `beat=<s>` (a `[beat]` line every s seconds: instructions, distinct ones, programs,
+loop rounds, waits, the last instructions).
 
 ### Two-interpreter builds: the payload
 
@@ -271,8 +359,10 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   does not open), `no model`, `init did not hand over`, `run failed`, `lift failed`.  A failed
   harness run's reason is the meaningful end of its output (`vmmodel.harness_tail`: the `[oracle]`,
   `[budget]`, `[timeout]`, `[error]` lines and the last error, without the per-access `[global]` /
-  `[call]` trace lines), printed up to 1000 characters; a traced run stopped at its time limit
-  (a script that waits for ever, e.g. for a key) says so in a `[timeout]` line.
+  `[call]` trace lines), printed up to 1000 characters.  A traced run that does not end is
+  normally stopped by the harness itself and lifted (see "A script that does not end"); one that
+  showed nothing of the script fails with its `[stalled]` line, and one that still did not end at
+  the last-resort limit of 1800 s says so in a `[timeout]` line.
 * **Containers.**  With `devm/container_static.py` in the tree the container is read without
   running it; otherwise by the sandboxed probe.  Either way the run executes the shipped file.
 
@@ -498,7 +588,11 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   from inside that program -- its top level is in the result but not separated -- or nothing of it.
   The same with `--root` set to the first program.  (The v14.9 rule of the proto-table layout, a
   program entered that was not reachable from the root's tables when it started, has no
-  counterpart here: every factory program is a closure made at run time.)
+  counterpart here: every factory program is a closure made at run time.)  Two exceptions, read
+  off the run (see "A script that does not end", "Which program is the script"): when the
+  script's output came from the first interpreter while programs on other interpreters exist,
+  those are helpers and not the script; and when that output came from a program the start-up
+  code entered at its end and never came back from, that program is lifted as the script.
 
 ### Names
 

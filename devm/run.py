@@ -239,7 +239,7 @@ def v152_generation(model):
     return any(l[2][0][0] == 'local' and vmmodel._outlined_test(l[2], l[2][0]) for l in model.loops)
 
 
-def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True):
+def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=None, http_reply=None, executor=None, mfp_delta=None, exercise=True, http_map=None, chunk_arg=None, chunk_name=None, mark_untaken=False, route='auto', budget=None, run_timeout=None, second_stage_limit=90, preliminary=None, diagnose=True, stall=None, stall_wait=None, stall_run=None, beat=None):
     os.makedirs(workdir, exist_ok=True)
     LAST_RUN['notes'] = []
     tag = os.path.splitext(os.path.basename(path))[0]
@@ -365,7 +365,10 @@ def deobfuscate(path, workdir, log=print, script_path=None, server=False, root=N
         # self-decrypting builds: lift the VM state at the end of a traced run (see Stage.run_traced).
         # exercise=1: functions of the script that nobody called are called once, so that their
         # code decrypts itself too.
-        stage.harness_options = (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
+        # (a script that does not end is stopped by the harness and its state lifted where it was:
+        # vmmodel.STALL; beat=<s> logs what the run is doing every <s> seconds)
+        stage.harness_options = vmmodel.stall_options(stall=stall, stallwait=stall_wait, stallrun=stall_run) + \
+            (['beat=%d' % beat] if beat else []) + (['exercise=1'] if exercise else ['binds=1']) + (['server=1'] if server else []) + (['scriptpath=' + script_path] if script_path else []) + (['httpreply=' + http_reply] if http_reply else []) + (['httpmap=' + http_map] if http_map else []) + (['executor=1'] if executor else []) + (['mfpdelta=%d' % mfp_delta] if mfp_delta is not None else [])
         # (a script in its shipped layout keeps its source's control flow: nothing to unflatten.
         # Luraph v15.2 does flatten: its start-up code and the script's main function share one
         # state machine, see README "Luraph v15.2")
@@ -724,6 +727,19 @@ def main(argv=None):
                          'auto = a, then b when the init does not hand over')
     ap.add_argument('--budget', type=int, default=None, help='route a: VM instructions the init may run before it is stopped')
     ap.add_argument('--run-timeout', type=int, default=None, help='route a: seconds the run may take')
+    ap.add_argument('--stall', type=int, default=None, metavar='S',
+                    help='factory layout (v15): a script that does not end (a key system waiting for its key, a GUI '
+                         'script in its event loop) is stopped once its own code has run this many seconds without a VM '
+                         'instruction running for the first time, and the state at that moment is lifted; the result is '
+                         'PARTIAL (default %d; 0: off)' % vmmodel.STALL['stall'])
+    ap.add_argument('--stall-wait', type=int, default=None, metavar='S',
+                    help='... or once it has waited this many seconds in task.wait / wait / an event\'s :Wait() without '
+                         'new code (nothing really waits in the mock, so these are counted; default %d)' % vmmodel.STALL['stallwait'])
+    ap.add_argument('--stall-run', type=int, default=None, metavar='S',
+                    help='... or this many seconds after its own code started, new code or not (default %d)' % vmmodel.STALL['stallrun'])
+    ap.add_argument('--beat', type=int, default=None, metavar='S',
+                    help='diagnosis: the traced run logs what it is doing every S seconds ([beat] lines in the harness\'s '
+                         'stderr, serve/stderr.txt in the work directory)')
     ap.add_argument('--no-diagnosis', action='store_true',
                     help='route a: when the init does not hand over, do not run it a second time with call logging '
                          '(the run that names the last mocked calls in the failure message)')
@@ -750,7 +766,7 @@ def main(argv=None):
 
     stop_on_signals()
     try:
-        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis)
+        text = deobfuscate(a.input, work, script_path=a.script_path, server=a.server, root=a.root, http_reply=a.http_reply, executor=a.executor, mfp_delta=a.mfp_delta, exercise=not a.no_exercise, http_map=a.http_map, chunk_arg=a.chunk_arg, chunk_name=a.chunk_name, mark_untaken=a.mark_untaken, route=a.route, budget=a.budget, run_timeout=a.run_timeout, preliminary=write_result, diagnose=not a.no_diagnosis, stall=a.stall, stall_wait=a.stall_wait, stall_run=a.stall_run, beat=a.beat)
     except Terminated as e:
         if vmmodel.SERVER is not None:
             vmmodel.SERVER.close()
@@ -866,10 +882,17 @@ def run_report(notes):
     import re
     out = []
     for n in notes:
-        m = re.match(r'\[oracle\] script (returned|stopped: .*?) after (\d+) instructions', n)
+        m = re.match(r'\[oracle\] script (returned|stopped: .*?|did not end\b.*?) after (\d+) instructions', n)
         if m:
             out.append('traced run: the script %s (%s VM instructions)' % (
-                'returned' if m.group(1) == 'returned' else 'stopped with "%s"' % m.group(1)[len('stopped: '):], m.group(2)))
+                'returned' if m.group(1) == 'returned' else
+                'did not end and was stopped, see the [stalled] line' if m.group(1).startswith('did not end') else
+                'stopped with "%s"' % m.group(1)[len('stopped: '):], m.group(2)))
+    # a script that waits or loops for ever: the harness stopped it (vmmodel.STALL) and the state at
+    # that moment is what was lifted
+    for n in notes:
+        if n.startswith('[stalled] '):
+            out.append(n)
     single = any(n.startswith('[root]') for n in notes)
     for n in notes:
         m = re.match(r'\[dumpnew\] the script starts at interpreter entry (\d+) \((\d+) VM instructions', n)
@@ -897,6 +920,8 @@ def run_report(notes):
             out.append('  ' + n[len('[env] '):])
         elif n.startswith('[hint]'):
             out.append(HINT_LINE + n[len('[hint] '):])
+        elif n.startswith('[entry] '):
+            out.append('  ' + n[len('[entry] '):])
         elif n.startswith('[cut] '):
             out.append('  note: ' + n[len('[cut] '):])
     # what the script itself printed or read, and where the mock had no Roblox answer (rbxmock.lua)
@@ -942,12 +967,16 @@ def report(text, returned=None, notes=None, parse=None):
                 head_notes.append('[startup] ' + lines[0][len('--   ' + STARTUP_LINE):])
             elif lines[0].startswith('--   ' + HINT_LINE):
                 head_notes.append('[hint] ' + lines[0][len('--   ' + HINT_LINE):])
+            elif lines[0].startswith('--   [stalled] '):
+                head_notes.append(lines[0][len('--   '):])
             del lines[0]
         text = '\n'.join(lines)
     if notes is None:
         notes = head_notes
     single_root = any(n.startswith('[single-root]') for n in notes)
     startup = any(n.startswith('[startup]') for n in notes)
+    # the traced run did not end: the harness stopped it (vmmodel.STALL)
+    stalled = any(n.startswith('[stalled]') for n in notes)
     # pipeline's hint: the proto taken for the script is tiny and calls nothing but pure library
     # functions, while the first program did all the work (the script is probably that program)
     hint = next((n for n in notes if n.startswith('[hint]')), None)
@@ -995,7 +1024,7 @@ def report(text, returned=None, notes=None, parse=None):
     out = []
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed):
+            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + unchecked + traps
     out.append('result: PARTIAL')
@@ -1015,6 +1044,9 @@ def report(text, returned=None, notes=None, parse=None):
         else:
             out.append('  %s instruction(s) did not lift and have no LIFT ERROR marker: they are in code the text does not '
                        'contain (its first line lists the errors)' % m.group(2))
+    if stalled:
+        out.append('  the script did not end (see the [stalled] line above): the run was stopped and the state at that moment '
+                   'lifted; what it would have done later (code it would load, fetch or decrypt after the wait) is not in the result')
     if startup:
         out.append('  the result is the VM\'s first program, which begins with Luraph\'s start-up code: the script was not '
                    'found as a program of its own (what the run shows about it is in the start-up code line above)')
