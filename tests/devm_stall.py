@@ -1006,6 +1006,10 @@ class CallChain(unittest.TestCase):
         interps, callers, notes = probe_evidence(dump, err)
         self.assertEqual(pipeline.script_votes(interps, [2], notes, callers), ({0: 1}, 'under'))
         self.assertEqual(pipeline.script_programs(interps, [2], notes, callers), ([], [2]))
+        self.assertEqual(pipeline.not_placed(notes), 1)
+        self.assertEqual(pipeline.helpers_reason(interps, [2], notes, callers),
+                         'the script\'s output and requests came from programs of the first interpreter (1 line(s); 1 more '
+                         'on threads whose call chain starts there, not placed), not from')
 
     def test_no_line_placed(self):
         """An [under] line that placed none of the lines leaves the choice to the [effects] line."""

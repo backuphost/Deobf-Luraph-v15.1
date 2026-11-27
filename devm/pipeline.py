@@ -270,10 +270,14 @@ def helpers_reason(interps, payload, notes, callers=None, first_root=1):
         return ('the run was stopped in program %s, a program of the first interpreter that does not run under a program of '
                 'another interpreter, not in or under' % p)
     own, total = votes.get(first, 0), sum(votes.values())
+    # (lines the call chains could not place, harness.lua watch.under: counted for neither side)
+    loose = not_placed(notes) if kind == 'under' else 0
+    tail = ('; %d more on threads whose call chain starts there, not placed' % loose) if loose else ''
     if own == total:
-        return 'the script\'s output and requests came from programs of the first interpreter, not from'
+        return 'the script\'s output and requests came from programs of the first interpreter%s, not from' % (
+            ' (%d line(s)%s)' % (total, tail) if loose else '')
     return ('%d of the script\'s %d lines of output and requests came from programs of the first interpreter (%d from under '
-            'programs of other interpreters), not from' % (own, total, total - own))
+            'programs of other interpreters%s), not from' % (own, total, total - own, tail))
 
 
 # instructions of the first program that may run for the first time after the program it entered
@@ -395,6 +399,16 @@ def under_programs(notes):
                 got[0] = int(m.group(1))
             return got
     return {}
+
+
+def not_placed(notes):
+    """how many lines of output and requests the harness's [under] line could not place (on a thread
+    whose call chain starts there, harness.lua watch.under); 0 without them"""
+    for n in notes:
+        if n.startswith('[under] '):
+            m = re.search(r'not placed: [^(]*\((\d+)\)', n)
+            return int(m.group(1)) if m else 0
+    return 0
 
 
 # the words of harness.lua's [stalled] line for a wait loop before the script showed itself otherwise
