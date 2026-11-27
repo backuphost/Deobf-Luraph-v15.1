@@ -81,10 +81,17 @@ def _run_traced(self):
     # keystream routine) and the script is the first program after all.
     forced = getattr(self, 'force_root', None)
     helpers = entry = None
+    # {program: the program that ran the instruction before its first one} (harness.lua, the
+    # record's `caller`): script_programs and entered_program follow these links
+    callers = {}
+    for i, p in enumerate(raw['protos']):
+        c = self.dump.conv(p, '__LPH_PROTOS[%d]' % (i + 1)).h.get('caller')
+        if isinstance(c, (int, float)):
+            callers[i + 1] = int(c)
     if forced:
         payload = [forced] if forced != root else []
     elif payload:
-        payload, helpers = script_programs([idx for idx, _ in self.lifter.records], payload, notes)
+        payload, helpers = script_programs([idx for idx, _ in self.lifter.records], payload, notes, callers, first_root)
         if helpers:
             self.log('[%s] the script\'s output and requests came from programs of the first interpreter (%s), not from '
                      'the %d program(s) on other interpreters (%s)' % (
@@ -96,11 +103,6 @@ def _run_traced(self):
         # function (the v15.2 example), or a program of its own that the start-up code enters at
         # its end.  Only a run that did not end is lifted from that program (entered_program says
         # why); otherwise the first program is, and its note names the program.
-        callers = {}
-        for i, p in enumerate(raw['protos']):
-            c = self.dump.conv(p, '__LPH_PROTOS[%d]' % (i + 1)).h.get('caller')
-            if isinstance(c, (int, float)):
-                callers[i + 1] = int(c)
         # (evidence of where the script runs: the programs its output and requests came from, or,
         # for a script that showed nothing, the program the run was stopped in)
         eff = effect_programs(notes)
@@ -163,16 +165,31 @@ def _run_traced(self):
 Stage.run_traced = _run_traced
 
 
-def script_programs(interps, payload, notes):
+def script_programs(interps, payload, notes, callers=None, first_root=1):
     """(payload, helpers): the programs on interpreters other than the first one (`payload`, in
     order; `interps[i]` is the interpreter of program i + 1) narrowed to those on an interpreter
     the script's output and requests came from (the harness's [effects] line).  A build can make
     programs on other interpreters that are helpers (routines of the build) while the script's own code
     runs on the first interpreter, its top level next to Luraph's start-up code: then no program
     is left and `helpers` lists the ones set aside (the first program is lifted, with the
-    [startup] note).  Without the line the payload stays as it is."""
+    [startup] note).  Without the line the payload stays as it is.
+
+    The script's program can itself call functions of the first interpreter (routines of the
+    build), and the last VM instruction before a line of its output is then in one of those.  So a
+    program the output came from is followed through `callers` ({program: the program that ran the
+    instruction before its first one}, harness.lua's record) towards the first program: where the
+    chain passes a program of `payload`, the output counts for that program's interpreter."""
     eff = effect_programs(notes)
-    where = {interps[p - 1] for p in eff if 0 < p <= len(interps)}
+    pay, callers = set(payload), callers or {}
+    where = set()
+    for p in eff:
+        x, seen = p, set()
+        while x not in pay and x != first_root and x in callers and x not in seen:
+            seen.add(x)
+            x = callers[x]
+        q = x if x in pay else p
+        if 0 < q <= len(interps):
+            where.add(interps[q - 1])
     if not where:
         return payload, None
     take = [p for p in payload if interps[p - 1] in where]

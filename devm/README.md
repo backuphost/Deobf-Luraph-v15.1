@@ -231,7 +231,12 @@ lazily decoded constants.
   - The script is taken from the interpreter its output came from (`pipeline.script_programs`).
     A build can make programs on other interpreters that are helpers (routines of the build)
     while the script runs on the first interpreter; the first of those helpers used to be lifted
-    as "the script".  The `start-up code:` line then names them as helpers.
+    as "the script".  The `start-up code:` line then names them as helpers.  The script's own
+    program can in turn call routines of the first interpreter, and the last VM instruction before
+    its output is then in one of those (seen in v15.1 and v15.2 corpus builds whose script is a
+    program on the second interpreter): a program the output came from is followed through its
+    callers, and where that chain passes a program on another interpreter, the output counts for
+    that program's interpreter.
   - On the first interpreter, the programs the output came from (for a script that showed
     nothing: the program the run was stopped in, `[where]`) are followed through their callers to
     the first program (`pipeline.entered_candidate`): the program below it on that chain is the
@@ -646,8 +651,9 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   program entered that was not reachable from the root's tables when it started, has no
   counterpart here: every factory program is a closure made at run time.)  Two exceptions, read
   off the run (see "A script that does not end", "Which program is the script"): when the
-  script's output came from the first interpreter while programs on other interpreters exist,
-  those are helpers and not the script; and when a run that did not end has that output in a
+  script's output came from the first interpreter (from programs that do not run under one of
+  the programs on other interpreters) while programs on other interpreters exist, those are
+  helpers and not the script; and when a run that did not end has that output in a
   program the start-up code entered at the end of its run, that program is lifted on its own
   (PARTIAL: the first program's code before the call is not in it).
 

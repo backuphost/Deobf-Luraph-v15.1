@@ -540,6 +540,24 @@ class ScriptPrograms(unittest.TestCase):
         self.assertEqual(pipeline.script_programs(interps, [5, 6, 7, 8], []), ([5, 6, 7, 8], None))
         self.assertEqual(pipeline.effect_programs(notes), {6: 2})
 
+    def test_output_from_a_function_the_script_called(self):
+        """The script's program (5, the only one on interpreter 2) calls a routine of the first
+        interpreter (4, whose first instruction ran right after one of program 5), and the last VM
+        instruction before its output is in that routine: the output counts for program 5."""
+        from devm import pipeline
+        interps = [1, 1, 1, 1, 2]
+        notes = ['[effects] the script\'s output and requests came from programs 4 (1)']
+        callers = {2: 1, 3: 2, 4: 5, 5: 1}
+        self.assertEqual(pipeline.script_programs(interps, [5], notes, callers, 1), ([5], None))
+        # (through a routine that routine called: 3 under 4 under 5)
+        notes3 = ['[effects] the script\'s output and requests came from programs 3 (2)']
+        self.assertEqual(pipeline.script_programs(interps, [5], notes3, {2: 1, 3: 4, 4: 5, 5: 1}, 1), ([5], None))
+        # without the links, or when the routine runs under the first program, program 5 is a helper
+        self.assertEqual(pipeline.script_programs(interps, [5], notes), ([], [5]))
+        self.assertEqual(pipeline.script_programs(interps, [5], notes, {2: 1, 3: 2, 4: 1, 5: 4}, 1), ([], [5]))
+        # (links that go round in a circle end the walk)
+        self.assertEqual(pipeline.script_programs(interps, [5], notes, {3: 4, 4: 3}, 1), ([], [5]))
+
 
 class EnteredProgram(unittest.TestCase):
     """pipeline.entered_candidate / entered_program: the program Luraph's start-up code entered at the end of
