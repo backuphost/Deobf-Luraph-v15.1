@@ -85,9 +85,9 @@ line per kind of thing that is missing:
 | `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
 | `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
-| `note: N call(s) of program K, set aside as a helper of the build ...` | not a defect: calls handed their caller's register array (or a helper's results the script keeps) whose effect on the caller's variables the run proves; the values are shown after the calls (see "Values the run proves") |
+| `note: N call(s) of program K, set aside as a helper of the build ...` | calls handed their caller's register array (or a helper's results the script keeps) whose values are shown after the calls: not a defect where the code proves that they are the same at every execution; where a `values assumed: ...` line names the same calls, the values are the run's and only assumed (see "Values the run proves") |
 | `values not shown: ...` | such calls where the run does not prove what they wrote or may have written (the call did not run, it went on to more than one instruction or shares it with another such call, what followed it held different values at different times, or what it is handed is not constant or not shown to give the same at every execution): after them a variable the call may have set is printed `nil --[[set by a call handed the register array: value not shown]]`, or the call is kept, and the constant handed to the call stays encrypted |
-| `values assumed: ...` | such calls whose values are shown although the check that they depend only on what the call is handed could not be completed (the code of the function called that ran did not all lift): each such value carries the comment `--[[the run's value; assumed to depend only on the call's inputs: the function called was not fully lifted]]`, and the result is PARTIAL |
+| `values assumed: ...` | such calls whose values are shown although the check that they depend only on what the call is handed could not be completed: each such value carries a comment `--[[the run's value; assumed to depend only on the call's inputs: ...]]` that ends with what could not be checked (`the function called was not fully lifted`; `the function called uses tostring, next, pairs or string.format`; `the calling code was not fully lifted`; `another call handed the register array was not fully checked`), and the result is PARTIAL |
 
 `run.report(text, notes=...)` gives the second part for any result file (it skips a head written
 earlier, and reads the start-up, single-root and hint lines off it when no run notes are given;
@@ -787,47 +787,76 @@ stays as a statement, handed its constant, and the register gets the value the r
      through its upvalue);
   4. the closure's lifted code, the functions it makes included, reads no global but the standard
      library's tables and functions (`string`, `table`, `math` but `math.random`, `bit32`, `utf8`,
-     `buffer`, `select`, `tostring`, ...), no value of Luraph's loader, changes no variable it shares
-     with other functions, and only stores into the register array it is handed (never reads it, nor
-     passes it on).  The library's functions count as functions of their arguments; these checks do
-     not look at what they are applied to (`tostring` of a table prints its address, which differs
-     between executions: a helper that wrote such a string would be shown with the run's).
+     `buffer`, `select`, `tostring`, ...; a field the library does not have, such as `string.n`, is a
+     place where a script can keep a value, also when it is read through a variable that holds the
+     table), no value of Luraph's loader, changes no variable it shares with other functions, and
+     only stores into the register array it is handed (never reads it, nor passes it on).  The
+     library's functions count as functions of their arguments, except `tostring`, `next`, `pairs`
+     and `string.format`: `tostring` of a table or a function (and `string.format` with `%s` or
+     `%p`) is its address, and `next` and `pairs` go through a table's keys in the order they are
+     stored in, which can differ between executions.  A function called that uses one of these is
+     taken to give the same at every execution only as an assumption (below).
+  And for all the calls of the function that makes the call together (`runvals._settle`): every
+  call handed its register array meets these rules, and the array reaches no other code (a call that
+  may be handed it but is not one of those followed, such as a call in one arm of a branch, the
+  array kept in a table, a global or a shared variable, returned, or stored into through a register
+  that holds it).  A call that fails a rule (`setmetatable` on the array, a helper handed a register
+  number read at run time) can keep the array and change any register later -- through any call, or
+  a metamethod -- which no statement shows; the rules above follow the statements, so then nothing
+  in that function is proved.  A register that a function of the program shares by reference and
+  assigns through its upvalue is not a constant anywhere in the program (a call of that function,
+  which is not handed the register array, changes it).
   When a rule fails, nothing is substituted: a value the script read at run time (a global, an
   argument, a result, a register of the caller) can differ at another execution, however often this
-  run saw the same one.  When no rule fails but the check cannot be completed because the code of
-  the function called that ran (by the oracle's records of its program; all of it when there are
-  none) has lift errors, instructions that did not lift, or values the lift could not describe, the
-  run's value is shown with `--[[the run's value; assumed to depend only on the call's inputs: the
-  function called was not fully lifted]]` right at it, the report has a `values assumed: ...` line,
-  and the result is PARTIAL: that the value depends only on what the call is handed is then assumed,
-  not proved.  (Earlier text here said that such a function "does the same at every execution" when
-  it is a closure handed constants: that was a claim about its captures and its code that nothing
-  checked.)
+  run saw the same one.  When no rule fails but the check cannot be completed, the run's value is
+  shown with a comment right at it, the report has a `values assumed: ...` line, and the result is
+  PARTIAL: that the value depends only on what the call is handed is then assumed, not proved.  The
+  comment says what could not be checked:
+  * `--[[the run's value; assumed to depend only on the call's inputs: the function called was not
+    fully lifted]]`: the code of the function called that ran (by the oracle's records of its
+    program; all of it when there are none) has lift errors, instructions that did not lift, or
+    values the lift could not describe;
+  * `...: the function called uses tostring, next, pairs or string.format]]`: see rule 4;
+  * `...: the calling code was not fully lifted]]`: an instruction of the function that makes the
+    call, one that can be reached from its entry, did not lift or lifted with an error (what it does
+    to the registers, and which functions it makes, is not known), or a variable the call depends on
+    is shared with a function that did not all lift;
+  * `...: another call handed the register array was not fully checked]]`: another call handed the
+    same register array is only assumed to meet the rules.
+  (Earlier text here said that such a function "does the same at every execution" when it is a
+  closure handed constants: that was a claim about its captures and its code that nothing checked.)
 * **Which record of the run covers the call.**  The harness sees a call only by the VM function it
   enters, so the record of what changed (`w`) is used only where the instruction's one call is the
   one handed the register array and calls a closure of the program (`runvals._trusted`; in a loop
-  the instructions are taken together, by induction over the run).  Elsewhere (a second call in the
+  the instructions are taken together, by induction over the run).  That the run saw a call leave a
+  register alone counts for the proof of another call only when the first call meets the rules
+  itself: otherwise it can write that register at another execution.  Elsewhere (a second call in the
   same instruction, a callee that is no VM function) a register the call names, or one that held a
   value before it, is proved or marked as below, never skipped because `w` did not list it.
 * **What is not proved is marked, not shown stale.**  For a register the call may have set -- one
   that held one value before the call and none after it, one the call names (a constant register
-  number handed with the register array), one the run saw the call change -- where the run proves
-  no value (no one value after the call, or a rule above fails), `R[r] = nil --[[set by a call
-  handed the register array: value not shown]]` goes in after the call, so the text does not print
-  the earlier value (the encrypted constant, or nothing) as the current one.  The same after a call
-  that did not run or went on to more than one instruction, and after each call of an instruction
-  that hands the register array to several, for the registers it names.  A register a function of
-  the program shares (captures by reference) is marked too when the call names it or the run saw it
-  change, unless a function of the program assigns it through its upvalue (then that function's text
-  shows the change).  A register the instruction's own statements after the call read before setting
-  it again is marked (the next instruction saw what they made of it, not what the call left); one
-  they set again without reading it first is left alone.  One such register is enough for the call
-  to count as not shown (`values not shown: ...`, PARTIAL), whatever else it shows.  A register
-  nothing reads after the call is not counted.
+  number handed with the register array), one the run saw the call change -- where the run proves no
+  value (no one value after the call, or a rule above fails), `R[r] = nil --[[set by a call handed
+  the register array: value not shown]]` goes in after the call, so the text does not print the
+  earlier value (the encrypted constant, or nothing) as the current one.  The same after a call that
+  did not run or went on to more than one instruction, and after each call of an instruction that
+  hands the register array to several, for the registers it names.  A register a function of the
+  program shares (captures by reference) is marked too when the call names it or the run saw it
+  change (by the record `w` where it covers the call, else because it held one value before the call
+  and another, or none, after it), unless a function of the program assigns it through its upvalue
+  (then that function's text shows the change).  A register the instruction's own statements after
+  the call read before setting it again is marked (the next instruction saw what they made of it,
+  not what the call left); one they set again without reading it first is left alone.  One such
+  register is enough for the call to count as not shown (`values not shown: ...`, PARTIAL), whatever
+  else it shows.  A register nothing reads after the call is not counted.
 * **What is not seen.**  A register that held no one value before the call nor after it, that the
   call does not name, and that the run did not see the call change (a callee that is no VM function
-  is not seen) is left as the code has it.  In a loop, the function called is only proved when the
-  run saw the call leave the register that holds it alone (the call itself could change it).
+  is not seen) is left as the code has it.  A call that fails a rule but, as far as the run saw,
+  changed nothing the code reads afterwards gets no mark and no note of its own (its `why=` is in
+  the devm log); what it can do at another execution is what makes every other value of the same
+  function not proved (above), and those are marked.  In a loop, the function called is only proved
+  when the run saw the call leave the register that holds it alone (the call itself could change
+  it).
 * Calls are kept: whether a helper has other effects is not known (its own lift can be incomplete).
 * Programs the pipeline names helpers of the build (programs on other interpreters set aside
   because the run's weighed evidence points at the first interpreter, see "Which program is the
@@ -855,11 +884,12 @@ stays as a statement, handed its constant, and the register gets the value the r
   have none; in one, a build without a second interpreter whose result is the first program, the
   start-up code has two calls handed the register array, both of which ran.  One entered a VM
   function (`h` 1, `w` empty), but the code does not show which function it calls, so that record
-  is not used (see "Which record of the run covers the call"); the other's callee is no VM
-  function, whose writes the run cannot see.  Neither is proved (`why=` in the log line: the function
-  called is not shown to be one the program makes; what it is handed is not constant), and neither
-  gets a mark or a note: no register the code reads after them held one value before the call and
-  another (or none) after it, and none they name is read afterwards without such a value.
+  is not used (see "Which record of the run covers the call"); the other is `setmetatable` handed
+  the register array, a library function whose effect the run cannot see.  Neither is proved
+  (`why=` in the log line: the function called is not shown to be one the program makes; the
+  function called is a library function), so nothing else in that program could be either, and
+  neither gets a mark or a note: no register the code reads after them held one value before the
+  call and another (or none) after it, and none they name is read afterwards without such a value.
 * `tests/devm_runvals.py`: the harness's records, and hand-written programs for the small VM of
   `tests/devm_lift_v14.py` whose helper decodes a constant while the probe runs, with the negative
   cases (values that differ per execution, a call that did not run, two successors, another table in
@@ -873,7 +903,15 @@ stays as a statement, handed its constant, and the register gets the value the r
   that is in the same instruction, a helper called through `pcall`, arguments from a table or from one
   of two paths, two calls handed the array in one instruction, a register shared by a function made
   after the call (and one the function called assigns through its upvalue, not marked), and a
-  register the instruction reads again after the call (and one it only sets again).
+  register the instruction reads again after the call (and one it only sets again).  And what the
+  proof follows (`WhatTheCodeShows`): an argument changed through a function that shares it,
+  another call handed the array and a register number read at run time (also where the helper
+  shares a variable by reference), `setmetatable` on the array, the array kept in a table, a shared
+  register changed by a call no record covers (no VM function; a VM function the code does not
+  name), a field the library does not have, `tostring` of a table (assumed), calling code that did
+  not all lift (assumed), another call only assumed (assumed), a variable shared with a function
+  that did not all lift (assumed), and a helper that calls a function it shares that returns a
+  constant (proved).
 
 ### Names
 

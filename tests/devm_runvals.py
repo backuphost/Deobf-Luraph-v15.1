@@ -32,6 +32,12 @@ would (no text of a protected file is in here).
   arguments the run cannot vouch for and two such calls in one instruction).  A register a function
   shares, or that the instruction reads again after the call, is marked unless that function's text
   or a plain store shows what it holds (SharedOrReadAgain).
+* The proof follows the code: a register a function shares and assigns is no constant; a call
+  handed the register array that fails a rule (or the array kept where other code reaches it) leaves
+  nothing in that function proved; a shared register the run saw change is marked also where no
+  record covers the call; a field the library does not have is not the library's; `tostring`,
+  calling code that did not all lift, another call only assumed, and a variable shared with a
+  function that did not all lift make a value assumed, said in the comment at it (WhatTheCodeShows).
 """
 import json
 import os
@@ -652,6 +658,12 @@ class InputsAtRunTime(unittest.TestCase):
 # 33: R[A] = R[R[B]]                             -- a register number known only at run time (does not lift)
 # 37: R[A] = function made from proto B that shares register C (its upvalue 0)
 # 39: upvalue B = R[A]
+# 40: R[A] = upvalue B
+# 41: R[A] = R[B][C]                             -- a constant key
+# 43: R[A](R[B], R, R[C])                        -- a register number read from a register
+# 44: setmetatable(R, R[A])
+# 45: R[A] = R[A]()
+# 46: R[A] = {}
 MORE = """elseif op == 27 then
 R[A[pc]](R[B[pc]], R, C[pc])
 R[A[pc] + 5] = R[A[pc] + 6]()
@@ -670,6 +682,16 @@ R[A[pc]](R[B[pc]], R, C[pc])
 R[A[pc]](R[B[pc]], R, C[pc] + 1)
 elseif op == 33 then
 R[A[pc]] = R[R[B[pc]]]
+elseif op == 41 then
+R[A[pc]] = R[B[pc]][C[pc]]
+elseif op == 43 then
+R[A[pc]](R[B[pc]], R, R[C[pc]])
+elseif op == 44 then
+setmetatable(R, R[A[pc]])
+elseif op == 45 then
+R[A[pc]] = R[A[pc]]()
+elseif op == 46 then
+R[A[pc]] = {}
 """
 
 
@@ -681,7 +703,10 @@ R[A[pc]] = wrap(B[pc], {[%d] = {[%d] = R, [%d] = C[pc]}})
 elseif op == 39 then
 local c = U[%d + B[pc]]
 c[%d][c[%d]] = R[A[pc]]
-""" % (base, cells[0], cells[1], base, cells[0], cells[1])
+elseif op == 40 then
+local c = U[%d + B[pc]]
+R[A[pc]] = c[%d][c[%d]]
+""" % (base, cells[0], cells[1], base, cells[0], cells[1], base, cells[0], cells[1])
     return Mini(HANDLERS + MORE + shared, prologue='for i = 1, NP do R[i] = args[i] end', outer=PACKER)
 
 
@@ -963,6 +988,237 @@ class SharedOrReadAgain(unittest.TestCase):
         self.assertEqual(report[0][:15], 'result: complet', report)
         self.assertNotIn(MARKED, text)
         self.assertEqual([(s.shown, s.unproved) for s in sites], [({}, set())])
+
+
+def helper_reverse_plus_up():
+    """function(s, R, n) R[n] = s:reverse() .. <upvalue 0> end"""
+    return proto([(23, 4, 1, 0), (40, 5, 0, 0), (21, 4, 4, 5), (22, 2, 3, 4), (2, 1, 0, 0)], nparams=3)
+
+
+def helper_calls_up():
+    """function(s, R, n) R[n] = s:reverse() .. <upvalue 0>() end"""
+    return proto([(23, 4, 1, 0), (40, 5, 0, 0), (45, 5, 0, 0), (21, 4, 4, 5), (22, 2, 3, 4), (2, 1, 0, 0)], nparams=3)
+
+
+def helper_reads_a_library_field():
+    """function(s, R, n) local t = string; R[n] = s:reverse() .. t.n end  (string.n: not the library's)"""
+    return proto([(23, 4, 1, 0), (3, 6, 'string', 0), (41, 5, 6, 'n'), (21, 4, 4, 5), (22, 2, 3, 4), (2, 1, 0, 0)],
+                 nparams=3)
+
+
+def helper_tostring_of_a_table():
+    """function(s, R, n) R[n] = s:reverse() .. tostring({}) end  (a table's address)"""
+    return proto([(23, 4, 1, 0), (3, 5, 'tostring', 0), (46, 6, 0, 0), (5, 5, 0, 0), (21, 4, 4, 5), (22, 2, 3, 4),
+                  (2, 1, 0, 0)], nparams=3)
+
+
+def sets_its_upvalue_to_a_global():
+    """function() <upvalue 0> = input end"""
+    return proto([(3, 1, 'input', 0), (39, 1, 0, 0), (2, 1, 0, 0)])
+
+
+# the encrypted constant printed as R2's value after the call
+STALE = r'^local (\w+) = "%s"\n(?:.*\n)*.*print\(\1 \.\. " world"\)' % ENC
+# ... and the variable a function shares printed as not shown
+SHARED_MARKED = r'local (\w+) = %s\n(?:.*\n)*.*print\(\1 \.\. " world"\)' % re.escape(MARKED)
+# print(R2 .. " world") (4 instructions, a return) and what the probe does for it
+PRINT_R2 = [(3, 3, 'print', 0), (1, 5, ' world', 0), (21, 4, 2, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+PRINT_R2_RUN = ('regs[3] = print', 'regs[5] = " world"', 'regs[4] = regs[2] .. regs[5]', 'regs[3] = nil')
+
+
+@unittest.skipUnless(have_luau(), 'needs bin/luau')
+class WhatTheCodeShows(unittest.TestCase):
+    """What a proof of a call follows is the program's code: a register changed by a function that shares it, a
+    register array handed to a call that is not followed (it can keep the array and change any register later), a
+    register the call changed that a function shares when no record of the run covers the call, a field the
+    standard library does not have, and library functions whose result can differ for the same arguments."""
+
+    def run_it(self, main, eff, work, helpers=True):
+        oracle = loop_oracle(eff, range(1, len(eff) + 2), work, vm=True)
+        return show_more(main, oracle, helpers)
+
+    def not_shown(self, main, eff, work, wrong, helpers=True):
+        # wrong: what the text must not show (a value as proved), or a pattern of the stale value printed
+        m, sites, notes, text, report = self.run_it(main, eff, work, helpers)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        if wrong.startswith('^'):
+            self.assertNotRegex(text, wrong[1:])
+        else:
+            self.assertNotIn(wrong, text)
+        self.assertIn(MARKED, text)
+        self.assertTrue(any(n.startswith('[runvals-missing] ') for n in notes), notes)
+        return m, sites, notes, text
+
+    def test_argument_changed_through_a_function_that_shares_it(self):
+        # (the verifier's probe P12h) R5 = "abc"; a function that shares R5 sets it to a global and is called (a call
+        # not handed the register array); then helper(R5, R, 2): what the helper is handed is not a constant
+        main = [(1, 5, 'abc', 0), (37, 6, sets_its_upvalue_to_a_global(), 5), (8, 1, helper_into_regs(), 0),
+                (45, 6, 0, 0), (20, 1, 5, 2)] + PRINT_R2
+        eff = effects('regs[5] = "abc"', 'regs[6] = function() regs[5] = %s end' % RUN_TIME, 'regs[1] = helper',
+                      'regs[6] = regs[6]()', 'regs[1](regs[5], regs, 2)', *PRINT_R2_RUN)
+        m, sites, notes, text = self.not_shown(main, eff, REVERSE, '"eurt"', helpers=False)
+        site = [s for s in sites if s.kind == 'regs'][0]
+        self.assertEqual((site.shown, site.unproved, site.fixed), ({}, {2}, False))
+        self.assertEqual(site.why, 'what it is handed is not constant')
+        self.assertIn('print(%s .. ' % MARKED, text)     # (R5, the shared variable, is " world" by then)
+
+
+    def test_another_call_handed_a_register_number_read_at_run_time(self):
+        # (P5) helper("zzz", R, idx) with idx a global (this run: 9, which nothing reads), then helper(R5, R, 2) with
+        # R5 = "abc": at another execution the first call can write R5 (or anything else)
+        main = [(8, 1, helper_into_regs(), 0), (1, 5, 'abc', 0), (3, 7, 'idx', 0), (1, 8, 'zzz', 0), (43, 1, 8, 7),
+                (20, 1, 5, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[5] = "abc"', 'regs[7] = 9', 'regs[8] = "zzz"',
+                      'regs[1](regs[8], regs, regs[7])', 'regs[1](regs[5], regs, 2)', *PRINT_R2_RUN)
+        m, sites, notes, text = self.not_shown(main, eff, REVERSE, '"cba"')
+        self.assertEqual([(s.shown, s.fixed) for s in sites], [({}, False), ({}, False)])
+        self.assertEqual(sites[0].why, 'what it is handed is not constant')
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+
+    def test_shared_variable_and_another_call_handed_a_run_time_register_number(self):
+        # (P5b) the helper shares R7 ("k"); another call handed the register array and a register number read at run
+        # time can change R7 at another execution
+        main = [(1, 7, 'k', 0), (37, 1, helper_reverse_plus_up(), 7), (8, 6, helper_into_regs(), 0), (3, 9, 'idx', 0),
+                (1, 8, 'zzz', 0), (43, 6, 8, 9), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[7] = "k"', 'regs[1] = helper', 'regs[6] = helper', 'regs[9] = 11', 'regs[8] = "zzz"',
+                      'regs[6](regs[8], regs, regs[9])', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)',
+                      *PRINT_R2_RUN)
+        m, sites, notes, text = self.not_shown(main, eff, 'if n == 2 then R[n] = string.reverse(s) .. "k" else '
+                                                          'R[n] = string.reverse(s) end', '"hellok"')
+        self.assertEqual([(s.fixed, s.unproved) for s in sites], [(False, set()), (False, {2})])
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+
+    def test_metatable_set_on_the_register_array(self):
+        # (P6b) setmetatable(R, mt) (a library function handed the register array) before the helper is made: what the
+        # helper stores goes through the metatable, which no statement shows
+        main = [(3, 6, 'mt', 0), (44, 6, 0, 0), (8, 1, helper_into_regs(), 0), (1, 2, ENC, 0), (20, 1, 2, 9),
+                (3, 3, 'print', 0), (1, 5, ' world', 0), (21, 4, 9, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+        eff = effects('regs[6] = {__newindex = function(t, k, v) rawset(t, k, k == 9 and v .. %s or v) end}' % RUN_TIME,
+                      'setmetatable(regs, regs[6])', 'regs[1] = helper', 'regs[2] = "%s"' % ENC,
+                      'regs[1](regs[2], regs, 9)', 'regs[3] = print', 'regs[5] = " world"', 'regs[4] = regs[9] .. regs[5]',
+                      'regs[3] = nil')
+        m, sites, notes, text = self.not_shown(main, eff, REVERSE, '"hellotrue"')
+        self.assertIn('library function (setmetatable)', sites[0].why)
+        self.assertEqual((sites[1].fixed, sites[1].unproved), (False, {9}))
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+
+    def test_register_array_kept_in_a_table(self):
+        # the program keeps its register array in a table (through R6 = R): any code that reaches the table can change
+        # any register later, which no statement shows
+        main = [(8, 1, helper_into_regs(), 0), (25, 6, 0, 0), (3, 7, 'stash', 0), (1, 8, 'k', 0), (22, 7, 8, 6),
+                (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[6] = regs', 'regs[7] = {}', 'regs[8] = "k"', 'regs[7][regs[8]] = regs[6]',
+                      'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        m, sites, notes, text = self.not_shown(main, eff, REVERSE, '"%s"' % PLAIN)
+        self.assertEqual([(s.fixed, s.unproved) for s in sites], [(False, {2})])
+        self.assertIn('the register array is kept in a table', sites[0].why)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+    def test_shared_register_changed_by_a_call_with_no_record(self):
+        # (P11) decode(R2, R, 0), decode a global that is no VM function, writes R2; a function made after the call
+        # shares R2: no record covers the call, but the run saw R2 change
+        main = [(3, 1, 'decode', 0), (1, 2, ENC, 0), (20, 1, 2, 0), (37, 6, proto([(2, 1, 0, 0)]), 2)] + PRINT_R2
+        eff = effects('regs[1] = function(s, R, n) R[2] = string.reverse(s) end', 'regs[2] = "%s"' % ENC,
+                      'regs[1](regs[2], regs, 0)', 'regs[6] = function() end', *PRINT_R2_RUN)
+        m, sites, notes, text = self.not_shown(main, eff, 'error("unused")', STALE, helpers=False)
+        self.assertEqual([(s.unproved, s.fixed) for s in sites], [({2}, False)])
+        self.assertRegex(text, SHARED_MARKED)
+
+    def test_shared_register_changed_by_a_function_the_code_does_not_name(self):
+        # (P11b) the same with a VM function read from a global: the harness saw it (`w`), but the code does not say
+        # which function it is, so that record is not used
+        main = [(3, 1, 'decode', 0), (1, 2, ENC, 0), (20, 1, 2, 0), (37, 6, proto([(2, 1, 0, 0)]), 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 0)', 'regs[6] = function() end',
+                      *PRINT_R2_RUN)
+        oracle = loop_oracle(eff, range(1, len(eff) + 2), 'R[2] = string.reverse(s)', vm=True)
+        self.assertEqual(own(oracle, 4)[(4, 0, 3)]['w'], {2})
+        m, sites, notes, text = self.not_shown(main, eff, 'R[2] = string.reverse(s)', STALE, helpers=False)
+        self.assertEqual([(s.unproved, s.fixed) for s in sites], [({2}, False)])
+        self.assertRegex(text, SHARED_MARKED)
+
+    def test_field_the_library_does_not_have(self):
+        # (P9) string.n, read through a variable that holds the string table: a script can keep a value there
+        main = [(8, 1, helper_reads_a_library_field(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        m, sites, notes, text = self.not_shown(main, eff, 'R[n] = string.reverse(s) .. tostring(string.n)', '"hellonil"')
+        self.assertIn('string.n, which the standard library does not have', sites[0].why)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+
+
+    def test_captured_function_that_returns_a_constant(self):
+        # (control, P1c) the helper calls a function it shares, which returns a constant: proved, shown, complete
+        g = proto([(1, 1, 'k', 0), (2, 1, 0, 0)])
+        main = [(8, 6, g, 0), (37, 1, helper_calls_up(), 6), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[6] = function() end', 'regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)',
+                      *PRINT_R2_RUN)
+        m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. "k"', helpers=False)
+        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertIn('print("hellok" .. " world")', text)
+        self.assertEqual([(s.fixed, s.assumed) for s in sites], [(True, False)])
+
+    def test_tostring_is_an_assumption(self):
+        # (P10) the helper appends tostring of a table it makes (an address, another at every execution): the value is
+        # the run's, said at the value to be assumed, and the result is PARTIAL
+        main = [(8, 1, helper_tostring_of_a_table(), 0), (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        m, sites, notes, text, report = self.run_it(main, eff, 'R[n] = string.reverse(s) .. tostring({})')
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.fixed, s.assumed, s.comment) for s in sites], [(True, True, runvals.ASSUMED_LIB)])
+        self.assertRegex(text, r'print\("hellotable: [^"]*" --\[\[%s\]\] \.\. " world"\)' % re.escape(runvals.ASSUMED_LIB))
+        self.assertIn('uses tostring', notes[-1])
+        self.assertIn('--[[%s]]' % runvals.ASSUMED_LIB, notes[-1])
+        self.assertTrue(any('the check could not be completed' in ln and runvals.ASSUMED_LIB in ln for ln in report), report)
+        self.assertEqual(run.report(text)[0], 'result: PARTIAL')
+
+    def test_calling_code_that_did_not_all_lift(self):
+        # the helper is proved, but an instruction of the calling function (on a path the run did not take) did not
+        # lift: what it does to the registers is not known, and the value is assumed
+        main = [(8, 1, helper_into_regs(), 0), (1, 2, ENC, 0), (20, 1, 2, 2), (3, 3, 'print', 0), (1, 5, ' world', 0),
+                (21, 4, 2, 5), (5, 3, 0, 0), (3, 6, 'flag', 0), (7, 6, 11, 0), (2, 3, 0, 0), (3, 8, 'idx', 0),
+                (33, 9, 8, 0), (2, 3, 0, 0)]
+        eff = effects('regs[1] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)', 'regs[3] = print',
+                      'regs[5] = " world"', 'regs[4] = regs[2] .. regs[5]', 'regs[3] = nil', 'regs[6] = false', '', '')
+        oracle = loop_oracle(eff, range(1, 11), REVERSE, vm=True)
+        m, sites, notes, text, report = show_more(main, oracle)
+        self.assertTrue(m.errors)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.fixed, s.assumed, s.comment) for s in sites],
+                         [({2: PLAIN}, True, True, runvals.ASSUMED_CALLER)])
+        self.assertIn('"%s" --[[%s]]' % (PLAIN, runvals.ASSUMED_CALLER), text)
+        self.assertIn('the code that makes the call did not all lift', notes[-1])
+
+    def test_another_call_only_assumed(self):
+        # two helpers handed the register array: the first did not all lift (assumed); the second is proved on its own,
+        # but it relies on what the first does with the array: assumed too
+        main = [(8, 1, helper_with_a_lift_error(), 0), (8, 7, helper_into_regs(), 0), (1, 2, ENC, 0), (20, 1, 2, 2),
+                (1, 9, ENC, 0), (20, 7, 9, 9), (3, 3, 'print', 0), (21, 4, 2, 9), (5, 3, 0, 0), (2, 3, 0, 0)]
+        eff = effects('regs[1] = helper', 'regs[7] = helper', 'regs[2] = "%s"' % ENC, 'regs[1](regs[2], regs, 2)',
+                      'regs[9] = "%s"' % ENC, 'regs[7](regs[9], regs, 9)', 'regs[3] = print', 'regs[4] = regs[2] .. regs[9]',
+                      'regs[3] = nil')
+        oracle = loop_oracle(eff, range(1, 11), REVERSE, vm=True)
+        m, sites, notes, text, report = show_more(main, oracle, helpers=False)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertEqual([(s.shown, s.assumed, s.comment) for s in sites],
+                         [({2: PLAIN}, True, runvals.ASSUMED), ({9: PLAIN}, True, runvals.ASSUMED_OTHER)])
+        self.assertIn('print("%s" --[[%s]] .. "%s" --[[%s]])' % (PLAIN, runvals.ASSUMED, PLAIN, runvals.ASSUMED_OTHER), text)
+        self.assertTrue(any('one of the comments' in ln for ln in report), report)
+
+    def test_variable_shared_with_a_function_that_did_not_all_lift(self):
+        # the helper shares R7 ("k") by reference with another function whose code did not all lift: whether that
+        # function changes R7 is not known, and the value is assumed
+        main = [(1, 7, 'k', 0), (37, 6, helper_with_a_lift_error(), 7), (37, 1, helper_reverse_plus_up(), 7),
+                (1, 2, ENC, 0), (20, 1, 2, 2)] + PRINT_R2
+        eff = effects('regs[7] = "k"', 'regs[6] = function() end', 'regs[1] = helper', 'regs[2] = "%s"' % ENC,
+                      'regs[1](regs[2], regs, 2)', *PRINT_R2_RUN)
+        oracle = loop_oracle(eff, range(1, len(eff) + 2), 'R[n] = string.reverse(s) .. "k"', vm=True)
+        m, sites, notes, text, report = show_more(main, oracle, helpers=False)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        site = [s for s in sites if s.kind == 'regs'][0]
+        self.assertEqual((site.shown, site.assumed, site.comment), ({2: 'hellok'}, True, runvals.ASSUMED_CALLER))
+        self.assertIn('did not all lift, so whether it changes that variable is not known', site.why)
 
 
 class Pure(unittest.TestCase):

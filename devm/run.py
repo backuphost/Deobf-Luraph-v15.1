@@ -1031,7 +1031,10 @@ def report(text, returned=None, notes=None, parse=None):
     ups = sum(1 for ln in lines if re.search(r'\bUPVAL_\d', ln))
     # (not the values runvals.show_run_values marks as not shown: the "values not shown" line counts those)
     marks = code.count('nil --[[%s]]' % runvals.MARK)
-    amarks = code.count('--[[%s]]' % runvals.ASSUMED)
+    # (every such comment begins with runvals.ASSUMED_HEAD and says what could not be checked)
+    amarks = code.count('--[[%s' % runvals.ASSUMED_HEAD)
+    # (... in the text, or named by the notes on such values)
+    akinds = sorted(set(re.findall(r'--\[\[(%s[^\]]*)\]\]' % re.escape(runvals.ASSUMED_HEAD), '\n'.join([code] + assumed))))
     holes = len(re.findall(r'nil --\[\[', code)) - marks
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
     # values the lifter could only name by where the dump holds them, and arguments / registers
@@ -1102,12 +1105,20 @@ def report(text, returned=None, notes=None, parse=None):
                    'those calls a variable the call may have set is printed `nil --[[%s]]` (%d in the text), or the text '
                    'keeps the call, and the constants handed to them stay encrypted' % (
                        len(unshown), 's' if len(unshown) > 1 else '', runvals.MARK, marks))
-    if assumed or amarks:
+    if (assumed or amarks) and akinds in ([], [runvals.ASSUMED]):
         out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
                    'the values shown after them are the run\'s, assumed, not proved, to depend only on what the call is '
                    'handed: the code of the function called that ran did not all lift (see the "values assumed" line%s '
                    'above): %d value(s) in the text carry the comment --[[%s]]' % (
                        len(assumed), 's' if len(assumed) > 1 else '', amarks, runvals.ASSUMED))
+    elif assumed or amarks:
+        out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
+                   'the values shown after them are the run\'s, assumed, not proved, to depend only on what the call is '
+                   'handed: the check could not be completed (see the "values assumed" line%s above): %d value(s) in the '
+                   'text carry %s' % (
+                       len(assumed), 's' if len(assumed) > 1 else '', amarks,
+                       'the comment --[[%s]]' % akinds[0] if len(akinds) == 1 else
+                       'one of the comments %s' % ', '.join('--[[%s]]' % c for c in akinds)))
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
     if blank:
