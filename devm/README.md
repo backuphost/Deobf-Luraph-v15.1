@@ -85,8 +85,8 @@ line per kind of thing that is missing:
 | `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
 | `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
-| `note: N call(s) of program K, a helper of the build ...` | not a defect: calls handed their caller's register array (or a helper's results the script keeps) whose effect on the caller's variables the run proves; the values are shown after the calls (see "Values the run proves") |
-| `values not shown: ...` | such calls where the run does not show one value of what they wrote (the call did not run, it went on to more than one instruction, or what followed it held different values at different times): after them a variable may show its earlier value, and the constant handed to the call stays encrypted |
+| `note: N call(s) of program K, set aside as a helper of the build ...` | not a defect: calls handed their caller's register array (or a helper's results the script keeps) whose effect on the caller's variables the run proves; the values are shown after the calls (see "Values the run proves") |
+| `values not shown: ...` | such calls where the run does not prove what they wrote or may have written (the call did not run, it went on to more than one instruction, what followed it held different values at different times, or what it is handed is not constant): after them a variable the call may have set is printed `nil --[[set by a call handed the register array: value not shown]]`, or the call is kept, and the constant handed to the call stays encrypted |
 
 `run.report(text, notes=...)` gives the second part for any result file (it skips a head written
 earlier, and reads the start-up, single-root and hint lines off it when no run notes are given;
@@ -219,6 +219,13 @@ lazily decoded constants.
     failed loops for ever) or in code that shows nothing, and a lift would be the start-up code,
     which is never written out as the script.  devm fails with `run failed: ... [stalled] the run
     did not end and showed nothing of the script ...` and the front end tries the next engine.
+    A loop the script's program started with the mock's `task.spawn` / `task.defer` /
+    `task.delay` / `spawn` runs under that program (see `watch.under` below), so it is the
+    script's start and is lifted like any stop after the start.  On a thread whose start is not
+    known (one the script's coroutine library runs, or one a mock function calls back on) the
+    run is not placed either way: it still ends without a dump, and the `[stalled]` line says
+    that it was stopped on such a thread and that whether the spin is the start-up code's or the
+    script's is not known (`... which of the two is not known, and nothing is lifted`).
   - `--stall-wait` seconds of waiting: the state is dumped and lifted.  Luraph's start-up code does
     not wait, so the waits are the script's own code on the first interpreter (its top level in
     Luraph's main function, or a program that function entered): a script that builds its window
@@ -251,11 +258,15 @@ lazily decoded constants.
   another interpreter` / `, under no program of another interpreter`).  A function that a mock
   function calls back runs on that function's own thread (`cwrap`), and a function `task.spawn`
   or a coroutine runs is on a thread of its own as well: such a chain starts at that function.
-  On a thread other than the one the VM started on, a stack without a program of another
-  interpreter therefore says nothing about where the code was started from (a script on another
-  interpreter whose plain functions run a loop in a spawned thread): those lines are counted as
-  `not placed: on a thread whose call chain starts there (count)` and vote for no interpreter,
-  and a run stopped there gets no placement on its `[where]` line.
+  For a thread the mock's task library starts (`task.spawn`, `task.defer`, `task.delay`,
+  `spawn`), the mock tells the harness (`P.onSpawn`, `watch.spawned`), which notes where the code
+  that started it ran at that moment: a stack of that thread without a program of another
+  interpreter counts as that place (a script on another interpreter whose plain functions run a
+  loop in a spawned thread is under its program there too).  For any other thread other than the
+  one the VM started on (the script's coroutine library, a mock callback), such a stack says
+  nothing about where the code was started from: those lines are counted as `not placed: on a
+  thread whose call chain starts there (count)` and vote for no interpreter, and a run stopped
+  there gets `, not placed: on a thread whose call chain starts there` on its `[where]` line.
   - The script is taken from the interpreter its output came from (`pipeline.script_programs`,
     `pipeline.script_votes`).  A build can make programs on other interpreters that are helpers
     (routines of the build) while the script runs on the first interpreter; the first of those
@@ -263,20 +274,29 @@ lazily decoded constants.
     helpers.  The script's own program can in turn call routines of the first interpreter, and the
     last VM instruction before its output is then in one of those (seen in v15.1 and v15.2 corpus
     builds whose script is a program on the second interpreter): the `[under]` line places that
-    output under the script's program.  Without that line (or when it placed none of the lines) a
-    program the output came from is followed through its first callers, and where that chain
-    passes a program on another interpreter, the output counts for that program's interpreter --
-    weaker evidence: a caller is only the program of the instruction before a program's first one,
-    which can be a helper that happened to run just before.
+    output under the script's program.  When the `[under]` line placed none of the lines (all on
+    threads whose start is not known) or the `[where]` line says the stop was not placed, the call
+    chains were known and do not say: like the harness's own start rule for that case, the first
+    interpreter is kept (and the note says why); the first callers are not consulted.  Only
+    without the call chains (a run without `binds=1` / `exercise=1`: no `[under]` line, a `[where]`
+    line without its placement) is a program of the `[effects]` line (or the program the run was
+    stopped in) counted for its own interpreter, and one of the first interpreter that only its
+    first callers link to a program on another interpreter counts for neither: a caller is only
+    the program of the instruction before a program's first one, which can be a helper that
+    happened to call it first, and it says nothing about where its later output ran.  When that is
+    all the evidence, the first interpreter is kept and the note says that the link alone did not
+    decide.
   - The evidence is weighed: every line of output and request counts once, and an interpreter
     other than the first is taken only when more of it points there than at the first interpreter
-    (the one with the most, if several).  One program among several, say one first called from a
-    helper, does not decide, and a tie keeps the first program.  When not all of it points at the
-    first interpreter, the `start-up code:` line gives the counts.
+    (the one with the most, if several).  One program among several does not decide, and a tie
+    keeps the first program.  When not all of it points at the first interpreter, the `start-up
+    code:` line gives the counts, and says where they come from (the call chains, or the programs
+    themselves when the run did not record the chains).
   - A run that did not end and showed no output and no request is placed by the program it was
-    stopped in, the same way: by its call chain where the `[where]` line gives it, else through its
-    first callers.  Without any of this evidence (a run that ended without output) the payload
-    stays the first program on another interpreter.
+    stopped in, the same way: by its call chain where the `[where]` line gives it (a stop that is
+    not placed keeps the first interpreter), else by that program's own interpreter.  Without any
+    of this evidence (a run that ended without output) the payload stays the first program on
+    another interpreter.
   - On the first interpreter, the programs the output came from (for a script that showed
     nothing: the program the run was stopped in, `[where]`) are followed through their callers to
     the first program (`pipeline.entered_candidate`): the program below it on that chain is the
@@ -736,41 +756,76 @@ read it afterwards: a message built from it printed ciphertext where the run pri
 The traced run knows better.  The harness's oracle now keeps, for every instruction that ran, the
 strings and booleans each register held at every visit (`s`, next to the numbers of `r`; strings up
 to 4096 bytes; nothing for code only the exercise or probe pass ran) and which registers held the
-activation's own register array (`a`).  `runvals.show_run_values` (called by `pipeline` after the
-lift) looks at every call handed the register array (an argument that stands for it in the code, or
-one read from a register the run shows holding it) and, when every execution of that instruction
-went on to the same next instruction, puts `R[r] = V` right after the call for each register `r`
-that the instruction itself does not write after the call, that no function of the program captures
-by reference, that the next instruction saw holding `V` at every visit, and that did not hold `V`
-before the call.  The rest of the lift (expression folding, dead stores) works from there: the
-decoded value shows where the script reads it, and a register nothing reads gets nothing.  A
-helper of the build whose result the script keeps in a register (`R[a] = helper(enc)`) is treated
-the same way: the call stays as a statement, handed its constant, and the register gets the value
-the run saw.
+activation's own register array (`a`).  For an instruction whose call entered a VM function it also
+keeps which of the caller's registers had changed when the caller went on (`w`), and at how many
+visits that was seen (`h`): the harness copies the caller's registers when the callee's first
+instruction runs and compares them at the caller's next instruction (`orcPend`; Luraph's closures
+take their arguments as `...`, so the callee's own registers do not show that it was handed the
+array).  `runvals.show_run_values` (called by `pipeline` after the lift) looks at every call
+handed the register array (an argument that stands for it in the code, or one read from a register
+the run shows holding it) and, when every execution of that instruction went on to the same next
+instruction, puts `R[r] = V` right after the call for each register `r` that the instruction itself
+does not write after the call, that no function of the program captures by reference, that the code
+reads after the call before writing it again, that the next instruction saw holding `V` at every
+visit, and that did not hold `V` before the call.  The rest of the lift (expression folding, dead
+stores) works from there: the decoded value shows where the script reads it.  A helper of the build
+whose result the script keeps in a register (`R[a] = helper(enc)`) is treated the same way: the call
+stays as a statement, handed its constant, and the register gets the value the run saw.
 
-* Nothing is put where the run did not prove a value: an instruction that did not run, one followed
-  by more than one instruction, a register that held different values at different visits.  Calls
-  are kept: whether a helper has other effects is not known (its own lift can be incomplete).
+* **Only what the run proves for every execution.**  A value goes in only when what the call is
+  handed is the same at every execution: the function called is one the program makes (a closure;
+  what it captures is not followed) and every argument besides the register array is a constant
+  (or arithmetic on constants), followed back through every definition that can reach the call
+  (`Flow.fixed`).  A value the script read at run time (a global, an argument, a result) can differ
+  at another execution, however often this run saw the same one: then nothing is substituted.
+* **What is not proved is marked, not shown stale.**  For a register the call may have set -- one
+  that held one value before the call and none after it, one the call names (a constant register
+  number handed with the register array), one the run saw the call change -- where the run proves
+  no value (no one value after the call, or inputs that are not constants), `R[r] = nil --[[set by
+  a call handed the register array: value not shown]]` goes in after the call, so the text does not
+  print the earlier value (the encrypted constant, or nothing) as the current one.  The same after
+  a call that did not run or went on to more than one instruction, for the registers it names.  One
+  such register is enough for the call to count as not shown (`values not shown: ...`, PARTIAL),
+  whatever else it shows.  A register nothing reads after the call is not counted.
+* **What is not seen.**  A register that held no one value before the call nor after it, that the
+  call does not name, and that the run did not see the call change (a callee that is no VM function
+  is not seen) is left as the code has it.  In a loop, the function called is only proved when the
+  run saw the call leave the register that holds it alone (the call itself could change it).
+* Calls are kept: whether a helper has other effects is not known (its own lift can be incomplete).
 * Programs the pipeline names helpers of the build (programs on other interpreters set aside
   because the run's weighed evidence points at the first interpreter, see "Which program is the
-  script") are labelled
-  in the text, as the first line of their body: `-- program N: a helper of the build (Luraph's
-  routine on another interpreter than the script's program), not the script's code`, with what it
-  writes when it writes into its caller's registers.  A function the pipeline does not name a helper
-  gets no label (its values are shown all the same: the call wrote them).
-* The run notes: `note: N call(s) of program K, a helper of the build ... write into its variables:
-  after each of them the text shows the values they wrote as the run saw them`; and, where the run
-  does not show one value for what such calls wrote, `values not shown: ...`, which makes the result
-  PARTIAL (after them a variable may show its earlier value, and a constant handed to the call
-  stays encrypted).
+  script") are labelled in the text, as the first line of their body, with that evidence and not a
+  verdict on their code: `-- program N: set aside as a helper of the build (on another interpreter
+  than the program taken for the script; first called by program M)`, with what it writes when it
+  writes into its caller's registers.  A function the pipeline does not name a helper gets no label
+  (its values are shown all the same: the call wrote them).
+* The run notes: `note: N call(s) of program K, set aside as a helper of the build ... write into
+  its variables: after each of them the text shows the values they wrote as the run saw them`; and,
+  where the run does not prove what such calls wrote, `values not shown: ...`, which makes the
+  result PARTIAL.  The devm log has a `runvals:` line with every call found, also those the run
+  proves complete.
 * Cost: the oracle file is a fifth to a third larger, and the traced run a few per cent slower
   (side by side on the same machine: 62 s against 60 s and 88 s against 83 s of processor time).
-  The factory-layout files of the public sample corpus come out as before: in none of them did the
-  run show a call writing into its caller's registers, and no run note was added.
+  The copies of the caller's registers at each VM call cost nothing measurable: the 12 traced
+  runs of the corpus's factory-layout files took 714 s and 729 s of processor time in all (two
+  runs), against 755 s before, within the spread of the runs themselves.
+* Corpus: the factory-layout files of the public sample corpus (the 12 v15.1 / v15.2 files that
+  run) come out as before, byte for byte but for the count of VM instructions in the head.  What
+  was measured is the `runvals:` line of each run's log, which lists every call handed the
+  register array and every call of a helper whose result goes to a register, whether the run
+  proves it or not (a missing note alone would not show that there was no such call): 11 runs
+  have none; in one, a build without a second interpreter whose result is the first program, the
+  start-up code has two calls handed the register array, both of which ran.  One entered a VM
+  function, and the run saw it change none of the caller's registers (`h` 1, `w` empty); the
+  other's callee is no VM function, whose writes the run cannot see, and none of the registers it
+  names or that changed across it is read afterwards without a proved value.  Neither gets a note.
 * `tests/devm_runvals.py`: the harness's records, and hand-written programs for the small VM of
   `tests/devm_lift_v14.py` whose helper decodes a constant while the probe runs, with the negative
   cases (values that differ per execution, a call that did not run, two successors, another table in
-  the register, a function of the script that keeps its result).
+  the register, a function of the script that keeps its result), a call that writes two registers
+  of which the run proves one, a register the call names that holds no one value before or after
+  it, a helper handed a value read at run time, and the same probes with the helper's work done by
+  a VM function of its own, which the harness sees.
 
 ### Names
 

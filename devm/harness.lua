@@ -612,6 +612,17 @@ local orc, orcNames = {}, {}
 -- the oracle keeps strings up to this length (longer ones are left out: a buffer, a chunk of code)
 local ORC_STR = 4096
 local orcLast = setmetatable({}, { __mode = "k" })
+-- What a call changed in its caller's registers (runvals.py: a call handed the caller's register
+-- array, `f(..., R, n)`, can write any of them).  When a new activation runs its first instruction
+-- (a VM function was called), the registers of the activation that ran the instruction before (the
+-- caller, in the middle of that instruction) are copied: the activation -> {rec = the record of
+-- that instruction, snap = the copy}.  When the caller runs its next instruction, the registers
+-- that differ from the copy are added to the record's `w`, and `h` counts the calls seen so
+-- (runvals.py compares it with the visits, `n`: a callee that is no VM function is not seen).
+-- (The callee's own registers are no help: Luraph's closures take their arguments as `...` and
+-- copy them into registers with instructions of their own.)
+local orcPend = setmetatable({}, { __mode = "k" })
+local orcPrevRegs = nil
 -- the instruction at pc as text: every numeric field of the proto's code arrays
 local insNames = {}
 local function insText(pid, pc)
@@ -774,9 +785,17 @@ local function writeOracle()
 		for i, t in rec.vers do vs[i] = string.format('[%d,"%s"]', rec.steps[i], t) end
 		local sc = {}
 		for k2 in rec.succ do sc[#sc + 1] = string.format("[%d,%d]", k2 // 2 ^ 24, k2 % 2 ^ 24) end
-		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"sv":%d,"r":{%s},"v":{%s},"s":{%s},"a":[%s],"vers":[%s],"last":%d,"final":"%s","succ":[%s]}', key // 2 ^ 32,
+		-- (calls handed the activation's register array that were seen: how many, and the registers
+		-- they changed, see orcPend)
+		local wr = ""
+		if rec.h > 0 then
+			local ws = {}
+			for i in rec.w do ws[#ws + 1] = string.format("%d", i) end
+			wr = string.format(',"h":%d,"w":[%s]', rec.h, table.concat(ws, ","))
+		end
+		parts[#parts + 1] = string.format('"%d:%d:%d":{"n":%d,"p":%d,"sv":%d,"r":{%s},"v":{%s},"s":{%s},"a":[%s],"vers":[%s],"last":%d,"final":"%s","succ":[%s]%s}', key // 2 ^ 32,
 			(key // 2 ^ 24) % 256, key % 2 ^ 24, rec.n, rec.probe and 1 or 0, rec.sv or 0, table.concat(r, ","), table.concat(v, ","), table.concat(sb, ","),
-			table.concat(own, ","), table.concat(vs, ","), rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","))
+			table.concat(own, ","), table.concat(vs, ","), rec.last or rec.steps[1], insText(key // 2 ^ 32, key % 2 ^ 24), table.concat(sc, ","), wr)
 	end
 	writefile(outPath .. ".oracle", "{" .. table.concat(parts, ",\n") .. "}")
 end
@@ -1115,6 +1134,10 @@ watch.unplaced = 0
 watch.made = nil          -- the first program the run made on another interpreter
 watch.th = nil             -- the thread that ran the last VM instruction (watch.step)
 watch.info = debug.info    -- (the real one: walks the stack of that thread)
+-- thread -> where the code that started it was (watch.under of that moment: a program, 0 for none),
+-- for the threads the mock's task library starts (rbxmock.lua P.onSpawn); not for threads the
+-- script's coroutine library makes or a mock function calls back on (cwrap): their start is not known
+watch.origin = setmetatable({}, { __mode = "k" })
 if watch.ticking then __LPH_N.k = watch.TICK end
 do
 	local w = watch
@@ -1129,10 +1152,13 @@ do
 	-- A thread other than the one the VM started on (mock.mainThread) begins its chain at its own
 	-- function: a function a mock function calls back (cwrap runs it on that function's thread), a
 	-- function task.spawn / defer / delay or the script's coroutine library runs.  Where that thread
-	-- was started from is not on its stack, so when its stack shows no program of another
-	-- interpreter, nothing is known (nil), not "none": a script on another interpreter whose plain
-	-- functions spawn a loop is not on the first interpreter for that.  (Only when the step hook
-	-- handed over the thread, w.th: otherwise the thread running is the hook's caller's own.)
+	-- was started from is not on its stack.  For a thread the mock's task library started, the place
+	-- of the code that started it was taken then (w.origin, from P.onSpawn): a script on another
+	-- interpreter whose plain functions spawn a loop is under that program there too.  For any other
+	-- thread whose stack shows no program of another interpreter nothing is known (nil), not "none".
+	-- (Only when the step hook handed over the thread, w.th: otherwise the thread running is the
+	-- hook's caller's own.)
+	function w.chains() return exercise or pokePath or recordBinds end
 	function w.under(pid)
 		if not pid then
 			local v = ring[stepCount % ringN]
@@ -1150,8 +1176,13 @@ do
 			if p and protos[p] and protos[p].interp ~= first then return p end
 		end
 		local main = mockRef and mockRef.mainThread
-		if w.th ~= nil and main ~= nil and w.th ~= main then return nil end
+		if w.th ~= nil and main ~= nil and w.th ~= main then return w.origin[w.th] end
 		return 0
+	end
+	-- a thread the mock's task library starts (task.spawn / defer / delay, spawn): it runs under what
+	-- the code that started it ran under (nil where that is not known either)
+	function w.spawned(co)
+		if w.origin[co] == nil and w.chains() then w.origin[co] = w.under() end
 	end
 	-- effect: output or a request (counted for the program that ran the last VM instruction, and
 	-- for the innermost program of another interpreter on its call chain)
@@ -1288,8 +1319,15 @@ do
 			pid = v and v // 2 ^ 32 or 0
 		end
 		w.where = pid
-		local u = pid > 0 and w.under(pid) or nil
+		local u = nil
+		if pid > 0 then u = w.under(pid) end
 		w.whereUnder = u
+		-- (stopped on a thread whose start is not known, see w.under: whether it ran under a program it
+		-- made on another interpreter cannot be told)
+		local loose = u == nil and w.made and w.chains()
+		local unknown = "it was stopped on a thread whose start is not known (not the VM's first thread; its call chain "
+			.. "starts there and shows no program of another interpreter), so whether it ran under a program it made on "
+			.. "another interpreter ("
 		if w.from then
 			w.stalled = string.format("the script did not end: it was stopped %d s after %s, %s; code it would "
 				.. "load or fetch later is missing", now - w.from, w.how, why)
@@ -1299,12 +1337,26 @@ do
 			w.stalled = string.format("the script did not end: it was stopped %d s after the run made program %d on another "
 				.. "interpreter, %s; code it would load or fetch later is missing", now - (protos[u].made or w.madeAt or w.t0),
 				u, why)
+		elseif w.before and loose then
+			-- (no lift: a spin on such a thread can be the start-up code's as well as the script's, and a lift
+			-- would be the first program, start-up code and all)
+			w.stalled = string.format("the run did not end and showed nothing of the script (no output, no request; %s%s) is "
+				.. "not known): it was stopped after %d s, %s.  It spins on that thread, in Luraph's start-up code or in code "
+				.. "of the script that shows nothing: which of the two is not known, and nothing is lifted", unknown,
+				madeList(), now - w.t0, why)
 		elseif w.before then
 			w.stalled = string.format("the run did not end and showed nothing of the script (no output, no request, %s): it "
 				.. "was stopped after %d s, %s.  It spins in Luraph's start-up code (an environment check that failed loops "
 				.. "for ever) or in code that shows nothing",
 				w.made and "and it was not in or under a program it made on another interpreter (" .. madeList() .. ")"
 					or "no program on another interpreter", now - w.t0, why)
+		elseif loose then
+			-- (a wait loop there: the script's own code; pipeline.script_programs keeps the first interpreter
+			-- for a stop that is not placed, see the [where] line)
+			w.stalled = string.format("the script did not end: it was stopped after %d s, before it showed itself otherwise "
+				.. "(no output, no request; %s%s) is not known), %s.  Luraph's start-up code does not wait: the waits are the "
+				.. "script's own code; with nothing that places them under a program of another interpreter, the first "
+				.. "interpreter is kept; code it would load or fetch later is missing", now - w.t0, unknown, madeList(), why)
 		else
 			-- (a wait loop before anything else of the script showed: Luraph's start-up code does not
 			-- wait, so the waiting is the script's own code, run by a program of the first interpreter
@@ -1423,6 +1475,32 @@ function watch.step(th, pid, loop, pc, regs, names, ...)
 		-- control-flow edges that were actually taken (per activation: one register array each)
 		local prev = orcLast[regs]
 		if prev then prev.succ[loop * 2 ^ 24 + pc] = true end
+		if regs ~= orcPrevRegs then
+			local pend = orcPend[regs]
+			if pend then
+				-- back from a call: what it changed in this activation's registers
+				orcPend[regs] = nil
+				local w, snap = pend.rec.w, pend.snap
+				for i, x in next, regs do
+					local y = snap[i]
+					if not rawequal(x, y) and not (x ~= x and y ~= y) and type(i) == "number" then w[i] = true end
+				end
+				for i in next, snap do
+					if rawget(regs, i) == nil then w[i] = true end
+				end
+				pend.rec.h += 1
+			elseif prev == nil and orcPrevRegs ~= nil and not probing and not watch.exercising then
+				-- a VM function's first instruction: the caller's registers as the call found them
+				local caller = orcPrevRegs
+				local crec = orcLast[caller]
+				if crec and not orcPend[caller] then
+					local snap = {}
+					for j, x in next, caller do snap[j] = x end
+					orcPend[caller] = { rec = crec, snap = snap }
+				end
+			end
+			orcPrevRegs = regs
+		end
 		-- (an instruction that runs for the first time: Luraph's tamper response is new code, and
 		-- its arguments reach the registers with its first instructions, see watch.entered)
 		if not rec and watch.on and watch.tamper then watch.entered(pid, regs) end
@@ -1468,6 +1546,7 @@ function watch.step(th, pid, loop, pc, regs, names, ...)
 			rec.vers = { ver }
 			rec.steps = { stepCount }
 			rec.succ = {}
+			rec.w, rec.h = {}, 0
 			rec.sv = codeVersion(pid)
 			rec.probe = probing      -- only ever executed by a probe: its register values mean nothing
 			orc[key] = rec
@@ -1846,6 +1925,7 @@ end
 -- what the script does that Luraph's start-up code does not (see watch.start), and its waits
 mock.onSay = function() watch.start("its first line of output", true) end
 mock.onWait = watch.waited
+mock.priv.onSpawn = watch.spawned
 mock.onHttp = function(method, url)
 	watch.start("its first request", true)
 	if httpMapPath and not httpMap then
@@ -2898,8 +2978,11 @@ local function afterRun(ok, message)
 	if watch.stalled then
 		if (watch.where or 0) > 0 then
 			-- (and the innermost program of another interpreter on its call chain, watch.under)
+			-- (not placed: a thread whose start is not known, see watch.under; no suffix: the closures are
+			-- not known)
 			local u = watch.whereUnder
-			ewrite("[where] the run was stopped in program " .. watch.where .. (u == nil and "" or u == 0 and
+			ewrite("[where] the run was stopped in program " .. watch.where .. (u == nil and (watch.chains() and
+				", not placed: on a thread whose call chain starts there" or "") or u == 0 and
 				", under no program of another interpreter" or u == watch.where and ", on another interpreter" or
 				", under program " .. u .. " of another interpreter") .. "\n")
 		end

@@ -547,17 +547,28 @@ class ScriptPrograms(unittest.TestCase):
         self.assertEqual(pipeline.effect_programs(notes), {6: 2})
 
     def test_output_from_a_function_the_script_called(self):
-        """The script's program (5, the only one on interpreter 2) calls a routine of the first
-        interpreter (4, whose first instruction ran right after one of program 5), and the last VM
-        instruction before its output is in that routine: the output counts for program 5."""
+        """Without the call chains (no [under] line: a run without binds=1 or exercise=1), the output came from
+        a routine of the first interpreter (4) whose first instruction ran right after one of program 5 on
+        interpreter 2.  That first caller is the only link to program 5, and it says nothing about where the
+        routine's output ran (a helper of the build can have called it first): the line counts for neither
+        interpreter, and with nothing else the first interpreter is kept (the call chains decide this case, see
+        CallChain.test_output_of_a_routine_counts_for_its_caller)."""
         from devm import pipeline
         interps = [1, 1, 1, 1, 2]
         notes = ['[effects] the script\'s output and requests came from programs 4 (1)']
         callers = {2: 1, 3: 2, 4: 5, 5: 1}
-        self.assertEqual(pipeline.script_programs(interps, [5], notes, callers, 1), ([5], None))
-        # (through a routine that routine called: 3 under 4 under 5)
+        self.assertEqual(pipeline.script_votes(interps, [5], notes, callers, 1), ({}, 'undecided'))
+        self.assertEqual(pipeline.script_programs(interps, [5], notes, callers, 1), ([], [5]))
+        self.assertEqual(pipeline.helpers_reason(interps, [5], notes, callers, 1),
+                         'the script\'s 1 line(s) of output and requests came from programs of the first interpreter that a '
+                         'program of another interpreter called first, a link that does not show where their output ran (the '
+                         'run did not record the VM call chains): without other evidence the first interpreter is kept, not')
+        # (the same through a routine that routine called: 3 under 4 under 5)
         notes3 = ['[effects] the script\'s output and requests came from programs 3 (2)']
-        self.assertEqual(pipeline.script_programs(interps, [5], notes3, {2: 1, 3: 4, 4: 5, 5: 1}, 1), ([5], None))
+        self.assertEqual(pipeline.script_programs(interps, [5], notes3, {2: 1, 3: 4, 4: 5, 5: 1}, 1), ([], [5]))
+        # output from the program on interpreter 2 itself is evidence for it
+        notes5 = ['[effects] the script\'s output and requests came from programs 4 (1), 5 (1)']
+        self.assertEqual(pipeline.script_programs(interps, [5], notes5, callers, 1), ([5], None))
         # without the links, or when the routine runs under the first program, program 5 is a helper
         self.assertEqual(pipeline.script_programs(interps, [5], notes), ([], [5]))
         self.assertEqual(pipeline.script_programs(interps, [5], notes, {2: 1, 3: 2, 4: 1, 5: 4}, 1), ([], [5]))
@@ -575,18 +586,29 @@ class ScriptPrograms(unittest.TestCase):
         from devm import pipeline
         callers = {2: 1, 3: 1, 4: 1, 5: 1, 6: 4, 7: 5, 8: 1}
         notes = ['[effects] the script\'s output and requests came from programs 6 (5), 7 (5)']
-        self.assertEqual(pipeline.script_votes(self.INTERPS, [5, 8], notes, callers), ({1: 5, 2: 5}, 'effects'))
+        self.assertEqual(pipeline.script_votes(self.INTERPS, [5, 8], notes, callers), ({1: 5}, 'effects'))
         self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], notes, callers), ([], [5, 8]))
         reason = pipeline.helpers_reason(self.INTERPS, [5, 8], notes, callers)
-        self.assertEqual(reason, '5 of the script\'s 10 lines of output and requests came from programs of the first '
-                                 'interpreter (5 from under programs of other interpreters), not from')
+        tail = ('5 more from programs of the first interpreter that a program of another interpreter called first, a link '
+                'that does not show where their output ran (the run did not record the VM call chains), counted for neither')
+        self.assertEqual(reason, 'the script\'s output and requests came from programs of the first interpreter (5 line(s); %s), '
+                                 'not from' % tail)
         note = pipeline.startup_note(notes + ['[script] print: hi'], None, 1, 3, helpers=[5, 8], reason=reason)
-        self.assertTrue(note.startswith('[startup] 5 of the script\'s 10 lines of output and requests came from programs of '
-                                        'the first interpreter (5 from under programs of other interpreters), not from the 2 '
-                                        'program(s) the run made on other interpreters (5, 8: helpers)'), note)
-        # most of it under program 5: its interpreter, and only that one
+        self.assertTrue(note.startswith('[startup] the script\'s output and requests came from programs of the first '
+                                        'interpreter (5 line(s); %s), not from the 2 program(s) the run made on other '
+                                        'interpreters (5, 8: helpers)' % tail), note)
+        # more lines from program 7 than from 6: still no evidence for program 5 (one first-caller link does not
+        # decide, however many lines that program printed)
         notes = ['[effects] the script\'s output and requests came from programs 6 (2), 7 (5)']
+        self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], notes, callers), ([], [5, 8]))
+        # output from program 5 itself is
+        notes = ['[effects] the script\'s output and requests came from programs 5 (3), 6 (2), 7 (5)']
+        self.assertEqual(pipeline.script_votes(self.INTERPS, [5, 8], notes, callers), ({2: 3, 1: 2}, 'effects'))
         self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], notes, callers), ([5], None))
+        self.assertEqual(pipeline.helpers_reason(self.INTERPS, [5, 8], ['[effects] the script\'s output and requests came '
+                                                                         'from programs 5 (1), 6 (2)'], callers),
+                         '2 of the script\'s 3 lines of output and requests came from programs of the first interpreter (1 '
+                         'from programs of other interpreters), not from')
 
     def test_call_chain_decides(self):
         """The harness's [under] line places each line of output and request by its VM call chain: where it is
@@ -623,10 +645,21 @@ class ScriptPrograms(unittest.TestCase):
         self.assertEqual(pipeline.script_votes(self.INTERPS, [5, 8], [where], callers), ({1: 1}, 'where'))
         self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], [where], callers), ([], [5, 8]))
         self.assertEqual(pipeline.helpers_reason(self.INTERPS, [5, 8], [where], callers),
-                         'the run was stopped in program 7, a program of the first interpreter that does not run under a '
-                         'program of another interpreter, not in or under')
-        # (first called from program 5: its interpreter)
-        self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], [where], {**callers, 7: 5}), ([5], None))
+                         'the run was stopped in program 7, a program of the first interpreter (the run did not record the VM '
+                         'call chains), not in or under')
+        # first called from program 5: no evidence for its interpreter (that link is only the caller of program
+        # 7's first instruction); the first interpreter is kept
+        self.assertEqual(pipeline.script_votes(self.INTERPS, [5, 8], [where], {**callers, 7: 5}), ({}, 'undecided'))
+        self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], [where], {**callers, 7: 5}), ([], [5, 8]))
+        self.assertEqual(pipeline.helpers_reason(self.INTERPS, [5, 8], [where], {**callers, 7: 5}),
+                         'the run was stopped in program 7, a program of the first interpreter that program 5 of another '
+                         'interpreter called first, a link that does not show where it ran (the run did not record the VM '
+                         'call chains): without other evidence the first interpreter is kept, not')
+        # a stop on a thread whose start is not known: like the harness's start rule, the first interpreter
+        notes = [where + ', not placed: on a thread whose call chain starts there']
+        self.assertEqual(pipeline.stopped_under(notes), pipeline.UNPLACED)
+        self.assertEqual(pipeline.script_votes(self.INTERPS, [5, 8], notes, {**callers, 7: 5}), ({1: 1}, 'unplaced'))
+        self.assertEqual(pipeline.script_programs(self.INTERPS, [5, 8], notes, {**callers, 7: 5}), ([], [5, 8]))
         # the call chain where it was stopped, when the line gives it, decides over the first callers
         for tail, got in ((', under no program of another interpreter', ([], [5, 8])),
                           (', under program 8 of another interpreter', ([8], None)),
@@ -861,6 +894,65 @@ task.spawn(function() __LPH_STEP(boot, 0, 3, r0); print("two") end)
 __LPH_STEP(boot, 0, 4, r0)
 '''
 
+# the script's program (second interpreter) spawns a plain function that loops in a routine of the first
+# interpreter, without output (%s: what the loop does besides)
+SPAWNED_LOOP = '''
+local r0, r1, r2 = {}, {}, {}
+local boot = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(boot, 0, 1, r0)
+local routine = __LPH_PROTO(0, {"K"}, 1, {2})
+local spid = __LPH_PROTO(1, {"K"}, 1, {3})
+local function loop() while true do __LPH_STEP(routine, 0, 1, r2) %s end end
+local m = __LPH_REG(spid, function() return function()
+    __LPH_STEP(spid, 0, 1, r1)
+    task.spawn(loop)
+    __LPH_STEP(spid, 0, 2, r1)
+end end)()
+m()
+__LPH_STEP(boot, 0, 2, r0)
+'''
+# ... a plain function of it enters Luraph's tamper response (handed the code arrays of program 1) in a thread
+SPAWNED_TAMPER = '''
+local r0, r1 = {}, {}
+local A, B, C = {1, 2, 3}, {4, 5, 6}, {7, 8, 9}
+local boot = __LPH_PROTO(0, {"A", "B", "C"}, 3, A, B, C)
+__LPH_STEP(boot, 0, 1, r0)
+local routine = __LPH_PROTO(0, {"K"}, 1, {2})
+local spid = __LPH_PROTO(1, {"K"}, 1, {3})
+local function check()
+    local tamper = __LPH_PROTO(0, {"X"}, 1, {0})
+    local r2 = {}
+    __LPH_STEP(tamper, 0, 1, r2)
+    r2[0], r2[1], r2[2], r2[3] = {}, A, B, C
+    local pc = 2
+    while true do __LPH_STEP(tamper, 0, pc, r2); A[1] = A[1] + 1; pc = pc % 50 + 2 end
+end
+local m = __LPH_REG(spid, function() return function()
+    __LPH_STEP(spid, 0, 1, r1)
+    task.spawn(check)
+    __LPH_STEP(spid, 0, 2, r1)
+end end)()
+m()
+__LPH_STEP(boot, 0, 2, r0)
+'''
+# the start-up code makes helper 2 (second interpreter), which runs routine 3 (first interpreter) first; then
+# it starts a wait loop in routine 3 (%s: how) and the main thread waits; no output
+STARTUP_WAIT_LOOP = '''
+local r0, r1, r2 = {}, {}, {}
+local boot = __LPH_PROTO(0, {"K"}, 1, {1})
+__LPH_STEP(boot, 0, 1, r0)
+local helper = __LPH_PROTO(1, {"K"}, 1, {2})
+local routine = __LPH_PROTO(0, {"K"}, 1, {3})
+local function routineFn() __LPH_STEP(routine, 0, 1, r2) end
+local h = __LPH_REG(helper, function() return function() __LPH_STEP(helper, 0, 1, r1); routineFn() end end)()
+h()
+__LPH_STEP(boot, 0, 2, r0)
+local function waiter() while true do routineFn(); task.wait() end end
+%s
+__LPH_STEP(boot, 0, 3, r0)
+while true do task.wait(1) end
+'''
+
 
 def probe_evidence(dump, err):
     """(interpreter of each program, callers, notes) of a probe run, as pipeline.script_programs takes them"""
@@ -904,7 +996,7 @@ class CallChain(unittest.TestCase):
         self.assertEqual(callers[2], 3)
         self.assertEqual(pipeline.script_programs(interps, [3], notes, callers), ([], [3]))
         without = [n for n in notes if not n.startswith('[under]')]
-        self.assertEqual(pipeline.script_votes(interps, [3], without, callers), ({1: 2, 0: 3}, 'effects'))
+        self.assertEqual(pipeline.script_votes(interps, [3], without, callers), ({0: 3}, 'effects'))
         self.assertEqual(pipeline.script_programs(interps, [3], without, callers), ([], [3]))
 
     def test_no_under_line_without_the_closures(self):
@@ -978,15 +1070,27 @@ class CallChain(unittest.TestCase):
 
     def test_a_thread_the_script_spawned(self):
         """The script's program prints, and a plain function of its own prints in a thread task.spawn started:
-        that thread's stack starts at the plain function, so its line is not placed (not 'under none', which
-        would tie with the program's own line and give the first program); the payload is kept."""
+        that thread's stack starts at the plain function, but the mock's task library told the harness where
+        the code that started it ran (under program 3): both lines are placed there."""
         took, err, dump, oracle = run_probe(SCRIPT_SPAWNS_PLAIN, *self.OPTS)
         self.assertIn('[effects] the script\'s output and requests came from programs 2 (2)', err)
+        self.assertIn('[under] the VM call chains of the script\'s output and requests: under program 3 (2)\n', err)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(interps, [0, 0, 1])
+        self.assertEqual(pipeline.script_votes(interps, [3], notes, callers), ({1: 2}, 'under'))
+        self.assertEqual(pipeline.script_programs(interps, [3], notes, callers), ([3], None))
+
+    def test_a_coroutine_of_the_script(self):
+        """... while a thread the script's coroutine library runs has no known start: its line is not placed
+        (not 'under none', which would tie with the program's own line and give the first program); the
+        payload is kept."""
+        took, err, dump, oracle = run_probe(SCRIPT_SPAWNS_PLAIN.replace('task.spawn(beat)', 'coroutine.wrap(beat)()'),
+                                            *self.OPTS)
         self.assertIn('[under] the VM call chains of the script\'s output and requests: under program 3 (1), not placed: on '
                       'a thread whose call chain starts there (1)', err)
         from devm import pipeline
         interps, callers, notes = probe_evidence(dump, err)
-        self.assertEqual(interps, [0, 0, 1])
         self.assertEqual(pipeline.under_programs(notes), {3: 1})
         self.assertEqual(pipeline.script_votes(interps, [3], notes, callers), ({1: 1}, 'under'))
         self.assertEqual(pipeline.script_programs(interps, [3], notes, callers), ([3], None))
@@ -997,9 +1101,21 @@ class CallChain(unittest.TestCase):
         self.assertIn('[under] the VM call chains of the script\'s output and requests: under program 3 (2)\n', err)
 
     def test_a_thread_the_start_up_code_spawned(self):
-        """The start-up code prints on the VM's thread (under none) and in a thread it started (not placed):
-        the first interpreter has the only vote, and the helper is set aside."""
+        """The start-up code prints on the VM's thread and in a thread it started with task.spawn: both under
+        no program of another interpreter, and the helper is set aside."""
         took, err, dump, oracle = run_probe(STARTUP_SPAWNS, *self.OPTS)
+        self.assertIn('[under] the VM call chains of the script\'s output and requests: under no program of another '
+                      'interpreter (2)\n', err)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(pipeline.script_votes(interps, [2], notes, callers), ({0: 2}, 'under'))
+        self.assertEqual(pipeline.script_programs(interps, [2], notes, callers), ([], [2]))
+        self.assertEqual(pipeline.not_placed(notes), 0)
+
+    def test_a_coroutine_of_the_start_up_code(self):
+        """... and in a coroutine (no known start): one line under none, one not placed."""
+        took, err, dump, oracle = run_probe(STARTUP_SPAWNS.replace('task.spawn(function()', 'coroutine.wrap(function()')
+                                            .replace('print("two") end)', 'print("two") end)()'), *self.OPTS)
         self.assertIn('[under] the VM call chains of the script\'s output and requests: under no program of another '
                       'interpreter (1), not placed: on a thread whose call chain starts there (1)', err)
         from devm import pipeline
@@ -1009,18 +1125,102 @@ class CallChain(unittest.TestCase):
         self.assertEqual(pipeline.not_placed(notes), 1)
         self.assertEqual(pipeline.helpers_reason(interps, [2], notes, callers),
                          'the script\'s output and requests came from programs of the first interpreter (1 line(s); 1 more '
-                         'on threads whose call chain starts there, not placed), not from')
+                         'on threads whose start is not known, not placed), not from')
 
     def test_no_line_placed(self):
-        """An [under] line that placed none of the lines leaves the choice to the [effects] line."""
+        """An [under] line that placed none of the lines: the call chains were known and do not say, so the
+        first callers are not used (program 2 was first entered from program 3, which would take program 3);
+        like the harness's start rule, the first interpreter is kept."""
         from devm import pipeline
         interps = [1, 1, 2]
         notes = ['[effects] the script\'s output and requests came from programs 2 (2)',
                  '[under] the VM call chains of the script\'s output and requests: not placed: on a thread whose call '
                  'chain starts there (2)']
         self.assertEqual(pipeline.under_programs(notes), {})
-        self.assertEqual(pipeline.script_votes(interps, [3], notes, {2: 3, 3: 1}), ({2: 2}, 'effects'))
-        self.assertEqual(pipeline.script_programs(interps, [3], notes, {2: 3, 3: 1}), ([3], None))
+        self.assertEqual(pipeline.script_votes(interps, [3], notes, {2: 3, 3: 1}), ({1: 2}, 'unplaced'))
+        self.assertEqual(pipeline.script_programs(interps, [3], notes, {2: 3, 3: 1}), ([], [3]))
+        self.assertEqual(pipeline.helpers_reason(interps, [3], notes, {2: 3, 3: 1}),
+                         'the script\'s 2 line(s) of output and requests ran on threads whose start is not known (their call '
+                         'chains start there and show no program of another interpreter): without evidence for another '
+                         'interpreter the first one is kept, not')
+
+    def test_spawned_busy_loop_of_the_script(self):
+        """The script's program (second interpreter) starts a silent busy loop with task.spawn in a plain function
+        that runs a routine of the first interpreter: the loop is under the script's program (where the code that
+        spawned it ran), the run is stopped like one that started, and the payload is lifted."""
+        took, err, dump, oracle = run_probe(SPAWNED_LOOP % '', *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('stopped 1 s after the run made program 3 on another interpreter, in a loop of its VM code', line)
+        self.assertIn('[where] the run was stopped in program 2, under program 3 of another interpreter', err)
+        self.assertIsNotNone(dump)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(pipeline.script_programs(interps, [3], notes, callers), ([3], None))
+
+    def test_tamper_response_on_a_spawned_thread_of_the_script(self):
+        """... and so is Luraph's tamper response entered on such a thread before any output: a stop of the
+        script's run, with a dump, not a failure of the start-up code."""
+        took, err, dump, oracle = run_probe(SPAWNED_TAMPER, *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('after the run made program 3 on another interpreter, at the entry of Luraph\'s tamper response', line)
+        self.assertIn('[where] the run was stopped in program 4, under program 3 of another interpreter', err)
+        self.assertIsNotNone(dump)
+
+    def test_spin_on_a_thread_whose_start_is_not_known(self):
+        """The same loop started with the script's coroutine library: where the thread was started is not known.
+        The run ends without a dump (a lift would be the first program, start-up code and all), and the
+        [stalled] line says that whether the spin is the start-up code's or the script's is not known."""
+        took, err, dump, oracle = run_probe((SPAWNED_LOOP % '').replace('task.spawn(loop)', 'coroutine.wrap(loop)()'),
+                                            *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertTrue(line.startswith('[stalled] the run did not end and showed nothing of the script (no output, no '
+                                        'request; it was stopped on a thread whose start is not known'), line)
+        self.assertIn('so whether it ran under a program it made on another interpreter (3) is not known', line)
+        self.assertIn('which of the two is not known, and nothing is lifted', line)
+        self.assertNotIn('It spins in Luraph\'s start-up code', line)
+        self.assertIn('[where] the run was stopped in program 2, not placed: on a thread whose call chain starts there', err)
+        self.assertIsNone(dump)
+
+    def test_wait_loop_the_start_up_code_spawned(self):
+        """The start-up code makes helper 2 (second interpreter), which enters routine 3 (first interpreter) first;
+        then the start-up code spawns a wait loop in routine 3 and the main thread waits, with no output: the loop
+        is under no program of another interpreter (where the code that spawned it ran), and the helper is set
+        aside, as the [stalled] line says."""
+        took, err, dump, oracle = run_probe(STARTUP_WAIT_LOOP % 'task.spawn(waiter)', *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('the waits are the script\'s own code, on the first interpreter', line)
+        self.assertIn('[where] the run was stopped in program 3, under no program of another interpreter', err)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(callers[3], 2)
+        self.assertEqual(pipeline.script_programs(interps, [2], notes, callers), ([], [2]))
+
+    def test_wait_loop_on_a_thread_whose_start_is_not_known(self):
+        """The same wait loop run by the script's coroutine library: the stop is not placed.  The [where] line says
+        so, and the program choice does what the harness's start rule does (the first interpreter), not follow
+        routine 3's first caller to the helper; the [stalled] line and the choice agree."""
+        took, err, dump, oracle = run_probe(STARTUP_WAIT_LOOP % 'coroutine.wrap(waiter)()', *self.OPTS)
+        line = stalled_line(err)
+        self.assertIsNotNone(line, err[-1500:])
+        self.assertIn('[where] the run was stopped in program 3, not placed: on a thread whose call chain starts there', err)
+        self.assertIn('so whether it ran under a program it made on another interpreter (2) is not known', line)
+        self.assertIn('with nothing that places them under a program of another interpreter, the first interpreter is kept',
+                      line)
+        self.assertIsNotNone(dump)
+        from devm import pipeline
+        interps, callers, notes = probe_evidence(dump, err)
+        self.assertEqual(callers[3], 2)
+        self.assertEqual(pipeline.stopped_under(notes), pipeline.UNPLACED)
+        self.assertEqual(pipeline.script_votes(interps, [2], notes, callers), ({0: 1}, 'unplaced'))
+        self.assertEqual(pipeline.script_programs(interps, [2], notes, callers), ([], [2]))
+        self.assertEqual(pipeline.helpers_reason(interps, [2], notes, callers),
+                         'the run was stopped in program 3, a program of the first interpreter, on a thread whose start is not '
+                         'known (its call chain starts there and shows no program of another interpreter): without evidence '
+                         'for another interpreter the first one is kept, not')
 
 
 class Report(unittest.TestCase):

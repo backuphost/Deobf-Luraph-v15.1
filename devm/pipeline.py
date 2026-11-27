@@ -163,11 +163,17 @@ def _run_traced(self):
             self.hints.append('[hint] the function taken for the script (proto %d, on the second interpreter) has only %d '
                               'instructions, while the first program executed %d: the script is probably the first '
                               'program; run again with --root %d' % (root, nodes, ran_first, first_root))
-    for n in runvals.notes(sites, helper_set):
+    # (every call found, also one the run proves complete without a note: what the README's corpus
+    # figures count)
+    self.log('[%s] runvals: %d call(s) handed their caller\'s register array, %d call(s) of a helper of the build whose '
+             'results go to registers%s' % (self.tag, sum(1 for x in sites if x.kind == 'regs'),
+                                            sum(1 for x in sites if x.kind == 'result'),
+                                            ''.join('; %r' % x for x in sites[:12]) + ('; ...' if len(sites) > 12 else '')))
+    for n in runvals.notes(sites, helper_set, callers):
         self.log('[%s] %s' % (self.tag, n))
         self.hints.append(n)
     d = structure.Decompiler(protos, self.lifter.root_key, self.native_text)
-    d.labels = runvals.labels(sites, helper_set, protos)
+    d.labels = runvals.labels(sites, helper_set, protos, callers)
     self.text = d.run()
     self.stats = d.stats
     self.log('[%s] decompiled: %d lines, %d unstructured' % (self.tag, self.text.count('\n'), d.stats['unstructured']))
@@ -175,6 +181,73 @@ def _run_traced(self):
 
 
 Stage.run_traced = _run_traced
+
+
+# stopped_under: the [where] line says the run was stopped on a thread whose start is not known (its
+# call chain starts there and shows no program of another interpreter, harness.lua watch.under)
+UNPLACED = -1
+
+
+def _evidence(interps, payload, notes, callers=None, first_root=1):
+    """(votes, kind, linked): script_votes's answer, and {program: (count, the program of `payload`
+    its first callers lead to)} for the evidence it did not count because only that link ties it to
+    another interpreter"""
+    first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
+    pay, callers = set(payload), callers or {}
+
+    def interp(p):
+        return interps[p - 1] if 0 < p <= len(interps) else None
+
+    def link(p):
+        # (the program of `payload` that p's chain of first callers passes, if any)
+        x, seen = p, set()
+        while x not in pay and x != first_root and x in callers and x not in seen:
+            seen.add(x)
+            x = callers[x]
+        return x if x in pay and x != p else None
+
+    votes, linked = {}, {}
+
+    def vote(i, n):
+        if i is not None:
+            votes[i] = votes.get(i, 0) + n
+
+    def weak(progs, kind):
+        # without the call chains: a program counts for its own interpreter, unless only its first
+        # caller links it to a program of another interpreter (then it counts for neither)
+        for p, n in progs.items():
+            q = link(p) if interp(p) == first else None
+            if q is not None:
+                linked[p] = (n, q)
+            else:
+                vote(interp(p), n)
+        return votes, ('undecided' if linked and not votes else kind), linked
+
+    under = under_programs(notes)
+    if under:
+        for p, n in under.items():
+            vote(interp(p) if p else first, n)
+        return votes, 'under', linked
+    loose = not_placed(notes)
+    if loose:
+        # (an [under] line, so the call chains were known, that placed none of the lines: as the
+        # harness's start rule does for a place it cannot tell, the first interpreter)
+        vote(first, loose)
+        return votes, 'unplaced', linked
+    eff = effect_programs(notes)
+    if eff:
+        return weak(eff, 'effects')
+    u = stopped_under(notes)
+    if u is not None:
+        if u == UNPLACED:
+            vote(first, 1)
+            return votes, 'unplaced', linked
+        vote(interp(u) if u else first, 1)
+        return votes, 'where', linked
+    got = stopped_in(notes)
+    if not got:
+        return votes, None, linked
+    return weak(got, 'where')
 
 
 def script_votes(interps, payload, notes, callers=None, first_root=1):
@@ -186,53 +259,25 @@ def script_votes(interps, payload, notes, callers=None, first_root=1):
     each request under the innermost program of another interpreter on its VM call chain (the
     script's program calls routines of the first interpreter too, and the last VM instruction
     before its output can be in one of those), or under none (the first interpreter).  Lines it
-    could not place (on a thread whose chain starts there, see harness.lua watch.under) count for
-    neither; when it placed none, the [effects] line is used.
-    kind 'effects': without that line, the programs of the [effects] line (the ones that ran the
-    last VM instruction before each), each followed through `callers` ({program: the program
-    that ran the instruction before its first one}, harness.lua's record) towards the first
-    program: where the chain passes a program of `payload`, its count goes to that program's
-    interpreter.  These links are only the caller at a program's first entry, so they are weaker
-    evidence than the call chain, and every program counts as often as its output and requests.
+    could not place (on a thread whose start is not known, see harness.lua watch.under) count for
+    neither.
+    kind 'unplaced': an [under] line that placed none of the lines, or a [where] line that says the
+    run was stopped on such a thread: the call chains were known and do not say, and like the
+    harness's own start rule for that case, the first interpreter is kept (it gets the count).
+    The first callers are not used when the call chains were known.
     kind 'where': a run that did not end and showed no output and no request: the program it was
-    stopped in ([where]), placed like the output, by the call chain where the line gives it and
-    otherwise through `callers`.  ({}, None) without evidence."""
-    first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
-    pay, callers = set(payload), callers or {}
-
-    def interp(p):
-        return interps[p - 1] if 0 < p <= len(interps) else None
-
-    def placed(p):
-        x, seen = p, set()
-        while x not in pay and x != first_root and x in callers and x not in seen:
-            seen.add(x)
-            x = callers[x]
-        return interp(x if x in pay else p)
-
-    votes = {}
-
-    def vote(i, n):
-        if i is not None:
-            votes[i] = votes.get(i, 0) + n
-
-    under = under_programs(notes)
-    if under:
-        for p, n in under.items():
-            vote(interp(p) if p else first, n)
-        return votes, 'under'
-    eff = effect_programs(notes)
-    if eff:
-        for p, n in eff.items():
-            vote(placed(p), n)
-        return votes, 'effects'
-    u = stopped_under(notes)
-    if u is not None:
-        vote(interp(u) if u else first, 1)
-        return votes, 'where'
-    for p, n in stopped_in(notes).items():
-        vote(placed(p), n)
-    return votes, ('where' if votes else None)
+    stopped in, placed by the call chain the [where] line gives.
+    Without the call chains (a run without binds=1, exercise=1 or poke=: no [under] line, a [where]
+    line without its placement), kind 'effects' (the programs of the [effects] line, the ones that
+    ran the last VM instruction before each line) or 'where' (the program the run was stopped in):
+    a program counts for its own interpreter -- but one of the first interpreter whose first caller
+    (`callers`: {program: the program that ran the instruction before its first one}, followed
+    towards the first program) is a program of `payload` counts for neither: that link is only the
+    caller at its first entry, which can be a helper that happened to call it first, and says
+    nothing about where its later output ran.  When that is all the evidence, kind 'undecided'
+    (votes {}): script_programs keeps the first interpreter.  ({}, None) without evidence."""
+    votes, kind, _linked = _evidence(interps, payload, notes, callers, first_root)
+    return votes, kind
 
 
 def script_programs(interps, payload, notes, callers=None, first_root=1):
@@ -247,9 +292,12 @@ def script_programs(interps, payload, notes, callers=None, first_root=1):
 
     The evidence is weighed: an interpreter other than the first is taken only when more of it
     points there than at the first interpreter (the one with the most, if several), so that one
-    program among many, say one first called from a helper, does not decide.  Without evidence
-    the payload stays as it is."""
-    votes, _kind = script_votes(interps, payload, notes, callers, first_root)
+    program among many does not decide.  Evidence that does not decide (script_votes 'undecided'
+    and 'unplaced') keeps the first interpreter: a helper of the build is not taken for the script on
+    it.  Without evidence the payload stays as it is."""
+    votes, kind = script_votes(interps, payload, notes, callers, first_root)
+    if kind == 'undecided':
+        return [], payload
     if not votes:
         return payload, None
     first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
@@ -262,22 +310,52 @@ def script_programs(interps, payload, notes, callers=None, first_root=1):
 def helpers_reason(interps, payload, notes, callers=None, first_root=1):
     """What made script_programs set the programs on other interpreters aside, in words for the
     notes: the start of a sentence that goes on with the programs (`... not from` / `... not in or
-    under`)"""
-    votes, kind = script_votes(interps, payload, notes, callers, first_root)
+    under` / `... not`)"""
+    votes, kind, linked = _evidence(interps, payload, notes, callers, first_root)
     first = interps[first_root - 1] if 0 < first_root <= len(interps) else None
-    if kind == 'where':
-        p = next(iter(stopped_in(notes)), None)
+    unknown = 'on a thread whose start is not known (its call chain starts there and shows no program of another interpreter)'
+    chains = 'the run did not record the VM call chains'
+    p = next(iter(stopped_in(notes)), None)
+    if kind == 'unplaced' and stopped_under(notes) == UNPLACED:
+        return ('the run was stopped in program %s, a program of the first interpreter, %s: without evidence for another '
+                'interpreter the first one is kept, not' % (p, unknown))
+    if kind == 'unplaced':
+        return ('the script\'s %d line(s) of output and requests ran on threads whose start is not known (their call chains '
+                'start there and show no program of another interpreter): without evidence for another interpreter the '
+                'first one is kept, not' % votes.get(first, 0))
+    if kind in ('where', 'undecided') and not effect_programs(notes):
+        if linked:
+            return ('the run was stopped in program %s, a program of the first interpreter that program %s of another '
+                    'interpreter called first, a link that does not show where it ran (%s): without other evidence the '
+                    'first interpreter is kept, not' % (p, linked[p][1] if p in linked else '?', chains))
+        if stopped_under(notes) is None:
+            return 'the run was stopped in program %s, a program of the first interpreter (%s), not in or under' % (p, chains)
         return ('the run was stopped in program %s, a program of the first interpreter that does not run under a program of '
                 'another interpreter, not in or under' % p)
     own, total = votes.get(first, 0), sum(votes.values())
-    # (lines the call chains could not place, harness.lua watch.under: counted for neither side)
-    loose = not_placed(notes) if kind == 'under' else 0
-    tail = ('; %d more on threads whose call chain starts there, not placed' % loose) if loose else ''
+    if kind == 'under':
+        # (lines the call chains could not place, harness.lua watch.under: counted for neither side)
+        loose = not_placed(notes)
+        tail = ('; %d more on threads whose start is not known, not placed' % loose) if loose else ''
+        if own == total:
+            return 'the script\'s output and requests came from programs of the first interpreter%s, not from' % (
+                ' (%d line(s)%s)' % (total, tail) if loose else '')
+        return ('%d of the script\'s %d lines of output and requests ran on the first interpreter by their VM call chains (%d '
+                'under programs of other interpreters%s), not from' % (own, total, total - own, tail))
+    # effects without the call chains: a program counts for its own interpreter; the ones only a first
+    # caller links to a program of another interpreter for neither
+    weak = sum(n for n, _q in linked.values())
+    tail = ('; %d more from programs of the first interpreter that a program of another interpreter called first, a link '
+            'that does not show where their output ran (%s), counted for neither' % (weak, chains)) if weak else ''
+    if not total:
+        return ('the script\'s %d line(s) of output and requests came from programs of the first interpreter that a program of '
+                'another interpreter called first, a link that does not show where their output ran (%s): without other '
+                'evidence the first interpreter is kept, not' % (weak, chains))
     if own == total:
         return 'the script\'s output and requests came from programs of the first interpreter%s, not from' % (
-            ' (%d line(s)%s)' % (total, tail) if loose else '')
-    return ('%d of the script\'s %d lines of output and requests came from programs of the first interpreter (%d from under '
-            'programs of other interpreters%s), not from' % (own, total, total - own, tail))
+            ' (%d line(s)%s)' % (total, tail) if weak else '')
+    return ('%d of the script\'s %d lines of output and requests came from programs of the first interpreter (%d from programs '
+            'of other interpreters%s), not from' % (own, total, total - own, tail))
 
 
 # instructions of the first program that may run for the first time after the program it entered
@@ -361,8 +439,9 @@ def stopped_in(notes):
 
 def stopped_under(notes):
     """The innermost program of another interpreter on the VM call chain where a run that did not
-    end was stopped (the harness's [where] line): that program, 0 for none, None when the line does
-    not say (or there is none)"""
+    end was stopped (the harness's [where] line): that program, 0 for none, UNPLACED for a thread
+    whose start is not known (`, not placed: ...`), None when the line does not say (the closures
+    were not known) or there is none"""
     for n in notes:
         m = re.match(r'\[where\] the run was stopped in program (\d+)(.*)$', n)
         if not m:
@@ -372,6 +451,8 @@ def stopped_under(notes):
             return int(m.group(1))
         if rest == ', under no program of another interpreter':
             return 0
+        if rest.startswith(', not placed: '):
+            return UNPLACED
         u = re.match(r', under program (\d+) of another interpreter$', rest)
         return int(u.group(1)) if u else None
     return None

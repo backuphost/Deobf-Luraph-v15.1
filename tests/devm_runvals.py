@@ -16,7 +16,8 @@ would (no text of a protected file is in here).
   decodes a constant into one of the program's registers while the script runs (the probe does the
   decoding, as the run would).  The lifted text used to show the encrypted constant wherever the
   program read that register; now the decoded value the run saw is put right after the call.  The
-  helper is labelled as a helper of the build when the pipeline names it one, and the report has a
+  helper is labelled as set aside as a helper of the build when the pipeline names it one (the label
+  gives the evidence: another interpreter, its first caller), and the report has a
   note line.  The same for a helper whose result the program keeps in a register
   (`R[a] = helper(x)`: the call stays, the value is the run's).
 * Nothing is put where the value differed between executions, where the call did not run, or where
@@ -283,13 +284,15 @@ class HelperIntoRegisters(unittest.TestCase):
         self.assertRegex(text, r'print\((?:"%s"|\w+) \.\. " world"\)' % PLAIN)
         self.assertNotRegex(text, r'local (\w+) = "%s"\n(?:.*\n)*.*print\(\1 \.\. " world"\)' % ENC)
         # the helper is labelled as the build's, not the script's code
-        self.assertIn('-- program %d: a helper of the build' % self.m.helper, text)
+        self.assertIn('-- program %d: set aside as a helper of the build (on another interpreter than the program taken for '
+                      'the script)' % self.m.helper, text)
         self.assertIn('It writes into the variables of the code that calls it', text)
         self.assertEqual(len(notes), 1, notes)
-        self.assertTrue(notes[0].startswith('[runvals] 1 call(s) of program %d, a helper of the build' % self.m.helper), notes)
+        self.assertTrue(notes[0].startswith('[runvals] 1 call(s) of program %d, set aside as a helper of the build' % self.m.helper),
+                        notes)
         self.assertIn('the text shows the values they wrote as the run saw them (1 value(s))', notes[0])
         lines = run.run_report(notes)
-        self.assertTrue(any(ln.startswith('  note: 1 call(s) of program %d, a helper of the build' % self.m.helper)
+        self.assertTrue(any(ln.startswith('  note: 1 call(s) of program %d, set aside as a helper of the build' % self.m.helper)
                             for ln in lines), lines)
         report = run.report(text, notes=notes)
         self.assertEqual(report[0][:15], 'result: complet', report)
@@ -311,9 +314,12 @@ class HelperIntoRegisters(unittest.TestCase):
         self.assertEqual(sites[0].shown, {})
         self.assertEqual(sites[0].unproved, {2})
         self.assertNotIn(PLAIN, text)
-        self.assertRegex(text, r'local (\w+) = "%s"\n(?:.*\n)*.*print\(\1 \.\. " world"\)' % ENC)
+        # (what the call wrote is not shown as the value from before it, the encrypted constant)
+        self.assertIn('print(nil --[[%s]] .. " world")' % runvals.MARK, text)
+        self.assertNotRegex(text, r'print\((?:"%s"|\w+) \.\. " world"\)' % ENC)
         self.assertEqual(len(notes), 1, notes)
-        self.assertTrue(notes[0].startswith('[runvals-missing] 1 call(s) of program %d, a helper of the build' % self.m.helper))
+        self.assertTrue(notes[0].startswith('[runvals-missing] 1 call(s) of program %d, set aside as a helper of the build'
+                                            % self.m.helper))
         self.assertIn('a constant handed to the call stays as it was (encrypted)', notes[0])
         lines = run.run_report(notes)
         self.assertTrue(any(ln.startswith(run.RUNVALS_LINE) for ln in lines), lines)
@@ -338,6 +344,9 @@ class HelperIntoRegisters(unittest.TestCase):
         self.assertFalse(sites[0].ran)
         self.assertNotIn(PLAIN, text)
         self.assertTrue(notes and notes[0].startswith('[runvals-missing] '), notes)
+        # the register the call names is printed as not shown after it, not as the constant from before
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+        self.assertEqual(sites[0].marked, {2})
 
     def test_call_followed_by_two_instructions(self):
         # after one run of the call the next instruction was another one (the probe jumps): the run
@@ -399,8 +408,9 @@ class HelperResult(unittest.TestCase):
         self.assertRegex(text, r'print\((?:"%s"|\w+) \.\. " world"\)' % PLAIN)
         # the call stays (as a statement), handed the encrypted constant
         self.assertRegex(text, r'(?m)^\s*(?:\w+|\(function\(\w+\)(?:.|\n)*?end\))\("%s"\)$' % ENC)
-        self.assertIn('-- program %d: a helper of the build' % self.m.helper, text)
-        self.assertTrue(notes[0].startswith('[runvals] 1 call(s) of program %d, a helper of the build' % self.m.helper), notes)
+        self.assertIn('-- program %d: set aside as a helper of the build' % self.m.helper, text)
+        self.assertTrue(notes[0].startswith('[runvals] 1 call(s) of program %d, set aside as a helper of the build' % self.m.helper),
+                        notes)
         self.assertIn('return values that the code that calls them keeps in variables', notes[0])
 
     def test_values_that_differ(self):
@@ -416,6 +426,209 @@ class HelperResult(unittest.TestCase):
         self.assertEqual(sites, [])
         self.assertEqual(notes, [])
         self.assertNotIn(PLAIN, text)
+
+
+# ---------------------------------------------------------------- loops, run-time inputs, calls the run saw
+# A loop: R1 = helper; R2 = ENC; [R9 = "x"]; R1(R2, R, 2); R3 = print; R4 = R2 .. R9; R3 = R3(R4); R6 = more;
+# if R6 goto 2; return R3.  The helper decodes R2 (the same value every round) and also writes R9 (another
+# value every round).
+LOOP_TWO = [(8, 1, None, 0), (1, 2, ENC, 0), (1, 9, 'x', 0), (20, 1, 2, 2), (3, 3, 'print', 0), (21, 4, 2, 9),
+            (5, 3, 0, 0), (3, 6, 'more', 0), (7, 6, 1, 0), (2, 3, 0, 0)]
+# the same without `R9 = "x"`: R9 holds no one value before the call either
+LOOP_TWO_NO_RESET = [(8, 1, None, 0), (1, 2, ENC, 0), (20, 1, 2, 2), (3, 3, 'print', 0), (21, 4, 2, 9),
+                     (5, 3, 0, 0), (3, 6, 'more', 0), (7, 6, 1, 0), (2, 3, 0, 0)]
+# a loop whose call decodes into R9, which nothing resets before the call:
+# R1 = helper; R2 = ENC; R1(R2, R, 9); R3 = print; R5 = " world"; R4 = R9 .. R5; R3 = R3(R4); R6 = more; if R6 goto 2
+LOOP_NINE = [(8, 1, None, 0), (1, 2, ENC, 0), (20, 1, 2, 9), (3, 3, 'print', 0), (1, 5, ' world', 0),
+             (21, 4, 9, 5), (5, 3, 0, 0), (3, 6, 'more', 0), (7, 6, 1, 0), (2, 3, 0, 0)]
+# the helper is handed a value read at run time (a global), not a constant: R2 = input; R1(R2, R, 2); ...
+FROM_INPUT = [(8, 1, None, 0), (3, 2, 'input', 0), (20, 1, 2, 2), (3, 3, 'print', 0), (1, 5, ' world', 0),
+              (21, 4, 2, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+# ... and the same for a helper whose result is kept: R2 = input; R1 = R1(R2); ...
+RESULT_FROM_INPUT = [(8, 1, None, 0), (3, 2, 'input', 0), (24, 1, 2, 0), (3, 3, 'print', 0), (1, 5, ' world', 0),
+                     (21, 4, 1, 5), (5, 3, 0, 0), (2, 3, 0, 0)]
+
+# A probe of such a program: `steps` are the instructions run, `effects` what each does to the registers
+# (Lua statements).  With `vm` the helper's work is done by a function that runs as a VM function of its
+# own (an activation with its own register array holding the caller's, as an interpreter's closure does):
+# the harness then sees the call and records which of the caller's registers it changed (`h` / `w`).
+PROBE_LOOP = '''
+local regs = {}
+local pid = __LPH_PROTO(0, {"K"}, 1, {1})
+local hp = __LPH_PROTO(0, {"K"}, 1, {2})
+local round = 0
+local function work(s, R, n)
+	%(work)s
+end
+local function helper(s, R, n)
+	if %(vm)s then
+		local hr = { s, R, n }
+		__LPH_STEP(hp, 0, 1, hr)
+	end
+	work(s, R, n)
+end
+local effect = { %(effects)s }
+for _, pc in {%(steps)s} do
+	__LPH_STEP(pid, 0, pc, regs)
+	if effect[pc] then effect[pc]() end
+end
+'''
+
+
+def loop_oracle(effects, steps, work, vm):
+    text = PROBE_LOOP % {'effects': ', '.join('[%d] = function() %s end' % kv for kv in sorted(effects.items())),
+                         'steps': ', '.join(str(x) for x in steps), 'work': work, 'vm': 'true' if vm else 'false'}
+    oracle, _err = probe_oracle(None, text=text)
+    return oracle
+
+
+def own(oracle, pid):
+    """the probe's program 1 is the lifted program `pid` (the helper's own program, 2, is left out)"""
+    return {(pid, loop, pc): rec for (p, loop, pc), rec in oracle.items() if p == 1}
+
+
+def show(main, helper, oracle, helpers):
+    m = lift(main, helper)
+    helpers = {m.helper} if helpers else set()
+    sites = runvals.show_run_values(m.protos, own(oracle, m.root), helpers)
+    notes = runvals.notes(sites, helpers)
+    text = text_of(m, runvals.labels(sites, helpers, m.protos))
+    return m, sites, notes, text, run.report(text, notes=notes)
+
+
+MARKED = 'nil --[[%s]]' % runvals.MARK
+ROUNDS = [1] + [2, 3, 4, 5, 6, 7, 8, 9] * 3 + [10]
+ROUNDS_NO_RESET = [1] + [2, 3, 4, 5, 6, 7, 8] * 3 + [9]
+
+
+@unittest.skipUnless(have_luau(), 'needs bin/luau')
+class EveryRegisterProved(unittest.TestCase):
+    """A call can write more than one register of its caller: one the run does not prove is enough for
+    the call to count as not shown (PARTIAL), and that register is printed as not shown, not as the value
+    it had before the call."""
+    EFFECTS = {1: 'regs[1] = helper', 2: 'regs[2] = "%s"' % ENC, 3: 'regs[9] = "x"',
+               4: 'regs[1](regs[2], regs, 2)', 5: 'regs[3] = print', 6: 'regs[4] = regs[2] .. regs[9]',
+               7: 'regs[3] = nil', 8: 'regs[6] = round < 3'}
+    WORK = 'round += 1; R[n] = string.reverse(s); R[9] = "r" .. round'
+
+    def test_one_proved_one_not(self):
+        # the run saw the helper (a VM function) change R2 and R9: R2 holds the same value after every
+        # call and is shown, R9 a different one each round
+        oracle = loop_oracle(self.EFFECTS, ROUNDS, self.WORK, vm=True)
+        m, sites, notes, text, report = show(LOOP_TWO, helper_into_regs(), oracle, True)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertNotIn('"x")', text)
+        self.assertEqual([n.split(' ')[0] for n in notes], ['[runvals]', '[runvals-missing]'], notes)
+        self.assertIn('print("%s" .. %s)' % (PLAIN, MARKED), text)
+        self.assertTrue(any('values not shown' in ln and '(1 in the text)' in ln for ln in report), report)
+        rec = own(oracle, 4)[(4, 0, 4)]
+        self.assertEqual((rec['h'], rec['n'], rec['w']), (3, 3, {2, 9}))
+        self.assertEqual([(s.shown, s.unproved, s.ran, s.fixed) for s in sites], [({2: PLAIN}, {9}, True, True)])
+
+    def test_without_the_record_of_the_call(self):
+        # the helper's work done without a VM function (the verifier's probe): the run does not say what the
+        # call changed, and in the loop the code does not say which function R1 holds at the call (the call
+        # itself could change it): nothing is shown, both registers are marked
+        oracle = loop_oracle(self.EFFECTS, ROUNDS, self.WORK, vm=False)
+        m, sites, notes, text, report = show(LOOP_TWO, helper_into_regs(), oracle, False)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertNotIn('"x"', text.split('print(')[-1])
+        self.assertIn('print(%s .. %s)' % (MARKED, MARKED), text)
+        self.assertFalse(own(oracle, 4)[(4, 0, 4)].get('h'))
+        self.assertEqual([(s.shown, s.unproved, s.fixed) for s in sites], [({}, {2, 9}, False)])
+
+    def test_a_register_with_no_value_before_or_after(self):
+        # R9 is not reset before the call: no one value before or after it.  Only the run's record of the
+        # call (the helper a VM function) says the call changed it
+        effects = dict(self.EFFECTS)
+        del effects[3]
+        effects = {k if k < 3 else k - 1: v for k, v in effects.items()}
+        oracle = loop_oracle(effects, ROUNDS_NO_RESET, self.WORK, vm=True)
+        m, sites, notes, text, report = show(LOOP_TWO_NO_RESET, helper_into_regs(), oracle, True)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertIn('print("%s" .. %s)' % (PLAIN, MARKED), text)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({2: PLAIN}, {9})])
+
+
+@unittest.skipUnless(have_luau(), 'needs bin/luau')
+class RegisterTheCallNames(unittest.TestCase):
+    """A call that ran, handed the register array and a register number, where the run shows no one value
+    for that register after the call (nor before it): the call is reported (PARTIAL), and the register is
+    printed as not shown, not as what the code had there before (here nothing: `nil .. " world"`)."""
+    EFFECTS = {1: 'regs[1] = helper', 2: 'regs[2] = "%s"' % ENC, 3: 'regs[1](regs[2], regs, 9)',
+               4: 'regs[3] = print', 5: 'regs[5] = " world"', 6: 'regs[4] = regs[9] .. regs[5]', 7: 'regs[3] = nil',
+               8: 'regs[6] = round < 3'}
+    WORK = 'round += 1; R[n] = string.reverse(s) .. round'
+
+    def check(self, vm):
+        oracle = loop_oracle(self.EFFECTS, ROUNDS_NO_RESET, self.WORK, vm=vm)
+        m, sites, notes, text, report = show(LOOP_NINE, helper_into_regs(), oracle, vm)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertNotIn('print(nil .. " world")', text)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+        self.assertTrue(notes and notes[-1].startswith('[runvals-missing] 1 call(s)'), notes)
+        self.assertEqual([(s.shown, s.unproved, s.ran) for s in sites], [({}, {9}, True)])
+
+    def test_named_register(self):
+        self.check(False)
+
+    def test_the_run_saw_the_call_change_it(self):
+        self.check(True)
+
+    def test_a_register_nothing_reads_after_the_call(self):
+        # the helper also stores a table in R5, which the next instructions set again before reading it:
+        # nothing in the text can show a stale value of it, and nothing is reported for it
+        effects = dict(HelperIntoRegisters_EFFECTS)
+        oracle = loop_oracle(effects, range(1, 9), 'R[n] = string.reverse(s); R[5] = {}', vm=True)
+        m, sites, notes, text, report = show(MAIN_REGS, helper_into_regs(), oracle, True)
+        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertEqual([(s.shown, s.unproved) for s in sites], [({2: PLAIN}, set())])
+        self.assertEqual(own(oracle, 4)[(4, 0, 3)]['w'], {2, 5})
+
+
+# MAIN_REGS run once, as the probes of HelperIntoRegisters do it
+HelperIntoRegisters_EFFECTS = {1: 'regs[1] = helper', 2: 'regs[2] = "%s"' % ENC, 3: 'regs[1](regs[2], regs, 2)',
+                               4: 'regs[3] = print', 5: 'regs[5] = " world"', 6: 'regs[4] = regs[2] .. regs[5]',
+                               7: 'regs[3] = nil'}
+
+
+@unittest.skipUnless(have_luau(), 'needs bin/luau')
+class InputsAtRunTime(unittest.TestCase):
+    """A helper handed a value the script read at run time (a global): the call ran once and the value
+    after it was one value, but another execution can hand it something else.  Nothing is substituted:
+    the value is printed as not shown (a call handed the register array) or the call is kept (a result),
+    and the result is PARTIAL."""
+
+    def test_register_array(self):
+        effects = dict(HelperIntoRegisters_EFFECTS)
+        effects[2] = 'regs[2] = "dlrow" .. tostring(os.clock() > -1)'
+        oracle = loop_oracle(effects, range(1, 9), 'R[n] = string.reverse(s)', vm=True)
+        m, sites, notes, text, report = show(FROM_INPUT, helper_into_regs(), oracle, True)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertNotIn('eurtworld', text)
+        self.assertIn('print(%s .. " world")' % MARKED, text)
+        self.assertIn('(input, ({}), 2)', text)
+        self.assertIn('what it is handed is not constant', notes[-1])
+        self.assertEqual([(s.shown, s.unproved, s.ran, s.fixed) for s in sites], [({}, {2}, True, False)])
+
+    def test_constant_input_is_shown(self):
+        # (the same probe with the constant: shown, complete)
+        oracle = loop_oracle(HelperIntoRegisters_EFFECTS, range(1, 9), 'R[n] = string.reverse(s)', vm=True)
+        m, sites, notes, text, report = show(MAIN_REGS, helper_into_regs(), oracle, True)
+        self.assertEqual(report[0][:15], 'result: complet', report)
+        self.assertEqual([(s.shown, s.fixed) for s in sites], [({2: PLAIN}, True)])
+
+    def test_result_kept(self):
+        text = PROBE % {'decode': SAME, 'enc': ENC, 'call': CALL_RESULT, 'src': 1, 'order': ', '.join(map(str, range(1, 9)))}
+        text = text.replace('regs[2] = "%s"' % ENC, 'regs[2] = "dlrow" .. tostring(os.clock() > -1)')
+        oracle, _err = probe_oracle(None, text=text)
+        m, sites, notes, text, report = show(RESULT_FROM_INPUT, helper_returns(), oracle, True)
+        self.assertEqual(report[0], 'result: PARTIAL', report)
+        self.assertNotIn('eurtworld', text)
+        # (the call stays, handed the input: the script's code as it is)
+        self.assertIn('(input) .. " world")', text)
+        self.assertTrue(notes[-1].startswith('[runvals-missing] '), notes)
+        self.assertEqual([(s.kind, s.shown, s.unproved, s.fixed) for s in sites], [('result', {}, {1}, False)])
 
 
 class Pure(unittest.TestCase):

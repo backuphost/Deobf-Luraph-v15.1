@@ -701,10 +701,12 @@ class Layer3Full(unittest.TestCase):
         # VM get their captured variables and their for loops; no stub for the first plain function
         self.assertTrue(any('script returned' in ln for ln in logs), logs[-12:])
         # the payload is the script's program: a request its plain functions make in a thread they
-        # started is not placed by its call chain (not "under no program"), so it does not outvote
-        # the one made under the payload (harness.lua watch.under)
-        self.assertTrue(any(' payload: proto ' in ln for ln in logs), [ln for ln in logs if '[under]' in ln])
-        self.assertTrue(any('[under] ' in ln and 'not placed' in ln for ln in logs), [ln for ln in logs if '[under]' in ln])
+        # started counts for the program the code that started it ran under (harness.lua
+        # watch.spawned), not for "no program", so nothing outvotes the one made under the payload
+        under = [ln for ln in logs if '[under] ' in ln]
+        self.assertTrue(any(' payload: proto ' in ln for ln in logs), under)
+        self.assertTrue(under and 'under program ' in under[0] and 'under no program' not in under[0]
+                        and 'not placed' not in under[0], under)
         self.assertLess(text.count('UPVAL_'), 20)
         self.assertNotIn('forval', text)
         self.assertNotIn('native function L', text)

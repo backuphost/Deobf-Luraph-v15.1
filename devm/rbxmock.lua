@@ -2218,13 +2218,20 @@ return function(G, fnames, libnames, opts)
 		-- (luaL_argerror form, no "got <type>").  Luraph's start-up code calls spawn, defer and delay
 		-- without arguments inside xpcall; before this the message was that of the mock's own
 		-- coroutine.create with a position inside rbxmock.lua.
+		-- (P.onSpawn: the harness notes where the code that started the thread runs, see harness.lua
+		-- watch.spawned; the thread's own stack does not show it.  In P, not M: a field of M changes
+		-- the order in which the script's environment is filled, which scripts can see)
+		local function started(co)
+			if P.onSpawn then P.onSpawn(co) end
+			return co
+		end
 		local function run(f, ...)
 			if type(f) == "thread" then
-				resume(f, ...)
+				resume(started(f), ...)
 				return f
 			end
 			if type(f) ~= "function" then error("invalid argument #1 to 'spawn' (function or thread expected)", 2) end
-			local co = coroutine.create(f)
+			local co = started(coroutine.create(f))
 			resume(co, ...)
 			return co
 		end
@@ -2233,7 +2240,7 @@ return function(G, fnames, libnames, opts)
 			if type(f) ~= "thread" and type(f) ~= "function" then
 				error("invalid argument #1 to 'defer' (function or thread expected)", 2)
 			end
-			local co = type(f) == "thread" and f or coroutine.create(f)
+			local co = started(type(f) == "thread" and f or coroutine.create(f))
 			queue[#queue + 1] = { co, ... }
 			return co
 		end)
@@ -2244,7 +2251,7 @@ return function(G, fnames, libnames, opts)
 			if type(f) ~= "thread" and type(f) ~= "function" then
 				error("invalid argument #2 to 'delay' (function or thread expected)", 2)
 			end
-			return type(f) == "thread" and f or coroutine.create(f)
+			return started(type(f) == "thread" and f or coroutine.create(f))
 		end)
 		-- What a wait returns is the time that really passed (documentation of task.wait and wait): at
 		-- least what was asked for, at least one step of the scheduler (task.wait resumes on the next

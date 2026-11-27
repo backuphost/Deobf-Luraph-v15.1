@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 
-from . import beautify, bootstrap, cleanup, container, ircfg, lifter, normalize, opaque, pe, pipeline, structure, unidata, vmmodel
+from . import beautify, bootstrap, cleanup, container, ircfg, lifter, normalize, opaque, pe, pipeline, runvals, structure, unidata, vmmodel
 
 sys.setrecursionlimit(100000)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1021,7 +1021,9 @@ def report(text, returned=None, notes=None, parse=None):
     flags = len(re.findall(r'exit\d+ = true', text))
     # placeholders the printer writes where it has no value or text to show
     ups = sum(1 for ln in lines if re.search(r'\bUPVAL_\d', ln))
-    holes = len(re.findall(r'nil --\[\[', code))
+    # (not the values runvals.show_run_values marks as not shown: the "values not shown" line counts those)
+    marks = code.count('nil --[[%s]]' % runvals.MARK)
+    holes = len(re.findall(r'nil --\[\[', code)) - marks
     stubs = code.count('--[[ native function L') + code.count('--[[ UNSTRUCTURED')
     # values the lifter could only name by where the dump holds them, and arguments / registers
     # it could not connect to a variable
@@ -1049,7 +1051,8 @@ def report(text, returned=None, notes=None, parse=None):
     out = []
     unchecked = ['  note: not checked that the text parses (%s)' % parse[2]] if parse is not None and parse[0] is None else []
     if not (errs or blank or refs or flat or flags or vm or ups or holes or stubs or preps or envrefs or regs
-            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry or unshown):
+            or keys or mixes or dead or single_root or startup or hint or hidden or unparsed or stalled or entry or unshown
+            or marks):
         out.append('result: complete (no unlifted instructions, no missing constants, all control flow structured)')
         return out + unchecked + traps
     out.append('result: PARTIAL')
@@ -1084,12 +1087,12 @@ def report(text, returned=None, notes=None, parse=None):
     if single_root:
         out.append('  the result is the VM\'s root program including Luraph\'s start-up code, lifted from the state before '
                    'it ran: what that code decodes at run time is still encoded, and the script is not separated from it')
-    if unshown:
+    if unshown or marks:
         out.append('  %d kind(s) of call write into the variables of the code that calls them, or return what it keeps, and '
                    'the run does not show one value for some of them (see the "values not shown" line%s above): after '
-                   'those calls a variable may show its earlier value, or the text keeps the call, and the constants '
-                   'handed to them stay encrypted' % (
-                       len(unshown), 's' if len(unshown) > 1 else ''))
+                   'those calls a variable the call may have set is printed `nil --[[%s]]` (%d in the text), or the text '
+                   'keeps the call, and the constants handed to them stay encrypted' % (
+                       len(unshown), 's' if len(unshown) > 1 else '', runvals.MARK, marks))
     if errs:
         out.append('  %d LIFT ERROR markers: an instruction could not be lifted; the code after it is missing' % errs)
     if blank:

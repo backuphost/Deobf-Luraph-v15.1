@@ -1200,6 +1200,10 @@ def read_oracle(path):
                     for i, v in (rec.get('s') or {}).items()}
         # registers that held the activation's own register array on every visit
         rec['a'] = {int(i) for i in rec.get('a') or ()}
+        # calls handed the activation's register array that the run saw (h, of the n visits) and the
+        # registers they changed (w)
+        rec['h'] = int(rec.get('h') or 0)
+        rec['w'] = {int(i) for i in rec.get('w') or ()}
         rec['succ'] = {tuple(x) for x in rec['succ']}
         out[(pid, loop, pc)] = rec
     return out
@@ -1214,7 +1218,9 @@ def run_oracle(model, workdir, tag, options=()):
     every executed instruction to a dict: r/v = numbers held by registers / interpreter locals on
     entry (same on every visit), s = strings and booleans held by registers on entry (same on every
     visit of the script's own run; not for code only the exercise pass ran), a = registers that held
-    the activation's own register array on every visit (likewise), vers = [(step, instruction text)]
+    the activation's own register array on every visit (likewise), h / w = how many calls handed the
+    activation's register array the run saw (a VM function as the callee) and the registers they
+    changed, vers = [(step, instruction text)]
     per version executed, final = the instruction text at the end of the run."""
     patched = os.path.join(workdir, tag + '.step.lua')
     outjson = os.path.join(workdir, tag + '.end.json')
