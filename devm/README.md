@@ -65,7 +65,10 @@ line per kind of thing that is missing:
 
 | Line | Meaning |
 |---|---|
-| `LIFT ERROR markers` | an instruction that could not be lifted; the code after it is missing |
+| `the text does not parse: line N: <error>` | `main()` runs `bin/luau-ast` on the result; a text it rejects is never complete. The line number is the written file's, report head included (without the parser: `note: not checked that the text parses`) |
+| `LIFT ERROR markers` | an instruction that could not be lifted; the code after it is missing (a `-- LIFT ERROR: N instruction(s) ...` head line is not counted here) |
+| `N instruction(s) ... did not lift and have no LIFT ERROR marker` | the text's head line: lift errors in code the text does not contain (proto-table layout), or in code the traced run executed (factory layout; `up to N ... may have no marker` when errors with one message are marked only in part: markers name the error, not its place) |
+| `the result may not be the script` | the `hint:` line: the proto taken for the script (the first of the second interpreter) is small and calls nothing but pure library functions while the first program did the work; `--root N` lifts the first program |
 | `lines index or call nil` | `(nil)[k]`, `t[nil]`: usually a constant of code that never ran |
 | `constants shown as __LPH_PROTOS[...]` | a value of the VM state the dump could not describe |
 | `uses of LuraphVM` | the table that holds Luraph's interpreter; protected code keeps helper functions and values in its fields. The table itself is not in the result |
@@ -78,11 +81,12 @@ line per kind of thing that is missing:
 | `lines compute a constant into a local nothing reads` | Luraph's dead arithmetic (`local v = <literals, arithmetic, bit32 / string calls>`, v14 self-patch values) that `cleanup.drop_dead_constants` left because it does not evaluate here (removing a line that raises would change the script) |
 | `the result is the VM's first program, which begins with Luraph's start-up code` | factory layout: the run made no program on a second interpreter, so the lift is the first program; the `start-up code:` line of the run says what the run shows about the script (its top level ran inside it but is not separated, or nothing of it showed) |
 | `the result is the VM's root program including Luraph's start-up code` | v14 single root program lifted from its first entry (`[single-root]`): what the start-up code decodes at run time is still encoded |
-| `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead |
+| `note: N instruction(s) that never ran did not lift` | factory layout: lift errors in never-executed code the result does not contain (cut as junk or unreachable); errors in code that ran without a marker give a `-- LIFT ERROR` head line instead, which lists only the messages of executed errors that may have no marker |
 | `note: N calls of <name>, Luraph's tamper response` | not a defect: the tests in front of those calls are checks of the protection, not of the script (v15.2, see below) |
 
 `run.report(text, notes=...)` gives the second part for any result file (it skips a head written
-earlier, and reads the start-up and single-root lines off it when no run notes are given).
+earlier, and reads the start-up, single-root and hint lines off it when no run notes are given;
+the parse check is `run.parse_check`, which `main()` passes in).
 
 ### Factory layout: traced end-state lifting
 
@@ -247,7 +251,16 @@ into the methods of one table (v14.4 - v14.9).  What differs per file is decorat
   `cleanup.drop_dead_constants` drops `local vN = E` when vN is read nowhere and E (literals,
   arithmetic, comparisons, and/or/not, calls of `bit32.*`, `math.floor/ceil/abs/min/max/modf/round`,
   `string.unpack/packsize/byte/len/sub/char/rep` on constants) evaluates without an error; what is
-  left of that shape is counted by the report.
+  left of that shape is counted by the report.  "Without an error" follows Luau (checked with
+  `bin/luau`): `string.unpack` only with two arguments, integer sizes 1..16 (unpack: 1..8), sizes
+  and `string.packsize` totals up to 2^30; the zero-argument `bit32.band()` / `bor()` / `bxor()`
+  are valid.  Uses are counted from tokens, the expressions inside backtick `{...}` included, and a
+  line that a long comment or string runs over (or opens) is never dropped.
+* **`;(` first in a block.**  A statement that starts with `(` is printed as `;(...)` (it would
+  continue the one before it).  When a cleanup pass removes the statement before it, the `;` can end
+  up first in its block, which Luau does not parse; the last step of `cleanup.tidy`
+  (`drop_block_semicolons`) drops a `;` that follows `do`, `then`, `else`, `repeat`, the `)` of a
+  function's parameter list, another `;` or nothing, and keeps every other one.
 * **Failures are one line.**  A run that writes no result ends with `devm: <stage>: <reason>` and a
   non-zero status: `unsupported target` (a build for Lua 5.3/5.4 or LuaJIT: `normalize.foreign_dialect`
   looks before the parser is tried), `damaged input` (text that does not parse, a container that
@@ -467,7 +480,8 @@ Checked against the Luraph directories `v15.0`, `v15.1`, `v15.2` of a public sam
   <how the run stopped> (a chunk cut out of a container needs its data: --chunk-arg)`.
 * **The `--root` hint** ("the script is probably the first program") is only given when the
   function taken for the script calls nothing but pure library functions (a helper of the build);
-  it used to be printed for every small script.
+  it used to be printed for every small script.  A result with the hint is PARTIAL (`the result may
+  not be the script`).
 * **No payload interpreter.**  When the run made no program on an interpreter other than the first
   (the run never reached the script's interpreter: a key check, a server reply, a mock difference;
   or a build such as the v15.2 example whose script's top level is flattened into the start-up

@@ -478,6 +478,65 @@ class HiddenErrors(unittest.TestCase):
         self.assertEqual(run.run_report(['[cut] 3 instruction(s) that never ran did not lift']),
                          ['  note: 3 instruction(s) that never ran did not lift'])
 
+    def test_head_line(self):
+        """'up to N ... may have no marker' where errors with one message are marked only in part; the
+        head line lists only messages of executed errors that may have no marker, and is not counted
+        as one more marker (the result stays PARTIAL)."""
+        from devm import run
+        oracle = {(1, 1, 10): {}, (1, 1, 11): {}}
+        errors = [(1, ((1, 10), 'bad A')), (1, ((1, 11), 'bad B')), (1, ((1, 12), 'bad B')), (2, ((1, 3), 'bad C'))]
+        # nothing marked: exactly the two executed errors have none
+        head, cold = run.hidden_head(errors, oracle, 'print(1)\n')
+        self.assertEqual(cold, 2)
+        self.assertTrue(head.startswith('-- LIFT ERROR: 2 instruction(s) that the traced run executed did not lift and have '
+                                        'no marker in the text below.'), head)
+        self.assertTrue(head.endswith('Their lift errors: bad A; bad B'), head)
+        # A marked, B not: the executed B has none for sure
+        body = 'print(1)\n-- LIFT ERROR: bad A\n'
+        head, _ = run.hidden_head(errors, oracle, body)
+        self.assertTrue(head.startswith('-- LIFT ERROR: 1 instruction(s) that the traced run executed'), head)
+        self.assertTrue(head.endswith('Their lift errors: bad B'), head)
+        # one marker of B for one executed and one cut B: which one has it is not known
+        body = 'print(1)\n-- LIFT ERROR: bad A\n-- LIFT ERROR: bad B\n'
+        head, cold = run.hidden_head(errors, oracle, body)
+        self.assertEqual(cold, 1)       # (C; the B without a marker is counted as the executed one)
+        self.assertTrue(head.startswith('-- LIFT ERROR: up to 1 instruction(s) that the traced run executed did not lift and '
+                                        'may have no marker in the text below (possibly none:'), head)
+        self.assertTrue(head.endswith('Their lift errors: bad B'), head)
+        self.assertEqual(run.hidden_head(errors, oracle, body + '-- LIFT ERROR: bad B\n')[0], None)
+        rep = run.report(head + '\n' + body)
+        self.assertEqual(rep[0], 'result: PARTIAL')
+        self.assertIn('  2 LIFT ERROR markers: an instruction could not be lifted; the code after it is missing', rep)
+        self.assertTrue(any(ln.startswith('  up to 1 instruction(s) that the traced run executed did not lift and may have no '
+                                          'LIFT ERROR marker') for ln in rep), rep)
+        # a head line alone: PARTIAL, no marker count
+        head, _ = run.hidden_head(errors, oracle, 'print(1)\n')
+        rep = run.report(head + '\nprint(1)\n')
+        self.assertEqual(rep[0], 'result: PARTIAL')
+        self.assertFalse(any('LIFT ERROR markers' in ln for ln in rep), rep)
+        self.assertTrue(any(ln.startswith('  2 instruction(s) that the traced run executed did not lift and have no LIFT '
+                                          'ERROR marker') for ln in rep), rep)
+
+
+class RootHintReport(unittest.TestCase):
+    """pipeline's hint that the proto taken for the script is a helper of the build makes the result
+    PARTIAL: it may not be the script."""
+    HINT = ('[hint] the function taken for the script (proto 9, on the second interpreter) has only 12 instructions, while '
+            'the first program executed 25000: the script is probably the first program; run again with --root 1')
+
+    def test_partial(self):
+        from devm import run
+        notes = ['[oracle] script returned after 25012 instructions', self.HINT]
+        lines = run.report('print(1)\n', notes=notes)
+        self.assertEqual(lines[0], 'result: PARTIAL')
+        self.assertTrue(any('may not be the script' in ln and '--root 1' in ln for ln in lines[1:]), lines)
+        self.assertTrue(run.report('print(1)\n', notes=notes[:1])[0].startswith('result: complete'))
+        # read off the head of a file main() wrote
+        rr = run.run_report(notes)
+        self.assertTrue(any(ln.startswith(run.HINT_LINE) for ln in rr), rr)
+        head = ['-- x.lua, %s.  How the run went and what this file lacks:' % run.HEAD_MARK] + ['--   ' + ln for ln in rr + lines]
+        self.assertEqual(run.report('\n'.join(head) + '\nprint(1)\n'), lines)
+
 
 class BlindKeyArithmetic(unittest.TestCase):
     """What the interpreter that runs the script leaves in a v15.1 result: key arithmetic on an

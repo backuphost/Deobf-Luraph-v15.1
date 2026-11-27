@@ -430,8 +430,15 @@ def run(job):
                 chunk_paths = [job.write(job.path(".chunk_%s.luau" % key), src, encoding="latin-1")
                                for key, src in raw_chunks.items()]
                 # (v15.2 "nested" shapes: one function holds Luraph's start-up code and the
-                # script's main function, the check below does not apply)
-                reached = "nested" if "nested" in shapes else not_reached(job, ppath, chunk_paths)
+                # script's main function, the check below does not apply.  Whether the lift
+                # starts from that function -- the program the VM entered first -- or from a
+                # payload VM of its own is the same test: nested_first)
+                nested_first = None
+                if "nested" in shapes:
+                    reached = "nested"
+                    nested_first = not_reached(job, ppath, chunk_paths)
+                else:
+                    reached = not_reached(job, ppath, chunk_paths)
                 if reached is True:
                     if status != "finished":
                         # Nothing of the script to lift: the lift would be
@@ -449,13 +456,9 @@ def run(job):
                 else:
                     lifted_lacks, failure[0] = lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath,
                                                     chunk_paths)
-                    if lifted_lacks is not None and reached is None:
-                        lifted_lacks.append("the script's main function could not be identified: the output may "
-                                            "start with Luraph's start-up code")
-                    elif lifted_lacks is not None and reached == "nested":
-                        lifted_lacks.append("Luraph v15.2 keeps its start-up code and the script's main function in "
-                                            "one function: the output includes Luraph's start-up code, not "
-                                            "separated from the script")
+                    lack = root_lack(reached, nested_first)
+                    if lifted_lacks is not None and lack:
+                        lifted_lacks.append(lack)
     runner.finish()
     if devirt_on and lifted_lacks is not None and os.path.exists(dpath):
         # a lift full of calls to nil misread the VM: the trace is the better result
@@ -506,6 +509,25 @@ def run(job):
         if not os.path.exists(job.trace_path):
             write_trace()
     return job.trace_path
+
+
+MAIN_UNKNOWN = ("the script's main function could not be identified: the output may start with Luraph's "
+                "start-up code")
+NESTED_START_UP = ("Luraph v15.2 keeps its start-up code and the script's main function in one function: the "
+                   "output includes Luraph's start-up code, not separated from the script")
+
+
+def root_lack(reached, nested_first):
+    """What a lift lacks for where it starts: reached is not_reached()'s answer
+    (or "nested" for v15.2 nested shapes), nested_first not_reached()'s answer
+    for a nested shape. A nested shape's lift includes Luraph's start-up code
+    only when its root is the program the VM entered first (nested_first True);
+    a payload VM made apart from the start-up VM is lifted without it."""
+    if reached is None or reached == "nested" and nested_first is None:
+        return MAIN_UNKNOWN
+    if reached == "nested" and nested_first is True:
+        return NESTED_START_UP
+    return None
 
 
 def not_reached(job, ppath, chunk_paths):

@@ -320,6 +320,117 @@ class DeadConstants(unittest.TestCase):
         from devm import cleanup
         self.assertNotIn('string.packsize', cleanup.tidy(self.JUNK))
 
+    def test_raises_in_luau(self):
+        """Lines that raise in Luau are kept (and counted); what Luau accepts is dropped."""
+        from devm import cleanup
+        for line in ('local v2 = string.unpack("<i4", "abcd", 1)',         # init: pe.fold_pure does not read it
+                     'local v2 = string.unpack("<i4", "abcd", 5)',         # ... and here Luau raises
+                     'local v2 = string.unpack("<i17", "%s")' % ('a' * 17),        # integral size out of limits
+                     'local v2 = string.unpack("<i0", "a")',
+                     'local v2 = string.unpack("<i9", "abcdefghi")',       # 9-byte integer does not fit
+                     'local v2 = string.packsize("i17")',
+                     'local v2 = string.packsize("i0") + 1',
+                     'local v2 = string.packsize("c1073741825")',          # size specifier is too large
+                     'local v2 = string.packsize("c1073741824b")',         # format result too large
+                     'local v2 = string.packsize("c") + 1',                # missing size
+                     'local v2 = bit32.bnot() + 1'):                       # missing argument
+            self.assertEqual(cleanup.drop_dead_constants(line + '\nprint(1)\n'), line + '\nprint(1)\n', line)
+            self.assertEqual(run.report(line + '\nprint(1)\n')[0], 'result: PARTIAL', line)
+        for line in ('local v2 = bit32.band()', 'local v2 = bit32.bor() + bit32.bxor()', 'local v2 = bit32.btest() and 1',
+                     'local v2 = string.packsize("c1073741823b")', 'local v2 = string.packsize("i16 I1")',
+                     'local v2 = string.unpack(">i8", "abcdefgh")'):
+            self.assertEqual(cleanup.drop_dead_constants(line + '\nprint(1)\n'), 'print(1)\n', line)
+
+    def test_tokens_over_lines(self):
+        """A line whose tail opens a long comment or string, or a line inside one, is not dropped."""
+        from devm import cleanup
+        for text in ('local v2 = "x" .. 1 --[==[ c\n]==]\nprint(1)\n',
+                     'local v2 = 7 + [[a\nb]]\nprint(1)\n',
+                     'local s = [[\nlocal v7 = 1\n]]\nprint(s, v7)\n',
+                     'local s = [[\nlocal v7\n]]\nprint(s, v7)\n'):
+            self.assertEqual(cleanup.drop_dead_constants(text), text)
+            self.assertEqual(cleanup.drop_unused(text), text)
+
+    def test_interpolation(self):
+        """A local read only inside a backtick interpolation is read."""
+        from devm import cleanup
+        for text in ('local v5 = 3\nprint(`value {v5}`)\n', 'local v5 = 3\nprint(`a {`b {v5 + 1}`} c`)\n',
+                     'local v5 = 3\nprint(`{ {v5} }`)\n', 'local v5 = 3\nprint(`\\{ {v5}`)\n'):
+            self.assertEqual(cleanup.drop_dead_constants(text), text)
+            self.assertEqual(cleanup.ident_counts(text)['v5'], 2, text)
+        self.assertEqual(cleanup.drop_unused('local v5\nprint(`{v5}`)\n'), 'local v5\nprint(`{v5}`)\n')
+        self.assertEqual(cleanup.drop_dead_constants('local v5 = 3\nprint(`v5 {1}`)\n'), 'print(`v5 {1}`)\n')
+        # the tokens put the text back together, and a rename reaches the interpolation
+        for text in ('print(`a{b}c{`d{e}`}`)', 'x = `unclosed {y', 'x = `{ {1, 2} }` .. "`"'):
+            self.assertEqual(''.join(s for _k, s in cleanup.tokens(text)), text)
+        self.assertEqual(cleanup.tidy('local v5 = game:GetService("Players")\nprint(`{v5.Name}`)\n'),
+                         'local Players = game:GetService("Players")\nprint(`{Players.Name}`)\n')
+
+
+class BlockSemicolons(unittest.TestCase):
+    """A statement that starts with `(` is printed as `;(...)`; when a pass removes the statement in
+    front of it, the `;` must not stay first in its block (Luau does not parse that)."""
+    PROBE = 'local v9 = function()\n\tlocal v1 = 11\n\t;(print)("x")\nend\nv9()\n'
+
+    def test_drop(self):
+        from devm import cleanup
+        f = cleanup.drop_block_semicolons
+        for before, after in ((';(f)()', '(f)()'), ('do\n;(f)()\nend', 'do\n(f)()\nend'),
+                              ('if a then\n\t-- note\n\t;(g)()\nelse\n\t;(h)()\nend', 'if a then\n\t-- note\n\t(g)()\nelse\n\t(h)()\nend'),
+                              ('while a do ;(g)() end', 'while a do (g)() end'), ('repeat\n;(g)()\nuntil a', 'repeat\n(g)()\nuntil a'),
+                              ('local function f(a, ...)\n;(g)()\nend', 'local function f(a, ...)\n(g)()\nend'),
+                              ('function a.b:c(x)\n;(g)()\nend', 'function a.b:c(x)\n(g)()\nend'),
+                              ('x = function()\n--[[ c ]]\n;(g)()\nend', 'x = function()\n--[[ c ]]\n(g)()\nend'),
+                              ('x = 1;\n;(g)()', 'x = 1;\n(g)()')):
+            self.assertEqual(f(before), after)
+        for keep in ('f()\n;(g)()', 'x = f(a)\n;(g)()', 'local x = function() end\n;(g)()', 't = {1}\n;(g)()',
+                     'x = function(a) g(b)\n;(h)()\nend', 'print(";(")', 'x = y\n;(g)()', 'do end\n;(g)()'):
+            self.assertEqual(f(keep), keep)
+
+    def test_tidy(self):
+        from devm import cleanup
+        self.assertEqual(cleanup.tidy(self.PROBE), 'local v9 = function()\n\t(print)("x")\nend\nv9()\n')
+
+    @unittest.skipUnless(os.path.exists(os.path.join(ROOT, 'bin', 'luau-ast')), 'needs bin/luau-ast')
+    def test_parses(self):
+        from devm import cleanup
+        self.assertEqual(run.parse_check(self.PROBE)[0], True)
+        self.assertEqual(run.parse_check(cleanup.tidy(self.PROBE))[0], True)
+        bad = run.parse_check('local f = function()\n;(print)("x")\nend\n')
+        self.assertEqual(bad[:2], (False, 1))
+        self.assertIn("got ';'", bad[2])
+
+    @unittest.skipUnless(os.path.exists(os.path.join(ROOT, 'bin', 'luau-ast')), 'needs bin/luau-ast')
+    def test_report_of_main(self):
+        """main(): a text that does not parse is PARTIAL, with the first error and its line in the file."""
+        import contextlib
+        import io
+        saved = run.deobfuscate
+        try:
+            for text, want in (('print(1)\nlocal f = function()\n;(print)("x")\nend\n', 'PARTIAL'),
+                               ('print(1)\n', 'complete')):
+                run.deobfuscate = lambda *a, **k: text
+                run.LAST_RUN['notes'] = []
+                with tempfile.TemporaryDirectory() as work:
+                    out = os.path.join(work, 'out.lua')
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        run.main([os.path.join(work, 'in.lua'), '-o', out, '--work', work])
+                    printed = buf.getvalue().split('\n')
+                    with open(out, encoding='utf-8') as f:
+                        written = f.read().split('\n')
+                self.assertTrue(any(ln.startswith('result: ' + want) for ln in printed), printed)
+                if want == 'PARTIAL':
+                    m = [re.match(r'^  the text does not parse: line (\d+): (.*)$', ln) for ln in printed]
+                    m = [x for x in m if x]
+                    self.assertEqual(len(m), 1, printed)
+                    self.assertEqual(written[int(m[0].group(1)) - 1], ';(print)("x")')
+                    self.assertIn("got ';'", m[0].group(2))
+                else:
+                    self.assertFalse(any('does not parse' in ln for ln in printed), printed)
+        finally:
+            run.deobfuscate = saved
+
 
 class Dialect(unittest.TestCase):
     LUAU = ('local a = b ~= c; local s = "a ~ b << | &" -- x ~ y\nlocal t = [[ ~ ]]',
