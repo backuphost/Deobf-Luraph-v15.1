@@ -523,6 +523,19 @@ def main():
               and info['vm']['dispatch_loops'] == 1
               and info['big_functions'] == [(a0, a0 + len(fn_text), len(fn_text))]
               and info['dispatchers'] == [(d0, d0 + len(dispatcher(160)), len(dispatcher(160)))], str(info))
+        # the same object whose interpreter computes its first test into a local first (the
+        # v15.1 outlined head `local D=F[b]; local J=D<1; if J then`): still a dispatch loop,
+        # so the static result is partial
+        osrc = nsrc.replace(dispatcher(160), dispatcher(160, head='local J=D<1;if J then'))
+        check('outlined head: the test input has the outlined first test',
+              osrc != nsrc and 'local D=F[b];local J=D<1;if J then' in osrc, '')
+        oin = os.path.join(tmp, 'outlined.lua')
+        with open(oin, 'w', encoding='utf-8') as fh:
+            fh.write(osrc)
+        rc, log = deob([oin, '-o', os.path.join(tmp, 'outlined.out.lua'), '--min-size', '3000', '--engine', 'static'],
+                       tmp)
+        check('outlined head: exit 6 with the form-A PARTIAL line, the interpreter dropped as a dispatcher',
+              rc == FORM_A and partial_line(log) and '剔除 VM 分派器 1 个' in log, log[-600:])
         # a UTF-8 byte order mark in front of the file: not part of the script
         bin_path = os.path.join(tmp, 'noui_bom.lua')
         with open(bin_path, 'wb') as fh:
